@@ -29,6 +29,8 @@ pub struct Factory {
     pub state_dir: PathBuf,
     #[serde(default = "default_claude")]
     pub claude_bin: String,
+    #[serde(default = "default_gh")]
+    pub gh_bin: String,
     /// The one Claude CLI version the factory runs. A different installed
     /// version stops a run before it starts.
     pub cli_version: String,
@@ -37,6 +39,10 @@ pub struct Factory {
     #[serde(default)]
     pub model_override: BTreeMap<String, String>,
     pub slack: Option<SlackSettings>,
+}
+
+fn default_gh() -> String {
+    "gh".to_string()
 }
 
 fn default_claude() -> String {
@@ -141,6 +147,41 @@ pub struct GitHub {
     pub repo: String,
     /// Every repository the factory's code may write to for this project.
     pub write: Vec<String>,
+    /// Checks that must be present and passed before a pull request counts as
+    /// green. Every other check that exists must pass as well. Naming them
+    /// means a workflow that has not started yet cannot be taken for a pass.
+    #[serde(default)]
+    pub required_checks: Vec<String>,
+    #[serde(default = "default_ci_poll")]
+    pub ci_poll_secs: u64,
+    /// How long to wait for checks before parking the unit.
+    #[serde(default = "default_ci_timeout")]
+    pub ci_timeout_secs: u64,
+    /// Green must still be green this long after it is first seen.
+    #[serde(default = "default_ci_settle")]
+    pub ci_settle_secs: u64,
+    /// The subject of the merge commit. `{bead}` is the bead ID, `{bead_short}`
+    /// the ID without the project's prefix, `{title}` the pull request's title.
+    pub merge_subject: Option<String>,
+    /// Remove the unit's branch from the remote once it has merged.
+    #[serde(default = "default_true")]
+    pub delete_branch_after_merge: bool,
+}
+
+fn default_ci_poll() -> u64 {
+    30
+}
+
+fn default_ci_timeout() -> u64 {
+    3 * 60 * 60
+}
+
+fn default_ci_settle() -> u64 {
+    60
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Deserialize)]

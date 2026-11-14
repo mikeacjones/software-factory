@@ -81,6 +81,14 @@ command = ["cargo", "test", "--locked", "--offline", "--package", "factory-drive
 timeout_secs = 900
 
 [[check]]
+id = "ci-and-landing"
+tier = "hermetic"
+bead = "sf-c9e.11"
+claim = "Against a scripted GitHub: a failed check ends the wait at once and its log reaches the builder's session; green needs every required check present and passed; nothing merges unless the head is the commit the factory published; the bead is closed only after the merge commit is on the default branch; a conflicting pull request parks the unit; and an ended unit can be moved onto the current flow by the owner."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-driver", "--package", "factory-github", "--", "a_red_check", "a_pull_request_that_conflicts", "a_push_by_someone_else", "the_owner_can_put", "one_failed_check", "green_needs", "check_runs_and", "a_merge_outside"]
+timeout_secs = 900
+
+[[check]]
 id = "scratch-walk-live"
 tier = "live"
 bead = "sf-c9e.7"
@@ -92,6 +100,6 @@ timeout_secs = 2400
 id = "zig-run"
 tier = "owner"
 bead = "sf-c9e.8"
-claim = "A factory unit for temporal-sdk-zig ended with a pull request into main from a factory branch that is open or merged on GitHub, its Slack thread has every step, and its bead is still claimed by the factory."
+claim = "A factory unit for temporal-sdk-zig ended with a pull request into main from a factory branch that is open or merged on GitHub, its Slack thread has every step, and its bead is claimed by the factory, or closed once the pull request has merged."
 command = ["proofs/walk_zig_verify.sh"]
 timeout_secs = 300

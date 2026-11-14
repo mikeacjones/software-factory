@@ -193,8 +193,36 @@ struct RawStep {
     on: BTreeMap<String, Route>,
 }
 
-/// The only factory action of the first cut.
-pub const ACTIONS: [&str; 1] = ["publish"];
+/// A factory action: fixed behaviour, placed by the flow.
+pub struct ActionSpec {
+    pub name: &'static str,
+    /// Every outcome the action can end with.
+    pub outcomes: &'static [&'static str],
+    /// The outcomes a flow must route.
+    pub required: &'static [&'static str],
+}
+
+pub const ACTIONS: [ActionSpec; 3] = [
+    // One final commit, a push, and the pull request.
+    ActionSpec {
+        name: "publish",
+        outcomes: &["done", "failed"],
+        required: &["done"],
+    },
+    // Wait for the pull request's checks: `red` as soon as one fails,
+    // `green` once every one has passed.
+    ActionSpec {
+        name: "await-ci",
+        outcomes: &["green", "red"],
+        required: &["green", "red"],
+    },
+    // Merge the pull request, confirm it, close the bead.
+    ActionSpec {
+        name: "land",
+        outcomes: &["done", "failed"],
+        required: &["done"],
+    },
+];
 
 /// What a flow is checked against: the things it may name.
 #[derive(Clone, Debug, Default)]
@@ -336,18 +364,24 @@ impl Flow {
                     }
                 }
                 StepKind::Action { action } => {
-                    if !ACTIONS.contains(&action.as_str()) {
-                        problems.push(format!("step `{id}`: unknown action `{action}`"));
-                    }
-                    for outcome in step.on.keys() {
-                        if !matches!(outcome.as_str(), "done" | "failed") {
-                            problems.push(format!(
-                                "step `{id}`: an action step cannot end with `{outcome}`"
-                            ));
+                    match ACTIONS.iter().find(|spec| spec.name == action) {
+                        None => problems.push(format!("step `{id}`: unknown action `{action}`")),
+                        Some(spec) => {
+                            for outcome in step.on.keys() {
+                                if !spec.outcomes.contains(&outcome.as_str()) {
+                                    problems.push(format!(
+                                        "step `{id}`: the action `{action}` cannot end with `{outcome}`"
+                                    ));
+                                }
+                            }
+                            for outcome in spec.required {
+                                if !step.on.contains_key(*outcome) {
+                                    problems.push(format!(
+                                        "step `{id}`: the action `{action}` must route `{outcome}`"
+                                    ));
+                                }
+                            }
                         }
-                    }
-                    if !step.on.contains_key("done") {
-                        problems.push(format!("step `{id}`: an action step must route `done`"));
                     }
                 }
             }
@@ -842,6 +876,41 @@ on.failed = "park"
             problems(&text),
             ["step `test`: `model` does not apply to a command step"]
         );
+    }
+
+    #[test]
+    fn an_action_must_route_what_it_can_end_with() {
+        let tail = r#"
+[[step]]
+id = "ci"
+kind = "action"
+action = "await-ci"
+on.green = "land"
+
+[[step]]
+id = "land"
+kind = "action"
+action = "land"
+on.done = "end"
+on.merged = "end"
+"#;
+        let text = format!(
+            "{}{tail}",
+            FLOW.replace("on.done = \"end\"", "on.done = \"ci\"")
+        );
+        let found = problems(&text);
+        assert!(found.contains(&"step `ci`: the action `await-ci` must route `red`".to_string()));
+        assert!(
+            found.contains(&"step `land`: the action `land` cannot end with `merged`".to_string())
+        );
+
+        let good = text
+            .replace(
+                "on.green = \"land\"",
+                "on.green = \"land\"\non.red = { to = \"fix\", max = 2 }",
+            )
+            .replace("on.merged = \"end\"\n", "");
+        Flow::parse(&good).unwrap().check(&registry()).unwrap();
     }
 
     #[test]

@@ -183,9 +183,217 @@ impl GitHub {
         })
     }
 
+    /// GitHub's own record of a pull request: its state, its head commit and
+    /// the checks on that commit.
+    pub fn pull_request_status(
+        &self,
+        cwd: &Path,
+        repo: &str,
+        number: u64,
+    ) -> Result<PullRequestStatus, GitHubError> {
+        let number = number.to_string();
+        let args = [
+            "pr",
+            "view",
+            &number,
+            "--repo",
+            repo,
+            "--json",
+            "state,headRefOid,mergeable,mergeCommit,statusCheckRollup",
+        ];
+        let out = self.gh(cwd, &args, None)?;
+        let answer: Value =
+            serde_json::from_str(out.trim()).map_err(|err| GitHubError::Answer {
+                command: format!("gh {}", args.join(" ")),
+                detail: err.to_string(),
+            })?;
+        let text = |key: &str| {
+            answer
+                .get(key)
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string()
+        };
+        Ok(PullRequestStatus {
+            state: text("state"),
+            head: text("headRefOid"),
+            mergeable: text("mergeable"),
+            merge_commit: answer
+                .pointer("/mergeCommit/oid")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            checks: answer
+                .get("statusCheckRollup")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+                .iter()
+                .map(check_of)
+                .collect(),
+        })
+    }
+
+    /// The failing part of a check's log, if GitHub will give it.
+    pub fn failed_log(&self, cwd: &Path, repo: &str, check: &Check) -> Option<String> {
+        // .../actions/runs/<run>/job/<job>
+        let url = check.url.as_deref()?;
+        let run = url.split("/actions/runs/").nth(1)?.split('/').next()?;
+        if run.is_empty() || !run.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        self.gh(
+            cwd,
+            &["run", "view", run, "--repo", repo, "--log-failed"],
+            None,
+        )
+        .ok()
+        .filter(|log| !log.trim().is_empty())
+    }
+
+    /// Merge a pull request with a merge commit, but only if its head is
+    /// still `head`: nothing that the factory did not publish is merged.
+    pub fn merge(
+        &self,
+        cwd: &Path,
+        repo: &str,
+        number: u64,
+        head: &str,
+        subject: Option<&str>,
+    ) -> Result<(), GitHubError> {
+        self.check_allowed(repo)?;
+        let number = number.to_string();
+        let mut args = vec![
+            "pr",
+            "merge",
+            &number,
+            "--repo",
+            repo,
+            "--merge",
+            "--match-head-commit",
+            head,
+        ];
+        if let Some(subject) = subject {
+            args.extend(["--subject", subject]);
+        }
+        self.gh(cwd, &args, None).map(|_| ())
+    }
+
     /// Whether `gh` is logged in at all.
     pub fn authenticated(&self, cwd: &Path) -> bool {
         self.gh(cwd, &["auth", "status"], None).is_ok()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheckState {
+    Pending,
+    Passed,
+    Failed,
+}
+
+/// One check on a pull request's head commit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Check {
+    pub name: String,
+    pub state: CheckState,
+    pub url: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PullRequestStatus {
+    /// `OPEN`, `MERGED` or `CLOSED`.
+    pub state: String,
+    /// The commit the pull request's branch is at.
+    pub head: String,
+    /// `MERGEABLE`, `CONFLICTING` or `UNKNOWN`.
+    pub mergeable: String,
+    pub merge_commit: Option<String>,
+    pub checks: Vec<Check>,
+}
+
+/// Read one entry of GitHub's check rollup: a check run or a commit status.
+fn check_of(entry: &Value) -> Check {
+    let text = |key: &str| entry.get(key).and_then(Value::as_str).unwrap_or("");
+    let is_status = text("__typename") == "StatusContext" || entry.get("context").is_some();
+    let (name, state, url) = if is_status {
+        let state = match text("state") {
+            "SUCCESS" => CheckState::Passed,
+            "FAILURE" | "ERROR" => CheckState::Failed,
+            _ => CheckState::Pending,
+        };
+        (text("context"), state, text("targetUrl"))
+    } else {
+        let state = if text("status") != "COMPLETED" {
+            CheckState::Pending
+        } else {
+            match text("conclusion") {
+                "SUCCESS" | "NEUTRAL" | "SKIPPED" => CheckState::Passed,
+                // Cancelled, timed out, action required, or anything new:
+                // not a pass, so not something to merge on.
+                _ => CheckState::Failed,
+            }
+        };
+        (text("name"), state, text("detailsUrl"))
+    };
+    Check {
+        name: name.to_string(),
+        state,
+        url: (!url.is_empty()).then(|| url.to_string()),
+    }
+}
+
+/// What a pull request's checks say, taken together.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CiVerdict {
+    /// Nothing has failed, and something has not finished or not appeared yet.
+    Pending {
+        passed: usize,
+        total: usize,
+        waiting: Vec<String>,
+    },
+    /// Every check has passed, and every required check is among them.
+    Green { passed: usize },
+    /// At least one check has failed. The others no longer matter.
+    Red { failed: Vec<Check> },
+}
+
+/// Judge the checks. One failure is red at once. Green needs every check that
+/// exists to have passed and every name in `required` to be among them, so a
+/// check that has not been created yet cannot be mistaken for a pass.
+pub fn ci_verdict(checks: &[Check], required: &[String]) -> CiVerdict {
+    let failed: Vec<Check> = checks
+        .iter()
+        .filter(|check| check.state == CheckState::Failed)
+        .cloned()
+        .collect();
+    if !failed.is_empty() {
+        return CiVerdict::Red { failed };
+    }
+    let passed = checks
+        .iter()
+        .filter(|check| check.state == CheckState::Passed)
+        .count();
+    let mut waiting: Vec<String> = checks
+        .iter()
+        .filter(|check| check.state == CheckState::Pending)
+        .map(|check| check.name.clone())
+        .collect();
+    for name in required {
+        if !checks.iter().any(|check| &check.name == name) {
+            waiting.push(format!("{name} (not started)"));
+        }
+    }
+    if checks.is_empty() {
+        waiting.push("no checks have appeared yet".to_string());
+    }
+    if waiting.is_empty() {
+        CiVerdict::Green { passed }
+    } else {
+        CiVerdict::Pending {
+            passed,
+            total: checks.len().max(required.len()),
+            waiting,
+        }
     }
 }
 
@@ -344,6 +552,105 @@ mod tests {
         assert!(
             publication_problems("token ghp_abc123", OWN, 100)[0].contains("looks like a secret")
         );
+    }
+
+    fn check(name: &str, state: CheckState) -> Check {
+        Check {
+            name: name.to_string(),
+            state,
+            url: None,
+        }
+    }
+
+    #[test]
+    fn one_failed_check_is_red_at_once_whatever_else_is_pending() {
+        let checks = [
+            check("fmt", CheckState::Passed),
+            check("unit", CheckState::Failed),
+            check("samples", CheckState::Pending),
+        ];
+        assert_eq!(
+            ci_verdict(&checks, &[]),
+            CiVerdict::Red {
+                failed: vec![check("unit", CheckState::Failed)]
+            }
+        );
+    }
+
+    #[test]
+    fn green_needs_every_check_passed_and_every_required_check_present() {
+        let two = [
+            check("fmt", CheckState::Passed),
+            check("unit", CheckState::Passed),
+        ];
+        assert_eq!(ci_verdict(&two, &[]), CiVerdict::Green { passed: 2 });
+
+        // A workflow that has not started yet has created no check: without
+        // the required list this would look green.
+        let required = ["fmt".to_string(), "unit".to_string(), "samples".to_string()];
+        assert_eq!(
+            ci_verdict(&two, &required),
+            CiVerdict::Pending {
+                passed: 2,
+                total: 3,
+                waiting: vec!["samples (not started)".to_string()]
+            }
+        );
+        let pending = [
+            check("fmt", CheckState::Passed),
+            check("unit", CheckState::Pending),
+        ];
+        assert!(matches!(
+            ci_verdict(&pending, &[]),
+            CiVerdict::Pending { passed: 1, .. }
+        ));
+        // No checks at all is never green.
+        assert!(matches!(ci_verdict(&[], &[]), CiVerdict::Pending { .. }));
+    }
+
+    #[test]
+    fn check_runs_and_commit_statuses_are_both_read() {
+        let run = |status: &str, conclusion: &str| {
+            check_of(&serde_json::json!({
+                "__typename": "CheckRun", "name": "unit", "status": status,
+                "conclusion": conclusion, "detailsUrl": "https://github.com/me/toy/actions/runs/55/job/66"
+            }))
+            .state
+        };
+        assert_eq!(run("IN_PROGRESS", ""), CheckState::Pending);
+        assert_eq!(run("QUEUED", ""), CheckState::Pending);
+        assert_eq!(run("COMPLETED", "SUCCESS"), CheckState::Passed);
+        assert_eq!(run("COMPLETED", "SKIPPED"), CheckState::Passed);
+        for conclusion in [
+            "FAILURE",
+            "CANCELLED",
+            "TIMED_OUT",
+            "ACTION_REQUIRED",
+            "SOMETHING_NEW",
+        ] {
+            assert_eq!(
+                run("COMPLETED", conclusion),
+                CheckState::Failed,
+                "{conclusion}"
+            );
+        }
+        let status = |state: &str| {
+            check_of(
+                &serde_json::json!({"__typename": "StatusContext", "context": "ci/x", "state": state}),
+            )
+        };
+        assert_eq!(status("SUCCESS").state, CheckState::Passed);
+        assert_eq!(status("PENDING").state, CheckState::Pending);
+        assert_eq!(status("ERROR").state, CheckState::Failed);
+        assert_eq!(status("SUCCESS").name, "ci/x");
+    }
+
+    #[test]
+    fn a_merge_outside_the_write_list_is_refused() {
+        let mut github = GitHub::new(vec!["me/toy".to_string()]);
+        github.gh_bin = "no-such-gh-anywhere".to_string();
+        let result = github.merge(&std::env::temp_dir(), "someone/else", 7, "abc", None);
+        assert!(matches!(result, Err(GitHubError::NotAllowed(_))));
     }
 
     #[test]

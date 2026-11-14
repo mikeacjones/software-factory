@@ -27,6 +27,32 @@ database = "temporal-sdk-zig"
 [github]
 repo = "mikeacjones/temporal-sdk-zig"
 write = ["mikeacjones/temporal-sdk-zig"]
+ci_poll_secs = 30
+ci_timeout_secs = 10800
+ci_settle_secs = 60
+merge_subject = "Merge bead/{bead_short}: {title}"
+delete_branch_after_merge = true
+# Green means each of these is present and passed, and nothing else failed.
+# A workflow that has not started has created no check, so without this list
+# an early look could mistake "not started" for "passed".
+required_checks = [
+    "check",
+    "changelog",
+    "samples-test (ubuntu-latest)",
+    "samples-test (macos-latest)",
+    "unit-test (x86_64-linux-gnu, Debug)",
+    "unit-test (x86_64-linux-gnu, ReleaseSafe)",
+    "unit-test (aarch64-linux-gnu, Debug)",
+    "unit-test (aarch64-linux-gnu, ReleaseSafe)",
+    "unit-test (x86_64-linux-musl, Debug)",
+    "unit-test (x86_64-linux-musl, ReleaseSafe)",
+    "unit-test (aarch64-linux-musl, Debug)",
+    "unit-test (aarch64-linux-musl, ReleaseSafe)",
+    "unit-test (aarch64-macos, Debug)",
+    "unit-test (aarch64-macos, ReleaseSafe)",
+    "unit-test (x86_64-macos, Debug)",
+    "unit-test (x86_64-macos, ReleaseSafe)",
+]
 
 [scopes]
 code = ["**"]

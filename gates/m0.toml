@@ -40,8 +40,8 @@ timeout_secs = 1800
 id = "workspace-check-offline"
 tier = "hermetic"
 bead = "sf-a82"
-claim = "With the network denied by the operating system, `cargo xtask check --offline` passes."
-command = ["sandbox-exec", "-p", "(version 1)(allow default)(deny network*)", "cargo", "xtask", "check", "--offline"]
+claim = "With every network connection denied by the operating system except loopback, which tests use to reach their own stand-in servers, `cargo xtask check --offline` passes."
+command = ["sandbox-exec", "-p", "(version 1)(allow default)(deny network*)(allow network* (local ip \"localhost:*\"))(allow network* (remote ip \"localhost:*\"))", "cargo", "xtask", "check", "--offline"]
 timeout_secs = 1800
 
 [[check]]

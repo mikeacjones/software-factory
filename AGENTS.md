@@ -26,6 +26,7 @@ factory flow check <project> --config config   # is the project's flow sound?
 factory bead <project> <bead> --config config  # may this bead be launched, and if not why?
 factory run <project> <bead> --config config   # walk one bead to a pull request
 factory run --unit <unit> --config config      # continue a stopped or parked unit
+factory run --unit <unit> --from <step> --config config  # owner's override: move a unit to a step of the current flow
 ```
 
 `config/` holds the project records, flows and role prompts. A unit's state, event log, artifacts and worktree are under `~/.local/state/software-factory/`.

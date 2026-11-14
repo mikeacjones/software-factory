@@ -27,7 +27,7 @@ pub enum BeadError {
         source: std::io::Error,
     },
     #[error(
-        "claimed `{id}` through bd, but the project's database shows status `{status}` and assignee `{assignee}`: bd may have written to another store"
+        "changed `{id}` through bd, but the project's database shows status `{status}` and assignee `{assignee}`: bd may have written to another store"
     )]
     ClaimNotVisible {
         id: String,
@@ -246,6 +246,51 @@ impl Source {
         Ok(bead)
     }
 
+    /// Close a bead, and confirm it in the project's database.
+    pub fn close(&self, id: &str, reason: &str, actor: &str) -> Result<Bead, BeadError> {
+        check_id(id)?;
+        match self {
+            Source::Files { dir } => {
+                let mut bead = self.read(id)?;
+                bead.status = "closed".to_string();
+                bead.notes = format!("{}\nClosed: {reason}", bead.notes)
+                    .trim()
+                    .to_string();
+                let path = dir.join(format!("{id}.json"));
+                let text =
+                    serde_json::to_string_pretty(&bead).map_err(|err| BeadError::Answer {
+                        command: path.display().to_string(),
+                        detail: err.to_string(),
+                    })?;
+                std::fs::write(&path, text).map_err(|source| BeadError::Io { path, source })?;
+            }
+            Source::Dolt { repo, .. } => {
+                let mut spec = Spec::new(
+                    ["bd", "close", id, "--reason", reason, "--actor", actor],
+                    repo,
+                    TIMEOUT,
+                );
+                spec.env = vec![("BEADS_ACTOR".to_string(), actor.to_string())];
+                let out = capture(&spec)?;
+                if !out.success() {
+                    return Err(BeadError::Command {
+                        command: format!("bd close {id}"),
+                        detail: out.combined().trim().to_string(),
+                    });
+                }
+            }
+        }
+        let bead = self.read(id)?;
+        if bead.status != "closed" {
+            return Err(BeadError::ClaimNotVisible {
+                id: id.to_string(),
+                status: bead.status,
+                assignee: bead.assignee,
+            });
+        }
+        Ok(bead)
+    }
+
     fn query(&self, sql: &str) -> Result<Vec<Value>, BeadError> {
         let Source::Dolt {
             host,
@@ -383,6 +428,9 @@ mod tests {
         assert_eq!(claimed.status, "in_progress");
         assert_eq!(source.read("toy-1").unwrap().assignee, "factory");
         assert!(matches!(source.read("toy-2"), Err(BeadError::NotFound(_))));
+        let closed = source.close("toy-1", "merged", "factory").unwrap();
+        assert_eq!(closed.status, "closed");
+        assert!(closed.notes.contains("Closed: merged"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -11,6 +11,8 @@ const USAGE: &str = "\
 usage:
   factory run <project> <bead> [--no-slack]   walk one bead through its project's flow
   factory run --unit <unit> [--no-slack]      continue a stopped or parked unit
+  factory run --unit <unit> --from <step>     owner's override: put the unit at that step
+                                              of the project's flow as it is now
   factory bead <project> <bead>               show a bead and whether it may be launched
   factory flow check <project>                check the flow a project names
 
@@ -23,6 +25,7 @@ struct Args {
     config: ConfigDir,
     slack: bool,
     unit: Option<String>,
+    from: Option<String>,
     positional: Vec<String>,
 }
 
@@ -31,6 +34,7 @@ fn parse(args: &[String]) -> Result<Args, String> {
         config: ConfigDir::default_location(),
         slack: true,
         unit: None,
+        from: None,
         positional: Vec::new(),
     };
     let mut args = args.iter();
@@ -41,6 +45,7 @@ fn parse(args: &[String]) -> Result<Args, String> {
                 parsed.config = ConfigDir(PathBuf::from(dir));
             }
             "--unit" => parsed.unit = Some(args.next().ok_or("--unit needs a unit ID")?.clone()),
+            "--from" => parsed.from = Some(args.next().ok_or("--from needs a step")?.clone()),
             "--no-slack" => parsed.slack = false,
             flag if flag.starts_with("--") => return Err(format!("unknown option `{flag}`")),
             value => parsed.positional.push(value.to_string()),
@@ -68,7 +73,9 @@ fn run(args: &[String]) -> Result<u8, String> {
         ["run", rest @ ..] => {
             let options = Options { slack: args.slack };
             let mut driver = match (&args.unit, rest) {
-                (Some(unit), []) => Driver::resume(args.config, unit, &options),
+                (Some(unit), []) => {
+                    Driver::resume(args.config, unit, &options, args.from.as_deref())
+                }
                 (None, [project, bead]) => Driver::start(args.config, project, bead, &options),
                 _ => {
                     return Err(format!(
@@ -84,9 +91,12 @@ fn run(args: &[String]) -> Result<u8, String> {
             println!("\n{}", usage_report(driver.unit(), driver.flow()));
             match status {
                 Status::Ended => {
-                    match &driver.unit().pull_request {
-                        Some(url) => println!("\nended: pull request {url}"),
-                        None => println!("\nended: branch {} pushed", driver.unit().branch),
+                    match (&driver.unit().merged, &driver.unit().pull_request) {
+                        (Some(commit), Some(url)) => {
+                            println!("\nended: {url} merged as {commit}; the bead is closed")
+                        }
+                        (None, Some(url)) => println!("\nended: pull request {url}"),
+                        _ => println!("\nended: branch {} pushed", driver.unit().branch),
                     }
                     Ok(0)
                 }

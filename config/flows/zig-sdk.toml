@@ -10,7 +10,7 @@
 # Then a fresh adversarial tester tries to break the change by running it, and
 # a fresh reviewer reads it. The builder's session is continued for every fix
 # and for the publication text. The factory commits, pushes and opens the pull
-# request; the owner merges.
+# request, watches its CI, and merges it when every check has passed.
 id = "zig-sdk"
 start = "baseline"
 
@@ -130,6 +130,25 @@ on.ready = "publish"
 id = "publish"
 kind = "action"
 action = "publish"
-on.done = "end"
+on.done = "ci"
 # A check on the final commit failed: the text is written again.
 on.failed = { to = "describe", max = 2 }
+
+# No model from here on unless CI fails. The factory polls the pull request's
+# checks. The first failed check ends the wait: its log goes to the builder,
+# and the fix goes through every step above again before it is republished.
+[[step]]
+id = "ci"
+kind = "action"
+action = "await-ci"
+on.green = "land"
+on.red = { to = "fix", max = 2 }
+
+# Every check passed: merge, confirm the merge commit is on the default
+# branch, close the bead, remove the worktree. No agent is asked.
+[[step]]
+id = "land"
+kind = "action"
+action = "land"
+on.done = "end"
+on.failed = "park"

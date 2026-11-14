@@ -24,7 +24,7 @@ use factory_core::{EventLog, ProjectId, StepId, UnitId, now_unix};
 use factory_flow::{
     ExitPolicy, Flow, Next, Position, Registry, SessionRule, Step, StepKind, Workspace,
 };
-use factory_github::{GitHub, publication_problems};
+use factory_github::{CiVerdict, GitHub, ci_verdict, publication_problems};
 use factory_slack::{Slack, code_block, escape, link, quote, truncate};
 use factory_supervise::{Control, tail};
 use serde::{Deserialize, Serialize};
@@ -133,6 +133,11 @@ pub struct Unit {
     /// The owner's answer to the current step's question.
     pub answer: Option<String>,
     pub pull_request: Option<String>,
+    #[serde(default)]
+    pub pull_request_number: Option<u64>,
+    /// The merge commit, once the pull request has landed.
+    #[serde(default)]
+    pub merged: Option<String>,
     pub runs: u32,
     pub started_at: u64,
 }
@@ -388,6 +393,8 @@ impl Driver {
                 owner_messages: Vec::new(),
                 answer: None,
                 pull_request: None,
+                pull_request_number: None,
+                merged: None,
                 runs: 0,
                 started_at,
             },
@@ -419,10 +426,15 @@ impl Driver {
     }
 
     /// Pick up a unit that was stopped or parked.
+    ///
+    /// `from` is the owner's override: put the unit at that step of the
+    /// project's flow as it is now, whatever flow the unit started with and
+    /// even if it had ended. It is how a unit is moved onto a changed flow.
     pub fn resume(
         config: ConfigDir,
         unit_id: &str,
         options: &Options,
+        from: Option<&str>,
     ) -> Result<Driver, DriverError> {
         let factory = config.factory()?;
         let dir = factory.state_dir.join("units").join(unit_id);
@@ -432,13 +444,27 @@ impl Driver {
             path: state.clone(),
             source,
         })?;
-        if unit.status == Status::Ended {
+        if unit.status == Status::Ended && from.is_none() {
             return Err(DriverError::AlreadyEnded(unit_id.to_string()));
         }
         let project = config.project(unit.project.as_str())?;
-        // A unit runs on the flow it started with, not on what the file says now.
         let pinned = dir.join("flow.toml");
-        let flow = Flow::parse(&std::fs::read_to_string(&pinned).map_err(io(&pinned))?)?;
+        let flow = match from {
+            // A unit runs on the flow it started with, not on what the file says now.
+            None => Flow::parse(&std::fs::read_to_string(&pinned).map_err(io(&pinned))?)?,
+            Some(step) => {
+                let (flow, text) = load_flow(&config, &factory, &project)?;
+                if flow.step(step).is_none() {
+                    return Err(factory_flow::FlowError::UnknownStep(step.to_string()).into());
+                }
+                std::fs::write(&pinned, text).map_err(io(&pinned))?;
+                unit.flow = flow.id.clone();
+                unit.position.step = step.to_string();
+                *unit.position.rounds.entry(step.to_string()).or_insert(0) += 1;
+                unit.in_step = None;
+                flow
+            }
+        };
         preflight(&factory, &project)?;
         let bead = bead_source(&project).read(&unit.bead)?;
         let log = EventLog::new(
@@ -461,9 +487,13 @@ impl Driver {
         };
         driver.thread = driver.open_thread(options, saved_thread);
         driver.event(
-            "unit.resumed",
+            if from.is_some() {
+                "unit.redirected"
+            } else {
+                "unit.resumed"
+            },
             None,
-            json!({ "step": driver.unit.position.step }),
+            json!({ "step": driver.unit.position.step, "flow": driver.unit.flow }),
         )?;
         driver.thread.say(&format!(
             ":arrow_forward: Continuing from step *{}*.",
@@ -704,7 +734,11 @@ impl Driver {
             let end = match &step.kind {
                 StepKind::Agent { .. } => self.agent_step(&step)?,
                 StepKind::Command { .. } => self.command_step(&step)?,
-                StepKind::Action { .. } => self.publish_step(&step)?,
+                StepKind::Action { action } => match action.as_str() {
+                    "await-ci" => self.await_ci_step(&step)?,
+                    "land" => self.land_step(&step)?,
+                    _ => self.publish_step(&step)?,
+                },
             };
             let used = self.unit.usage.entry(step_id.clone()).or_default();
             used.wall_secs += started.elapsed().as_secs();
@@ -751,24 +785,34 @@ impl Driver {
                         json!({ "pull_request": self.unit.pull_request }),
                     )?;
                     let report = usage_report(&self.unit, &self.flow);
-                    let done = match &self.unit.pull_request {
-                        Some(url) => format!(":tada: *Done.* Pull request: {}", link(url, url)),
-                        None => format!(
-                            ":tada: *Done.* Branch `{}` is pushed.",
-                            escape(&self.unit.branch)
+                    let (done, status) = match (&self.unit.merged, &self.unit.pull_request) {
+                        (Some(commit), Some(url)) => (
+                            format!(
+                                ":tada: *Landed.* {} is merged into `{}` as `{}`, and the bead is closed.",
+                                link(url, "The pull request"),
+                                escape(&self.project.default_branch),
+                                &commit[..commit.len().min(10)]
+                            ),
+                            format!(":white_check_mark: landed: {}", link(url, url)),
+                        ),
+                        (_, Some(url)) => (
+                            format!(
+                                ":tada: *Done.* Pull request: {}\nThe bead stays claimed by `{}` until it merges.",
+                                link(url, url),
+                                escape(&self.project.bead_actor)
+                            ),
+                            format!(":white_check_mark: pull request opened: {}", link(url, url)),
+                        ),
+                        _ => (
+                            format!(
+                                ":tada: *Done.* Branch `{}` is pushed.",
+                                escape(&self.unit.branch)
+                            ),
+                            ":white_check_mark: done".to_string(),
                         ),
                     };
-                    self.thread.say(&format!(
-                        "{done}\nThe bead stays claimed by `{}` until the pull request merges.\n{}",
-                        escape(&self.project.bead_actor),
-                        code_block(&report)
-                    ));
-                    self.thread.status(&match &self.unit.pull_request {
-                        Some(url) => {
-                            format!(":white_check_mark: pull request opened: {}", link(url, url))
-                        }
-                        None => ":white_check_mark: done".to_string(),
-                    });
+                    self.thread.say(&format!("{done}\n{}", code_block(&report)));
+                    self.thread.status(&status);
                     self.save()?;
                     return Ok(Status::Ended);
                 }
@@ -1515,6 +1559,398 @@ impl Driver {
         Ok(StepEnd::Outcome("fail".to_string()))
     }
 
+    /// An action could not do its job. Routed as `failed` if the flow routes
+    /// that, and parked otherwise.
+    fn action_failed(&mut self, step: &Step, reason: String) -> Result<StepEnd, DriverError> {
+        self.event("action.failed", Some(&step.id), json!({ "reason": reason }))?;
+        self.unit.feedback = Some(reason.clone());
+        self.thread.say(&format!(
+            ":x: *{}* · {}",
+            step.id,
+            escape(&truncate(&reason, 1500))
+        ));
+        self.save()?;
+        Ok(if step.on.contains_key("failed") {
+            StepEnd::Outcome("failed".to_string())
+        } else {
+            StepEnd::Park(reason)
+        })
+    }
+
+    fn pull_request_number(&self) -> Option<u64> {
+        self.unit.pull_request_number.or_else(|| {
+            self.unit
+                .pull_request
+                .as_deref()
+                .and_then(|url| url.rsplit('/').next())
+                .and_then(|last| last.parse().ok())
+        })
+    }
+
+    /// The `await-ci` action: watch the pull request's checks by polling, with
+    /// no model involved. One failed check ends the wait at once as `red`,
+    /// with its log as feedback for the step that fixes it. `green` needs every
+    /// check passed, and to still be so a little later.
+    fn await_ci_step(&mut self, step: &Step) -> Result<StepEnd, DriverError> {
+        let (Some(settings), Some(number)) =
+            (self.project.github.clone(), self.pull_request_number())
+        else {
+            return Ok(StepEnd::Park(format!(
+                "step `{}` waits for CI, but the unit has no pull request",
+                step.id
+            )));
+        };
+        let github = github_client(&self.factory, &settings);
+        let repo_dir = self.project.repo.clone();
+        let poll = Duration::from_secs(settings.ci_poll_secs.max(1));
+        let settle = Duration::from_secs(settings.ci_settle_secs);
+        let timeout = Duration::from_secs(settings.ci_timeout_secs);
+        let started = Instant::now();
+        let mut green_since: Option<Instant> = None;
+        let mut last_status: Option<Instant> = None;
+        let mut unreadable = 0;
+        let mut waiting_on: Vec<String> = Vec::new();
+        let short = self.unit.checkpoint[..self.unit.checkpoint.len().min(10)].to_string();
+        self.thread.say(&format!(
+            ":eyes: *{}* · watching GitHub CI on `{short}`. No model runs while it waits: one failed check goes back to the builder, all green goes on.",
+            step.id
+        ));
+
+        loop {
+            if self.hear_owner() {
+                return Ok(StepEnd::Park("the owner said stop".to_string()));
+            }
+            let status = match github.pull_request_status(&repo_dir, &settings.repo, number) {
+                Ok(status) => {
+                    unreadable = 0;
+                    status
+                }
+                Err(err) => {
+                    // GitHub being down is not the change's fault: keep looking.
+                    unreadable += 1;
+                    self.event(
+                        "ci.unreadable",
+                        Some(&step.id),
+                        json!({ "error": err.to_string(), "times": unreadable }),
+                    )?;
+                    if started.elapsed() >= timeout {
+                        return Ok(StepEnd::Park(format!(
+                            "GitHub could not be read for the pull request's checks: {err}"
+                        )));
+                    }
+                    std::thread::sleep(poll);
+                    continue;
+                }
+            };
+            if status.state == "MERGED" {
+                // Someone merged it by hand. There is nothing left to wait for.
+                self.event("ci.merged_elsewhere", Some(&step.id), json!({}))?;
+                return Ok(StepEnd::Outcome("green".to_string()));
+            }
+            if status.state != "OPEN" {
+                return Ok(StepEnd::Park(format!(
+                    "the pull request is {}, so there is nothing to land",
+                    status.state.to_lowercase()
+                )));
+            }
+            if status.head != self.unit.checkpoint {
+                return Ok(StepEnd::Park(format!(
+                    "the pull request's head is `{}`, not the commit the factory published (`{}`): something else pushed to the branch",
+                    status.head, self.unit.checkpoint
+                )));
+            }
+
+            match ci_verdict(&status.checks, &settings.required_checks) {
+                CiVerdict::Red { failed } => {
+                    let names: Vec<String> = failed
+                        .iter()
+                        .map(|check| match &check.url {
+                            Some(url) => format!("- `{}`: {url}", check.name),
+                            None => format!("- `{}`", check.name),
+                        })
+                        .collect();
+                    let log = failed.iter().find_map(|check| {
+                        github
+                            .failed_log(&repo_dir, &settings.repo, check)
+                            .map(|log| (check.name.clone(), log))
+                    });
+                    let mut feedback = format!(
+                        "GitHub CI failed on the pull request, on commit `{short}`. The factory's own checks passed on this machine, so look for what differs there: the platform, the optimisation mode, timing.\n\nFailed checks:\n{}\n",
+                        names.join("\n")
+                    );
+                    let mut log_path = None;
+                    if let Some((name, log)) = &log {
+                        self.unit.runs += 1;
+                        let path = self.artifact(&format!("{}-failed.log", step.id), log)?;
+                        feedback.push_str(&format!(
+                            "\nThe end of the failing log of `{name}`:\n\n```\n{}\n```\n\nThe full failing log is in `{}`.\n",
+                            tail(log, 150),
+                            path.display()
+                        ));
+                        log_path = Some(path);
+                    }
+                    feedback.push_str("\nReproduce the failure if you can, fix its cause, and run the project's commands before you return.");
+                    self.unit.feedback = Some(feedback);
+                    self.event(
+                        "ci.red",
+                        Some(&step.id),
+                        json!({
+                            "failed": failed.iter().map(|check| check.name.clone()).collect::<Vec<_>>(),
+                            "log": log_path, "secs": started.elapsed().as_secs(),
+                        }),
+                    )?;
+                    let shown = log
+                        .as_ref()
+                        .map(|(_, log)| code_block(&truncate(&tail(log, 20), 2200)))
+                        .unwrap_or_default();
+                    self.thread.say(&format!(
+                        ":x: *{}* · CI failed after {} · handing it back to the builder\n{}\n{shown}",
+                        step.id,
+                        duration_text(started.elapsed().as_secs()),
+                        escape(&names.join("\n"))
+                    ));
+                    self.save()?;
+                    return Ok(StepEnd::Outcome("red".to_string()));
+                }
+                CiVerdict::Green { passed } => match green_since {
+                    // Seen green twice, far enough apart: no check appeared late.
+                    Some(since) if since.elapsed() >= settle => {
+                        self.event(
+                            "ci.green",
+                            Some(&step.id),
+                            json!({ "checks": passed, "secs": started.elapsed().as_secs() }),
+                        )?;
+                        self.thread.say(&format!(
+                            ":white_check_mark: *{}* · all {passed} checks passed on `{short}` · {}",
+                            step.id,
+                            duration_text(started.elapsed().as_secs())
+                        ));
+                        return Ok(StepEnd::Outcome("green".to_string()));
+                    }
+                    Some(_) => {}
+                    None => green_since = Some(Instant::now()),
+                },
+                CiVerdict::Pending {
+                    passed,
+                    total,
+                    waiting,
+                } => {
+                    green_since = None;
+                    waiting_on = waiting;
+                    if last_status.is_none_or(|at| at.elapsed() >= Duration::from_secs(60)) {
+                        last_status = Some(Instant::now());
+                        let mut names = waiting_on.clone();
+                        let more = names.len().saturating_sub(3);
+                        names.truncate(3);
+                        self.thread.status(&format!(
+                            ":hourglass_flowing_sand: *{}* · {passed}/{total} checks passed · {} · waiting on {}{}",
+                            step.id,
+                            duration_text(started.elapsed().as_secs()),
+                            escape(&names.join(", ")),
+                            if more > 0 { format!(" and {more} more") } else { String::new() }
+                        ));
+                    }
+                }
+            }
+            if started.elapsed() >= timeout {
+                return Ok(StepEnd::Park(format!(
+                    "CI had not finished after {}; still waiting on: {}",
+                    duration_text(timeout.as_secs()),
+                    waiting_on.join(", ")
+                )));
+            }
+            std::thread::sleep(poll);
+        }
+    }
+
+    /// The `land` action: merge the pull request, confirm the merge commit is
+    /// on the default branch, close the bead and clean up.
+    fn land_step(&mut self, step: &Step) -> Result<StepEnd, DriverError> {
+        match self.land(step) {
+            Ok(end) => Ok(end),
+            Err(err) => self.action_failed(step, format!("landing failed: {err}")),
+        }
+    }
+
+    fn land(&mut self, step: &Step) -> Result<StepEnd, DriverError> {
+        let (Some(settings), Some(number)) =
+            (self.project.github.clone(), self.pull_request_number())
+        else {
+            return Ok(StepEnd::Park(format!(
+                "step `{}` lands a pull request, but the unit has none",
+                step.id
+            )));
+        };
+        let github = github_client(&self.factory, &settings);
+        let repo_dir = self.project.repo.clone();
+        let read = |github: &GitHub| {
+            github
+                .pull_request_status(&repo_dir, &settings.repo, number)
+                .map_err(|err| DriverError::Preflight(err.to_string()))
+        };
+        self.thread.status(&format!(
+            ":arrows_counterclockwise: *{}* · merging",
+            step.id
+        ));
+
+        let mut status = read(&github)?;
+        if status.state == "OPEN" {
+            if status.head != self.unit.checkpoint {
+                return Ok(StepEnd::Park(format!(
+                    "the pull request's head is `{}`, not the commit the factory published (`{}`)",
+                    status.head, self.unit.checkpoint
+                )));
+            }
+            // GitHub works out whether a pull request can merge when asked.
+            for _ in 0..10 {
+                if status.mergeable != "UNKNOWN" {
+                    break;
+                }
+                std::thread::sleep(Duration::from_secs(3));
+                status = read(&github)?;
+            }
+            if status.mergeable != "MERGEABLE" {
+                return self.action_failed(
+                    step,
+                    format!(
+                        "the pull request cannot be merged as it stands (GitHub says `{}`): the default branch has probably changed the same files since the unit started",
+                        status.mergeable
+                    ),
+                );
+            }
+            if !matches!(
+                ci_verdict(&status.checks, &settings.required_checks),
+                CiVerdict::Green { .. }
+            ) {
+                return self.action_failed(
+                    step,
+                    "the pull request's checks are no longer all green".to_string(),
+                );
+            }
+            let title = self
+                .publication()
+                .and_then(|text| {
+                    text.get("pr_title")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| self.unit.title.clone());
+            let prefix = format!("{}-", self.project.id);
+            let subject = settings.merge_subject.as_ref().map(|template| {
+                template
+                    .replace(
+                        "{bead_short}",
+                        self.unit
+                            .bead
+                            .strip_prefix(&prefix)
+                            .unwrap_or(&self.unit.bead),
+                    )
+                    .replace("{bead}", &self.unit.bead)
+                    .replace("{title}", &title)
+            });
+            github
+                .merge(
+                    &repo_dir,
+                    &settings.repo,
+                    number,
+                    &status.head,
+                    subject.as_deref(),
+                )
+                .map_err(|err| DriverError::Preflight(err.to_string()))?;
+            self.event(
+                "landing.merge_requested",
+                Some(&step.id),
+                json!({ "head": status.head, "subject": subject }),
+            )?;
+            for _ in 0..20 {
+                status = read(&github)?;
+                if status.state == "MERGED" {
+                    break;
+                }
+                std::thread::sleep(Duration::from_secs(3));
+            }
+        }
+        if status.state != "MERGED" {
+            return self.action_failed(
+                step,
+                format!(
+                    "GitHub reports the pull request as {}, not merged",
+                    status.state.to_lowercase()
+                ),
+            );
+        }
+        let Some(merge_commit) = status.merge_commit.clone() else {
+            return self.action_failed(
+                step,
+                "GitHub gave no merge commit for the merged pull request".to_string(),
+            );
+        };
+
+        // A bead is closed only when its change is on the default branch, as
+        // git sees it and not only as GitHub says.
+        factory_git::fetch(&repo_dir, &self.project.remote)?;
+        let default = format!("{}/{}", self.project.remote, self.project.default_branch);
+        if !factory_git::is_ancestor(&repo_dir, &merge_commit, &default)? {
+            return self.action_failed(
+                step,
+                format!("the merge commit `{merge_commit}` is not on `{default}`"),
+            );
+        }
+        self.unit.merged = Some(merge_commit.clone());
+        self.event(
+            "landed",
+            Some(&step.id),
+            json!({ "merge_commit": merge_commit }),
+        )?;
+        self.save()?;
+
+        let url = self.unit.pull_request.clone().unwrap_or_default();
+        bead_source(&self.project).close(
+            &self.unit.bead,
+            &format!("Merged {url} as {merge_commit}; every CI check passed"),
+            &self.project.bead_actor,
+        )?;
+        self.event(
+            "bead.closed",
+            Some(&step.id),
+            json!({ "bead": self.unit.bead }),
+        )?;
+
+        // Tidying up. A failure here leaves litter, not a wrong result.
+        let mut litter = Vec::new();
+        if self.unit.worktree.exists()
+            && let Err(err) = factory_git::worktree_remove(&repo_dir, &self.unit.worktree)
+        {
+            litter.push(err.to_string());
+        }
+        if let Err(err) = factory_git::delete_branch(&repo_dir, &self.unit.branch) {
+            litter.push(err.to_string());
+        }
+        if settings.delete_branch_after_merge
+            && let Err(err) = factory_git::delete_remote_branch(
+                &repo_dir,
+                &self.project.remote,
+                &self.unit.branch,
+            )
+        {
+            litter.push(err.to_string());
+        }
+        self.event("cleanup", Some(&step.id), json!({ "problems": litter }))?;
+        self.save()?;
+        Ok(StepEnd::Outcome("done".to_string()))
+    }
+
+    /// The latest result of a step that works to the publication contract.
+    fn publication(&self) -> Option<Value> {
+        self.flow
+            .steps
+            .iter()
+            .rev()
+            .filter(|other| matches!(&other.kind, StepKind::Agent { role, .. } if contract_of(role) == Some(Contract::Publication)))
+            .find_map(|other| self.unit.results.get(&other.id))
+            .cloned()
+    }
+
     /// The `publish` action: one final commit, a push, and the pull request.
     fn publish_step(&mut self, step: &Step) -> Result<StepEnd, DriverError> {
         match self.publish(step) {
@@ -1635,10 +2071,11 @@ impl Driver {
             }
         }
 
-        let url = factory_git::remote_url(&self.project.repo, &self.project.remote)?;
+        // The URL as the project configured it: that is what the write list is about.
+        let url = factory_git::configured_remote_url(&self.project.repo, &self.project.remote)?;
         if let Some(github) = &self.project.github {
             let slug = factory_git::github_slug(&url).unwrap_or_default();
-            GitHub::new(github.write.clone())
+            github_client(&self.factory, github)
                 .check_allowed(&slug)
                 .map_err(|err| DriverError::Preflight(format!("push to `{url}`: {err}")))?;
         }
@@ -1656,7 +2093,7 @@ impl Driver {
             escape(&self.unit.branch)
         );
         if let Some(github) = self.project.github.clone() {
-            let pull_request = GitHub::new(github.write.clone())
+            let pull_request = github_client(&self.factory, &github)
                 .publish_pull_request(
                     &worktree,
                     &github.repo,
@@ -1681,12 +2118,19 @@ impl Driver {
                     &format!("#{} {title}", pull_request.number)
                 )
             ));
+            self.unit.pull_request_number = Some(pull_request.number);
             self.unit.pull_request = Some(pull_request.url);
         }
         self.thread.say(&said);
         self.save()?;
         Ok(StepEnd::Outcome("done".to_string()))
     }
+}
+
+fn github_client(factory: &Factory, settings: &factory_config::GitHub) -> GitHub {
+    let mut github = GitHub::new(settings.write.clone());
+    github.gh_bin = factory.gh_bin.clone();
+    github
 }
 
 /// Checks before a unit is prepared or continued: the pinned CLI and the repo.
@@ -1705,7 +2149,7 @@ fn preflight(factory: &Factory, project: &Project) -> Result<(), DriverError> {
         )));
     }
     if let Some(github) = &project.github
-        && !GitHub::new(github.write.clone()).authenticated(&project.repo)
+        && !github_client(factory, github).authenticated(&project.repo)
     {
         return Err(DriverError::Preflight("`gh` is not logged in".to_string()));
     }

@@ -194,6 +194,75 @@ timeout_secs = 30
         .unwrap();
     }
 
+    /// Give the project a GitHub repository, played by a scripted `gh` and
+    /// the bare remote, and the Zig project's flow, which watches CI and lands.
+    /// `ci` is what each look at the checks sees, one word per look.
+    fn with_github(&self, ci: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let gh = self.path("bin/gh");
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fake-gh.sh"),
+            &gh,
+        )
+        .unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let state = self.path("bin/state-gh");
+        std::fs::create_dir_all(&state).unwrap();
+        let remote = self.path("remote.git");
+        std::fs::write(state.join("remote"), remote.to_str().unwrap()).unwrap();
+        std::fs::write(state.join("ci"), ci.replace(' ', "\n") + "\n").unwrap();
+
+        // The project says it pushes to GitHub; git is told where that is.
+        let toy = self.path("toy");
+        run(
+            &toy,
+            "git",
+            &["remote", "set-url", "origin", "git@github.com:me/toy.git"],
+        );
+        let key = format!("url.{}.insteadOf", remote.display());
+        run(&toy, "git", &["config", &key, "git@github.com:me/toy.git"]);
+
+        let factory = self.path("config/factory.toml");
+        let text = std::fs::read_to_string(&factory).unwrap();
+        std::fs::write(&factory, format!("gh_bin = \"{}\"\n{text}", gh.display())).unwrap();
+        let project = self.path("config/projects/toy.toml");
+        let text = std::fs::read_to_string(&project)
+            .unwrap()
+            .replace("flow = \"build-break-review\"", "flow = \"zig-sdk\"");
+        std::fs::write(
+            &project,
+            format!(
+                "{text}
+[commands.samples-index]
+argv = [\"true\"]
+timeout_secs = 30
+
+[commands.samples-test]
+argv = [\"true\"]
+timeout_secs = 30
+
+[github]
+repo = \"me/toy\"
+write = [\"me/toy\"]
+required_checks = [\"fmt\", \"unit\"]
+ci_poll_secs = 1
+ci_settle_secs = 1
+ci_timeout_secs = 30
+merge_subject = \"Merge bead/{{bead_short}}: {{title}}\"
+"
+            ),
+        )
+        .unwrap();
+    }
+
+    fn gh_calls(&self) -> Vec<String> {
+        std::fs::read_to_string(self.path("bin/state-gh/calls"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
     fn scenario(&self, words: &str) {
         std::fs::create_dir_all(self.path("bin/state")).unwrap();
         std::fs::write(self.path("bin/state/scenario"), words).unwrap();
@@ -412,7 +481,7 @@ fn a_parked_unit_continues_from_the_step_it_stopped_at() {
 
     // The owner fixes the host, and the unit carries on where it stopped.
     std::fs::write(&allow, "").unwrap();
-    let mut driver = Driver::resume(world.config(), &unit_id, &OPTIONS).unwrap();
+    let mut driver = Driver::resume(world.config(), &unit_id, &OPTIONS, None).unwrap();
     assert_eq!(driver.run().unwrap(), Status::Ended);
     let roles: Vec<String> = world.calls().iter().map(|call| call[0].clone()).collect();
     assert_eq!(
@@ -421,7 +490,7 @@ fn a_parked_unit_continues_from_the_step_it_stopped_at() {
         "build, its retry, one fix"
     );
     assert!(matches!(
-        Driver::resume(world.config(), &unit_id, &OPTIONS),
+        Driver::resume(world.config(), &unit_id, &OPTIONS, None),
         Err(DriverError::AlreadyEnded(_))
     ));
 }
@@ -592,4 +661,243 @@ fn a_check_on_the_final_commit_sends_the_text_back_before_anything_is_pushed() {
         run(&remote, "git", &["log", "-1", "--format=%B", &branch])
             .contains("Changelog: none (test)")
     );
+}
+
+/// The steps from the first publication on.
+fn after_publish(kinds: &[String]) -> Vec<&str> {
+    let first = kinds
+        .iter()
+        .position(|kind| kind == "publish:done")
+        .unwrap();
+    kinds[first..]
+        .iter()
+        .filter(|kind| kind.contains(':') || *kind == "landed" || *kind == "bead.closed")
+        .map(String::as_str)
+        .collect()
+}
+
+#[test]
+fn a_red_check_goes_back_to_the_builder_and_green_is_merged_without_asking_anyone() {
+    let world = World::new("land", "true");
+    // First pull request: CI is still running, then one check fails. After
+    // the fix: a look before every workflow has started, then running, then green.
+    world.with_github("pending red early pending green");
+
+    let mut driver = Driver::start(world.config(), "toy", "toy-1", &OPTIONS).unwrap();
+    assert_eq!(driver.run().unwrap(), Status::Ended);
+    let kinds = world.event_kinds(&driver);
+    assert_eq!(
+        after_publish(&kinds),
+        [
+            "publish:done",
+            "ci:red",
+            "fix:done",
+            "fmt:pass",
+            "index:pass",
+            "readme:pass",
+            "changelog:pass",
+            "test:pass",
+            "samples:pass",
+            "break:held",
+            "review:approve",
+            "describe:ready",
+            "publish:done",
+            "ci:green",
+            "landed",
+            "bead.closed",
+            "land:done",
+        ]
+    );
+
+    // The failing log reached the builder's own session, with nothing else re-sent.
+    let calls = world.calls();
+    let fix = calls.iter().rposition(|call| call[0] == "builder").unwrap();
+    assert_eq!(
+        calls[fix][1], calls[0][1],
+        "the CI failure goes to the session that built it"
+    );
+    let brief =
+        std::fs::read_to_string(world.path(&format!("bin/state/brief-{}.md", fix + 1))).unwrap();
+    assert!(brief.contains("GitHub CI failed on the pull request"));
+    assert!(brief.contains("- `unit`: https://github.com/me/toy/actions/runs/55/job/66"));
+    assert!(brief.contains("error: expected 4, found 5"));
+    // No agent ran after the last publication: green needs no opinion.
+    let agents_after_green = kinds
+        .iter()
+        .skip(
+            kinds
+                .iter()
+                .rposition(|kind| kind == "publish:done")
+                .unwrap(),
+        )
+        .filter(|kind| *kind == "run.started")
+        .count();
+    assert_eq!(agents_after_green, 0);
+
+    // "early" showed one passed check and nothing else. With the required
+    // list that is not green, so the merge waited for the real thing.
+    let gh = world.gh_calls();
+    let merges: Vec<&String> = gh
+        .iter()
+        .filter(|call| call.starts_with("pr merge"))
+        .collect();
+    assert_eq!(merges.len(), 1);
+    assert!(merges[0].contains("--match-head-commit"));
+    assert!(
+        merges[0].contains("--subject Merge bead/1: Add the feature"),
+        "{}",
+        merges[0]
+    );
+
+    // What landed: the published commit, under a merge commit on main.
+    let unit = driver.unit().clone();
+    let remote = world.path("remote.git");
+    let merged = unit.merged.clone().unwrap();
+    assert_eq!(run(&remote, "git", &["rev-parse", "main"]), merged);
+    assert_eq!(
+        run(&remote, "git", &["log", "-1", "--format=%s", "main"]),
+        "Merge bead/1: Add the feature"
+    );
+    assert_eq!(
+        run(&remote, "git", &["show", "main:feature.txt"])
+            .lines()
+            .count(),
+        3
+    );
+    // The bead is closed, the worktree and both copies of the branch are gone.
+    let bead = std::fs::read_to_string(world.path("beads/toy-1.json")).unwrap();
+    assert!(bead.contains("\"closed\"") && bead.contains(&merged));
+    assert!(!unit.worktree.exists());
+    let branches = run(&remote, "git", &["branch", "--list", "factory/*"]);
+    assert_eq!(branches, "", "the remote branch should be deleted");
+    assert_eq!(
+        run(
+            &world.path("toy"),
+            "git",
+            &["branch", "--list", "factory/*"]
+        ),
+        ""
+    );
+}
+
+#[test]
+fn a_pull_request_that_conflicts_is_not_merged() {
+    let world = World::new("conflict", "true");
+    world.with_github("green");
+    std::fs::write(world.path("bin/state-gh/mergeable"), "CONFLICTING").unwrap();
+    let mut driver = Driver::start(world.config(), "toy", "toy-1", &OPTIONS).unwrap();
+    let Status::Parked(reason) = driver.run().unwrap() else {
+        panic!("expected the unit to park");
+    };
+    assert!(reason.contains("cannot be merged as it stands"), "{reason}");
+    assert!(reason.contains("CONFLICTING"), "{reason}");
+    assert!(
+        !world
+            .gh_calls()
+            .iter()
+            .any(|call| call.starts_with("pr merge"))
+    );
+    let bead = std::fs::read_to_string(world.path("beads/toy-1.json")).unwrap();
+    assert!(bead.contains("\"in_progress\""), "the bead stays open");
+}
+
+#[test]
+fn a_push_by_someone_else_stops_the_landing() {
+    let world = World::new("foreign-push", "true");
+    world.with_github("pending pending pending pending pending pending pending pending green");
+    let mut driver = Driver::start(world.config(), "toy", "toy-1", &OPTIONS).unwrap();
+    // Someone pushes to the unit's branch while CI is running.
+    let remote = world.path("remote.git");
+    let toy = world.path("toy");
+    let pusher = std::thread::spawn(move || {
+        for _ in 0..200 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let listed = Command::new("git")
+                .args(["branch", "--list", "factory/*"])
+                .current_dir(&remote)
+                .output()
+                .unwrap();
+            let branch = String::from_utf8_lossy(&listed.stdout).trim().to_string();
+            if !branch.is_empty() {
+                run(
+                    &toy,
+                    "git",
+                    &[
+                        "commit",
+                        "--quiet",
+                        "--allow-empty",
+                        "-m",
+                        "not the factory's",
+                    ],
+                );
+                let refspec = format!("+HEAD:refs/heads/{branch}");
+                run(
+                    &toy,
+                    "git",
+                    &["push", "--quiet", remote.to_str().unwrap(), &refspec],
+                );
+                return;
+            }
+        }
+    });
+    let status = driver.run().unwrap();
+    pusher.join().unwrap();
+    let Status::Parked(reason) = status else {
+        panic!("expected the unit to park");
+    };
+    assert!(
+        reason.contains("not the commit the factory published"),
+        "{reason}"
+    );
+    assert!(
+        !world
+            .gh_calls()
+            .iter()
+            .any(|call| call.starts_with("pr merge"))
+    );
+}
+
+#[test]
+fn the_owner_can_put_an_ended_unit_onto_the_projects_current_flow() {
+    // A unit that ended under a flow with no CI watching...
+    let world = World::new("redirect", "true");
+    world.with_github("green");
+    let project = world.path("config/projects/toy.toml");
+    let zig = std::fs::read_to_string(&project).unwrap();
+    std::fs::copy(
+        repo_config().join("flows/zig-sdk.toml"),
+        world.path("config/flows/old.toml"),
+    )
+    .unwrap();
+    let old = std::fs::read_to_string(world.path("config/flows/old.toml"))
+        .unwrap()
+        .replace("id = \"zig-sdk\"", "id = \"old\"")
+        .replace("on.done = \"ci\"", "on.done = \"end\"");
+    let cut = old.find("# No model from here on").unwrap();
+    std::fs::write(world.path("config/flows/old.toml"), &old[..cut]).unwrap();
+    std::fs::write(
+        &project,
+        zig.replace("flow = \"zig-sdk\"", "flow = \"old\""),
+    )
+    .unwrap();
+
+    let mut driver = Driver::start(world.config(), "toy", "toy-1", &OPTIONS).unwrap();
+    assert_eq!(driver.run().unwrap(), Status::Ended);
+    assert!(driver.unit().merged.is_none());
+    let unit_id = driver.unit().id.to_string();
+    let agents = world.calls().len();
+    drop(driver);
+
+    // ...is moved to the `ci` step of the flow the project names now.
+    std::fs::write(&project, zig).unwrap();
+    assert!(matches!(
+        Driver::resume(world.config(), &unit_id, &OPTIONS, None),
+        Err(DriverError::AlreadyEnded(_))
+    ));
+    let mut driver = Driver::resume(world.config(), &unit_id, &OPTIONS, Some("ci")).unwrap();
+    assert_eq!(driver.run().unwrap(), Status::Ended);
+    assert!(driver.unit().merged.is_some());
+    assert_eq!(world.calls().len(), agents, "no agent ran to land it");
+    let bead = std::fs::read_to_string(world.path("beads/toy-1.json")).unwrap();
+    assert!(bead.contains("\"closed\""));
 }

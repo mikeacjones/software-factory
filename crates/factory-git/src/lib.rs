@@ -205,6 +205,29 @@ pub fn push(dir: &Path, remote: &str, branch: &str) -> Result<(), GitError> {
     git(dir, &["push", "--no-verify", remote, &refspec], NETWORK).map(|_| ())
 }
 
+/// The remote's URL exactly as configured, before any `insteadOf` rewriting:
+/// what the project says it pushes to.
+pub fn configured_remote_url(repo: &Path, remote: &str) -> Result<String, GitError> {
+    let key = format!("remote.{remote}.url");
+    Ok(git(repo, &["config", "--get", &key], LOCAL)?
+        .trim()
+        .to_string())
+}
+
+/// Whether `commit` is contained in `branch`.
+pub fn is_ancestor(dir: &Path, commit: &str, branch: &str) -> Result<bool, GitError> {
+    Ok(git_raw(dir, &["merge-base", "--is-ancestor", commit, branch], LOCAL)?.success())
+}
+
+pub fn delete_branch(repo: &Path, branch: &str) -> Result<(), GitError> {
+    git(repo, &["branch", "-D", branch], LOCAL).map(|_| ())
+}
+
+pub fn delete_remote_branch(repo: &Path, remote: &str, branch: &str) -> Result<(), GitError> {
+    let refspec = format!(":refs/heads/{branch}");
+    git(repo, &["push", "--no-verify", remote, &refspec], NETWORK).map(|_| ())
+}
+
 /// `owner/name` from a GitHub remote URL, in either of its two forms.
 pub fn github_slug(url: &str) -> Option<String> {
     let rest = url
