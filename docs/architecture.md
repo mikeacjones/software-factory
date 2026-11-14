@@ -67,6 +67,18 @@ The first flow, `build-break-review`, has four roles. The **builder** implements
 
 A flow can also carry reports. A command step may say it *produces* a named artifact, such as a directory of scanner output, and an agent step may say it *needs* one. The factory gives the command a directory outside the worktree, and briefs each step that needs the artifact with where it is and what its index says. The validator refuses a flow in which, on some path, a step would be given reports that are missing or were written before the code last changed.
 
+## Goals
+
+A pipeline takes one bead to its landing. A *goal* sits above pipelines: an objective and a stop condition on a *project*, the *director* that runs it, the *flow* its beads go through and how many pipelines it may have at once. How goals of a kind run is a file, `goals/<project>/<id>.toml`; the objective itself comes from the owner.
+
+- **It starts as a conversation.** The owner's top-level message in the project's channel opens the goal, and that message's thread is the goal's. The director talks with the owner in one session until it can propose a charter: objective, stop condition, plan, and any bead changes the owner agreed to. Nothing is written or run until the owner presses Start.
+- **It runs on events.** A pipeline ended, the owner wrote in the thread, the owner answered a request: each wakes the director, in a fresh session briefed by code with the charter, what happened, the tracker, its own journal for the goal and the project's memory. Between events no model runs.
+- **The director decides and code acts.** Its result is a list of decisions: start a bead's pipeline, file a bead with a type, a priority and whether it is deferred, change a bead that exists, ask the owner, propose completion. Code refuses a start on a bead that is not launchable or past the cap, completion without evidence, and any result that would leave the goal with nothing to move it. What the director may do alone is the goal definition's `[permissions]`: by default it files new beads freely and a change to an existing bead is put to the owner.
+- **Findings are the director's to rule on.** When a pipeline ends, what its tester and reviewer left unfixed goes to the director, which files each as a bead or drops it with a reason.
+- **Ending is the owner's act.** The director proposes completion with evidence; the factory posts it with an Accept button. Accept marks the goal complete with no agent involved. A reply instead is guidance, and the goal goes on.
+
+The service is `factory serve`. It listens to Slack over a socket (Socket Mode), so nothing is polled and nothing needs to be reachable from outside. Pipelines run on threads of the service, each with its own Slack thread, and a restart continues the goals and pipelines it finds on disk. For now the director runs inside the service's one loop, so two goals take turns thinking, and a goal's cap above one waits on conflict handling.
+
 ## Failure classes
 
 Every failure the factory must survive is listed in a catalogue with how code detects it, its class, the response and the resume condition. There are three classes.

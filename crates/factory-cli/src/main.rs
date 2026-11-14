@@ -5,6 +5,7 @@ use std::process::ExitCode;
 
 use factory_beads::readiness;
 use factory_config::ConfigDir;
+use factory_driver::goal::{Supervisor, check_definitions};
 use factory_driver::{Driver, Options, Status, bead_source, load_flow, usage_report};
 
 const USAGE: &str = "\
@@ -13,6 +14,12 @@ usage:
   factory run --unit <unit> [--no-slack]      continue a stopped or parked unit
   factory run --unit <unit> --from <step>     owner's override: put the unit at that step
                                               of the project's flow as it is now
+  factory serve                               the always-on service: listen to Slack over a
+                                              socket, open goals from the owner's messages,
+                                              and run them on events
+  factory slack check                         connect the Slack socket once and say whether it worked
+  factory goal check                          check every project's goal definitions
+  factory goal list                           the goals the factory knows and where each stands
   factory bead <project> <bead>               show a bead and whether it may be launched
   factory flow check <project>                check the flow a project names
 
@@ -71,7 +78,10 @@ fn run(args: &[String]) -> Result<u8, String> {
     let fail = |err: &dyn std::fmt::Display| err.to_string();
     match words.as_slice() {
         ["run", rest @ ..] => {
-            let options = Options { slack: args.slack };
+            let options = Options {
+                slack: args.slack,
+                flow: None,
+            };
             let mut driver = match (&args.unit, rest) {
                 (Some(unit), []) => {
                     Driver::resume(args.config, unit, &options, args.from.as_deref())
@@ -110,6 +120,65 @@ fn run(args: &[String]) -> Result<u8, String> {
                 }
                 Status::Running => Err("the run stopped without ending or parking".to_string()),
             }
+        }
+        ["serve"] => {
+            let (mut supervisor, listener) =
+                Supervisor::from_config(args.config).map_err(|err| fail(&err))?;
+            println!(
+                "listening for goals on: {}",
+                supervisor.projects_listening().join(", ")
+            );
+            supervisor.resume().map_err(|err| fail(&err))?;
+            supervisor.serve(&listener);
+            Ok(0)
+        }
+        ["slack", "check"] => {
+            let (supervisor, listener) =
+                Supervisor::from_config(args.config).map_err(|err| fail(&err))?;
+            for _ in 0..40 {
+                if listener.connected() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            listener.stop();
+            if !listener.connected() {
+                return Err("the Slack socket did not connect within ten seconds".to_string());
+            }
+            println!(
+                "the Slack socket is connected; goals would be heard in the channels of: {}",
+                supervisor.projects_listening().join(", ")
+            );
+            Ok(0)
+        }
+        ["goal", "check"] => {
+            let lines = check_definitions(&args.config).map_err(|err| fail(&err))?;
+            if lines.is_empty() {
+                println!("no project has a goal definition");
+            }
+            for line in lines {
+                println!("{line}");
+            }
+            Ok(0)
+        }
+        ["goal", "list"] => {
+            let supervisor =
+                Supervisor::new(args.config, None, Vec::new(), false).map_err(|err| fail(&err))?;
+            for goal in supervisor.goals() {
+                println!(
+                    "{}  {:?}  {} wakes, {} pipelines, est. ${:.2} for the director\n    {}",
+                    goal.id,
+                    goal.phase,
+                    goal.wakes,
+                    goal.units.len(),
+                    goal.usage.cost_usd,
+                    goal.charter
+                        .as_ref()
+                        .map(|charter| charter.objective.replace('\n', " "))
+                        .unwrap_or_else(|| "(still being agreed)".to_string())
+                );
+            }
+            Ok(0)
         }
         ["bead", project, bead] => {
             let project = args.config.project(project).map_err(|err| fail(&err))?;

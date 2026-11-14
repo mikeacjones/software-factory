@@ -294,6 +294,85 @@ impl Default for Limits {
     }
 }
 
+/// How goals of one kind run on a project: `goals/<project>/<id>.toml`.
+///
+/// A goal itself, the objective the owner wants reached, starts as a
+/// conversation in Slack. This says who directs it and how.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GoalDefinition {
+    pub id: String,
+    /// The definition a project's goals use unless the owner names another.
+    #[serde(default)]
+    pub default: bool,
+    /// The pipeline each bead of the goal goes through. Without it, the
+    /// project's own flow.
+    pub flow: Option<String>,
+    /// The most pipelines the goal may have running at once.
+    #[serde(default = "default_pipelines")]
+    pub max_pipelines: u32,
+    /// A standing objective and stop condition, for a goal the owner starts
+    /// without saying more.
+    pub objective: Option<String>,
+    pub stop_when: Option<String>,
+    pub director: Director,
+    #[serde(default)]
+    pub permissions: GoalPermissions,
+}
+
+fn default_pipelines() -> u32 {
+    1
+}
+
+/// The agent that directs a goal.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Director {
+    pub model: String,
+    pub effort: String,
+    /// The wall-clock cap of one wake.
+    #[serde(default = "default_wake_timeout")]
+    pub timeout_secs: u64,
+}
+
+fn default_wake_timeout() -> u64 {
+    30 * 60
+}
+
+/// Whether the director's decision is carried out at once or put to the owner.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Permission {
+    Allow,
+    #[default]
+    Ask,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GoalPermissions {
+    /// Filing a new bead, with its type, priority and deferral.
+    #[serde(default = "allow")]
+    pub file_beads: Permission,
+    /// Changing a bead that already exists: its acceptance criteria, its
+    /// priority, or deferring it.
+    #[serde(default)]
+    pub edit_beads: Permission,
+}
+
+fn allow() -> Permission {
+    Permission::Allow
+}
+
+impl Default for GoalPermissions {
+    fn default() -> Self {
+        Self {
+            file_beads: Permission::Allow,
+            edit_beads: Permission::Ask,
+        }
+    }
+}
+
 /// A config directory.
 #[derive(Clone, Debug)]
 pub struct ConfigDir(pub PathBuf);
@@ -386,6 +465,71 @@ impl ConfigDir {
             });
         }
         Ok(project)
+    }
+
+    /// The IDs of every project in the registry.
+    pub fn projects(&self) -> Result<Vec<String>, ConfigError> {
+        let dir = self.0.join("projects");
+        let mut ids = Vec::new();
+        for entry in std::fs::read_dir(&dir).map_err(|source| ConfigError::Io {
+            path: dir.clone(),
+            source,
+        })? {
+            let name = entry
+                .map_err(|source| ConfigError::Io {
+                    path: dir.clone(),
+                    source,
+                })?
+                .file_name()
+                .to_string_lossy()
+                .into_owned();
+            if let Some(id) = name.strip_suffix(".toml") {
+                ids.push(id.to_string());
+            }
+        }
+        ids.sort();
+        Ok(ids)
+    }
+
+    /// Every goal definition of a project. A project with none has no goals.
+    pub fn goal_definitions(&self, project: &str) -> Result<Vec<GoalDefinition>, ConfigError> {
+        let dir = self.0.join("goals").join(project);
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return Ok(Vec::new());
+        };
+        let mut definitions = Vec::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(id) = name.strip_suffix(".toml") else {
+                continue;
+            };
+            let (path, text) = self.read(&format!("goals/{project}/{name}"))?;
+            let definition: GoalDefinition = parse(&path, &text)?;
+            let invalid = |reason: String| ConfigError::Invalid {
+                path: path.clone(),
+                reason,
+            };
+            if definition.id != id {
+                return Err(invalid(format!(
+                    "id is `{}` but the file is named `{name}`",
+                    definition.id
+                )));
+            }
+            if definition.max_pipelines == 0 {
+                return Err(invalid("max_pipelines must be at least 1".to_string()));
+            }
+            definitions.push(definition);
+        }
+        definitions.sort_by(|a, b| a.id.cmp(&b.id));
+        let defaults = definitions.iter().filter(|d| d.default).count();
+        if defaults > 1 || (defaults == 0 && definitions.len() > 1) {
+            return Err(ConfigError::Invalid {
+                path: dir,
+                reason: "exactly one goal definition of a project must be marked `default = true`"
+                    .to_string(),
+            });
+        }
+        Ok(definitions)
     }
 
     /// The text of a flow file.
@@ -546,6 +690,69 @@ timeout_secs = 60
         let err = dir.project("toy").unwrap_err().to_string();
         std::fs::remove_dir_all(&dir.0).unwrap();
         assert!(err.contains("`nope`"), "{err}");
+    }
+
+    #[test]
+    fn goal_definitions_load_and_one_is_the_default() {
+        let dir = dir_with(PROJECT);
+        let goals = dir.0.join("goals/toy");
+        std::fs::create_dir_all(&goals).unwrap();
+        let definition = |id: &str, extra: &str| {
+            format!("id = \"{id}\"\n{extra}\n[director]\nmodel = \"m\"\neffort = \"high\"\n")
+        };
+        std::fs::write(
+            goals.join("parity.toml"),
+            definition("parity", "default = true\nmax_pipelines = 2"),
+        )
+        .unwrap();
+        std::fs::write(
+            goals.join("bugs.toml"),
+            definition("bugs", "[permissions]\nedit_beads = \"allow\""),
+        )
+        .unwrap();
+        let loaded = dir.goal_definitions("toy").unwrap();
+        assert_eq!(
+            loaded.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(),
+            ["bugs", "parity"]
+        );
+        assert_eq!(loaded[1].max_pipelines, 2);
+        assert_eq!(loaded[1].permissions.edit_beads, Permission::Ask);
+        assert_eq!(loaded[1].permissions.file_beads, Permission::Allow);
+        assert_eq!(loaded[0].permissions.edit_beads, Permission::Allow);
+        assert_eq!(dir.projects().unwrap(), ["toy"]);
+        assert!(dir.goal_definitions("other").unwrap().is_empty());
+
+        // Two defaults, a cap of zero and a misspelt key are each refused.
+        std::fs::write(
+            goals.join("bugs.toml"),
+            definition("bugs", "default = true"),
+        )
+        .unwrap();
+        assert!(
+            dir.goal_definitions("toy")
+                .unwrap_err()
+                .to_string()
+                .contains("exactly one")
+        );
+        std::fs::write(
+            goals.join("bugs.toml"),
+            definition("bugs", "max_pipelines = 0"),
+        )
+        .unwrap();
+        assert!(
+            dir.goal_definitions("toy")
+                .unwrap_err()
+                .to_string()
+                .contains("at least 1")
+        );
+        std::fs::write(goals.join("bugs.toml"), definition("bugs", "pipelines = 3")).unwrap();
+        assert!(
+            dir.goal_definitions("toy")
+                .unwrap_err()
+                .to_string()
+                .contains("pipelines")
+        );
+        std::fs::remove_dir_all(&dir.0).unwrap();
     }
 
     #[test]

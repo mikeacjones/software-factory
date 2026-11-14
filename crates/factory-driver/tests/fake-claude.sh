@@ -8,6 +8,9 @@
 #   state/scenario   optional words that change behaviour:
 #                      reject-once   the builder's first result has no evidence
 #                      ask-once      the builder first asks the owner a question
+#                      minor-finding the reviewer approves with one finding left open
+#   state/director-N.json, state/intake-N.json
+#                    what a goal's director returns on its Nth call
 here=$(cd "$(dirname "$0")" && pwd)
 state="$here/state"
 mkdir -p "$state"
@@ -35,6 +38,8 @@ echo "$count" > "$state/count"
 scenario=$(cat "$state/scenario" 2>/dev/null)
 
 case "$system" in
+  *"You direct a goal"*) role=director ;;
+  *"You are opening a goal"*) role=intake ;;
   *"You are the builder"*) role=builder ;;
   *"You are the adversarial tester"*) role=tester ;;
   *"You are the reviewer"*) role=reviewer ;;
@@ -43,6 +48,15 @@ esac
 session=${resume:-fake-$role-$count}
 echo "$role $session $(pwd)" >> "$state/calls"
 printf '%s\n' "$brief" > "$state/brief-$count.md"
+
+# A goal's director says whatever the test wrote for its nth call.
+case "$role" in
+  director|intake)
+    n=$(( $(cat "$state/n-$role" 2>/dev/null || echo 0) + 1 ))
+    echo "$n" > "$state/n-$role"
+    output=$(cat "$state/$role-$n.json" 2>/dev/null || echo '{}')
+    ;;
+esac
 
 common='"question":"","reply_to_owner":""'
 case "$role" in
@@ -79,7 +93,11 @@ case "$role" in
     fi
     ;;
   reviewer)
-    output='{"outcome":"approve","summary":"Meets the criteria.",'$common',"findings":[]}'
+    findings='[]'
+    case "$scenario" in
+      *minor-finding*) findings='[{"title":"The doc omits the timeout","severity":"minor","location":"feature.txt:1","category":"docs","evidence":"line 1 says nothing about it","must_fix":false}]' ;;
+    esac
+    output='{"outcome":"approve","summary":"Meets the criteria.",'$common',"findings":'$findings'}'
     ;;
   publisher)
     trailer=""

@@ -27,6 +27,10 @@ factory bead <project> <bead> --config config  # may this bead be launched, and 
 factory run <project> <bead> --config config   # walk one bead to a pull request
 factory run --unit <unit> --config config      # continue a stopped or parked unit
 factory run --unit <unit> --from <step> --config config  # owner's override: move a unit to a step of the current flow
+factory serve --config config                  # the always-on service: Slack socket, goals, pipelines
+factory goal check --config config             # are the goal definitions sound?
+factory goal list --config config              # every goal and where it stands
+factory slack check --config config            # does the Slack socket connect?
 ```
 
 `config/` holds the project records, flows and role prompts. A unit's state, event log, artifacts and worktree are under `~/.local/state/software-factory/`.

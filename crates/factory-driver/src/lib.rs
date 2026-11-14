@@ -9,6 +9,7 @@
 //!
 //! This is the thin first cut of the driver: one unit, no ticks, no Redis.
 
+pub mod goal;
 pub mod thread;
 
 use std::collections::BTreeMap;
@@ -170,6 +171,8 @@ enum StepEnd {
 pub struct Options {
     /// Post to Slack. Off, the thread is written to the event log only.
     pub slack: bool,
+    /// The pipeline to run instead of the project's own, when a goal names one.
+    pub flow: Option<String>,
 }
 
 pub struct Driver {
@@ -376,7 +379,10 @@ impl Driver {
         options: &Options,
     ) -> Result<Driver, DriverError> {
         let factory = config.factory()?;
-        let project = config.project(project_id)?;
+        let mut project = config.project(project_id)?;
+        if let Some(flow) = &options.flow {
+            project.flow = flow.clone();
+        }
         let (flow, flow_text) = load_flow(&config, &factory, &project)?;
         preflight(&factory, &project)?;
 

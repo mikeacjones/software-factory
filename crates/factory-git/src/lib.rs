@@ -123,6 +123,17 @@ pub fn worktree_add_detached(repo: &Path, dir: &Path, commit: &str) -> Result<()
     git(repo, &["worktree", "add", "--detach", &dir, commit], LOCAL).map(|_| ())
 }
 
+/// Move a worktree that has no branch to another commit, discarding whatever
+/// was changed in it.
+pub fn checkout_detached(dir: &Path, rev: &str) -> Result<(), GitError> {
+    git(
+        dir,
+        &["checkout", "--quiet", "--force", "--detach", rev],
+        LOCAL,
+    )?;
+    git(dir, &["clean", "--quiet", "-fd"], LOCAL).map(|_| ())
+}
+
 pub fn worktree_remove(repo: &Path, dir: &Path) -> Result<(), GitError> {
     let dir = dir.to_string_lossy();
     git(repo, &["worktree", "remove", "--force", &dir], LOCAL).map(|_| ())

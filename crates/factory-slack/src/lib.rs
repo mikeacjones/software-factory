@@ -3,6 +3,8 @@
 //!
 //! Code posts. No agent holds the token.
 
+pub mod socket;
+
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -41,6 +43,17 @@ impl std::fmt::Debug for Slack {
             .field("base_url", &self.base_url)
             .finish_non_exhaustive()
     }
+}
+
+/// A button under a message.
+#[derive(Clone, Copy, Debug)]
+pub struct Button<'a> {
+    pub action_id: &'a str,
+    pub label: &'a str,
+    /// Returned with the click: which thing the button is about.
+    pub value: &'a str,
+    /// `primary` (green) or `danger` (red).
+    pub style: Option<&'a str>,
 }
 
 /// Slack's limit on the text of one section block.
@@ -250,6 +263,50 @@ impl Slack {
         }
         let answer = self.call("chat.postMessage", body)?;
         Self::field(&answer, "chat.postMessage", "/ts")
+    }
+
+    /// Post a message that ends with buttons. A click arrives over the socket
+    /// as an [`socket::Incoming::Action`] carrying the button's ID and value.
+    pub fn post_with_buttons(
+        &self,
+        channel: &str,
+        thread_ts: Option<&str>,
+        text: &str,
+        buttons: &[Button<'_>],
+    ) -> Result<String, SlackError> {
+        let mut body = message_body(channel, text);
+        if let Some(ts) = thread_ts {
+            body["thread_ts"] = json!(ts);
+        }
+        let elements: Vec<Value> = buttons
+            .iter()
+            .map(|button| {
+                let mut element = json!({
+                    "type": "button",
+                    "action_id": button.action_id,
+                    "value": button.value,
+                    "text": { "type": "plain_text", "text": button.label },
+                });
+                if let Some(style) = button.style {
+                    element["style"] = json!(style);
+                }
+                element
+            })
+            .collect();
+        if let Some(blocks) = body["blocks"].as_array_mut() {
+            blocks.push(json!({ "type": "actions", "elements": elements }));
+        }
+        let answer = self.call("chat.postMessage", body)?;
+        Self::field(&answer, "chat.postMessage", "/ts")
+    }
+
+    /// A link to a message, for pointing from one thread at another.
+    pub fn permalink(&self, channel: &str, ts: &str) -> Result<String, SlackError> {
+        let answer = self.get(
+            "chat.getPermalink",
+            &[("channel", channel), ("message_ts", ts)],
+        )?;
+        Self::field(&answer, "chat.getPermalink", "/permalink")
     }
 
     /// Replace the text of a message the bot posted.

@@ -67,6 +67,52 @@ fn default_type() -> String {
     "task".to_string()
 }
 
+/// One line of the tracker, for choosing what to work on next.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Summary {
+    pub id: String,
+    pub title: String,
+    pub status: String,
+    pub issue_type: String,
+    pub priority: i64,
+    pub assignee: String,
+    pub has_criteria: bool,
+    /// Whether an open bead blocks it.
+    pub blocked: bool,
+}
+
+impl Summary {
+    /// Whether the readiness check would let a pipeline start on it.
+    pub fn launchable(&self) -> bool {
+        self.status == "open" && self.assignee.is_empty() && self.has_criteria && !self.blocked
+    }
+}
+
+/// A bead to file.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NewBead {
+    pub title: String,
+    pub issue_type: String,
+    pub priority: i64,
+    pub description: String,
+    pub acceptance_criteria: String,
+    /// The epic or bead it belongs under, if any.
+    pub parent: Option<String>,
+    /// The bead whose work turned this one up.
+    pub discovered_from: Option<String>,
+    /// Filed straight into the icebox: kept, but not ready work.
+    pub deferred: bool,
+}
+
+/// A change to a bead that exists. A `None` leaves that field alone.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Change {
+    pub acceptance_criteria: Option<String>,
+    pub priority: Option<i64>,
+    /// `Some(true)` defers the bead, `Some(false)` brings it back.
+    pub deferred: Option<bool>,
+}
+
 /// Why a bead may not be launched. Empty means it may.
 ///
 /// A bead already claimed by `actor` is launchable, so a stopped run can be
@@ -237,6 +283,244 @@ impl Source {
         }
         let bead = self.read(id)?;
         if bead.status != "in_progress" || bead.assignee != actor {
+            return Err(BeadError::ClaimNotVisible {
+                id: id.to_string(),
+                status: bead.status,
+                assignee: bead.assignee,
+            });
+        }
+        Ok(bead)
+    }
+
+    /// Every bead that is not closed and is a piece of work (not an epic or
+    /// a milestone), most urgent first.
+    pub fn list_open(&self) -> Result<Vec<Summary>, BeadError> {
+        let mut beads = match self {
+            Source::Files { dir } => {
+                let mut beads = Vec::new();
+                let entries = std::fs::read_dir(dir).map_err(|source| BeadError::Io {
+                    path: dir.clone(),
+                    source,
+                })?;
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    let Some(id) = name.strip_suffix(".json") else {
+                        continue;
+                    };
+                    let bead = self.read(id)?;
+                    beads.push(Summary {
+                        has_criteria: !bead.acceptance_criteria.trim().is_empty(),
+                        blocked: !bead.open_blockers.is_empty(),
+                        id: bead.id,
+                        title: bead.title,
+                        status: bead.status,
+                        issue_type: bead.issue_type,
+                        priority: bead.priority,
+                        assignee: bead.assignee,
+                    });
+                }
+                beads
+            }
+            Source::Dolt { .. } => {
+                let number = |row: &Value, key: &str| {
+                    row.get(key)
+                        .and_then(|value| {
+                            value
+                                .as_i64()
+                                .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+                        })
+                        .unwrap_or(0)
+                };
+                self.query(
+                    "select i.id, i.title, i.status, i.issue_type, i.priority, coalesce(i.assignee, '') as assignee, \
+                     (i.acceptance_criteria <> '') as has_criteria, \
+                     exists (select 1 from dependencies d join issues b on b.id = d.depends_on_issue_id \
+                             where d.issue_id = i.id and d.type = 'blocks' and b.status <> 'closed') as blocked \
+                     from issues i where i.status <> 'closed'",
+                )?
+                .iter()
+                .map(|row| {
+                    let text = |key: &str| {
+                        row.get(key)
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string()
+                    };
+                    Summary {
+                        id: text("id"),
+                        title: text("title"),
+                        status: text("status"),
+                        issue_type: text("issue_type"),
+                        priority: number(row, "priority"),
+                        assignee: text("assignee"),
+                        has_criteria: number(row, "has_criteria") != 0,
+                        blocked: number(row, "blocked") != 0,
+                    }
+                })
+                .collect()
+            }
+        };
+        beads.retain(|bead| {
+            bead.status != "closed" && !matches!(bead.issue_type.as_str(), "epic" | "milestone")
+        });
+        beads.sort_by(|a, b| (a.priority, &a.id).cmp(&(b.priority, &b.id)));
+        Ok(beads)
+    }
+
+    fn bd(&self, repo: &Path, args: &[&str], actor: &str) -> Result<String, BeadError> {
+        let argv: Vec<&str> = std::iter::once("bd")
+            .chain(args.iter().copied())
+            .chain(["--actor", actor])
+            .collect();
+        let mut spec = Spec::new(argv, repo, TIMEOUT);
+        spec.env = vec![("BEADS_ACTOR".to_string(), actor.to_string())];
+        let out = capture(&spec)?;
+        if !out.success() {
+            return Err(BeadError::Command {
+                command: format!("bd {}", args.first().copied().unwrap_or("")),
+                detail: out.combined().trim().to_string(),
+            });
+        }
+        Ok(out.stdout)
+    }
+
+    fn write_file(&self, dir: &Path, bead: &Bead) -> Result<(), BeadError> {
+        let path = dir.join(format!("{}.json", bead.id));
+        let text = serde_json::to_string_pretty(bead).map_err(|err| BeadError::Answer {
+            command: path.display().to_string(),
+            detail: err.to_string(),
+        })?;
+        std::fs::write(&path, text).map_err(|source| BeadError::Io { path, source })
+    }
+
+    /// File a new bead, and read it back from the project's database.
+    pub fn create(&self, new: &NewBead, actor: &str) -> Result<Bead, BeadError> {
+        for id in new.parent.iter().chain(&new.discovered_from) {
+            check_id(id)?;
+        }
+        let id = match self {
+            Source::Files { dir } => {
+                let count = self.list_open().map(|beads| beads.len()).unwrap_or(0);
+                let id = format!("filed-{}", count + 1);
+                self.write_file(
+                    dir,
+                    &Bead {
+                        id: id.clone(),
+                        title: new.title.clone(),
+                        description: new.description.clone(),
+                        acceptance_criteria: new.acceptance_criteria.clone(),
+                        notes: new
+                            .discovered_from
+                            .as_ref()
+                            .map(|from| format!("Discovered from {from}"))
+                            .unwrap_or_default(),
+                        status: if new.deferred { "deferred" } else { "open" }.to_string(),
+                        issue_type: new.issue_type.clone(),
+                        priority: new.priority,
+                        ..Bead::default()
+                    },
+                )?;
+                id
+            }
+            Source::Dolt { repo, .. } => {
+                let priority = new.priority.to_string();
+                let mut args = vec![
+                    "create",
+                    "--silent",
+                    "--title",
+                    &new.title,
+                    "--type",
+                    &new.issue_type,
+                    "--priority",
+                    &priority,
+                    "--description",
+                    &new.description,
+                ];
+                if !new.acceptance_criteria.trim().is_empty() {
+                    args.extend(["--acceptance", &new.acceptance_criteria]);
+                }
+                if let Some(parent) = &new.parent {
+                    args.extend(["--parent", parent]);
+                }
+                let id = self
+                    .bd(repo, &args, actor)?
+                    .lines()
+                    .last()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                check_id(&id)?;
+                if let Some(from) = &new.discovered_from {
+                    self.bd(
+                        repo,
+                        &["dep", "add", &id, from, "--type", "discovered-from"],
+                        actor,
+                    )?;
+                }
+                if new.deferred {
+                    self.bd(repo, &["defer", &id], actor)?;
+                }
+                id
+            }
+        };
+        let bead = self.read(&id)?;
+        if bead.title != new.title {
+            return Err(BeadError::ClaimNotVisible {
+                id,
+                status: bead.status,
+                assignee: bead.assignee,
+            });
+        }
+        Ok(bead)
+    }
+
+    /// Change a bead, and read it back from the project's database.
+    pub fn change(&self, id: &str, change: &Change, actor: &str) -> Result<Bead, BeadError> {
+        check_id(id)?;
+        match self {
+            Source::Files { dir } => {
+                let mut bead = self.read(id)?;
+                if let Some(criteria) = &change.acceptance_criteria {
+                    bead.acceptance_criteria = criteria.clone();
+                }
+                if let Some(priority) = change.priority {
+                    bead.priority = priority;
+                }
+                match change.deferred {
+                    Some(true) => bead.status = "deferred".to_string(),
+                    Some(false) if bead.status == "deferred" => bead.status = "open".to_string(),
+                    _ => {}
+                }
+                self.write_file(dir, &bead)?;
+            }
+            Source::Dolt { repo, .. } => {
+                let priority = change.priority.map(|priority| priority.to_string());
+                let mut args = vec!["update", id];
+                if let Some(criteria) = &change.acceptance_criteria {
+                    args.extend(["--acceptance", criteria]);
+                }
+                if let Some(priority) = &priority {
+                    args.extend(["--priority", priority]);
+                }
+                if args.len() > 2 {
+                    self.bd(repo, &args, actor)?;
+                }
+                match change.deferred {
+                    Some(true) => drop(self.bd(repo, &["defer", id], actor)?),
+                    Some(false) => drop(self.bd(repo, &["undefer", id], actor)?),
+                    None => {}
+                }
+            }
+        }
+        let bead = self.read(id)?;
+        let criteria_ok = change
+            .acceptance_criteria
+            .as_ref()
+            .is_none_or(|criteria| bead.acceptance_criteria.trim() == criteria.trim());
+        let priority_ok = change
+            .priority
+            .is_none_or(|priority| bead.priority == priority);
+        if !criteria_ok || !priority_ok {
             return Err(BeadError::ClaimNotVisible {
                 id: id.to_string(),
                 status: bead.status,
@@ -431,6 +715,79 @@ mod tests {
         let closed = source.close("toy-1", "merged", "factory").unwrap();
         assert_eq!(closed.status, "closed");
         assert!(closed.notes.contains("Closed: merged"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn beads_are_listed_filed_and_changed() {
+        let dir = std::env::temp_dir().join(format!("factory-beads-w-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = Source::Files { dir: dir.clone() };
+        let mut urgent = ready();
+        urgent.id = "toy-2".to_string();
+        urgent.priority = 0;
+        urgent.acceptance_criteria = String::new();
+        let mut later = ready();
+        later.priority = 2;
+        for bead in [later, urgent] {
+            std::fs::write(
+                dir.join(format!("{}.json", bead.id)),
+                serde_json::to_string(&bead).unwrap(),
+            )
+            .unwrap();
+        }
+        let listed = source.list_open().unwrap();
+        assert_eq!(
+            listed.iter().map(|b| b.id.as_str()).collect::<Vec<_>>(),
+            ["toy-2", "toy-1"]
+        );
+        assert!(!listed[0].launchable(), "no criteria yet");
+        assert!(listed[1].launchable());
+
+        // The owner confirmed criteria: now it may be launched.
+        let changed = source
+            .change(
+                "toy-2",
+                &Change {
+                    acceptance_criteria: Some("- it works".to_string()),
+                    priority: Some(1),
+                    deferred: None,
+                },
+                "factory",
+            )
+            .unwrap();
+        assert_eq!(changed.priority, 1);
+        assert!(source.list_open().unwrap()[0].launchable());
+
+        // A finding becomes a bead, filed into the icebox.
+        let filed = source
+            .create(
+                &NewBead {
+                    title: "Document the timeout".to_string(),
+                    issue_type: "task".to_string(),
+                    priority: 4,
+                    description: "The doc comment omits it.".to_string(),
+                    discovered_from: Some("toy-1".to_string()),
+                    deferred: true,
+                    ..NewBead::default()
+                },
+                "factory",
+            )
+            .unwrap();
+        assert_eq!(filed.status, "deferred");
+        assert!(filed.notes.contains("toy-1"));
+        let back = source
+            .change(
+                &filed.id,
+                &Change {
+                    deferred: Some(false),
+                    ..Change::default()
+                },
+                "factory",
+            )
+            .unwrap();
+        assert_eq!(back.status, "open");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

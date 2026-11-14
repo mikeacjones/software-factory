@@ -1,0 +1,77 @@
+# Goals: a directing agent runs pipelines toward an objective. Each check is
+# an acceptance line of a bead in epic E17 (sf-rzb).
+id = "goals"
+title = "A goal runs to its stop condition"
+bead = "sf-rzb.8"
+
+[[tool]]
+name = "claude"
+command = ["claude", "--version"]
+
+[[tool]]
+name = "bd"
+command = ["bd", "--version"]
+
+[[check]]
+id = "definitions"
+tier = "hermetic"
+bead = "sf-rzb.1"
+claim = "Goal definitions load side by side with one default per project, a cap below one or a misspelt key is refused, and a definition naming an unknown pipeline or a model that is not allowed is refused with the reason."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-config", "--package", "factory-driver", "--", "goal_definitions_load", "a_goal_definition_that_cannot_run"]
+timeout_secs = 900
+
+[[check]]
+id = "shipped-definitions"
+tier = "hermetic"
+bead = "sf-rzb.1"
+claim = "Every goal definition in config/ names a sound pipeline, an allowed model and prompts that exist."
+command = ["cargo", "run", "--quiet", "--locked", "--offline", "--package", "factory-cli", "--", "goal", "check", "--config", "config"]
+timeout_secs = 900
+
+[[check]]
+id = "decisions"
+tier = "hermetic"
+bead = "sf-rzb.2"
+claim = "A decision to start a bead that is not launchable, is unknown or would exceed the cap is refused with the reason; completion without evidence, or with a pipeline running, is refused; a result that would leave the goal with nothing to move it is refused; and the director's briefing is the same text for the same inputs."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-driver", "--lib", "goal::"]
+timeout_secs = 900
+
+[[check]]
+id = "bead-writes"
+tier = "hermetic"
+bead = "sf-rzb.3"
+claim = "Beads are listed most urgent first with whether each may be launched, and a bead is filed (deferred, typed, linked to what it was discovered from) and changed, each write read back."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-beads", "beads_are_listed_filed_and_changed"]
+timeout_secs = 900
+
+[[check]]
+id = "socket"
+tier = "hermetic"
+bead = "sf-rzb.4"
+claim = "Against a local WebSocket stand-in, the Socket Mode listener connects, acknowledges every envelope and delivers owner messages and button presses, and drops bot messages, edits and noise."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-slack", "socket::"]
+timeout_secs = 900
+
+[[check]]
+id = "goal-run"
+tier = "hermetic"
+bead = "sf-rzb.5"
+claim = "With a scripted director and a real pipeline against scripted stand-ins: only the owner's top-level message opens a goal; the opening conversation is one session and nothing is written or run before Start; each wake is a fresh session that gets the journal and the project memory; a refused decision goes back to the same session; a pipeline ending wakes the director with its unfixed findings, which it files or drops; a change to an existing bead waits for the owner's approval; and Accept ends the goal with no agent, after a restart."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-driver", "--test", "walk", "a_goal_is_agreed_run_on_events_and_ended_by_the_owner"]
+timeout_secs = 900
+
+[[check]]
+id = "socket-live"
+tier = "owner"
+bead = "sf-rzb.4"
+claim = "With the owner's Slack app, the socket connects and the factory finds the channels of the projects that have goals."
+command = ["cargo", "run", "--quiet", "--locked", "--package", "factory-cli", "--", "slack", "check", "--config", "config"]
+timeout_secs = 300
+
+[[check]]
+id = "zig-goal"
+tier = "owner"
+bead = "sf-rzb.8"
+claim = "A goal on temporal-sdk-zig was opened from a Slack message, started by the owner, landed at least one bead, and was accepted as complete by the owner."
+command = ["proofs/goal_zig_verify.sh"]
+timeout_secs = 300

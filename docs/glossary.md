@@ -58,6 +58,18 @@ A Claude subscription the factory may run workers under. It is supplied to a run
 
 One Claude Code conversation, named by its session ID. An agent step starts a fresh session or continues the session of a named earlier step.
 
+## goal
+
+An objective the owner wants reached on a project, with the condition that ends it. It starts as a conversation in Slack, runs on events, and ends when the owner accepts that the condition is met.
+
+## pipeline
+
+What one bead goes through from being started to being landed: a unit walking its flow. A goal runs pipelines, up to its cap at a time.
+
+## director
+
+The agent that directs a goal: it decides which bead's pipeline runs next, what to file, when the owner is needed and when to propose that the goal is complete. It starts fresh at every event and its decisions are checked by code.
+
 ## tick
 
 One pass of the driver: preflight, observe, step every unit, execute actions with at most one landing, dispatch, write the heartbeat.

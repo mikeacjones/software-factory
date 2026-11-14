@@ -1,0 +1,25 @@
+# How goals run on the Zig SDK. A goal itself starts as a message from the
+# owner in #temporal-sdk-zig; this says who directs it and what it may do.
+id = "parity"
+default = true
+
+# The pipeline every bead of the goal goes through.
+flow = "zig-sdk"
+max_pipelines = 1
+
+# The standing objective, for a goal the owner opens without saying more. The
+# opening conversation turns it into a charter the owner agrees to.
+objective = "Reach GA parity with the other Temporal SDKs."
+stop_when = "All GA features and capabilities match."
+
+[director]
+model = "claude-fable-5-2"
+effort = "high"
+timeout_secs = 2400
+
+[permissions]
+# New beads, with their type, priority and deferral, are the director's call.
+file_beads = "allow"
+# Changing a bead that exists (its acceptance criteria, its priority, deferring
+# it) is put to the owner. Set to "allow" to let the director decide alone.
+edit_beads = "ask"

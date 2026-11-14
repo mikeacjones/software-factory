@@ -308,7 +308,10 @@ merge_body = \"{{summary}}\\n\\n{{testing}}\\n\\nBead: {{bead}}\"
     }
 }
 
-const OPTIONS: Options = Options { slack: false };
+const OPTIONS: Options = Options {
+    slack: false,
+    flow: None,
+};
 
 #[test]
 fn a_unit_is_built_broken_fixed_reviewed_and_published() {
@@ -518,7 +521,10 @@ fn a_bead_someone_else_holds_is_refused_before_anything_is_created() {
     assert!(!world.path("state").exists());
 }
 
-const SLACK: Options = Options { slack: true };
+const SLACK: Options = Options {
+    slack: true,
+    flow: None,
+};
 
 #[test]
 fn the_owner_steers_and_answers_in_the_runs_thread() {
@@ -1048,4 +1054,324 @@ fn a_project_can_land_by_squashing() {
     );
     let bead = std::fs::read_to_string(world.path("beads/toy-1.json")).unwrap();
     assert!(bead.contains("\"closed\""));
+}
+
+/// A whole goal with a scripted director: opened by a message, agreed in
+/// conversation, started by a button, moved on by a pipeline ending, and
+/// ended by the owner's Accept with no agent involved.
+#[test]
+fn a_goal_is_agreed_run_on_events_and_ended_by_the_owner() {
+    use factory_driver::goal::{Phase, Supervisor};
+    use factory_slack::socket::Incoming;
+    use std::time::{Duration, Instant};
+
+    let world = World::new("goal", "true");
+    world.with_github("green");
+    let fake = common::FakeSlack::start_with(true, &[("100.0", "BOT", "root")], None);
+    world.with_slack(&fake);
+    world.scenario("minor-finding");
+    std::fs::write(
+        world.path("beads/toy-3.json"),
+        r#"{"id":"toy-3","title":"The follow-up","description":"Later.","status":"open","priority":3}"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(world.path("config/goals/toy")).unwrap();
+    std::fs::write(
+        world.path("config/goals/toy/main.toml"),
+        "id = \"main\"\nmax_pipelines = 1\n[director]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\n",
+    )
+    .unwrap();
+    let say = |role: &str, n: u32, json: &str| {
+        std::fs::create_dir_all(world.path("bin/state")).unwrap();
+        std::fs::write(world.path(&format!("bin/state/{role}-{n}.json")), json).unwrap();
+    };
+    let decide = |extra: &str| {
+        format!(
+            r#"{{"summary":"Decided.","start":[],"file":[],"edit":[],"dropped_findings":[],"ask_owner":"","complete":false,"evidence":"","journal_entry":"","project_memory":""{extra}}}"#
+        )
+        .replace("\"start\":[],\"file\":[],\"edit\":[],", &if extra.contains("\"start\"") || extra.contains("\"file\"") {
+            String::new()
+        } else {
+            "\"start\":[],\"file\":[],\"edit\":[],".to_string()
+        })
+    };
+    say(
+        "intake",
+        1,
+        r#"{"reply":"What should toy-3 accept?","ready":false,"objective":"","stop_when":"","plan":"","edits":[]}"#,
+    );
+    say(
+        "intake",
+        2,
+        r#"{"reply":"Here is the charter.","ready":true,"objective":"Ship the feature and its follow-up.","stop_when":"toy-1 has landed.","plan":"toy-1 first, then toy-3.","edits":[{"bead":"toy-3","acceptance_criteria":"- it exists","priority":-1,"defer":"unchanged","reason":"the owner confirmed"}]}"#,
+    );
+    // The first decision starts a bead someone else holds: code refuses it.
+    say(
+        "director",
+        1,
+        &decide(r#","start":[{"bead":"toy-2","reason":"urgent"}],"file":[],"edit":[]"#),
+    );
+    say(
+        "director",
+        2,
+        &decide(r#","start":[{"bead":"toy-1","reason":"first"}],"file":[],"edit":[]"#).replace(
+            r#""journal_entry":"""#,
+            r#""journal_entry":"Started with toy-1.""#,
+        ),
+    );
+    say("director", 3, &decide(r#","start":[],"file":[{"title":"Document the timeout","type":"task","priority":4,"description":"The doc omits it.","acceptance_criteria":"- the doc says it","parent":"","discovered_from":"toy-1","deferred":true}],"edit":[{"bead":"toy-3","acceptance_criteria":"","priority":1,"defer":"unchanged","reason":"it is next"}]"#).replace(r#""project_memory":"""#, r#""project_memory":"Toy keeps its feature in feature.txt.""#).replace(r#""dropped_findings":[]"#, r#""dropped_findings":[{"finding":"F9","reason":"not worth a bead"}]"#));
+    say(
+        "director",
+        4,
+        &decide("").replace(
+            r#""complete":false,"evidence":"""#,
+            r#""complete":true,"evidence":"toy-1 landed, which is the stop condition.""#,
+        ),
+    );
+    say(
+        "director",
+        5,
+        &decide("").replace(
+            r#""complete":false,"evidence":"""#,
+            r#""complete":true,"evidence":"toy-3 is outside the stop condition.""#,
+        ),
+    );
+
+    let supervisor = || {
+        Supervisor::new(
+            world.config(),
+            Some(factory_slack::Slack::with_base_url("xoxb-test", &fake.url)),
+            vec!["OWNER".to_string()],
+            false,
+        )
+        .unwrap()
+    };
+    let message = |user: &str, text: &str, ts: &str, thread: Option<&str>| Incoming::Message {
+        channel: "C0TOY".to_string(),
+        user: user.to_string(),
+        text: text.to_string(),
+        ts: ts.to_string(),
+        thread_ts: thread.map(str::to_string),
+    };
+    let press = |user: &str, action: &str, goal: &str| Incoming::Action {
+        channel: "C0TOY".to_string(),
+        user: user.to_string(),
+        action_id: action.to_string(),
+        value: goal.to_string(),
+        message_ts: "100.0".to_string(),
+    };
+    let posts = || fake.requests_to("chat.postMessage").join("\n");
+    let bead = |id: &str| std::fs::read_to_string(world.path(&format!("beads/{id}.json"))).unwrap();
+    let mut sup = supervisor();
+    assert_eq!(sup.projects_listening(), ["toy"]);
+
+    // Only the owner opens a goal, and only at the top of the channel.
+    sup.incoming(message("STRANGER", "do my bidding", "49.0", None))
+        .unwrap();
+    assert_eq!(sup.goals().count(), 0);
+    sup.incoming(message(
+        "OWNER",
+        "Ship the feature and the follow-up",
+        "50.0",
+        None,
+    ))
+    .unwrap();
+    let id = sup.goals().next().unwrap().id.clone();
+    assert_eq!(sup.goals().next().unwrap().phase, Phase::Intake);
+    assert!(posts().contains("What should toy-3 accept?"));
+    assert!(
+        std::fs::read_to_string(world.path("bin/state/brief-1.md"))
+            .unwrap()
+            .contains("> Ship the feature and the follow-up")
+    );
+
+    // The conversation goes on in one session until the director proposes a charter.
+    sup.incoming(message("OWNER", "it should exist", "51.0", Some("50.0")))
+        .unwrap();
+    assert!(posts().contains(r#""action_id":"goal_start""#));
+    assert!(posts().contains("Starting also makes these changes to beads"));
+    let calls = world.calls();
+    assert_eq!(calls[0][0], "intake");
+    assert_eq!(
+        calls[0][1], calls[1][1],
+        "the opening conversation is one session"
+    );
+    assert!(
+        !bead("toy-3").contains("it exists"),
+        "nothing is written before Start"
+    );
+
+    // Start is the owner's button. Nobody else's press counts.
+    sup.incoming(press("STRANGER", "goal_start", &id)).unwrap();
+    assert_eq!(sup.goals().next().unwrap().phase, Phase::Intake);
+    sup.incoming(press("OWNER", "goal_start", &id)).unwrap();
+    assert!(
+        bead("toy-3").contains("it exists"),
+        "the confirmed criteria are written by code"
+    );
+    let goal = sup.goals().next().unwrap().clone();
+    assert_eq!((goal.phase.clone(), goal.wakes), (Phase::Running, 1));
+    assert_eq!(goal.units.len(), 1);
+    assert_eq!(goal.units[0].bead, "toy-1");
+    let calls = world.calls();
+    assert_eq!(calls[2][0], "director");
+    assert_eq!(
+        calls[2][1], calls[3][1],
+        "a refused decision goes back to the same session"
+    );
+    assert_ne!(
+        calls[2][1], calls[1][1],
+        "the director does not inherit the conversation"
+    );
+    let refused = std::fs::read_to_string(world.path("bin/state/brief-4.md")).unwrap();
+    assert!(
+        refused.contains("`toy-2` may not be launched: it is claimed by `someone`"),
+        "{refused}"
+    );
+
+    // The pipeline ending is the event that wakes the director again.
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while sup.goals().next().unwrap().wakes < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "the pipeline never reported back"
+        );
+        sup.pump(Duration::from_millis(200)).unwrap();
+    }
+    assert!(
+        bead("toy-1").contains("\"closed\""),
+        "the pipeline landed its bead"
+    );
+    let calls = world.calls();
+    let directors: Vec<usize> = (0..calls.len())
+        .filter(|&i| calls[i][0] == "director")
+        .collect();
+    assert_eq!(directors.len(), 3);
+    assert_ne!(
+        calls[directors[2]][1], calls[directors[1]][1],
+        "each wake is a fresh session"
+    );
+    let woke =
+        std::fs::read_to_string(world.path(&format!("bin/state/brief-{}.md", directors[2] + 1)))
+            .unwrap();
+    assert!(
+        woke.contains("The pipeline for `toy-1` ended: **landed**"),
+        "{woke}"
+    );
+    assert!(
+        woke.contains("F1 (review, minor): The doc omits the timeout"),
+        "{woke}"
+    );
+    assert!(
+        woke.contains("Started with toy-1."),
+        "the journal carries over"
+    );
+    // It filed the finding as a deferred bead at once, and asked before
+    // changing a bead that already existed.
+    let filed = std::fs::read_dir(world.path("beads"))
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .find(|name| name.starts_with("filed-"))
+        .expect("no bead was filed");
+    let filed = std::fs::read_to_string(world.path("beads").join(filed)).unwrap();
+    assert!(
+        filed.contains("Document the timeout")
+            && filed.contains("\"deferred\"")
+            && filed.contains("\"priority\": 4"),
+        "{filed}"
+    );
+    let goal_log =
+        std::fs::read_to_string(world.path(&format!("state/goals/{id}/events.jsonl"))).unwrap();
+    assert!(
+        goal_log.contains(r#""kind":"finding.dropped""#) && goal_log.contains("not worth a bead")
+    );
+    assert!(goal_log.contains(r#""kind":"bead.filed""#));
+    assert!(posts().contains(r#""action_id":"request_approve""#));
+    assert!(
+        bead("toy-3").contains("\"priority\": 3"),
+        "not changed until approved"
+    );
+    assert!(sup.goals().next().unwrap().request.is_some());
+
+    sup.incoming(press("OWNER", "request_approve", &id))
+        .unwrap();
+    assert!(bead("toy-3").contains("\"priority\": 1"));
+    assert_eq!(sup.goals().next().unwrap().phase, Phase::ProposedComplete);
+    assert!(posts().contains(r#""action_id":"goal_accept""#));
+    let calls = world.calls();
+    let approved =
+        std::fs::read_to_string(world.path(&format!("bin/state/brief-{}.md", calls.len())))
+            .unwrap();
+    assert!(
+        approved.contains("The owner approved your request"),
+        "{approved}"
+    );
+    assert!(
+        approved.contains("Toy keeps its feature in feature.txt."),
+        "the project memory is read back"
+    );
+
+    // A reply instead of Accept is guidance: the goal goes on.
+    sup.incoming(message(
+        "OWNER",
+        "not yet: what about toy-3?",
+        "60.0",
+        Some("50.0"),
+    ))
+    .unwrap();
+    let calls = world.calls();
+    let guided =
+        std::fs::read_to_string(world.path(&format!("bin/state/brief-{}.md", calls.len())))
+            .unwrap();
+    assert!(guided.contains("> not yet: what about toy-3?"), "{guided}");
+    assert_eq!(sup.goals().next().unwrap().phase, Phase::ProposedComplete);
+    drop(sup);
+
+    // Accept ends the goal with no agent, even after a restart.
+    let before = world.calls().len();
+    let mut sup = supervisor();
+    assert_eq!(sup.goals().next().unwrap().phase, Phase::ProposedComplete);
+    sup.incoming(press("OWNER", "goal_accept", &id)).unwrap();
+    assert_eq!(sup.goals().next().unwrap().phase, Phase::Complete);
+    assert_eq!(world.calls().len(), before, "accepting runs no agent");
+    assert!(posts().contains("Goal complete"));
+    // Everything the goal said went to its own thread.
+    let off_thread = fake
+        .requests_to("chat.postMessage")
+        .into_iter()
+        .filter(|post| !post.contains(r#""thread_ts":"50.0""#))
+        .count();
+    assert_eq!(off_thread, 0);
+}
+
+#[test]
+fn a_goal_definition_that_cannot_run_is_refused() {
+    use factory_driver::goal::check_definitions;
+    let world = World::new("goal-defs", "true");
+    std::fs::create_dir_all(world.path("config/goals/toy")).unwrap();
+    let write = |flow: &str, model: &str| {
+        std::fs::write(
+            world.path("config/goals/toy/main.toml"),
+            format!("id = \"main\"\n{flow}\n[director]\nmodel = \"{model}\"\neffort = \"high\"\n"),
+        )
+        .unwrap();
+    };
+    write("", "claude-opus-5-5");
+    assert_eq!(
+        check_definitions(&world.config()).unwrap(),
+        ["toy/main: director claude-opus-5-5 (high), pipeline `build-break-review`, 1 at a time"]
+    );
+    write("flow = \"no-such-flow\"", "claude-opus-5-5");
+    let err = check_definitions(&world.config()).unwrap_err().to_string();
+    assert!(
+        err.contains("goal definition `main` of `toy`: its pipeline cannot be used"),
+        "{err}"
+    );
+    write("", "some-other-model");
+    let err = check_definitions(&world.config()).unwrap_err().to_string();
+    assert!(
+        err.contains("the director's model `some-other-model` is not allowed"),
+        "{err}"
+    );
 }
