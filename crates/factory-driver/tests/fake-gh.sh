@@ -66,7 +66,13 @@ case "$1 $2" in
     git clone --quiet "$remote" "$work"
     cd "$work" || exit 1
     git config user.name "GitHub" && git config user.email "noreply@localhost" && git config commit.gpgsign false
-    git merge --quiet --no-ff -m "${subject:-Merge pull request 7}" -m "${body:-No body.}" "origin/$branch" || exit 1
+    case " $* " in
+      *" --squash "*)
+        git merge --quiet --squash "origin/$branch" || exit 1
+        git commit --quiet -m "${subject:-Squashed 7}" -m "${body:-No body.}" || exit 1 ;;
+      *)
+        git merge --quiet --no-ff -m "${subject:-Merge pull request 7}" -m "${body:-No body.}" "origin/$branch" || exit 1 ;;
+    esac
     git push --quiet origin HEAD:main || exit 1
     git rev-parse HEAD > "$state/merged"
     echo "$head" > "$state/merged-head" ;;

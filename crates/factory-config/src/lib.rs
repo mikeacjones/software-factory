@@ -90,6 +90,9 @@ pub struct Project {
     pub slack_channel: Option<String>,
     /// The flow units of this project run.
     pub flow: String,
+    /// What the publication step should know about this project's commit
+    /// messages and pull requests, such as the trailers it expects.
+    pub publication_note: Option<String>,
     /// The first part of a unit's branch name, by bead type. A type not
     /// listed here uses the built-in choice: see [`Project::branch_prefix`].
     #[serde(default)]
@@ -197,17 +200,36 @@ pub struct GitHub {
     /// Green must still be green this long after it is first seen.
     #[serde(default = "default_ci_settle")]
     pub ci_settle_secs: u64,
-    /// The subject of the merge commit. `{bead}` is the bead ID, `{bead_short}`
-    /// the ID without the project's prefix, `{title}` the pull request's title.
+    /// How a pull request reaches the default branch.
+    #[serde(default)]
+    pub merge_method: MergeMethod,
+    /// The subject of the commit the landing makes (a merge commit, or the
+    /// one commit of a squash). `{bead}` is the bead ID, `{bead_short}` the ID
+    /// without the project's prefix, `{title}` the pull request's title and
+    /// `{number}` its number.
     pub merge_subject: Option<String>,
-    /// The body of the merge commit. `{summary}` is the paragraph the
-    /// publication step wrote, `{testing}` the factory's own account of what
-    /// passed, `{bead}` and `{bead_short}` the bead ID. Without it GitHub
-    /// writes its default body.
+    /// The body of that commit. `{summary}` is the paragraph the publication
+    /// step wrote for a merge commit; `{commit_body}` and `{commit_trailers}`
+    /// are the published commit's own body and its final block of trailers,
+    /// for a squash; `{testing}` is the factory's own account of what passed;
+    /// `{bead}` and `{bead_short}` the bead ID. Without it GitHub writes its
+    /// default body.
     pub merge_body: Option<String>,
     /// Remove the unit's branch from the remote once it has merged.
     #[serde(default = "default_true")]
     pub delete_branch_after_merge: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MergeMethod {
+    /// A merge commit on top of the branch's commits.
+    #[default]
+    Merge,
+    /// One new commit holding the whole change.
+    Squash,
+    /// The branch's commits replayed onto the default branch.
+    Rebase,
 }
 
 fn default_ci_poll() -> u64 {

@@ -513,6 +513,13 @@ pub fn render(brief: &Brief<'_>) -> String {
             _ => "Continue the step.",
         };
         section(&mut out, "Task", task);
+        if contract == Some(Contract::Publication) {
+            section(
+                &mut out,
+                "This project's rules for the text",
+                brief.project.publication_note.as_deref().unwrap_or(""),
+            );
+        }
         if contract == Some(Contract::Publication) && !brief.project.publish_checks.is_empty() {
             let checks = bullets(brief.project.publish_checks.iter().filter_map(|name| {
                 let command = brief.project.commands.get(name)?;

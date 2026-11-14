@@ -975,3 +975,77 @@ fn the_owner_can_put_an_ended_unit_onto_the_projects_current_flow() {
     let bead = std::fs::read_to_string(world.path("beads/toy-1.json")).unwrap();
     assert!(bead.contains("\"closed\""));
 }
+
+#[test]
+fn a_project_can_land_by_squashing() {
+    let world = World::new("squash", "true");
+    world.with_github("green");
+    let project = world.path("config/projects/toy.toml");
+    let text = std::fs::read_to_string(&project).unwrap();
+    let text = text
+        .replace(
+            "merge_subject = \"Merge bead/{bead_short}: {title}\"",
+            "merge_method = \"squash\"\nmerge_subject = \"{title} (#{number})\"",
+        )
+        .replace(
+            "merge_body = \"{summary}\\n\\n{testing}\\n\\nBead: {bead}\"",
+            "merge_body = \"{commit_body}\\n\\n{testing}\\n\\n{commit_trailers}\"",
+        )
+        .replace(
+            "flow = \"zig-sdk\"",
+            "flow = \"zig-sdk\"\npublication_note = \"End with the trailer Bead: <id>.\"",
+        );
+    assert!(
+        text.contains("merge_method = \"squash\""),
+        "the project record was not rewritten"
+    );
+    std::fs::write(&project, text).unwrap();
+
+    let mut driver = Driver::start(world.config(), "toy", "toy-1", &OPTIONS).unwrap();
+    assert_eq!(driver.run().unwrap(), Status::Ended);
+
+    let merges: Vec<String> = world
+        .gh_calls()
+        .into_iter()
+        .filter(|call| call.starts_with("pr merge"))
+        .collect();
+    assert_eq!(merges.len(), 1);
+    assert!(
+        merges[0].contains("--squash") && !merges[0].contains("--merge "),
+        "{}",
+        merges[0]
+    );
+
+    // One commit on main, with one parent: no merge commit.
+    let remote = world.path("remote.git");
+    let merged = driver.unit().merged.clone().unwrap();
+    assert_eq!(run(&remote, "git", &["rev-parse", "main"]), merged);
+    assert_eq!(run(&remote, "git", &["rev-list", "--count", "main"]), "2");
+    assert_eq!(
+        run(&remote, "git", &["rev-list", "--parents", "-1", "main"])
+            .split(' ')
+            .count(),
+        2
+    );
+    assert_eq!(
+        run(&remote, "git", &["log", "-1", "--format=%s", "main"]),
+        "Add the feature (#7)"
+    );
+    // Its body is the change's own body, then what was tested.
+    let body = run(&remote, "git", &["log", "-1", "--format=%b", "main"]);
+    assert!(
+        body.starts_with("It adds lines to feature.txt.\n\nTesting: on "),
+        "{body}"
+    );
+    assert!(!body.contains("{"), "an unfilled placeholder: {body}");
+    // The publisher was told the project's rule for trailers.
+    let calls = world.calls();
+    let brief = std::fs::read_to_string(world.path(&format!("bin/state/brief-{}.md", calls.len())))
+        .unwrap();
+    assert!(
+        brief.contains("End with the trailer Bead: <id>."),
+        "{brief}"
+    );
+    let bead = std::fs::read_to_string(world.path("beads/toy-1.json")).unwrap();
+    assert!(bead.contains("\"closed\""));
+}

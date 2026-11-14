@@ -24,7 +24,9 @@ use factory_core::{EventLog, ProjectId, StepId, UnitId, now_unix};
 use factory_flow::{
     ExitPolicy, Flow, Next, Position, Registry, SessionRule, Step, StepKind, Workspace,
 };
-use factory_github::{CiVerdict, GitHub, ci_verdict, publication_problems};
+use factory_github::{
+    CiVerdict, GitHub, MergeMethod, MergeRequest, ci_verdict, publication_problems,
+};
 use factory_slack::{Slack, code_block, escape, link, quote, truncate};
 use factory_supervise::{Control, tail};
 use serde::{Deserialize, Serialize};
@@ -1969,7 +1971,13 @@ impl Driver {
                     .replace("{bead_short}", self.project.bead_short(&self.unit.bead))
                     .replace("{bead}", &self.unit.bead)
                     .replace("{title}", &title)
+                    .replace("{number}", &number.to_string())
             });
+            let method = match settings.merge_method {
+                factory_config::MergeMethod::Merge => MergeMethod::Merge,
+                factory_config::MergeMethod::Squash => MergeMethod::Squash,
+                factory_config::MergeMethod::Rebase => MergeMethod::Rebase,
+            };
             let body = settings.merge_body.as_ref().map(|template| {
                 let passed = match ci_verdict(&status.checks, &settings.required_checks) {
                     CiVerdict::Green { passed } => passed,
@@ -1981,16 +1989,19 @@ impl Driver {
                 .merge(
                     &repo_dir,
                     &settings.repo,
-                    number,
-                    &status.head,
-                    subject.as_deref(),
-                    body.as_deref(),
+                    &MergeRequest {
+                        number,
+                        method,
+                        head: &status.head,
+                        subject: subject.as_deref(),
+                        body: body.as_deref(),
+                    },
                 )
                 .map_err(|err| DriverError::Preflight(err.to_string()))?;
             self.event(
                 "landing.merge_requested",
                 Some(&step.id),
-                json!({ "head": status.head, "subject": subject }),
+                json!({ "head": status.head, "subject": subject, "method": format!("{method:?}") }),
             )?;
             for _ in 0..20 {
                 status = read(&github)?;
@@ -2109,11 +2120,31 @@ impl Driver {
             std::env::consts::OS,
             commands.join(", "),
         );
-        template
+        // The published commit's own message, for a squash: its body, and
+        // the block of trailers it ends with.
+        let message = self
+            .publication()
+            .and_then(|text| {
+                text.get("commit_message")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
+        let (commit_body, commit_trailers) = split_message(&message);
+        let filled = template
             .replace("{summary}", &wrap(&summary, 72))
+            .replace("{commit_body}", &commit_body)
+            .replace("{commit_trailers}", &commit_trailers)
             .replace("{testing}", &wrap(&testing, 72))
             .replace("{bead_short}", self.project.bead_short(&self.unit.bead))
-            .replace("{bead}", &self.unit.bead)
+            .replace("{bead}", &self.unit.bead);
+        // A part that came out empty must not leave a hole in the message.
+        filled
+            .split("\n\n")
+            .map(str::trim)
+            .filter(|paragraph| !paragraph.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n")
     }
 
     /// What a step that needs an artifact is told about it.
@@ -2352,6 +2383,30 @@ impl Driver {
     }
 }
 
+/// A commit message without its subject, as its body and its final block
+/// of trailers (`Key: value` lines). Either may be empty.
+fn split_message(message: &str) -> (String, String) {
+    let mut paragraphs: Vec<&str> = message
+        .trim()
+        .split("\n\n")
+        .map(str::trim)
+        .filter(|paragraph| !paragraph.is_empty())
+        .collect();
+    if !paragraphs.is_empty() {
+        paragraphs.remove(0);
+    }
+    let is_trailer = |line: &str| {
+        line.split_once(": ").is_some_and(|(key, _)| {
+            !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        })
+    };
+    let trailers = match paragraphs.last() {
+        Some(last) if last.lines().all(is_trailer) => paragraphs.pop().unwrap_or_default(),
+        _ => "",
+    };
+    (paragraphs.join("\n\n"), trailers.to_string())
+}
+
 /// Wrap prose at `width` columns, keeping its paragraphs.
 fn wrap(text: &str, width: usize) -> String {
     text.split("\n\n")
@@ -2407,6 +2462,30 @@ fn preflight(factory: &Factory, project: &Project) -> Result<(), DriverError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_commit_message_splits_into_body_and_trailers() {
+        let message = "Add a thing\n\nWhy it was needed.\n\nHow it works: in two parts.\n\nBead: toy-1\nChangelog: none (internal)\n";
+        assert_eq!(
+            split_message(message),
+            (
+                "Why it was needed.\n\nHow it works: in two parts.".to_string(),
+                "Bead: toy-1\nChangelog: none (internal)".to_string()
+            )
+        );
+        // Prose that happens to contain a colon is not a trailer block.
+        assert_eq!(
+            split_message("Subject\n\nNote: this one\nruns over two lines."),
+            (
+                "Note: this one\nruns over two lines.".to_string(),
+                String::new()
+            )
+        );
+        assert_eq!(
+            split_message("Subject only"),
+            (String::new(), String::new())
+        );
+    }
 
     #[test]
     fn prose_is_wrapped_and_keeps_its_paragraphs() {

@@ -5,6 +5,8 @@ default_branch = "main"
 bead_actor = "factory"
 slack_channel = "temporal-sdk-zig"
 flow = "zig-sdk"
+publication_note = """
+End the commit message with a trailer block: `Bead: <the bead's full ID>`, which is the trailer this repository's history uses (not `Refs:`), and after it the changelog trailer when the change needs one. The pull request is squashed when it lands, so this commit message, with a testing paragraph the factory adds, is what the default branch keeps: write it for someone reading the history a year from now."""
 
 # CI checks out the Rust core as a submodule, so every worktree does too.
 setup = ["submodules"]
@@ -30,8 +32,12 @@ write = ["mikeacjones/temporal-sdk-zig"]
 ci_poll_secs = 30
 ci_timeout_secs = 10800
 ci_settle_secs = 60
-merge_subject = "Merge bead/{bead_short}: {title}"
-merge_body = "{summary}\n\n{testing}\n\nBead: {bead}"
+# Squash and merge: the default branch gets one commit per bead. Its subject
+# is the change's own, with the pull request's number; its body is the
+# change's own body, then what was tested, then the commit's trailers.
+merge_method = "squash"
+merge_subject = "{title} (#{number})"
+merge_body = "{commit_body}\n\n{testing}\n\n{commit_trailers}"
 delete_branch_after_merge = true
 # Green means each of these is present and passed, and nothing else failed.
 # A workflow that has not started has created no check, so without this list

@@ -250,34 +250,34 @@ impl GitHub {
         .filter(|log| !log.trim().is_empty())
     }
 
-    /// Merge a pull request with a merge commit, but only if its head is
-    /// still `head`: nothing that the factory did not publish is merged.
+    /// Merge a pull request, but only if its head is still `head`: nothing
+    /// that the factory did not publish is merged. A rebase keeps the
+    /// commits' own messages, so `subject` and `body` do not apply to it.
     pub fn merge(
         &self,
         cwd: &Path,
         repo: &str,
-        number: u64,
-        head: &str,
-        subject: Option<&str>,
-        body: Option<&str>,
+        request: &MergeRequest<'_>,
     ) -> Result<(), GitHubError> {
         self.check_allowed(repo)?;
-        let number = number.to_string();
+        let number = request.number.to_string();
         let mut args = vec![
             "pr",
             "merge",
             &number,
             "--repo",
             repo,
-            "--merge",
+            request.method.flag(),
             "--match-head-commit",
-            head,
+            request.head,
         ];
-        if let Some(subject) = subject {
-            args.extend(["--subject", subject]);
-        }
-        if let Some(body) = body {
-            args.extend(["--body", body]);
+        if request.method != MergeMethod::Rebase {
+            if let Some(subject) = request.subject {
+                args.extend(["--subject", subject]);
+            }
+            if let Some(body) = request.body {
+                args.extend(["--body", body]);
+            }
         }
         self.gh(cwd, &args, None).map(|_| ())
     }
@@ -286,6 +286,38 @@ impl GitHub {
     pub fn authenticated(&self, cwd: &Path) -> bool {
         self.gh(cwd, &["auth", "status"], None).is_ok()
     }
+}
+
+/// How a pull request's commits reach the default branch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MergeMethod {
+    /// A merge commit on top of the branch's commits.
+    Merge,
+    /// One new commit holding the whole change.
+    Squash,
+    /// The branch's commits replayed onto the default branch.
+    Rebase,
+}
+
+impl MergeMethod {
+    fn flag(self) -> &'static str {
+        match self {
+            MergeMethod::Merge => "--merge",
+            MergeMethod::Squash => "--squash",
+            MergeMethod::Rebase => "--rebase",
+        }
+    }
+}
+
+/// One landing: which pull request, how, and what the commit it makes says.
+#[derive(Clone, Copy, Debug)]
+pub struct MergeRequest<'a> {
+    pub number: u64,
+    pub method: MergeMethod,
+    /// The commit the pull request's head must still be at.
+    pub head: &'a str,
+    pub subject: Option<&'a str>,
+    pub body: Option<&'a str>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -653,7 +685,17 @@ mod tests {
     fn a_merge_outside_the_write_list_is_refused() {
         let mut github = GitHub::new(vec!["me/toy".to_string()]);
         github.gh_bin = "no-such-gh-anywhere".to_string();
-        let result = github.merge(&std::env::temp_dir(), "someone/else", 7, "abc", None, None);
+        let result = github.merge(
+            &std::env::temp_dir(),
+            "someone/else",
+            &MergeRequest {
+                number: 7,
+                method: MergeMethod::Squash,
+                head: "abc",
+                subject: None,
+                body: None,
+            },
+        );
         assert!(matches!(result, Err(GitHubError::NotAllowed(_))));
     }
 
