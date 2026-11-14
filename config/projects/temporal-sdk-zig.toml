@@ -1,0 +1,60 @@
+id = "temporal-sdk-zig"
+repo = "~/Source/temporal-sdk-zig"
+remote = "origin"
+default_branch = "main"
+bead_actor = "factory"
+slack_channel = "temporal-sdk-zig"
+flow = "zig-sdk"
+
+# CI checks out the Rust core as a submodule, so every worktree does too.
+setup = ["submodules"]
+
+# No bead of the first runs may touch these. A core bump changes
+# deps/sdk-core and is not factory work yet.
+forbidden_paths = [".github/**", ".beads/**", ".claude/**", "deps/sdk-core", "deps/sdk-core/**", "worktrees/**"]
+
+[beads]
+kind = "dolt"
+host = "127.0.0.1"
+port = 3306
+user = "root"
+database = "temporal-sdk-zig"
+
+[github]
+repo = "mikeacjones/temporal-sdk-zig"
+write = ["mikeacjones/temporal-sdk-zig"]
+
+[scopes]
+code = ["**"]
+
+[commands.submodules]
+argv = ["git", "submodule", "update", "--init"]
+timeout_secs = 900
+
+[commands.fmt]
+argv = ["zig", "build", "fmt"]
+timeout_secs = 900
+
+[commands.samples-index]
+argv = ["sh", "-c", "zig build samples-index && git diff --exit-code samples/dispatch.zig"]
+timeout_secs = 900
+
+[commands.readme]
+argv = ["zig", "build", "readme-check"]
+timeout_secs = 1800
+
+[commands.changelog]
+argv = ["scripts/changelog-check.sh", "origin/main"]
+timeout_secs = 300
+
+[commands.test]
+argv = ["zig", "build", "test"]
+timeout_secs = 3600
+
+[commands.samples-test]
+argv = ["zig", "build", "samples-test"]
+timeout_secs = 3600
+
+[limits]
+step_timeout_secs = 7200
+step_budget_usd = 80.0

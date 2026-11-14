@@ -1,0 +1,134 @@
+# The flow for temporal-sdk-zig: build-break-review, with this project's own
+# checks around it.
+#
+# Before any model runs, the unit tests are run on the untouched base. That
+# proves the default branch is green, so a later failure is the change's
+# fault, and it builds the Rust core once so the builder's own runs are fast.
+#
+# After the builder: formatting, the generated samples index, README examples,
+# changelog fragments, the unit tests, and every sample against a dev server.
+# Then a fresh adversarial tester tries to break the change by running it, and
+# a fresh reviewer reads it. The builder's session is continued for every fix
+# and for the publication text. The factory commits, pushes and opens the pull
+# request; the owner merges.
+id = "zig-sdk"
+start = "baseline"
+
+[[step]]
+id = "baseline"
+kind = "command"
+command = "test"
+on.pass = "build"
+on.fail = "park"
+
+[[step]]
+id = "build"
+kind = "agent"
+role = "builder"
+model = "claude-opus-5-5"
+effort = "medium"
+session = "fresh"
+writes = ["code"]
+on.done = "fmt"
+on.already_done = "park"
+on.needs_owner = { to = "ask", max = 3 }
+
+[[step]]
+id = "fmt"
+kind = "command"
+command = "fmt"
+on.pass = "index"
+on.fail = { to = "fix", max = 2 }
+
+# samples/dispatch.zig is generated from the samples; it must be current.
+[[step]]
+id = "index"
+kind = "command"
+command = "samples-index"
+on.pass = "readme"
+on.fail = { to = "fix", max = 2 }
+
+[[step]]
+id = "readme"
+kind = "command"
+command = "readme"
+on.pass = "changelog"
+on.fail = { to = "fix", max = 2 }
+
+[[step]]
+id = "changelog"
+kind = "command"
+command = "changelog"
+on.pass = "test"
+on.fail = { to = "fix", max = 2 }
+
+[[step]]
+id = "test"
+kind = "command"
+command = "test"
+on.pass = "samples"
+on.fail = { to = "fix", max = 3 }
+
+# A finished sample stays in the suite: breaking one is a regression.
+[[step]]
+id = "samples"
+kind = "command"
+command = "samples-test"
+on.pass = "break"
+on.fail = { to = "fix", max = 2 }
+
+# Not a reader: it runs the change and hunts for inputs and sequences that
+# break it. Every finding carries a reproduction it ran.
+[[step]]
+id = "break"
+kind = "agent"
+role = "tester"
+model = "claude-opus-5-5"
+effort = "high"
+session = "fresh"
+workspace = "scratch"
+on.held = "review"
+# After two fix rounds the tester no longer decides alone: the reviewer sees
+# its open findings and rules on each one.
+on.broken = { to = "fix", max = 2, then = "review" }
+on.needs_owner = { to = "ask", max = 2 }
+
+[[step]]
+id = "review"
+kind = "agent"
+role = "reviewer"
+model = "claude-opus-5-5"
+effort = "high"
+session = "fresh"
+workspace = "scratch"
+on.approve = "describe"
+on.rework = { to = "fix", max = 2 }
+on.needs_owner = { to = "ask", max = 2 }
+
+# Every way back leads here, and from here through every check again.
+[[step]]
+id = "fix"
+kind = "agent"
+role = "builder"
+model = "claude-opus-5-5"
+effort = "medium"
+session = "continue:build"
+writes = ["code"]
+on.done = { to = "fmt", max = 8 }
+on.needs_owner = { to = "ask", max = 2 }
+
+[[step]]
+id = "describe"
+kind = "agent"
+role = "publisher"
+model = "claude-opus-5-5"
+effort = "medium"
+session = "continue:build"
+on.ready = "publish"
+
+[[step]]
+id = "publish"
+kind = "action"
+action = "publish"
+on.done = "end"
+on.failed = "park"

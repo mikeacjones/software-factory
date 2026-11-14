@@ -1,0 +1,11 @@
+# Factory-wide settings.
+state_dir = "~/.local/state/software-factory"
+claude_bin = "claude"
+cli_version = "2.1.325"
+allowed_models = ["claude-fable-5-2", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"]
+
+[slack]
+# Holds SLACK_BOT_TOKEN and SLACK_OWNER_USER_ID. Readable by the owner only.
+env_file = "~/.config/software-factory/slack.env"
+poll_secs = 10
+answer_wait_secs = 43200

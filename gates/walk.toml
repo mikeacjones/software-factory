@@ -1,0 +1,97 @@
+# The first milestone: one real bead walked to a pull request. Each check is
+# an acceptance line of a bead in epic E16 (sf-c9e).
+id = "walk"
+title = "One real bead reaches a pull request"
+bead = "sf-c9e.9"
+
+[[tool]]
+name = "claude"
+command = ["claude", "--version"]
+
+[[tool]]
+name = "bd"
+command = ["bd", "--version"]
+
+[[tool]]
+name = "gh"
+command = ["gh", "--version"]
+
+[[check]]
+id = "flow"
+tier = "hermetic"
+bead = "sf-c9e.1"
+claim = "A flow with an unrouted outcome, an unknown target or an unbounded backward route is refused with the reason, a scripted unit walks every step with no model, and a saved position is restored."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-flow", "--package", "factory-config"]
+timeout_secs = 900
+
+[[check]]
+id = "shipped-flows"
+tier = "hermetic"
+bead = "sf-c9e.1"
+claim = "The flow the Zig project names is sound against its project record and the role registry."
+command = ["cargo", "run", "--quiet", "--locked", "--offline", "--package", "factory-cli", "--", "flow", "check", "temporal-sdk-zig", "--config", "config"]
+timeout_secs = 900
+
+[[check]]
+id = "claude-adapter"
+tier = "hermetic"
+bead = "sf-c9e.2"
+claim = "Recorded stream output from the pinned CLI parses into an outcome, session, typed result and usage; a run refused at the limit is Limited whatever its subtype says; the command line is headless, bypass mode and never bare."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-claude", "--package", "factory-supervise"]
+timeout_secs = 900
+
+[[check]]
+id = "work-sources"
+tier = "hermetic"
+bead = "sf-c9e.3"
+claim = "A claimed, closed, blocked or criteria-less bead is refused with the reason; a step's changes outside its path scopes are reported; a failing command is told apart from one that could not run or timed out; checkpoints squash to one commit with the same content."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-beads", "--package", "factory-git", "--package", "factory-checks"]
+timeout_secs = 900
+
+[[check]]
+id = "slack-thread"
+tier = "hermetic"
+bead = "sf-c9e.4"
+claim = "Against a stand-in for Slack: a missing channel is created and the owner invited, owner replies are heard once each and strangers never, and with Slack unreachable the run carries on with the failure in its event log."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-slack", "--package", "factory-driver", "--test", "slack", "--lib"]
+timeout_secs = 900
+
+[[check]]
+id = "contracts"
+tier = "hermetic"
+bead = "sf-c9e.5"
+claim = "A briefing is the same bytes for the same inputs, each step's schema allows exactly the outcomes its flow routes, and a tester finding without a reproduction is rejected by code."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-brief"]
+timeout_secs = 900
+
+[[check]]
+id = "publish"
+tier = "hermetic"
+bead = "sf-c9e.6"
+claim = "A write to a repository outside the project's write list is refused, publication text with a mention or a reference to another repository is refused, and publishing twice yields one pull request."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-github"]
+timeout_secs = 900
+
+[[check]]
+id = "unit-walk"
+tier = "hermetic"
+bead = "sf-c9e.7"
+claim = "With a scripted stand-in for the CLI, a unit is built, broken by the tester, fixed, held, reviewed and published as one commit; its event log names every step and its usage adds up; a parked unit continues from the step it stopped at."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-driver", "--test", "walk"]
+timeout_secs = 900
+
+[[check]]
+id = "scratch-walk-live"
+tier = "live"
+bead = "sf-c9e.7"
+claim = "With the real CLI on Haiku, a scratch-project bead goes through the whole flow and ends as one pushed commit that passes the project's test and does what the bead asked."
+command = ["proofs/walk_scratch.sh"]
+timeout_secs = 2400
+
+[[check]]
+id = "zig-run"
+tier = "owner"
+bead = "sf-c9e.8"
+claim = "A factory unit for temporal-sdk-zig ended with a pull request into main from a factory branch that is open or merged on GitHub, its Slack thread has every step, and its bead is still claimed by the factory."
+command = ["proofs/walk_zig_verify.sh"]
+timeout_secs = 300

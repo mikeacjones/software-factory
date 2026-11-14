@@ -1,0 +1,18 @@
+[package]
+name = "factory-cli"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "factory"
+path = "src/main.rs"
+
+[dependencies]
+factory-beads.workspace = true
+factory-config.workspace = true
+factory-driver.workspace = true

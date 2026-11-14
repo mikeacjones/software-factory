@@ -1,0 +1,28 @@
+[package]
+name = "factory-driver"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+factory-beads.workspace = true
+factory-brief.workspace = true
+factory-checks.workspace = true
+factory-claude.workspace = true
+factory-config.workspace = true
+factory-core.workspace = true
+factory-flow.workspace = true
+factory-git.workspace = true
+factory-github.workspace = true
+factory-slack.workspace = true
+factory-supervise.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

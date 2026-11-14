@@ -16,7 +16,19 @@ cargo xtask gate --list      # every gate with its checks and tiers
 cargo xtask gate <id>        # prove a milestone; the report is target/gates/<id>.json
 proofs/backup_beads.sh backup   # back up every bead database, then verify by restoring
 proofs/backup_beads.sh verify   # restore the latest backup set and compare
+proofs/walk_scratch.sh          # one scratch bead through the real flow on Haiku (real Claude calls)
 ```
+
+Running the factory by hand (`cargo build -p factory-cli` puts it at `target/debug/factory`):
+
+```bash
+factory flow check <project> --config config   # is the project's flow sound?
+factory bead <project> <bead> --config config  # may this bead be launched, and if not why?
+factory run <project> <bead> --config config   # walk one bead to a pull request
+factory run --unit <unit> --config config      # continue a stopped or parked unit
+```
+
+`config/` holds the project records, flows and role prompts. A unit's state, event log, artifacts and worktree are under `~/.local/state/software-factory/`.
 
 ## Rules
 

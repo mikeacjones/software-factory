@@ -53,6 +53,18 @@ A crate is added by the bead that first needs it. Until then the name above is r
 
 Workers are headless: `claude -p --output-format stream-json`, in bypass mode, with the account supplied as a token in the environment. Liveness comes from what the operating system and the child's output already provide (process exit, lines on stdout, a lease the runner refreshes, CPU time), never from asking the model.
 
+## The first cut
+
+The first milestone walks one bead to a pull request by hand: `factory run <project> <bead>`. It is a thin slice through the crates above, not a separate program. What it leaves out is listed here so nobody mistakes it for the whole design.
+
+- **No Redis.** A unit's state is one JSON file and its audit log one JSONL file, both under the state directory. The driver walks a single unit in the foreground; there are no ticks, slots or leases.
+- **No stall rules.** A run is judged by its exit, its output stream and a wall-clock cap.
+- **One account.** A usage limit pauses the step until the window resets; there is no failover.
+- **No landing.** The factory opens the pull request and the owner merges. The bead stays claimed by the factory.
+- **Steps run one at a time.** A flow has no groups yet.
+
+The first flow, `build-break-review`, has four roles. The **builder** implements the bead, and its session is continued for every fix. The **tester** is adversarial: it gets a scratch worktree at the checkpoint and tries to break the change by running it, and every finding must carry a reproduction it ran. The **reviewer** reads the change. The **publisher** continues the builder's session to write the commit message and pull-request text. Slack is one channel per project and one thread per run; the owner steers by replying in the thread.
+
 ## Failure classes
 
 Every failure the factory must survive is listed in a catalogue with how code detects it, its class, the response and the resume condition. There are three classes.
