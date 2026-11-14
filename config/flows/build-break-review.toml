@@ -105,4 +105,5 @@ id = "publish"
 kind = "action"
 action = "publish"
 on.done = "end"
-on.failed = "park"
+# A check on the final commit failed: the text is written again.
+on.failed = { to = "describe", max = 2 }

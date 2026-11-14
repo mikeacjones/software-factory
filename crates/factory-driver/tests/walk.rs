@@ -526,3 +526,62 @@ fn a_question_nobody_answers_parks_the_unit() {
         "{reason}"
     );
 }
+
+#[test]
+fn a_check_on_the_final_commit_sends_the_text_back_before_anything_is_pushed() {
+    let world = World::new("publish-check", "true");
+    let project = world.path("config/projects/toy.toml");
+    let text = std::fs::read_to_string(&project).unwrap();
+    std::fs::write(
+        &project,
+        format!(
+            "{}\n[commands.trailer]\nargv = [\"sh\", \"-c\", \"git log -1 --format=%B | grep -q '^Changelog:' || {{ echo 'no Changelog trailer'; exit 1; }}\"]\ntimeout_secs = 30\n",
+            text.replace("flow = ", "publish_checks = [\"trailer\"]\nflow = ")
+        ),
+    )
+    .unwrap();
+
+    let mut driver = Driver::start(world.config(), "toy", "toy-1", &OPTIONS).unwrap();
+    assert_eq!(driver.run().unwrap(), Status::Ended);
+    let kinds = world.event_kinds(&driver);
+    let tail: Vec<&str> = kinds
+        .iter()
+        .filter(|kind| {
+            kind.starts_with("describe:")
+                || kind.starts_with("publish:")
+                || *kind == "published.pushed"
+        })
+        .map(String::as_str)
+        .collect();
+    // The first message had no trailer: nothing was pushed until it did.
+    assert_eq!(
+        tail,
+        [
+            "describe:ready",
+            "publish:failed",
+            "describe:ready",
+            "published.pushed",
+            "publish:done"
+        ]
+    );
+    let calls = world.calls();
+    let second =
+        std::fs::read_to_string(world.path(&format!("bin/state/brief-{}.md", calls.len())))
+            .unwrap();
+    assert!(second.contains("publish check `trailer`") && second.contains("no Changelog trailer"));
+    assert!(second.contains("## Checks on the final commit"));
+    let branch = format!("refs/heads/{}", driver.unit().branch);
+    let remote = world.path("remote.git");
+    assert_eq!(
+        run(
+            &remote,
+            "git",
+            &["rev-list", "--count", &format!("main..{branch}")]
+        ),
+        "1"
+    );
+    assert!(
+        run(&remote, "git", &["log", "-1", "--format=%B", &branch])
+            .contains("Changelog: none (test)")
+    );
+}

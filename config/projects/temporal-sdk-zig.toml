@@ -9,6 +9,10 @@ flow = "zig-sdk"
 # CI checks out the Rust core as a submodule, so every worktree does too.
 setup = ["submodules"]
 
+# The changelog check reads commit messages, and the factory writes the real
+# one only when it publishes.
+publish_checks = ["changelog-commits"]
+
 # No bead of the first runs may touch these. A core bump changes
 # deps/sdk-core and is not factory work yet.
 forbidden_paths = [".github/**", ".beads/**", ".claude/**", "deps/sdk-core", "deps/sdk-core/**", "worktrees/**"]
@@ -43,7 +47,13 @@ timeout_secs = 900
 argv = ["zig", "build", "readme-check"]
 timeout_secs = 1800
 
+# The fragment files in the worktree. Which commits carry a fragment or a
+# trailer is checked on the final commit: see publish_checks.
 [commands.changelog]
+argv = ["scripts/changelog-check.sh"]
+timeout_secs = 300
+
+[commands.changelog-commits]
 argv = ["scripts/changelog-check.sh", "origin/main"]
 timeout_secs = 300
 

@@ -96,6 +96,11 @@ pub struct Project {
     /// Commands run once in a new worktree before the first step.
     #[serde(default)]
     pub setup: Vec<String>,
+    /// Commands run on the final commit, after the checkpoints are squashed
+    /// and before the push. For checks that read the commit message, which
+    /// does not exist until then.
+    #[serde(default)]
+    pub publish_checks: Vec<String>,
     #[serde(default)]
     pub limits: Limits,
 }
@@ -213,12 +218,17 @@ impl ConfigDir {
         if let BeadSource::Files { dir } = &mut project.beads {
             *dir = expand_home(dir);
         }
-        for name in &project.setup {
-            if !project.commands.contains_key(name) {
-                return Err(ConfigError::Invalid {
-                    path,
-                    reason: format!("setup names the command `{name}`, which is not defined"),
-                });
+        for (list, names) in [
+            ("setup", &project.setup),
+            ("publish_checks", &project.publish_checks),
+        ] {
+            for name in names {
+                if !project.commands.contains_key(name) {
+                    return Err(ConfigError::Invalid {
+                        path,
+                        reason: format!("{list} names the command `{name}`, which is not defined"),
+                    });
+                }
             }
         }
         for (name, command) in &project.commands {

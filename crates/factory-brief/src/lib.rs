@@ -509,6 +509,19 @@ pub fn render(brief: &Brief<'_>) -> String {
             _ => "Continue the step.",
         };
         section(&mut out, "Task", task);
+        if contract == Some(Contract::Publication) && !brief.project.publish_checks.is_empty() {
+            let checks = bullets(brief.project.publish_checks.iter().filter_map(|name| {
+                let command = brief.project.commands.get(name)?;
+                Some(format!("`{name}`: `{}`", command.argv.join(" ")))
+            }));
+            section(
+                &mut out,
+                "Checks on the final commit",
+                &format!(
+                    "The factory runs these on the one commit it makes from your message, before it pushes. A failure comes back to you.\n\n{checks}"
+                ),
+            );
+        }
         section(
             &mut out,
             "Why you are here again",

@@ -1333,7 +1333,9 @@ impl Driver {
                 }
                 self.unit.feedback = Some(text);
             }
-            (Contract::Change, "done") => self.unit.feedback = None,
+            (Contract::Change, "done") | (Contract::Publication, "ready") => {
+                self.unit.feedback = None
+            }
             _ => {}
         }
         self.save()?;
@@ -1570,6 +1572,52 @@ impl Driver {
             Some(&step.id),
             json!({ "commit": commit }),
         )?;
+        self.save()?;
+
+        // Checks that read the commit message can only run now that it exists.
+        for name in self.project.publish_checks.clone() {
+            let command = self.project.commands[&name].clone();
+            let shown = command.argv.join(" ");
+            let result = run_command(
+                &command.argv,
+                &worktree,
+                Duration::from_secs(command.timeout_secs),
+            );
+            self.event(
+                "publish.check",
+                Some(&step.id),
+                json!({
+                    "command": name, "verdict": format!("{:?}", result.verdict), "commit": commit,
+                }),
+            )?;
+            match result.verdict {
+                Verdict::Passed => {}
+                Verdict::CouldNotRun(reason) => {
+                    return Ok(StepEnd::Park(format!(
+                        "the publish check `{name}` could not run: {reason}"
+                    )));
+                }
+                Verdict::Failed { .. } | Verdict::TimedOut => {
+                    let reason = format!(
+                        "The final commit did not pass the project's publish check `{name}` (`{shown}`), so nothing was pushed. The check reads the commit the factory makes from your commit message.\n\nThe end of its output:\n\n```\n{}\n```\n\nWrite the commit message and pull-request text again so that the check passes.",
+                        tail(&result.output, 60)
+                    );
+                    self.unit.feedback = Some(reason.clone());
+                    self.thread.say(&format!(
+                        ":x: *{}* · the final commit failed `{}`; nothing was pushed\n{}",
+                        step.id,
+                        escape(&shown),
+                        code_block(&truncate(&tail(&result.output, 15), 2000))
+                    ));
+                    self.save()?;
+                    return Ok(if step.on.contains_key("failed") {
+                        StepEnd::Outcome("failed".to_string())
+                    } else {
+                        StepEnd::Park(reason)
+                    });
+                }
+            }
+        }
 
         let url = factory_git::remote_url(&self.project.repo, &self.project.remote)?;
         if let Some(github) = &self.project.github {

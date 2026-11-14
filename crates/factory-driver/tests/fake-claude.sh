@@ -82,7 +82,11 @@ case "$role" in
     output='{"outcome":"approve","summary":"Meets the criteria.",'$common',"findings":[]}'
     ;;
   publisher)
-    output='{"outcome":"ready","summary":"Wrote the text.",'$common',"commit_message":"Add the feature\n\nIt adds lines to feature.txt.\n","pr_title":"Add the feature","pr_body":"Adds the feature for toy-1."}'
+    trailer=""
+    case "$brief" in
+      *"publish check"*) trailer='\nChangelog: none (test)\n' ;;
+    esac
+    output='{"outcome":"ready","summary":"Wrote the text.",'$common',"commit_message":"Add the feature\n\nIt adds lines to feature.txt.\n'$trailer'","pr_title":"Add the feature","pr_body":"Adds the feature for toy-1."}'
     ;;
 esac
 
