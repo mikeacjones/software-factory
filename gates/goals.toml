@@ -61,6 +61,22 @@ command = ["cargo", "test", "--locked", "--offline", "--package", "factory-drive
 timeout_secs = 900
 
 [[check]]
+id = "accounts"
+tier = "hermetic"
+bead = "sf-rzb.9"
+claim = "Among usable accounts the one whose five-hour session resets soonest is chosen and one with no session open is kept for later; an account at its session or weekly limit is skipped until the reset; a limit on one model leaves the account usable for others; with every account at a limit the choice is to wait for the earliest reset; a run refused at a limit continues its session under another account; and no token reaches a log or the state file."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-claude", "--package", "factory-driver", "--", "accounts::", "a_run_refused_at_a_limit"]
+timeout_secs = 900
+
+[[check]]
+id = "accounts-live"
+tier = "owner"
+bead = "sf-rzb.9"
+claim = "With the owner's two accounts, the factory reads each one's windows without a model call and names the account a run would use."
+command = ["cargo", "run", "--quiet", "--locked", "--package", "factory-cli", "--", "accounts", "--config", "config"]
+timeout_secs = 300
+
+[[check]]
 id = "socket-live"
 tier = "owner"
 bead = "sf-rzb.4"

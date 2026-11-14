@@ -300,6 +300,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "ureq",
 ]
 
 [[package]]
@@ -307,7 +308,9 @@ name = "factory-cli"
 version = "0.0.0"
 dependencies = [
  "factory-beads",
+ "factory-claude",
  "factory-config",
+ "factory-core",
  "factory-driver",
 ]
 

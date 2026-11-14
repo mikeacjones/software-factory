@@ -31,6 +31,7 @@ factory serve --config config                  # the always-on service: Slack so
 factory goal check --config config             # are the goal definitions sound?
 factory goal list --config config              # every goal and where it stands
 factory slack check --config config            # does the Slack socket connect?
+factory accounts --config config               # each Claude account's windows, and which a run would use
 ```
 
 `config/` holds the project records, flows and role prompts. A unit's state, event log, artifacts and worktree are under `~/.local/state/software-factory/`.

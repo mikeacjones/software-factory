@@ -9,6 +9,9 @@
 #                      reject-once   the builder's first result has no evidence
 #                      ask-once      the builder first asks the owner a question
 #                      minor-finding the reviewer approves with one finding left open
+#                      limit-default-once
+#                                    the first run without an account token is refused
+#                                    at the five-hour limit
 #   state/director-N.json, state/intake-N.json
 #                    what a goal's director returns on its Nth call
 here=$(cd "$(dirname "$0")" && pwd)
@@ -46,7 +49,20 @@ case "$system" in
   *) role=publisher ;;
 esac
 session=${resume:-fake-$role-$count}
-echo "$role $session $(pwd)" >> "$state/calls"
+echo "$role $session $(pwd) ${CLAUDE_CODE_OAUTH_TOKEN:-default}" >> "$state/calls"
+
+# The CLI's own login is at its five-hour limit, once: the run is refused.
+case "$scenario" in
+  *limit-default-once*)
+    if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && [ ! -f "$state/limited" ]; then
+      touch "$state/limited"
+      reset=$(( $(date +%s) + 3600 ))
+      printf '%s\n' '{"type":"system","subtype":"init","session_id":"'"$session"'","model":"'"$model"'","claude_code_version":"2.1.325"}'
+      printf '%s\n' '{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":'"$reset"',"rateLimitType":"five_hour","unifiedWindows":{"five_hour":{"utilization":1.0,"resetsAt":'"$reset"',"status":"rejected"}}}}'
+      printf '%s\n' '{"type":"result","subtype":"success","is_error":true,"api_error_status":429,"num_turns":1,"duration_ms":5,"result":"limit reached","session_id":"'"$session"'","modelUsage":{}}'
+      exit 1
+    fi ;;
+esac
 printf '%s\n' "$brief" > "$state/brief-$count.md"
 
 # A goal's director says whatever the test wrote for its nth call.

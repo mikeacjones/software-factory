@@ -39,6 +39,34 @@ pub struct Factory {
     #[serde(default)]
     pub model_override: BTreeMap<String, String>,
     pub slack: Option<SlackSettings>,
+    /// The Claude accounts workers may run under. With none listed there is
+    /// one: the CLI's own login.
+    #[serde(default, rename = "account")]
+    pub accounts: Vec<Account>,
+    /// How long after a usage window's reset time to wait before using the
+    /// account again.
+    #[serde(default = "default_limit_grace")]
+    pub limit_grace_secs: u64,
+}
+
+fn default_limit_grace() -> u64 {
+    60
+}
+
+/// A Claude subscription workers can run under.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Account {
+    pub id: String,
+    /// Where the account's token for running sessions is: a file only the
+    /// owner can read, an environment variable, or a Keychain item. With
+    /// none of them the account is the CLI's own login.
+    pub token_file: Option<PathBuf>,
+    pub token_env: Option<String>,
+    pub token_keychain: Option<String>,
+    /// The Keychain item holding a full login for this account, used only to
+    /// read its usage windows without a model call.
+    pub usage_keychain: Option<String>,
 }
 
 fn default_gh() -> String {
@@ -401,6 +429,22 @@ impl ConfigDir {
         factory.state_dir = expand_home(&factory.state_dir);
         if let Some(slack) = &mut factory.slack {
             slack.env_file = expand_home(&slack.env_file);
+        }
+        if factory.accounts.is_empty() {
+            factory.accounts.push(Account {
+                id: "claude".to_string(),
+                ..Account::default()
+            });
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for account in &mut factory.accounts {
+            account.token_file = account.token_file.as_deref().map(expand_home);
+            if !seen.insert(account.id.clone()) {
+                return Err(ConfigError::Invalid {
+                    path,
+                    reason: format!("account `{}` is listed twice", account.id),
+                });
+            }
         }
         Ok(factory)
     }

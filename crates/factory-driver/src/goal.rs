@@ -556,6 +556,10 @@ fn command(text: &str) -> String {
     text.trim().trim_end_matches(['.', '!']).to_lowercase()
 }
 
+/// How `run_director` says that every account is at a limit: this, then
+/// the time to try again.
+const LIMITED: &str = "limited until ";
+
 /// One run of the director: which prompt it works to, what it must return,
 /// and what it is told.
 struct Turn {
@@ -1087,9 +1091,15 @@ impl Supervisor {
                 / 2
                 + 1;
             let _ = std::fs::write(dir.join(format!("{run:03}-{role}-brief.md")), &prompt);
+            let model = self.model(&definition.director.model);
+            let (account, oauth_token) = match crate::pick_account(&self.factory, &model) {
+                Ok(crate::AccountPick::Use { id, token }) => (id, token),
+                Ok(crate::AccountPick::Wait { until }) => return Err(format!("{LIMITED}{until}")),
+                Err(err) => return Err(err.to_string()),
+            };
             let spec = RunSpec {
                 claude_bin: self.factory.claude_bin.clone(),
-                model: self.model(&definition.director.model),
+                model,
                 effort: definition.director.effort.clone(),
                 session: session.clone(),
                 system_prompt: system_prompt.clone(),
@@ -1098,6 +1108,7 @@ impl Supervisor {
                 prompt: prompt.clone(),
                 budget_usd: project.limits.step_budget_usd,
                 timeout: Duration::from_secs(definition.director.timeout_secs),
+                oauth_token,
             };
             let finished = factory_claude::run(
                 &spec,
@@ -1106,11 +1117,17 @@ impl Supervisor {
             )
             .map_err(|err| err.to_string())?;
             let usage = finished.transcript.usage();
+            crate::observe_account(
+                &self.factory,
+                &account,
+                usage.rate_limit.as_ref(),
+                &spec.model,
+            );
             goal.usage.add(&usage);
             self.log(
                 goal,
                 "director.ran",
-                json!({ "role": role, "run": run, "outcome": finished.outcome.name(), "session": finished.transcript.session_id, "usage": usage }),
+                json!({ "role": role, "run": run, "account": account, "outcome": finished.outcome.name(), "session": finished.transcript.session_id, "usage": usage }),
             );
             let id = finished.transcript.session_id.clone().unwrap_or_default();
             match finished.outcome {
@@ -1136,9 +1153,12 @@ impl Supervisor {
                     );
                     session = Session::Resume(id);
                 }
-                Outcome::Limited { resets_at, .. } => {
-                    goal.retry_at = Some(resets_at.unwrap_or_else(|| now_unix() + 900) + 60);
-                    return Err("the account is at its usage limit".to_string());
+                // The tracker has taken that account out: the next attempt
+                // picks another and continues the session, or waits.
+                Outcome::Limited { .. } => {
+                    if !id.is_empty() {
+                        session = Session::Resume(id);
+                    }
                 }
                 other => return Err(format!("the director's run ended as `{}`", other.name())),
             }
@@ -1149,6 +1169,20 @@ impl Supervisor {
     /// What to do when the director could not be run: try again later, and
     /// after five failures in a row stop and tell the owner.
     fn director_failed(&mut self, mut goal: Goal, reason: &str) -> Result<(), DriverError> {
+        if let Some(until) = reason
+            .strip_prefix(LIMITED)
+            .and_then(|at| at.parse::<u64>().ok())
+        {
+            // Waiting for a usage window is not a failure.
+            goal.retry_at = Some(until);
+            self.log(&goal, "accounts.limited", json!({ "until": until }));
+            self.say(&goal, &format!(
+                ":hourglass: Every account is at a usage limit. The director wakes at {:02}:{:02} UTC.",
+                (until % 86_400) / 3600,
+                (until % 3600) / 60
+            ));
+            return self.save(goal);
+        }
         goal.failures += 1;
         self.log(
             &goal,

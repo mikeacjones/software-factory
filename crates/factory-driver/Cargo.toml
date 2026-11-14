@@ -25,5 +25,8 @@ serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+factory-claude.workspace = true
+factory-core.workspace = true
+factory-slack.workspace = true
 toml.workspace = true
 serde_json.workspace = true

@@ -6,6 +6,8 @@
 //! authority on whether a run succeeded: the subtype has been seen to say
 //! "success" on a run that failed.
 
+pub mod accounts;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -39,6 +41,8 @@ pub struct RunSpec {
     pub prompt: String,
     pub budget_usd: Option<f64>,
     pub timeout: Duration,
+    /// The account's token, for an account that is not the CLI's own login.
+    pub oauth_token: Option<String>,
 }
 
 /// The exact command for a run. Always headless, always bypass mode, never
@@ -85,6 +89,12 @@ pub fn command(spec: &RunSpec) -> Spec {
         .collect();
     // Subagents run on the step's model, not on whatever the default is.
     command.env = vec![("CLAUDE_CODE_SUBAGENT_MODEL".to_string(), spec.model.clone())];
+    // The account is chosen for each run, and reaches the CLI only here.
+    if let Some(token) = &spec.oauth_token {
+        command
+            .env
+            .push(("CLAUDE_CODE_OAUTH_TOKEN".to_string(), token.clone()));
+    }
     command
 }
 
@@ -703,6 +713,7 @@ mod tests {
             prompt: "the brief".to_string(),
             budget_usd: Some(25.0),
             timeout: Duration::from_secs(60),
+            oauth_token: None,
         }
     }
 

@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use factory_beads::{Bead, Source, readiness};
 use factory_brief::{Brief, Contract, Note, contract_of, findings_text, render, result_problems};
 use factory_checks::{Verdict, run_command, scope_violations};
+use factory_claude::accounts::{Choice, TokenSource, Tracker, choose, read_usage, session_token};
 use factory_claude::{Outcome, RunSpec, Session, Usage};
 use factory_config::{BeadSource, ConfigDir, Factory, Project, read_env_file};
 use factory_core::{EventLog, ProjectId, StepId, UnitId, now_unix};
@@ -65,6 +66,8 @@ pub enum DriverError {
     NotLaunchable { bead: String, reasons: Vec<String> },
     #[error("the installed Claude CLI is `{installed}`, but the factory is pinned to `{pinned}`")]
     CliVersion { installed: String, pinned: String },
+    #[error(transparent)]
+    Account(#[from] factory_claude::accounts::AccountError),
     #[error("{0}")]
     Preflight(String),
     #[error("unit `{0}` has already ended")]
@@ -932,43 +935,34 @@ impl Driver {
         used.usage.add(usage);
     }
 
-    /// Wait out a usage limit. Returns why the unit should park, if it should.
-    fn wait_for_limit(
-        &mut self,
-        step: &str,
-        resets_at: Option<u64>,
-    ) -> Result<Option<String>, DriverError> {
-        let Some(resets_at) = resets_at else {
-            return Ok(Some(
-                "the account is at a usage limit and the CLI gave no reset time".to_string(),
-            ));
-        };
-        let wait = resets_at.saturating_sub(now_unix()) + 60;
+    /// Every account is at a limit: wait for the first to come back. The
+    /// step's session is kept. Returns why the unit should park, if it should.
+    fn wait_for_accounts(&mut self, step: &str, until: u64) -> Result<Option<String>, DriverError> {
+        let wait = until.saturating_sub(now_unix());
         self.event(
-            "account.limited",
+            "accounts.limited",
             Some(step),
-            json!({ "resets_at": resets_at, "wait_secs": wait }),
+            json!({ "until": until, "wait_secs": wait }),
         )?;
-        if wait > 6 * 3600 {
-            return Ok(Some(format!(
-                "the account is at a usage limit that resets in {}",
-                duration_text(wait)
-            )));
-        }
+        let clock = format!(
+            "{:02}:{:02} UTC",
+            (until % 86_400) / 3600,
+            (until % 3600) / 60
+        );
         self.thread.say(&format!(
-            ":hourglass: *Usage limit.* Step *{step}* is paused and its session kept. Resuming in {}.",
+            ":hourglass: *Every account is at a usage limit.* Step *{step}* is paused and its session kept. It resumes at {clock}, in {}.",
             duration_text(wait)
         ));
         self.thread.status(&format!(
-            ":hourglass: usage limit, resuming *{step}* in {}",
-            duration_text(wait)
+            ":hourglass: usage limits: resuming *{step}* at {clock}"
         ));
-        let until = Instant::now() + Duration::from_secs(wait);
-        while Instant::now() < until {
+        while now_unix() < until {
             if self.hear_owner() {
                 return Ok(Some("the owner said stop".to_string()));
             }
-            std::thread::sleep(Duration::from_secs(15));
+            std::thread::sleep(Duration::from_secs(
+                until.saturating_sub(now_unix()).clamp(1, 15),
+            ));
         }
         Ok(None)
     }
@@ -1115,6 +1109,18 @@ impl Driver {
                 .dir
                 .join("runs")
                 .join(format!("{:03}-{}.jsonl", self.unit.runs, step.id));
+            // The account is chosen afresh for every run: the one whose
+            // session resets soonest, or a wait when all are at a limit.
+            let (account, oauth_token) = loop {
+                match pick_account(&self.factory, &model)? {
+                    AccountPick::Use { id, token } => break (id, token),
+                    AccountPick::Wait { until } => {
+                        if let Some(reason) = self.wait_for_accounts(&step.id, until)? {
+                            return Ok(StepEnd::Park(reason));
+                        }
+                    }
+                }
+            };
             let spec = RunSpec {
                 claude_bin: self.factory.claude_bin.clone(),
                 model: model.clone(),
@@ -1126,14 +1132,16 @@ impl Driver {
                 prompt,
                 budget_usd: self.project.limits.step_budget_usd,
                 timeout,
+                oauth_token,
             };
             self.event("run.started", Some(&step.id), json!({
                 "run": self.unit.runs, "role": role, "model": model, "effort": effort,
+                "account": account,
                 "session": match &session { Session::Fresh => json!("fresh"), Session::Resume(id) => json!(id) },
                 "cwd": cwd, "log": log_path,
             }))?;
             self.thread.status(&format!(
-                ":arrows_counterclockwise: *{}* · round {round} · {role} on `{model}`",
+                ":arrows_counterclockwise: *{}* · round {round} · {role} on `{model}` · account `{account}`",
                 step.id
             ));
 
@@ -1169,6 +1177,7 @@ impl Driver {
             // Said while the step ran: for the next agent step.
             self.unit.owner_messages.extend(heard);
             let usage = finished.transcript.usage();
+            observe_account(&self.factory, &account, usage.rate_limit.as_ref(), &model);
             self.record_usage(&step.id, &usage);
             if let Some(id) = &finished.transcript.session_id {
                 self.unit.in_step = Some(InStep {
@@ -1265,16 +1274,28 @@ impl Driver {
                     rejected = vec![format!("{why}. End by returning the structured result.")];
                     answer = None;
                 }
-                Outcome::Limited { resets_at, .. } => {
+                Outcome::Limited { window, resets_at } => {
+                    // The tracker has already taken the account out until its
+                    // reset. The next turn of this loop picks another, or
+                    // waits, and continues this same session.
                     limit_waits += 1;
-                    if limit_waits > 4 {
+                    self.event(
+                        "account.limited",
+                        Some(&step.id),
+                        json!({
+                            "account": account, "window": window, "resets_at": resets_at,
+                        }),
+                    )?;
+                    if limit_waits > 8 {
                         return Ok(StepEnd::Park(
-                            "the account hit its usage limit five times in one step".to_string(),
+                            "the step was refused at a usage limit nine times".to_string(),
                         ));
                     }
-                    if let Some(reason) = self.wait_for_limit(&step.id, resets_at)? {
-                        return Ok(StepEnd::Park(reason));
-                    }
+                    self.thread.say(&format!(
+                        ":hourglass: Account `{account}` is at its {} limit. Step *{}* continues its session under another account, or waits if there is none.",
+                        window.as_deref().unwrap_or("usage").replace('_', "-"),
+                        step.id
+                    ));
                     attempts -= 1;
                     interrupted = true;
                 }
@@ -2434,6 +2455,88 @@ fn wrap(text: &str, width: usize) -> String {
         .filter(|paragraph| !paragraph.is_empty())
         .collect::<Vec<_>>()
         .join("\n\n")
+}
+
+/// The account a run should use, or how long to wait for one.
+pub enum AccountPick {
+    Use {
+        id: String,
+        /// `None` for the CLI's own login.
+        token: Option<String>,
+    },
+    Wait {
+        until: u64,
+    },
+}
+
+const USAGE_API: &str = "https://api.anthropic.com";
+/// A picture of an account older than this is refreshed from the usage
+/// endpoint before a choice is made, if the account has a login to ask with.
+const STALE_SECS: u64 = 30 * 60;
+
+/// Choose the account for a run on `model`. The accounts' windows are
+/// learned from every run; one the factory has not heard from lately is
+/// asked about once, without a model call.
+pub fn pick_account(factory: &Factory, model: &str) -> Result<AccountPick, DriverError> {
+    let tracker = Tracker::new(&factory.state_dir);
+    let now = now_unix();
+    let states = tracker.load();
+    for account in &factory.accounts {
+        let Some(service) = &account.usage_keychain else {
+            continue;
+        };
+        let known = states.get(&account.id).cloned().unwrap_or_default();
+        if now.saturating_sub(known.updated_at.max(known.usage_checked_at)) <= STALE_SECS {
+            continue;
+        }
+        let read = read_usage(&account.id, service, USAGE_API, now);
+        let _ = tracker.update(&account.id, |state| {
+            if let Ok(mut fresh) = read {
+                // Limits a run hit and that have not ended still stand.
+                for (scope, until) in &state.blocked {
+                    if *until > now {
+                        fresh.blocked.entry(scope.clone()).or_insert(*until);
+                    }
+                }
+                *state = fresh;
+            }
+            state.usage_checked_at = now;
+        });
+    }
+    let ids: Vec<String> = factory.accounts.iter().map(|a| a.id.clone()).collect();
+    Ok(match choose(&ids, &tracker.load(), model, now) {
+        Choice::Wait { until } => AccountPick::Wait {
+            until: until + factory.limit_grace_secs,
+        },
+        Choice::Use(id) => {
+            let account = factory.accounts.iter().find(|a| a.id == id);
+            let token = match account {
+                Some(account) => session_token(
+                    &id,
+                    TokenSource {
+                        file: account.token_file.as_deref(),
+                        env: account.token_env.as_deref(),
+                        keychain: account.token_keychain.as_deref(),
+                    },
+                )?,
+                None => None,
+            };
+            AccountPick::Use { id, token }
+        }
+    })
+}
+
+/// Record what a run's rate-limit event said about the account it ran under.
+pub fn observe_account(
+    factory: &Factory,
+    account: &str,
+    limit: Option<&factory_claude::RateLimit>,
+    model: &str,
+) {
+    if let Some(limit) = limit {
+        let _ = Tracker::new(&factory.state_dir)
+            .update(account, |state| state.observe(limit, model, now_unix()));
+    }
 }
 
 fn github_client(factory: &Factory, settings: &factory_config::GitHub) -> GitHub {

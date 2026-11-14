@@ -6,7 +6,9 @@ use std::process::ExitCode;
 use factory_beads::readiness;
 use factory_config::ConfigDir;
 use factory_driver::goal::{Supervisor, check_definitions};
-use factory_driver::{Driver, Options, Status, bead_source, load_flow, usage_report};
+use factory_driver::{
+    AccountPick, Driver, Options, Status, bead_source, load_flow, pick_account, usage_report,
+};
 
 const USAGE: &str = "\
 usage:
@@ -17,6 +19,8 @@ usage:
   factory serve                               the always-on service: listen to Slack over a
                                               socket, open goals from the owner's messages,
                                               and run them on events
+  factory accounts                            each Claude account's usage windows, and which
+                                              one a run would use now
   factory slack check                         connect the Slack socket once and say whether it worked
   factory goal check                          check every project's goal definitions
   factory goal list                           the goals the factory knows and where each stands
@@ -130,6 +134,65 @@ fn run(args: &[String]) -> Result<u8, String> {
             );
             supervisor.resume().map_err(|err| fail(&err))?;
             supervisor.serve(&listener);
+            Ok(0)
+        }
+        ["accounts"] => {
+            let factory = args.config.factory().map_err(|err| fail(&err))?;
+            let now = factory_core::now_unix();
+            let tracker = factory_claude::accounts::Tracker::new(&factory.state_dir);
+            // Choosing refreshes an account the factory has not heard from lately.
+            let choices: Vec<String> = ["claude-opus-5-5", "claude-fable-5-2"]
+                .iter()
+                .map(|model| {
+                    let pick = match pick_account(&factory, model) {
+                        Ok(AccountPick::Use { id, .. }) => format!("account `{id}`"),
+                        Ok(AccountPick::Wait { until }) => {
+                            format!("wait {} minutes", until.saturating_sub(now).div_ceil(60))
+                        }
+                        Err(err) => format!("no account ({err})"),
+                    };
+                    format!("a run on {model} now would use: {pick}")
+                })
+                .collect();
+            let states = tracker.load();
+            for account in &factory.accounts {
+                let state = states.get(&account.id).cloned().unwrap_or_default();
+                let window = |window: &Option<factory_claude::Window>| match window {
+                    Some(w) if w.resets_at > now => format!(
+                        "{:>3.0}%, resets in {}h {:02}m",
+                        w.utilization * 100.0,
+                        (w.resets_at - now) / 3600,
+                        (w.resets_at - now) % 3600 / 60
+                    ),
+                    Some(_) => "not open".to_string(),
+                    None => "unknown".to_string(),
+                };
+                println!("{}", account.id);
+                println!("  session (5h):  {}", window(&state.five_hour));
+                println!("  week:          {}", window(&state.seven_day));
+                for (scope, until) in state.blocked.iter().filter(|(_, until)| **until > now) {
+                    println!(
+                        "  at a limit for {}: {} more minutes",
+                        if scope == "*" { "every model" } else { scope },
+                        (until - now).div_ceil(60)
+                    );
+                }
+                println!(
+                    "  learned from:  {}",
+                    if state.updated_at == 0 {
+                        "nothing yet".to_string()
+                    } else {
+                        format!(
+                            "{}, {} minutes ago",
+                            state.source,
+                            (now - state.updated_at) / 60
+                        )
+                    }
+                );
+            }
+            for line in choices {
+                println!("{line}");
+            }
             Ok(0)
         }
         ["slack", "check"] => {

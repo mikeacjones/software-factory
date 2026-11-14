@@ -1375,3 +1375,66 @@ fn a_goal_definition_that_cannot_run_is_refused() {
         "{err}"
     );
 }
+
+#[test]
+fn a_run_refused_at_a_limit_continues_its_session_under_another_account() {
+    let world = World::new("accounts", "true");
+    world.scenario("limit-default-once");
+    let token = world.path("token-b");
+    std::fs::write(&token, "tok-b\n").unwrap();
+    let factory = world.path("config/factory.toml");
+    let text = std::fs::read_to_string(&factory).unwrap();
+    std::fs::write(
+        &factory,
+        format!(
+            "limit_grace_secs = 0\n{text}\n[[account]]\nid = \"a\"\n\n[[account]]\nid = \"b\"\ntoken_file = \"{}\"\n",
+            token.display()
+        ),
+    )
+    .unwrap();
+
+    let mut driver = Driver::start(world.config(), "toy", "toy-1", &OPTIONS).unwrap();
+    assert_eq!(driver.run().unwrap(), Status::Ended);
+
+    // The builder started under the first account, was refused, and carried
+    // on in the same session under the second. Nothing went back to the
+    // first: it is out until its window resets.
+    let calls = world.calls();
+    assert_eq!(
+        (calls[0][0].as_str(), calls[0][3].as_str()),
+        ("builder", "default")
+    );
+    assert_eq!(
+        (calls[1][0].as_str(), calls[1][3].as_str()),
+        ("builder", "tok-b")
+    );
+    assert_eq!(
+        calls[0][1], calls[1][1],
+        "the session continues across accounts"
+    );
+    assert!(calls[1..].iter().all(|call| call[3] == "tok-b"));
+
+    let log = std::fs::read_to_string(driver.event_log()).unwrap();
+    assert!(log.contains(r#""kind":"account.limited""#) && log.contains(r#""account":"a""#));
+    assert!(log.contains(r#""account":"b""#));
+    assert!(
+        !log.contains("tok-b"),
+        "a token must never reach the event log"
+    );
+    assert!(
+        !std::fs::read_to_string(world.path("state/accounts.json"))
+            .unwrap()
+            .contains("tok-b")
+    );
+
+    // What the factory now knows about each account.
+    let states = factory_claude::accounts::Tracker::new(&world.path("state")).load();
+    let now = factory_core::now_unix();
+    let back = states["a"].available_at("claude-opus-5-5", now);
+    assert!(
+        back > now + 3000 && back <= now + 3600,
+        "a is out until its reset"
+    );
+    assert_eq!(states["b"].available_at("claude-opus-5-5", now), 0);
+    assert_eq!(states["b"].source, "run");
+}

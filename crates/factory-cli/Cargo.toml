@@ -16,3 +16,5 @@ path = "src/main.rs"
 factory-beads.workspace = true
 factory-config.workspace = true
 factory-driver.workspace = true
+factory-claude.workspace = true
+factory-core.workspace = true
