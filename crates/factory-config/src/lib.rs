@@ -90,6 +90,10 @@ pub struct Project {
     pub slack_channel: Option<String>,
     /// The flow units of this project run.
     pub flow: String,
+    /// The first part of a unit's branch name, by bead type. A type not
+    /// listed here uses the built-in choice: see [`Project::branch_prefix`].
+    #[serde(default)]
+    pub branch_prefixes: BTreeMap<String, String>,
     /// Named sets of path globs that a flow step's `writes` refers to.
     #[serde(default)]
     pub scopes: BTreeMap<String, Vec<String>>,
@@ -117,6 +121,39 @@ fn default_remote() -> String {
 
 fn default_actor() -> String {
     "factory".to_string()
+}
+
+impl Project {
+    /// The kind of change a bead of this type is, as the first part of its
+    /// branch name: `feat`, `bug`, `chore` and so on. The branch says what
+    /// the change is, not who made it.
+    pub fn branch_prefix(&self, issue_type: &str) -> String {
+        if let Some(prefix) = self.branch_prefixes.get(issue_type) {
+            return prefix.clone();
+        }
+        match issue_type {
+            "feature" | "task" | "" => "feat".to_string(),
+            "bug" => "bug".to_string(),
+            "chore" | "decision" => "chore".to_string(),
+            // Any other type names itself: docs, spike, and whatever comes.
+            other => other
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() {
+                        c.to_ascii_lowercase()
+                    } else {
+                        '-'
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    /// A bead's ID without the project's own prefix: `d51.16.62` for
+    /// `temporal-sdk-zig-d51.16.62`.
+    pub fn bead_short<'a>(&self, bead: &'a str) -> &'a str {
+        bead.strip_prefix(&format!("{}-", self.id)).unwrap_or(bead)
+    }
 }
 
 /// Where a project's beads live. Always stated, never taken from the working
@@ -280,6 +317,20 @@ impl ConfigDir {
                 });
             }
         }
+        for (issue_type, prefix) in &project.branch_prefixes {
+            let ok = !prefix.is_empty()
+                && prefix
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+            if !ok {
+                return Err(ConfigError::Invalid {
+                    path,
+                    reason: format!(
+                        "branch prefix `{prefix}` for `{issue_type}` must be lowercase letters, digits and dashes"
+                    ),
+                });
+            }
+        }
         if let Some(github) = &project.github
             && !github.write.contains(&github.repo)
         {
@@ -401,6 +452,33 @@ timeout_secs = 60
         assert_eq!(project.limits.step_timeout_secs, 5400);
         assert!(!project.repo.starts_with("~"));
         assert!(matches!(project.beads, BeadSource::Dolt { port: 3306, .. }));
+    }
+
+    #[test]
+    fn a_branch_says_what_kind_of_change_it_is() {
+        let dir =
+            dir_with(&PROJECT.replace("[beads]", "[branch_prefixes]\nbug = \"fix\"\n\n[beads]"));
+        let project = dir.project("toy").unwrap();
+        std::fs::remove_dir_all(&dir.0).unwrap();
+        assert_eq!(project.branch_prefix("feature"), "feat");
+        assert_eq!(project.branch_prefix("task"), "feat");
+        assert_eq!(project.branch_prefix("chore"), "chore");
+        assert_eq!(project.branch_prefix("docs"), "docs");
+        assert_eq!(project.branch_prefix("Spike!"), "spike-");
+        // The project's own choice wins.
+        assert_eq!(project.branch_prefix("bug"), "fix");
+        assert_eq!(project.bead_short("toy-d51.2"), "d51.2");
+        assert_eq!(project.bead_short("other-7"), "other-7");
+    }
+
+    #[test]
+    fn a_branch_prefix_that_git_would_dislike_is_refused() {
+        let dir = dir_with(
+            &PROJECT.replace("[beads]", "[branch_prefixes]\nbug = \"Bug Fix\"\n\n[beads]"),
+        );
+        let err = dir.project("toy").unwrap_err().to_string();
+        std::fs::remove_dir_all(&dir.0).unwrap();
+        assert!(err.contains("`Bug Fix`"), "{err}");
     }
 
     #[test]

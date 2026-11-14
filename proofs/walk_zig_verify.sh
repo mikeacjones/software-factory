@@ -38,7 +38,7 @@ bead="$(jq -r .bead "$dir/unit.json")"
 pr="$(gh pr view "$url" --repo "$repo" --json state,baseRefName,headRefName,commits,url)"
 echo "$pr" | jq -e '.state == "OPEN" or .state == "MERGED"' >/dev/null || fail "the pull request is $(echo "$pr" | jq -r .state)"
 echo "$pr" | jq -e '.baseRefName == "main"' >/dev/null || fail "the pull request is not into main"
-echo "$pr" | jq -e --arg b "$branch" '.headRefName == $b and (.headRefName | startswith("factory/"))' >/dev/null || fail "the pull request is not from the unit's factory branch"
+echo "$pr" | jq -e --arg b "$branch" '.headRefName == $b' >/dev/null || fail "the pull request is not from the unit's branch"
 echo "$pr" | jq -e '.commits | length == 1' >/dev/null || fail "the pull request does not hold exactly one commit"
 echo "ok   pull request $url: $(echo "$pr" | jq -r .state), one commit, $branch -> main"
 

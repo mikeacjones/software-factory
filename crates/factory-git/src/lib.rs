@@ -57,8 +57,10 @@ fn git(dir: &Path, args: &[&str], timeout: Duration) -> Result<String, GitError>
     Ok(out.stdout)
 }
 
-/// `factory/<bead>-<slug>`: the branch of a unit.
-pub fn branch_name(bead: &str, title: &str) -> String {
+/// `<prefix>/<bead>-<slug>`: the branch of a unit, such as
+/// `feat/d51.16.62-sample-external-env-conf`. The prefix is the kind of
+/// change, from the bead's type.
+pub fn branch_name(prefix: &str, bead: &str, title: &str) -> String {
     let mut slug = String::new();
     for c in title.chars() {
         if c.is_ascii_alphanumeric() {
@@ -82,9 +84,9 @@ pub fn branch_name(bead: &str, title: &str) -> String {
         })
         .collect();
     if slug.is_empty() {
-        format!("factory/{bead}")
+        format!("{prefix}/{bead}")
     } else {
-        format!("factory/{bead}-{slug}")
+        format!("{prefix}/{bead}-{slug}")
     }
 }
 
@@ -268,12 +270,13 @@ mod tests {
     fn branch_names_are_tame() {
         assert_eq!(
             branch_name(
-                "zig-d51.16.2",
+                "feat",
+                "d51.16.2",
                 "samples/README.md: Go sample → Zig map & status"
             ),
-            "factory/zig-d51.16.2-samples-readme-md-go-sample-zig-map-stat"
+            "feat/d51.16.2-samples-readme-md-go-sample-zig-map-stat"
         );
-        assert_eq!(branch_name("x 1", "!!!"), "factory/x-1");
+        assert_eq!(branch_name("bug", "x 1", "!!!"), "bug/x-1");
     }
 
     #[test]
@@ -296,7 +299,7 @@ mod tests {
         let base = rev_parse(&repo, "HEAD").unwrap();
         let work = temp("unit-wt");
         std::fs::remove_dir_all(&work).unwrap();
-        worktree_add(&repo, &work, "factory/toy-1", &base).unwrap();
+        worktree_add(&repo, &work, "feat/toy-1", &base).unwrap();
 
         // Nothing changed: no commit.
         assert_eq!(checkpoint(&work, "empty").unwrap(), (base.clone(), false));
@@ -340,9 +343,9 @@ mod tests {
             LOCAL,
         )
         .unwrap();
-        push(&work, "origin", "factory/toy-1").unwrap();
+        push(&work, "origin", "feat/toy-1").unwrap();
         assert_eq!(
-            rev_parse(&bare, "refs/heads/factory/toy-1").unwrap(),
+            rev_parse(&bare, "refs/heads/feat/toy-1").unwrap(),
             published
         );
 

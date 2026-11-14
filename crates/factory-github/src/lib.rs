@@ -661,7 +661,7 @@ mod tests {
         let result = github.publish_pull_request(
             &std::env::temp_dir(),
             "someone/else",
-            "factory/x",
+            "feat/x",
             "main",
             "t",
             "b",
@@ -699,7 +699,7 @@ esac
         github.gh_bin = script.to_string_lossy().into_owned();
         let publish = || {
             github
-                .publish_pull_request(&dir, "me/toy", "factory/x", "main", "Title", "Body")
+                .publish_pull_request(&dir, "me/toy", "feat/x", "main", "Title", "Body")
                 .unwrap()
         };
         let first = publish();

@@ -367,7 +367,11 @@ impl Driver {
             unit_id.clone(),
         );
 
-        let branch = factory_git::branch_name(&bead.id, &bead.title);
+        let branch = factory_git::branch_name(
+            &project.branch_prefix(&bead.issue_type),
+            project.bead_short(&bead.id),
+            &bead.title,
+        );
         let worktree = factory.state_dir.join("worktrees").join(unit_id.as_str());
         let mut driver = Driver {
             thread: Thread::disabled(log.clone()),
@@ -1835,16 +1839,9 @@ impl Driver {
                         .map(str::to_string)
                 })
                 .unwrap_or_else(|| self.unit.title.clone());
-            let prefix = format!("{}-", self.project.id);
             let subject = settings.merge_subject.as_ref().map(|template| {
                 template
-                    .replace(
-                        "{bead_short}",
-                        self.unit
-                            .bead
-                            .strip_prefix(&prefix)
-                            .unwrap_or(&self.unit.bead),
-                    )
+                    .replace("{bead_short}", self.project.bead_short(&self.unit.bead))
                     .replace("{bead}", &self.unit.bead)
                     .replace("{title}", &title)
             });

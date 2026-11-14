@@ -409,7 +409,7 @@ fn a_unit_is_built_broken_fixed_reviewed_and_published() {
     // What was published: one commit on the unit's branch, without the probes.
     let remote = world.path("remote.git");
     let branch = format!("refs/heads/{}", unit.branch);
-    assert_eq!(unit.branch, "factory/toy-1-add-the-feature");
+    assert_eq!(unit.branch, "feat/1-add-the-feature");
     assert_eq!(
         run(
             &remote,
@@ -768,14 +768,10 @@ fn a_red_check_goes_back_to_the_builder_and_green_is_merged_without_asking_anyon
     let bead = std::fs::read_to_string(world.path("beads/toy-1.json")).unwrap();
     assert!(bead.contains("\"closed\"") && bead.contains(&merged));
     assert!(!unit.worktree.exists());
-    let branches = run(&remote, "git", &["branch", "--list", "factory/*"]);
+    let branches = run(&remote, "git", &["branch", "--list", "feat/*"]);
     assert_eq!(branches, "", "the remote branch should be deleted");
     assert_eq!(
-        run(
-            &world.path("toy"),
-            "git",
-            &["branch", "--list", "factory/*"]
-        ),
+        run(&world.path("toy"), "git", &["branch", "--list", "feat/*"]),
         ""
     );
 }
@@ -813,7 +809,7 @@ fn a_push_by_someone_else_stops_the_landing() {
         for _ in 0..200 {
             std::thread::sleep(std::time::Duration::from_millis(100));
             let listed = Command::new("git")
-                .args(["branch", "--list", "factory/*"])
+                .args(["branch", "--list", "feat/*"])
                 .current_dir(&remote)
                 .output()
                 .unwrap();
