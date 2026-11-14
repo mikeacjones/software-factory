@@ -531,7 +531,11 @@ impl Driver {
                     .collect()
             })
             .unwrap_or_default();
-        let slack = Slack::new(token.clone());
+        // SLACK_API_URL exists for tests, which point it at a local stand-in.
+        let slack = match env.get("SLACK_API_URL") {
+            Some(url) => Slack::with_base_url(token.clone(), url.clone()),
+            None => Slack::new(token.clone()),
+        };
         match saved {
             Some(state) => Thread::resume(slack, state, owners, self.header(), self.log.clone()),
             None => Thread::open(slack, channel, owners, self.header(), self.log.clone()),
@@ -797,7 +801,7 @@ impl Driver {
         self.thread
             .status(&format!(":question: *{step}* is waiting for your answer"));
         let settings = self.factory.slack.clone();
-        let poll = Duration::from_secs(settings.as_ref().map_or(10, |s| s.poll_secs).max(2));
+        let poll = Duration::from_secs(settings.as_ref().map_or(10, |s| s.poll_secs).max(1));
         let limit = Duration::from_secs(settings.as_ref().map_or(43_200, |s| s.answer_wait_secs));
         let started = Instant::now();
         // Anything said before the question was asked is steering, not an answer.
@@ -964,7 +968,7 @@ impl Driver {
             .slack
             .as_ref()
             .map_or(10, |s| s.poll_secs)
-            .max(2);
+            .max(1);
 
         let mut rejected: Vec<String> = Vec::new();
         let mut answer = self.unit.answer.take();

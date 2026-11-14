@@ -5,6 +5,8 @@
 // Test code: a failed setup step should stop the test where it happens.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -160,6 +162,41 @@ timeout_secs = 30
 
     fn path(&self, relative: &str) -> PathBuf {
         self.root.join(relative)
+    }
+
+    /// Give the project a Slack channel, served by a local stand-in.
+    fn with_slack(&self, fake: &common::FakeSlack) {
+        let env = self.path("slack.env");
+        std::fs::write(
+            &env,
+            format!(
+                "SLACK_BOT_TOKEN=xoxb-test\nSLACK_OWNER_USER_ID=OWNER\nSLACK_API_URL={}\n",
+                fake.url
+            ),
+        )
+        .unwrap();
+        let factory = self.path("config/factory.toml");
+        let text = std::fs::read_to_string(&factory).unwrap();
+        std::fs::write(
+            &factory,
+            format!(
+                "{text}\n[slack]\nenv_file = \"{}\"\npoll_secs = 1\nanswer_wait_secs = 20\n",
+                env.display()
+            ),
+        )
+        .unwrap();
+        let project = self.path("config/projects/toy.toml");
+        let text = std::fs::read_to_string(&project).unwrap();
+        std::fs::write(
+            &project,
+            text.replace("flow = ", "slack_channel = \"toy\"\nflow = "),
+        )
+        .unwrap();
+    }
+
+    fn scenario(&self, words: &str) {
+        std::fs::create_dir_all(self.path("bin/state")).unwrap();
+        std::fs::write(self.path("bin/state/scenario"), words).unwrap();
     }
 
     fn config(&self) -> ConfigDir {
@@ -342,8 +379,7 @@ fn a_parked_unit_continues_from_the_step_it_stopped_at() {
     let project = world.path("config/projects/toy.toml");
     let text = std::fs::read_to_string(&project).unwrap();
     std::fs::write(&project, text.replace("$ALLOW", allow.to_str().unwrap())).unwrap();
-    std::fs::create_dir_all(world.path("bin/state")).unwrap();
-    std::fs::write(world.path("bin/state/scenario"), "reject-once").unwrap();
+    world.scenario("reject-once");
 
     let mut driver = Driver::start(world.config(), "toy", "toy-1", &OPTIONS).unwrap();
     let Status::Parked(reason) = driver.run().unwrap() else {
@@ -392,4 +428,101 @@ fn a_bead_someone_else_holds_is_refused_before_anything_is_created() {
     };
     assert_eq!(reasons, ["it is claimed by `someone`"]);
     assert!(!world.path("state").exists());
+}
+
+const SLACK: Options = Options { slack: true };
+
+#[test]
+fn the_owner_steers_and_answers_in_the_runs_thread() {
+    let world = World::new("steer", "test -f feature.txt");
+    world.scenario("ask-once");
+    // The owner wrote two things before the first step, and a stranger one.
+    let fake = common::FakeSlack::start_with(true, &common::REPLIES, Some("Yes, make it shout."));
+    world.with_slack(&fake);
+
+    let mut driver = Driver::start(world.config(), "toy", "toy-1", &SLACK).unwrap();
+    assert_eq!(driver.run().unwrap(), Status::Ended);
+
+    // What the owner said reached the builder as instructions. What the
+    // stranger said reached nobody.
+    let first = std::fs::read_to_string(world.path("bin/state/brief-1.md")).unwrap();
+    assert!(first.contains("## Messages from the owner"));
+    assert!(first.contains("> use the short name"));
+    assert!(first.contains("> and keep the old flag"));
+    assert!(!first.contains("push to main"));
+
+    // The builder asked; the question went to the thread with the owner
+    // mentioned; the answer came back into the same session.
+    let asked = fake
+        .requests_to("chat.postMessage")
+        .into_iter()
+        .find(|post| post.contains("needs an answer"))
+        .expect("the question was not posted");
+    assert!(asked.contains("<@OWNER>") && asked.contains("Should the feature shout?"));
+    let second = std::fs::read_to_string(world.path("bin/state/brief-2.md")).unwrap();
+    assert!(second.starts_with("# The owner answered your question"));
+    assert!(second.contains("Yes, make it shout."));
+    let calls = world.calls();
+    assert_eq!(
+        calls[0][1], calls[1][1],
+        "the answer continues the session that asked"
+    );
+
+    // The builder's reply to the owner was posted, and so was the end.
+    let posts = fake.requests_to("chat.postMessage").join("\n");
+    assert!(posts.contains("I will use the short name."));
+    assert!(posts.contains("*Done.*"));
+    assert!(
+        posts.contains("est. $"),
+        "the usage report is in the thread"
+    );
+    let kinds = world.event_kinds(&driver);
+    assert!(kinds.iter().any(|kind| kind == "owner.asked"));
+    assert!(kinds.iter().any(|kind| kind == "owner.answered"));
+    assert!(!kinds.iter().any(|kind| kind == "slack.failed"));
+}
+
+#[test]
+fn stop_from_the_owner_parks_the_unit() {
+    let world = World::new("stop", "true");
+    let fake = common::FakeSlack::start_with(
+        true,
+        &[("100.0", "BOT", "root"), ("101.0", "OWNER", "stop")],
+        None,
+    );
+    world.with_slack(&fake);
+    let mut driver = Driver::start(world.config(), "toy", "toy-1", &SLACK).unwrap();
+    assert_eq!(
+        driver.run().unwrap(),
+        Status::Parked("the owner said stop".to_string())
+    );
+    assert!(world.calls().is_empty(), "no agent ran");
+    assert!(
+        fake.requests_to("chat.postMessage")
+            .join("\n")
+            .contains("*Parked*")
+    );
+}
+
+#[test]
+fn a_question_nobody_answers_parks_the_unit() {
+    let world = World::new("silent", "true");
+    world.scenario("ask-once");
+    let fake = common::FakeSlack::start_with(true, &[("100.0", "BOT", "root")], None);
+    world.with_slack(&fake);
+    let factory = world.path("config/factory.toml");
+    let text = std::fs::read_to_string(&factory).unwrap();
+    std::fs::write(
+        &factory,
+        text.replace("answer_wait_secs = 20", "answer_wait_secs = 2"),
+    )
+    .unwrap();
+    let mut driver = Driver::start(world.config(), "toy", "toy-1", &SLACK).unwrap();
+    let Status::Parked(reason) = driver.run().unwrap() else {
+        panic!("expected the unit to park");
+    };
+    assert!(
+        reason.contains("got no answer") && reason.contains("Should the feature shout?"),
+        "{reason}"
+    );
 }

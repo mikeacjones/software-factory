@@ -187,7 +187,15 @@ impl Source {
                     status: text("status"),
                     issue_type: text("issue_type"),
                     assignee: text("assignee"),
-                    priority: row.get("priority").and_then(Value::as_i64).unwrap_or(0),
+                    // Dolt prints some integer columns as strings.
+                    priority: row
+                        .get("priority")
+                        .and_then(|value| {
+                            value
+                                .as_i64()
+                                .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+                        })
+                        .unwrap_or(0),
                     labels: column(labels, "label"),
                     open_blockers: column(blockers, "id"),
                 })

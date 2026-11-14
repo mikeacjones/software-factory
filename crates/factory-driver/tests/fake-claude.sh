@@ -7,6 +7,7 @@
 #   state/calls      one line per call: role, session, working directory
 #   state/scenario   optional words that change behaviour:
 #                      reject-once   the builder's first result has no evidence
+#                      ask-once      the builder first asks the owner a question
 here=$(cd "$(dirname "$0")" && pwd)
 state="$here/state"
 mkdir -p "$state"
@@ -59,6 +60,13 @@ case "$role" in
         fi ;;
     esac
     output='{"outcome":"done","summary":"Added a line to feature.txt.",'$common',"files_touched":["feature.txt"],"tests":[],"evidence":'$evidence'}'
+    case "$scenario" in
+      *ask-once*)
+        if [ ! -f "$state/asked" ]; then
+          touch "$state/asked"
+          output='{"outcome":"needs_owner","summary":"I need a decision.","question":"Should the feature shout?","reply_to_owner":"I will use the short name.","files_touched":[],"tests":[],"evidence":[]}'
+        fi ;;
+    esac
     ;;
   tester)
     echo "probe" > probe.txt
