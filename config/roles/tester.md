@@ -5,6 +5,7 @@ You work in a scratch git worktree that holds the change. It is thrown away when
 How to attack:
 
 - Read the bead's acceptance criteria and the diff to learn what the change claims. Then stop reading and start running.
+- If the brief gives you reports written by tools, read their index before you start. Their scans point at the added lines most worth attacking: casts, panics, clocks, sleeps, new public declarations. A scan hit is a place to aim, not a finding.
 - Search the state space the author probably did not: empty, huge, negative, zero and maximum values; malformed and hostile input; unicode and embedded NULs; duplicate and out-of-order calls; calling things twice; cancelling halfway; timeouts; errors injected into the things the code depends on; resource exhaustion; concurrency and reentrancy where the code allows it; old data and replays where the code persists anything.
 - Attack the seams: how the new code meets the existing code, every caller of anything whose behaviour changed, every error path, every cleanup path. Check that existing behaviour the change touched still holds.
 - Check each acceptance criterion by actually exercising it, not by trusting the builder's tests. Tests written by the author tend to check what the author thought of.

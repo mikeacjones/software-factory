@@ -31,6 +31,7 @@ ci_poll_secs = 30
 ci_timeout_secs = 10800
 ci_settle_secs = 60
 merge_subject = "Merge bead/{bead_short}: {title}"
+merge_body = "{summary}\n\n{testing}\n\nBead: {bead}"
 delete_branch_after_merge = true
 # Green means each of these is present and passed, and nothing else failed.
 # A workflow that has not started has created no check, so without this list
@@ -86,6 +87,22 @@ timeout_secs = 300
 [commands.test]
 argv = ["zig", "build", "test"]
 timeout_secs = 3600
+
+[commands.test-releasesafe]
+argv = ["zig", "build", "test", "-Doptimize=ReleaseSafe"]
+timeout_secs = 3600
+
+# The project's own review tooling (.review/). --quick leaves the test suites
+# out: the flow runs them as steps of their own, where a failure goes straight
+# back to the builder.
+[commands.reports]
+argv = [".review/reports.sh", "--base", "{base}", "--out", "{out}", "--quick"]
+timeout_secs = 1800
+summary = "INDEX.txt"
+note = """
+Read INDEX.txt first, then the files it points to: diff.patch, added-lines.txt, public-api-diff.txt, dependencies.txt, the scan-*.txt files and each scanner's log. A scan hit is a line to look at, not a finding: look at each one and decide.
+
+Two lines of the index need care. Its changelog-check reads the factory's checkpoint commits, which carry no changelog trailer, so a failure there means only that the change adds no changelog fragment: judge for yourself whether it needs one. The factory runs the same check on the final commit before it pushes. And the test suites are not in these reports: the factory ran them, in Debug and ReleaseSafe, as steps of their own."""
 
 [commands.samples-test]
 argv = ["zig", "build", "samples-test"]

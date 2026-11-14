@@ -124,6 +124,9 @@ pub struct Unit {
     pub feedback: Option<String>,
     /// The latest note each step produced for later steps.
     pub notes: BTreeMap<String, Note>,
+    /// The latest copy of each artifact a command step produced.
+    #[serde(default)]
+    pub artifacts: BTreeMap<String, Artifact>,
     /// The latest typed result of each agent step.
     pub results: BTreeMap<String, Value>,
     pub usage: BTreeMap<String, StepUsage>,
@@ -140,6 +143,20 @@ pub struct Unit {
     pub merged: Option<String>,
     pub runs: u32,
     pub started_at: u64,
+}
+
+/// Something a command step wrote for later steps, such as a directory of
+/// reports. It is kept outside the worktree and describes one commit.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Artifact {
+    pub path: PathBuf,
+    /// The commit it describes.
+    pub commit: String,
+    pub step: String,
+    /// The command that wrote it, as run.
+    pub command: String,
+    /// How the command ended: `passed`, or what went wrong.
+    pub ended: String,
 }
 
 /// How a step ended, as far as the flow is concerned.
@@ -182,10 +199,29 @@ pub fn load_flow(
         commands: project.commands.keys().cloned().collect(),
         scopes: project.scopes.keys().cloned().collect(),
     })?;
-    // A role the flow names must have a prompt before anything starts.
+    // A role the flow names must have a prompt before anything starts, and a
+    // command must write an artifact exactly when its step says it produces one.
     for step in &flow.steps {
-        if let StepKind::Agent { role, .. } = &step.kind {
-            config.role_prompt(role)?;
+        match &step.kind {
+            StepKind::Agent { role, .. } => {
+                config.role_prompt(role)?;
+            }
+            StepKind::Command { command, .. } => {
+                let wants_out = project.commands[command].wants_out();
+                if step.produces.is_some() && !wants_out {
+                    return Err(DriverError::Preflight(format!(
+                        "step `{}` produces an artifact, but the command `{command}` has no `{{out}}` in its argv to say where it goes",
+                        step.id
+                    )));
+                }
+                if step.produces.is_none() && wants_out {
+                    return Err(DriverError::Preflight(format!(
+                        "the command `{command}` writes to `{{out}}`, but step `{}` does not say what it produces",
+                        step.id
+                    )));
+                }
+            }
+            StepKind::Action { .. } => {}
         }
     }
     Ok((flow, text))
@@ -391,6 +427,7 @@ impl Driver {
                 in_step: None,
                 feedback: None,
                 notes: BTreeMap::new(),
+                artifacts: BTreeMap::new(),
                 results: BTreeMap::new(),
                 usage: BTreeMap::new(),
                 thread: None,
@@ -1009,6 +1046,18 @@ impl Driver {
                 .filter_map(|other| self.unit.notes.get(&other.id).cloned())
                 .collect()
         };
+        let mut notes = notes;
+        for name in &step.needs {
+            match self.artifact_note(name) {
+                Ok(note) => notes.push(note),
+                Err(reason) => {
+                    return Ok(StepEnd::Park(format!(
+                        "step `{}` needs `{name}`: {reason}",
+                        step.id
+                    )));
+                }
+            }
+        }
         let feedback = self.unit.feedback.clone();
         let timeout = Duration::from_secs(
             step.timeout_secs
@@ -1166,6 +1215,7 @@ impl Driver {
                             ("commit_message", 8000),
                             ("pr_title", 200),
                             ("pr_body", 30_000),
+                            ("merge_summary", 2000),
                         ] {
                             let text = result.get(field).and_then(Value::as_str).unwrap_or("");
                             problems.extend(
@@ -1475,15 +1525,39 @@ impl Driver {
             return Ok(StepEnd::Park("not a command step".to_string()));
         };
         let command = self.project.commands[name].clone();
+        self.unit.runs += 1;
+        // An artifact gets a directory of its own, outside the worktree.
+        let out_dir = match &step.produces {
+            Some(artifact) => {
+                let dir = self
+                    .dir
+                    .join("artifacts")
+                    .join(format!("{:03}-{artifact}", self.unit.runs));
+                std::fs::create_dir_all(&dir).map_err(io(&dir))?;
+                Some(dir)
+            }
+            None => None,
+        };
+        let argv: Vec<String> = command
+            .argv
+            .iter()
+            .map(|arg| {
+                let arg = arg.replace("{base}", &self.unit.base);
+                match &out_dir {
+                    Some(dir) => arg.replace("{out}", &dir.to_string_lossy()),
+                    None => arg,
+                }
+            })
+            .collect();
+        // What people are shown: the command as configured, not the long paths.
         let shown = command.argv.join(" ");
         self.thread.status(&format!(
             ":arrows_counterclockwise: *{}* · running `{}`",
             step.id,
             escape(&shown)
         ));
-        self.unit.runs += 1;
         let result = run_command(
-            &command.argv,
+            &argv,
             &self.unit.worktree,
             Duration::from_secs(command.timeout_secs),
         );
@@ -1493,7 +1567,7 @@ impl Driver {
             "command.ran",
             Some(&step.id),
             json!({
-                "command": name, "argv": command.argv, "verdict": format!("{:?}", result.verdict),
+                "command": name, "argv": argv, "verdict": format!("{:?}", result.verdict),
                 "secs": secs, "output": output_path, "commit": self.unit.checkpoint,
             }),
         )?;
@@ -1505,6 +1579,14 @@ impl Driver {
                     "the command `{name}` could not run: {reason}"
                 )));
             }
+            // A report that was cut short is not a report.
+            (Verdict::TimedOut, ExitPolicy::ReportOnly) => (
+                false,
+                format!(
+                    "was still running after {} and was killed",
+                    duration_text(command.timeout_secs)
+                ),
+            ),
             (_, ExitPolicy::ReportOnly) => (true, "reported".to_string()),
             (Verdict::Passed, ExitPolicy::MustPass) => (true, "passed".to_string()),
             (Verdict::Passed, ExitPolicy::MustFail) => {
@@ -1528,7 +1610,50 @@ impl Driver {
                 ),
             ),
         };
-        let short = &self.unit.checkpoint[..self.unit.checkpoint.len().min(10)];
+        let short = self.unit.checkpoint[..self.unit.checkpoint.len().min(10)].to_string();
+        let short = short.as_str();
+        if let (Some(artifact), Some(dir), true) = (&step.produces, &out_dir, passed) {
+            let ended = match &result.verdict {
+                Verdict::Passed => "passed".to_string(),
+                Verdict::Failed { code } => format!(
+                    "exited {}",
+                    code.map_or("with no code".to_string(), |c| c.to_string())
+                ),
+                other => format!("{other:?}"),
+            };
+            self.unit.artifacts.insert(
+                artifact.clone(),
+                Artifact {
+                    path: dir.clone(),
+                    commit: self.unit.checkpoint.clone(),
+                    step: step.id.clone(),
+                    command: shown.clone(),
+                    ended: ended.clone(),
+                },
+            );
+            self.event(
+                "artifact.produced",
+                Some(&step.id),
+                json!({ "artifact": artifact, "path": dir, "commit": self.unit.checkpoint, "ended": ended }),
+            )?;
+            let summary = command
+                .summary
+                .as_ref()
+                .and_then(|file| std::fs::read_to_string(dir.join(file)).ok())
+                .unwrap_or_default();
+            self.thread.say(&format!(
+                ":page_facing_up: *{}* · `{artifact}` written on `{short}` ({ended}) · {}\n{}",
+                step.id,
+                duration_text(secs),
+                if summary.trim().is_empty() {
+                    String::new()
+                } else {
+                    code_block(&truncate(&summary, 2400))
+                }
+            ));
+            self.save()?;
+            return Ok(StepEnd::Outcome("pass".to_string()));
+        }
         self.unit.notes.insert(
             step.id.clone(),
             Note {
@@ -1845,6 +1970,13 @@ impl Driver {
                     .replace("{bead}", &self.unit.bead)
                     .replace("{title}", &title)
             });
+            let body = settings.merge_body.as_ref().map(|template| {
+                let passed = match ci_verdict(&status.checks, &settings.required_checks) {
+                    CiVerdict::Green { passed } => passed,
+                    _ => status.checks.len(),
+                };
+                self.merge_body(template, &title, number, passed)
+            });
             github
                 .merge(
                     &repo_dir,
@@ -1852,6 +1984,7 @@ impl Driver {
                     number,
                     &status.head,
                     subject.as_deref(),
+                    body.as_deref(),
                 )
                 .map_err(|err| DriverError::Preflight(err.to_string()))?;
             self.event(
@@ -1935,6 +2068,101 @@ impl Driver {
         self.event("cleanup", Some(&step.id), json!({ "problems": litter }))?;
         self.save()?;
         Ok(StepEnd::Outcome("done".to_string()))
+    }
+
+    /// The body of the merge commit: the publisher's paragraph on what the
+    /// branch adds, then the factory's own account of what passed.
+    fn merge_body(&self, template: &str, title: &str, number: u64, ci_passed: usize) -> String {
+        let summary = self
+            .publication()
+            .and_then(|text| {
+                text.get("merge_summary")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .filter(|summary| !summary.trim().is_empty())
+            .unwrap_or_else(|| format!("{title}."));
+        // Every must-pass command of the flow that ran: the unit could not
+        // have reached the landing unless each passed on the published code.
+        let mut commands: Vec<String> = Vec::new();
+        for step in &self.flow.steps {
+            if let StepKind::Command {
+                command,
+                policy: ExitPolicy::MustPass,
+            } = &step.kind
+                && self.unit.usage.contains_key(&step.id)
+                && let Some(spec) = self.project.commands.get(command)
+            {
+                let shown = spec
+                    .argv
+                    .join(" ")
+                    .replace("{base}", &self.project.default_branch);
+                if !commands.contains(&shown) {
+                    commands.push(shown);
+                }
+            }
+        }
+        let short = &self.unit.checkpoint[..self.unit.checkpoint.len().min(10)];
+        let testing = format!(
+            "Testing: on {}-{} the factory ran {}, and each passed on the published commit ({short}); all {ci_passed} CI checks passed on pull request {number}'s head.",
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            commands.join(", "),
+        );
+        template
+            .replace("{summary}", &wrap(&summary, 72))
+            .replace("{testing}", &wrap(&testing, 72))
+            .replace("{bead_short}", self.project.bead_short(&self.unit.bead))
+            .replace("{bead}", &self.unit.bead)
+    }
+
+    /// What a step that needs an artifact is told about it.
+    fn artifact_note(&self, name: &str) -> Result<Note, String> {
+        let artifact = self
+            .unit
+            .artifacts
+            .get(name)
+            .ok_or_else(|| "it has not been produced".to_string())?;
+        if artifact.commit != self.unit.checkpoint {
+            return Err(format!(
+                "it describes commit `{}`, but the code is now at `{}`",
+                artifact.commit, self.unit.checkpoint
+            ));
+        }
+        let spec = self
+            .flow
+            .step(&artifact.step)
+            .and_then(|step| match &step.kind {
+                StepKind::Command { command, .. } => self.project.commands.get(command),
+                _ => None,
+            });
+        let short = &artifact.commit[..artifact.commit.len().min(10)];
+        let mut body = format!(
+            "Written by `{}`, with no model involved, on commit `{short}`: the commit you are looking at. The command {}.\n\nThey are in `{}`.",
+            artifact.command,
+            if artifact.ended == "passed" {
+                "exited 0".to_string()
+            } else {
+                artifact.ended.clone()
+            },
+            artifact.path.display()
+        );
+        if let Some(note) = spec.and_then(|spec| spec.note.as_ref()) {
+            body.push_str(&format!("\n\n{}", note.trim()));
+        }
+        if let Some(file) = spec.and_then(|spec| spec.summary.as_ref()) {
+            match std::fs::read_to_string(artifact.path.join(file)) {
+                Ok(text) => body.push_str(&format!(
+                    "\n\n`{file}`:\n\n```\n{}\n```",
+                    truncate(text.trim_end(), 6000)
+                )),
+                Err(err) => return Err(format!("its `{file}` cannot be read: {err}")),
+            }
+        }
+        Ok(Note {
+            title: format!("Reports: `{name}`"),
+            body,
+        })
     }
 
     /// The latest result of a step that works to the publication contract.
@@ -2124,6 +2352,29 @@ impl Driver {
     }
 }
 
+/// Wrap prose at `width` columns, keeping its paragraphs.
+fn wrap(text: &str, width: usize) -> String {
+    text.split("\n\n")
+        .map(|paragraph| {
+            let mut lines: Vec<String> = Vec::new();
+            let mut line = String::new();
+            for word in paragraph.split_whitespace() {
+                if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > width {
+                    lines.push(std::mem::take(&mut line));
+                }
+                if !line.is_empty() {
+                    line.push(' ');
+                }
+                line.push_str(word);
+            }
+            lines.push(line);
+            lines.join("\n")
+        })
+        .filter(|paragraph| !paragraph.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
 fn github_client(factory: &Factory, settings: &factory_config::GitHub) -> GitHub {
     let mut github = GitHub::new(settings.write.clone());
     github.gh_bin = factory.gh_bin.clone();
@@ -2156,6 +2407,20 @@ fn preflight(factory: &Factory, project: &Project) -> Result<(), DriverError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prose_is_wrapped_and_keeps_its_paragraphs() {
+        let text = "one two three four five six\n\nseven  eight\nnine";
+        assert_eq!(
+            wrap(text, 14),
+            "one two three\nfour five six\n\nseven eight\nnine"
+        );
+        assert!(
+            wrap(&"word ".repeat(40), 72)
+                .lines()
+                .all(|line| line.len() <= 72)
+        );
+    }
 
     #[test]
     fn durations_and_token_counts_read_naturally() {

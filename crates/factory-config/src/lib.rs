@@ -200,6 +200,11 @@ pub struct GitHub {
     /// The subject of the merge commit. `{bead}` is the bead ID, `{bead_short}`
     /// the ID without the project's prefix, `{title}` the pull request's title.
     pub merge_subject: Option<String>,
+    /// The body of the merge commit. `{summary}` is the paragraph the
+    /// publication step wrote, `{testing}` the factory's own account of what
+    /// passed, `{bead}` and `{bead_short}` the bead ID. Without it GitHub
+    /// writes its default body.
+    pub merge_body: Option<String>,
     /// Remove the unit's branch from the remote once it has merged.
     #[serde(default = "default_true")]
     pub delete_branch_after_merge: bool,
@@ -224,8 +229,24 @@ fn default_true() -> bool {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CommandSpec {
+    /// `{base}` is replaced by the commit the unit's branch started from, and
+    /// `{out}` by the directory the factory made for the artifact the step
+    /// produces.
     pub argv: Vec<String>,
     pub timeout_secs: u64,
+    /// For a command that produces an artifact: the file in it to show the
+    /// steps that need it, such as an index.
+    pub summary: Option<String>,
+    /// For a command that produces an artifact: what a reader should know
+    /// before using it.
+    pub note: Option<String>,
+}
+
+impl CommandSpec {
+    /// Whether the command writes an artifact the factory must make room for.
+    pub fn wants_out(&self) -> bool {
+        self.argv.iter().any(|arg| arg.contains("{out}"))
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]

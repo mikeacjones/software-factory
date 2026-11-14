@@ -259,6 +259,7 @@ impl GitHub {
         number: u64,
         head: &str,
         subject: Option<&str>,
+        body: Option<&str>,
     ) -> Result<(), GitHubError> {
         self.check_allowed(repo)?;
         let number = number.to_string();
@@ -274,6 +275,9 @@ impl GitHub {
         ];
         if let Some(subject) = subject {
             args.extend(["--subject", subject]);
+        }
+        if let Some(body) = body {
+            args.extend(["--body", body]);
         }
         self.gh(cwd, &args, None).map(|_| ())
     }
@@ -649,7 +653,7 @@ mod tests {
     fn a_merge_outside_the_write_list_is_refused() {
         let mut github = GitHub::new(vec!["me/toy".to_string()]);
         github.gh_bin = "no-such-gh-anywhere".to_string();
-        let result = github.merge(&std::env::temp_dir(), "someone/else", 7, "abc", None);
+        let result = github.merge(&std::env::temp_dir(), "someone/else", 7, "abc", None, None);
         assert!(matches!(result, Err(GitHubError::NotAllowed(_))));
     }
 

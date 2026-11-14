@@ -153,6 +153,11 @@ pub enum StepKind {
 pub struct Step {
     pub id: String,
     pub kind: StepKind,
+    /// The artifact a command step writes, such as a directory of reports.
+    pub produces: Option<String>,
+    /// The artifacts an agent step is given. Each must have been produced,
+    /// on the code as it now stands, on every path that reaches the step.
+    pub needs: Vec<String>,
     pub timeout_secs: Option<u64>,
     /// Outcome to route.
     pub on: BTreeMap<String, Route>,
@@ -188,6 +193,8 @@ struct RawStep {
     command: Option<String>,
     policy: Option<ExitPolicy>,
     action: Option<String>,
+    produces: Option<String>,
+    needs: Option<Vec<String>>,
     timeout_secs: Option<u64>,
     #[serde(default)]
     on: BTreeMap<String, Route>,
@@ -429,6 +436,9 @@ impl Flow {
             problems.extend(self.reachability());
         }
         if problems.is_empty() {
+            problems.extend(self.artifact_problems());
+        }
+        if problems.is_empty() {
             Ok(())
         } else {
             Err(FlowError::Invalid {
@@ -442,6 +452,89 @@ impl Flow {
         step.on
             .values()
             .flat_map(|route| [&route.to, &route.then].into_iter())
+    }
+
+    /// Whether a step can change the unit's code, which makes every artifact
+    /// written about the code out of date.
+    fn changes_code(step: &Step) -> bool {
+        matches!(
+            &step.kind,
+            StepKind::Agent { workspace: Workspace::Unit, writes, .. } if !writes.is_empty()
+        )
+    }
+
+    /// The artifacts sure to exist, and to describe the current code, when
+    /// each step starts: on every path from the start, some step produced
+    /// them after the last step that could change the code.
+    pub fn artifacts_on_entry(&self) -> BTreeMap<String, BTreeSet<String>> {
+        let all: BTreeSet<String> = self
+            .steps
+            .iter()
+            .filter_map(|step| step.produces.clone())
+            .collect();
+        // Start from "everything" and remove what some path does not supply.
+        let mut entry: BTreeMap<String, BTreeSet<String>> = self
+            .steps
+            .iter()
+            .map(|step| {
+                let known = if step.id == self.start {
+                    BTreeSet::new()
+                } else {
+                    all.clone()
+                };
+                (step.id.clone(), known)
+            })
+            .collect();
+        loop {
+            let mut changed = false;
+            for step in &self.steps {
+                let mut leaving = if Self::changes_code(step) {
+                    BTreeSet::new()
+                } else {
+                    entry.get(&step.id).cloned().unwrap_or_default()
+                };
+                leaving.extend(step.produces.clone());
+                for target in self.successors(step) {
+                    let Target::Step(next) = target else { continue };
+                    if let Some(known) = entry.get_mut(next) {
+                        let before = known.len();
+                        known.retain(|artifact| leaving.contains(artifact));
+                        changed |= known.len() != before;
+                    }
+                }
+            }
+            if !changed {
+                return entry;
+            }
+        }
+    }
+
+    fn artifact_problems(&self) -> Vec<String> {
+        let mut problems = Vec::new();
+        let entry = self.artifacts_on_entry();
+        for step in &self.steps {
+            for artifact in &step.needs {
+                if !self
+                    .steps
+                    .iter()
+                    .any(|other| other.produces.as_ref() == Some(artifact))
+                {
+                    problems.push(format!(
+                        "step `{}`: needs `{artifact}`, which no step produces",
+                        step.id
+                    ));
+                } else if !entry
+                    .get(&step.id)
+                    .is_some_and(|known| known.contains(artifact))
+                {
+                    problems.push(format!(
+                        "step `{}`: needs `{artifact}`, but on some path that reaches it `{artifact}` has not been produced since the code last changed",
+                        step.id
+                    ));
+                }
+            }
+        }
+        problems
     }
 
     /// Every step can be reached from the start, and from every step some
@@ -598,9 +691,23 @@ fn convert(raw: RawStep) -> Result<Step, String> {
         }
         other => return Err(format!("step `{id}`: unknown kind `{other}`")),
     };
+    if raw.produces.is_some() && !matches!(kind, StepKind::Command { .. }) {
+        return Err(format!(
+            "step `{}`: only a command step can produce an artifact",
+            raw.id
+        ));
+    }
+    if raw.needs.is_some() && !matches!(kind, StepKind::Agent { .. }) {
+        return Err(format!(
+            "step `{}`: only an agent step can need an artifact",
+            raw.id
+        ));
+    }
     Ok(Step {
         id: raw.id,
         kind,
+        produces: raw.produces,
+        needs: raw.needs.unwrap_or_default(),
         timeout_secs: raw.timeout_secs,
         on: raw.on,
     })
@@ -911,6 +1018,83 @@ on.merged = "end"
             )
             .replace("on.merged = \"end\"\n", "");
         Flow::parse(&good).unwrap().check(&registry()).unwrap();
+    }
+
+    /// The reference flow with a reports step between the test and the tester.
+    fn with_reports(needs_on: &str) -> String {
+        let text = FLOW
+            .replace(
+                "on.pass = \"break\"\n",
+                "on.pass = \"reports\"\n",
+            )
+            .replace(
+                "[[step]]\nid = \"break\"",
+                "[[step]]\nid = \"reports\"\nkind = \"command\"\ncommand = \"test\"\npolicy = \"report-only\"\nproduces = \"reports\"\non.pass = \"break\"\non.fail = \"park\"\n\n[[step]]\nid = \"break\"",
+            );
+        text.replace(
+            &format!("id = \"{needs_on}\"\nkind = \"agent\""),
+            &format!("id = \"{needs_on}\"\nkind = \"agent\"\nneeds = [\"reports\"]"),
+        )
+    }
+
+    #[test]
+    fn a_step_may_need_what_every_path_produces_on_the_current_code() {
+        for step in ["break", "review"] {
+            Flow::parse(&with_reports(step))
+                .unwrap()
+                .check(&registry())
+                .unwrap();
+        }
+        let flow = Flow::parse(&with_reports("break")).unwrap();
+        let entry = flow.artifacts_on_entry();
+        assert!(entry["review"].contains("reports"));
+        assert!(entry["build"].is_empty());
+        // The fix step changes the code, so what it leaves is not described
+        // by any report until the reports step has run again.
+        assert!(entry["test"].is_empty());
+    }
+
+    #[test]
+    fn a_needed_artifact_that_is_missing_or_stale_on_some_path_is_refused() {
+        // The fix step is reached from the test step before any report exists.
+        assert_eq!(
+            problems(&with_reports("fix")),
+            [
+                "step `fix`: needs `reports`, but on some path that reaches it `reports` has not been produced since the code last changed"
+            ]
+        );
+        // A fix that skips the reports step leaves the reviewer with reports
+        // about code that has since changed.
+        let stale = with_reports("review").replace(
+            "on.done = { to = \"test\", max = 5 }",
+            "on.done = { to = \"review\", max = 5 }",
+        );
+        assert_eq!(
+            problems(&stale),
+            [
+                "step `review`: needs `reports`, but on some path that reaches it `reports` has not been produced since the code last changed"
+            ]
+        );
+        let unknown = FLOW.replace(
+            "id = \"review\"\nkind = \"agent\"",
+            "id = \"review\"\nkind = \"agent\"\nneeds = [\"audit\"]",
+        );
+        assert_eq!(
+            problems(&unknown),
+            ["step `review`: needs `audit`, which no step produces"]
+        );
+    }
+
+    #[test]
+    fn only_commands_produce_and_only_agents_need() {
+        let text = FLOW.replace(
+            "id = \"review\"\nkind = \"agent\"",
+            "id = \"review\"\nkind = \"agent\"\nproduces = \"x\"",
+        );
+        assert_eq!(
+            problems(&text),
+            ["step `review`: only a command step can produce an artifact"]
+        );
     }
 
     #[test]

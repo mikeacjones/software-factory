@@ -232,6 +232,10 @@ pub fn schema(contract: Contract, outcomes: &[String]) -> Value {
             },
             "pr_title": text(),
             "pr_body": text(),
+            "merge_summary": {
+                "type": "string",
+                "description": "One paragraph of plain prose for the merge commit that lands this change: what the branch adds and why, naming the real types, functions and files. No heading, no list, no trailers."
+            },
         }),
     };
     if let (Some(all), Some(extra)) = (properties.as_object_mut(), body.as_object()) {
@@ -356,7 +360,7 @@ pub fn result_problems(contract: Contract, outcomes: &[String], result: &Value) 
             }
         }
         Contract::Publication => {
-            for key in ["commit_message", "pr_title", "pr_body"] {
+            for key in ["commit_message", "pr_title", "pr_body", "merge_summary"] {
                 if string_at(result, key).trim().is_empty() {
                     problems.push(format!("`{key}` is empty"));
                 }

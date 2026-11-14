@@ -58,6 +58,7 @@ case "$1 $2" in
     branch=$(cat "$state/pr")
     want=$(arg_after --match-head-commit "$@")
     subject=$(arg_after --subject "$@")
+    body=$(arg_after --body "$@")
     head=$(git --git-dir="$remote" rev-parse "refs/heads/$branch")
     if [ "$want" != "$head" ]; then echo "head commit does not match" >&2; exit 1; fi
     work="$state/merge-work"
@@ -65,7 +66,7 @@ case "$1 $2" in
     git clone --quiet "$remote" "$work"
     cd "$work" || exit 1
     git config user.name "GitHub" && git config user.email "noreply@localhost" && git config commit.gpgsign false
-    git merge --quiet --no-ff -m "${subject:-Merge pull request 7}" "origin/$branch" || exit 1
+    git merge --quiet --no-ff -m "${subject:-Merge pull request 7}" -m "${body:-No body.}" "origin/$branch" || exit 1
     git push --quiet origin HEAD:main || exit 1
     git rev-parse HEAD > "$state/merged"
     echo "$head" > "$state/merged-head" ;;

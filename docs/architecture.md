@@ -65,6 +65,8 @@ The first milestone walks one bead to a pull request by hand: `factory run <proj
 
 The first flow, `build-break-review`, has four roles. The **builder** implements the bead, and its session is continued for every fix. The **tester** is adversarial: it gets a scratch worktree at the checkpoint and tries to break the change by running it, and every finding must carry a reproduction it ran. The **reviewer** reads the change. The **publisher** continues the builder's session to write the commit message and pull-request text. Slack is one channel per project and one thread per run; the owner steers by replying in the thread.
 
+A flow can also carry reports. A command step may say it *produces* a named artifact, such as a directory of scanner output, and an agent step may say it *needs* one. The factory gives the command a directory outside the worktree, and briefs each step that needs the artifact with where it is and what its index says. The validator refuses a flow in which, on some path, a step would be given reports that are missing or were written before the code last changed.
+
 ## Failure classes
 
 Every failure the factory must survive is listed in a catalogue with how code detects it, its class, the response and the resume condition. There are three classes.

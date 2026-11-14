@@ -42,9 +42,11 @@ echo "$pr" | jq -e --arg b "$branch" '.headRefName == $b' >/dev/null || fail "th
 echo "$pr" | jq -e '.commits | length == 1' >/dev/null || fail "the pull request does not hold exactly one commit"
 echo "ok   pull request $url: $(echo "$pr" | jq -r .state), one commit, $branch -> main"
 
-# Every step of the flow ended, and each agent step has a session and usage.
+# Every step of the flow the unit ran on ended at least once. `fix` is the
+# one step a clean run never enters.
 steps="$(jq -r 'select(.kind == "step.ended") | .step' "$events" | sort -u | tr '\n' ' ')"
-for step in baseline build fmt index readme changelog test samples break review describe publish; do
+for step in $(awk '/^\[\[step\]\]/ { want = 1; next } want && /^id = / { gsub(/"/, "", $3); print $3; want = 0 }' "$dir/flow.toml"); do
+  [ "$step" = fix ] && continue
   case " $steps " in *" $step "*) ;; *) fail "step $step never ended" ;; esac
 done
 for step in build break review describe; do

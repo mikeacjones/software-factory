@@ -6,9 +6,10 @@
 # fault, and it builds the Rust core once so the builder's own runs are fast.
 #
 # After the builder: formatting, the generated samples index, README examples,
-# changelog fragments, the unit tests, and every sample against a dev server.
-# Then a fresh adversarial tester tries to break the change by running it, and
-# a fresh reviewer reads it. The builder's session is continued for every fix
+# changelog fragments, the unit tests in both modes, and every sample against a
+# dev server. Then the project's review reports are written, and a fresh
+# adversarial tester tries to break the change by running it and a fresh
+# reviewer reads it, both starting from those reports. The builder's session is continued for every fix
 # and for the publication text. The factory commits, pushes and opens the pull
 # request, watches its CI, and merges it when every check has passed.
 id = "zig-sdk"
@@ -66,16 +67,39 @@ on.fail = { to = "fix", max = 2 }
 id = "test"
 kind = "command"
 command = "test"
-on.pass = "samples"
+on.pass = "test-safe"
 on.fail = { to = "fix", max = 3 }
+
+# Fiber and bridge code has failed only under optimization before.
+[[step]]
+id = "test-safe"
+kind = "command"
+command = "test-releasesafe"
+on.pass = "samples"
+on.fail = { to = "fix", max = 2 }
 
 # A finished sample stays in the suite: breaking one is a regression.
 [[step]]
 id = "samples"
 kind = "command"
 command = "samples-test"
-on.pass = "break"
+on.pass = "reports"
 on.fail = { to = "fix", max = 2 }
+
+# The project's own review reports: scanners, the public API diff, hazard
+# scans of the added lines. Written by tools, with no model, into a directory
+# the factory makes outside the worktree. The steps below that say they need
+# `reports` are briefed with its index. The validator proves the reports are
+# always about the code those steps look at: every fix passes through here
+# again.
+[[step]]
+id = "reports"
+kind = "command"
+command = "reports"
+policy = "report-only"
+produces = "reports"
+on.pass = "break"
+on.fail = "park"
 
 # Not a reader: it runs the change and hunts for inputs and sequences that
 # break it. Every finding carries a reproduction it ran.
@@ -87,6 +111,7 @@ model = "claude-opus-5-5"
 effort = "high"
 session = "fresh"
 workspace = "scratch"
+needs = ["reports"]
 on.held = "review"
 # After two fix rounds the tester no longer decides alone: the reviewer sees
 # its open findings and rules on each one.
@@ -101,6 +126,7 @@ model = "claude-opus-5-5"
 effort = "high"
 session = "fresh"
 workspace = "scratch"
+needs = ["reports"]
 on.approve = "describe"
 on.rework = { to = "fix", max = 2 }
 on.needs_owner = { to = "ask", max = 2 }

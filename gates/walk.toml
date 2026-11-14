@@ -89,6 +89,14 @@ command = ["cargo", "test", "--locked", "--offline", "--package", "factory-drive
 timeout_secs = 900
 
 [[check]]
+id = "report-artifacts"
+tier = "hermetic"
+bead = "sf-c9e.12"
+claim = "A flow whose step needs an artifact that is missing or stale on some path is refused with the step and artifact named; a report command gets its output directory from the factory, outside the worktree, and the steps that need it are briefed with its location and index; the merge commit carries the summary, a Testing line and the project's trailer."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-flow", "--package", "factory-driver", "--", "a_step_may_need", "a_needed_artifact", "only_commands_produce", "a_red_check", "prose_is_wrapped"]
+timeout_secs = 900
+
+[[check]]
 id = "scratch-walk-live"
 tier = "live"
 bead = "sf-c9e.7"

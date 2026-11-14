@@ -241,6 +241,16 @@ timeout_secs = 30
 argv = [\"true\"]
 timeout_secs = 30
 
+[commands.test-releasesafe]
+argv = [\"true\"]
+timeout_secs = 30
+
+[commands.reports]
+argv = [\"sh\", \"-c\", \"echo scanned $1 > $0/INDEX.txt; echo No check failed. >> $0/INDEX.txt\", \"{{out}}\", \"{{base}}\"]
+timeout_secs = 30
+summary = \"INDEX.txt\"
+note = \"A scan hit is a line to look at.\"
+
 [github]
 repo = \"me/toy\"
 write = [\"me/toy\"]
@@ -249,6 +259,7 @@ ci_poll_secs = 1
 ci_settle_secs = 1
 ci_timeout_secs = 30
 merge_subject = \"Merge bead/{{bead_short}}: {{title}}\"
+merge_body = \"{{summary}}\\n\\n{{testing}}\\n\\nBead: {{bead}}\"
 "
             ),
         )
@@ -697,7 +708,9 @@ fn a_red_check_goes_back_to_the_builder_and_green_is_merged_without_asking_anyon
             "readme:pass",
             "changelog:pass",
             "test:pass",
+            "test-safe:pass",
             "samples:pass",
+            "reports:pass",
             "break:held",
             "review:approve",
             "describe:ready",
@@ -708,6 +721,53 @@ fn a_red_check_goes_back_to_the_builder_and_green_is_merged_without_asking_anyon
             "land:done",
         ]
     );
+
+    // The reports were written by a command, once for each version of the
+    // code (the build, the fix after the tester, the fix after CI), into a
+    // directory outside the worktree, and the steps that need them were
+    // briefed with where they are and what their index says.
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|kind| *kind == "artifact.produced")
+            .count(),
+        3
+    );
+    let all_calls = world.calls();
+    let review = all_calls
+        .iter()
+        .rposition(|call| call[0] == "reviewer")
+        .unwrap();
+    let review_brief =
+        std::fs::read_to_string(world.path(&format!("bin/state/brief-{}.md", review + 1))).unwrap();
+    assert!(
+        review_brief.contains("## Reports: `reports`"),
+        "{review_brief}"
+    );
+    assert!(review_brief.contains("No check failed."));
+    assert!(review_brief.contains("A scan hit is a line to look at."));
+    let unit_now = driver.unit().clone();
+    assert!(
+        review_brief.contains(&format!("scanned {}", unit_now.base)),
+        "{{base}} is filled in"
+    );
+    let reports = &unit_now.artifacts["reports"];
+    assert!(reports.path.join("INDEX.txt").exists());
+    assert!(!reports.path.starts_with(&unit_now.worktree));
+    // They describe the last checkpoint, which holds exactly what was published.
+    let toy = world.path("toy");
+    let tree = |commit: &str| run(&toy, "git", &["rev-parse", &format!("{commit}^{{tree}}")]);
+    assert_eq!(tree(&reports.commit), tree(&unit_now.checkpoint));
+    let tester = all_calls
+        .iter()
+        .rposition(|call| call[0] == "tester")
+        .unwrap();
+    let tester_brief =
+        std::fs::read_to_string(world.path(&format!("bin/state/brief-{}.md", tester + 1))).unwrap();
+    assert!(tester_brief.contains("## Reports: `reports`"));
+    // The builder is not given them: its fix step does not say it needs them.
+    let build_brief = std::fs::read_to_string(world.path("bin/state/brief-1.md")).unwrap();
+    assert!(!build_brief.contains("## Reports"));
 
     // The failing log reached the builder's own session, with nothing else re-sent.
     let calls = world.calls();
@@ -764,6 +824,24 @@ fn a_red_check_goes_back_to_the_builder_and_green_is_merged_without_asking_anyon
             .count(),
         3
     );
+    // The merge commit says what landed, what passed, and which bead it was.
+    let body = run(&remote, "git", &["log", "-1", "--format=%b", "main"]);
+    assert!(
+        body.starts_with("The branch adds feature.txt, which the bead asked for."),
+        "{body}"
+    );
+    assert!(body.contains("\n\nTesting: on "), "{body}");
+    assert!(
+        body.replace('\n', " ")
+            .contains("all 2 CI checks passed on pull request 7's head."),
+        "{body}"
+    );
+    assert!(body.trim_end().ends_with("Bead: toy-1"), "{body}");
+    assert!(
+        body.lines().all(|line| line.chars().count() <= 72),
+        "{body}"
+    );
+
     // The bead is closed, the worktree and both copies of the branch are gone.
     let bead = std::fs::read_to_string(world.path("beads/toy-1.json")).unwrap();
     assert!(bead.contains("\"closed\"") && bead.contains(&merged));
