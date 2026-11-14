@@ -456,6 +456,8 @@ fn bullets(items: impl IntoIterator<Item = String>) -> String {
         .join("\n")
 }
 
+const PUBLICATION_TASK: &str = "The change has passed its checks and reviews. Write the commit message and the pull-request title and body for it. The whole change becomes one commit with your message when it lands. Follow this project's rules for commit messages and changelog trailers. Do not mention people with @, and do not refer to issues or pull requests in other repositories.";
+
 /// Render the briefing for an agent step.
 pub fn render(brief: &Brief<'_>) -> String {
     let StepKind::Agent {
@@ -504,9 +506,7 @@ pub fn render(brief: &Brief<'_>) -> String {
     if brief.continuing {
         // The session already knows the bead and the rules. Send what is new.
         let task = match (contract, session) {
-            (Some(Contract::Publication), _) => {
-                "The change has passed its checks and reviews. Write the commit message and the pull-request title and body for it. The factory squashes the whole change into one commit with your message, pushes it and opens the pull request. Follow this project's rules for commit messages and changelog trailers. Do not mention people with @, and do not refer to issues or pull requests in other repositories."
-            }
+            (Some(Contract::Publication), _) => PUBLICATION_TASK,
             (_, SessionRule::Continue(_)) => {
                 "You are continuing your earlier work on this bead. A later step sent it back. Fix what it found, keep every acceptance criterion met, and run the project's commands before you return."
             }
@@ -560,6 +560,15 @@ pub fn render(brief: &Brief<'_>) -> String {
             ),
         };
         section(&mut out, "Where you are", &place);
+        if contract == Some(Contract::Publication) {
+            // A publisher that did not build the change still needs its task.
+            section(&mut out, "Task", PUBLICATION_TASK);
+            section(
+                &mut out,
+                "This project's rules for the text",
+                brief.project.publication_note.as_deref().unwrap_or(""),
+            );
+        }
         section(
             &mut out,
             "Why you are here again",

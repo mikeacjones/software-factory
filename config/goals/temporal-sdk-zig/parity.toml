@@ -3,8 +3,11 @@
 id = "parity"
 default = true
 
-# The pipeline every bead of the goal goes through.
-flow = "zig-sdk"
+# A goal is worked in sub-goals, each landing as one pull request. Every bead
+# goes through the light pipeline and is absorbed into its sub-goal's branch;
+# the heavy pipeline runs once when the director ships the sub-goal.
+flow = "zig-sdk-bead"
+ship_flow = "zig-sdk-ship"
 max_pipelines = 1
 
 # The standing objective, for a goal the owner opens without saying more. The

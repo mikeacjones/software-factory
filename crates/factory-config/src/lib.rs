@@ -341,6 +341,11 @@ pub struct GoalDefinition {
     /// The pipeline each bead of the goal goes through. Without it, the
     /// project's own flow.
     pub flow: Option<String>,
+    /// The pipeline that ships a sub-goal: run once on the sub-goal's branch,
+    /// it opens the one pull request for all its beads and lands it. With it,
+    /// `flow` is the light pipeline of one bead, which ends by absorbing into
+    /// the sub-goal's branch. Without it every bead is its own pull request.
+    pub ship_flow: Option<String>,
     /// The most pipelines the goal may have running at once.
     #[serde(default = "default_pipelines")]
     pub max_pipelines: u32,

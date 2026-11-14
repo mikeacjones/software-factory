@@ -1,0 +1,130 @@
+# The pipeline that ships a sub-goal of the Zig SDK: the heavy half of the
+# pair with zig-sdk-bead. It runs once on the sub-goal's branch, which holds
+# one commit for each bead, every one already built, adversarially tested and
+# reviewed by itself.
+#
+# Here the whole repository is verified once: the fast checks, the unit tests
+# in both modes and every sample against a dev server. Then the review
+# reports are written for the whole diff and a reviewer reads the beads
+# together, which no bead's own reviewer could. One pull request is opened
+# with the commits as they are, CI is watched, and it is squashed onto the
+# default branch. Landing closes every bead of the sub-goal.
+#
+# A failure here has no builder session to return to, so the fix step is a
+# fresh builder on the sub-goal's branch, briefed with the failure.
+id = "zig-sdk-ship"
+start = "fmt"
+
+[[step]]
+id = "fmt"
+kind = "command"
+command = "fmt"
+on.pass = "index"
+on.fail = { to = "fix", max = 2 }
+
+[[step]]
+id = "index"
+kind = "command"
+command = "samples-index"
+on.pass = "readme"
+on.fail = { to = "fix", max = 2 }
+
+[[step]]
+id = "readme"
+kind = "command"
+command = "readme"
+on.pass = "changelog"
+on.fail = { to = "fix", max = 2 }
+
+[[step]]
+id = "changelog"
+kind = "command"
+command = "changelog"
+on.pass = "test"
+on.fail = { to = "fix", max = 2 }
+
+[[step]]
+id = "test"
+kind = "command"
+command = "test"
+on.pass = "test-safe"
+on.fail = { to = "fix", max = 3 }
+
+[[step]]
+id = "test-safe"
+kind = "command"
+command = "test-releasesafe"
+on.pass = "samples"
+on.fail = { to = "fix", max = 3 }
+
+[[step]]
+id = "samples"
+kind = "command"
+command = "samples-test"
+on.pass = "reports"
+on.fail = { to = "fix", max = 3 }
+
+[[step]]
+id = "reports"
+kind = "command"
+command = "reports"
+policy = "report-only"
+produces = "reports"
+on.pass = "review"
+on.fail = "park"
+
+# The beads read together: do they fit, does the whole meet the sub-goal?
+[[step]]
+id = "review"
+kind = "agent"
+role = "reviewer"
+model = "claude-opus-5-5"
+effort = "medium"
+session = "fresh"
+workspace = "scratch"
+needs = ["reports"]
+on.approve = "describe"
+on.rework = { to = "fix", max = 2 }
+on.needs_owner = { to = "ask", max = 2 }
+
+[[step]]
+id = "fix"
+kind = "agent"
+role = "builder"
+model = "claude-opus-5-5"
+effort = "medium"
+session = "fresh"
+writes = ["code"]
+on.done = { to = "fmt", max = 6 }
+on.needs_owner = { to = "ask", max = 2 }
+
+# The text of the one pull request, and of the one commit it becomes.
+[[step]]
+id = "describe"
+kind = "agent"
+role = "publisher"
+model = "claude-opus-5-5"
+effort = "medium"
+session = "fresh"
+on.ready = "publish"
+
+[[step]]
+id = "publish"
+kind = "action"
+action = "publish"
+on.done = "ci"
+on.failed = { to = "describe", max = 2 }
+
+[[step]]
+id = "ci"
+kind = "action"
+action = "await-ci"
+on.green = "land"
+on.red = { to = "fix", max = 2 }
+
+[[step]]
+id = "land"
+kind = "action"
+action = "land"
+on.done = "end"
+on.failed = "park"

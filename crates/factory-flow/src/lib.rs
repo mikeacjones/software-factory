@@ -209,7 +209,7 @@ pub struct ActionSpec {
     pub required: &'static [&'static str],
 }
 
-pub const ACTIONS: [ActionSpec; 3] = [
+pub const ACTIONS: [ActionSpec; 4] = [
     // One final commit, a push, and the pull request.
     ActionSpec {
         name: "publish",
@@ -222,6 +222,13 @@ pub const ACTIONS: [ActionSpec; 3] = [
         name: "await-ci",
         outcomes: &["green", "red"],
         required: &["green", "red"],
+    },
+    // Add the unit's change, as one commit, to the branch of the sub-goal it
+    // belongs to. Nothing is pushed and the bead stays open.
+    ActionSpec {
+        name: "absorb",
+        outcomes: &["done", "failed"],
+        required: &["done"],
     },
     // Merge the pull request, confirm it, close the bead.
     ActionSpec {

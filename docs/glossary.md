@@ -62,6 +62,10 @@ One Claude Code conversation, named by its session ID. An agent step starts a fr
 
 An objective the owner wants reached on a project, with the condition that ends it. It starts as a conversation in Slack, runs on events, and ends when the owner accepts that the condition is met.
 
+## sub-goal
+
+A part of a goal that lands as one pull request, such as one feature. It has a branch of its own that its beads are absorbed into, one commit each, and it is shipped once: verified as a whole, opened as a pull request, and squashed onto the default branch, which closes its beads.
+
 ## pipeline
 
 What one bead goes through from being started to being landed: a unit walking its flow. A goal runs pipelines, up to its cap at a time.

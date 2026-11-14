@@ -31,7 +31,7 @@ use factory_supervise::Control;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::{Driver, DriverError, Options, Status, bead_source};
+use crate::{Driver, DriverError, Options, Ship, Status, Within, bead_source};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -110,14 +110,39 @@ impl BeadEdit {
     }
 }
 
+/// A part of the goal that lands as one pull request: a branch of its own
+/// that beads are absorbed into, shipped when the director says it is whole.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SubGoal {
+    /// A short slug, which also names its branch.
+    pub id: String,
+    pub title: String,
+    pub objective: String,
+    /// The beads the director meant it to hold when it was opened.
+    pub planned: Vec<String>,
+    pub branch: String,
+    pub worktree: PathBuf,
+    /// The commit of the default branch it started from.
+    pub base: String,
+    /// `open`, `shipping`, `parked` or `landed`.
+    pub state: String,
+    /// The beads whose work is on its branch, with the commit each became.
+    pub absorbed: Vec<(String, String)>,
+    pub ship_unit: Option<String>,
+    pub pull_request: Option<String>,
+}
+
 /// One pipeline the goal started.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GoalUnit {
     pub bead: String,
     pub unit: Option<String>,
-    /// `running`, `landed`, `published`, `parked`, `refused` or `failed`.
+    /// `running`, `absorbed`, `landed`, `published`, `parked`, `refused` or `failed`.
     pub state: String,
     pub detail: String,
+    /// Whether this pipeline ships a sub-goal; `bead` is then the sub-goal's ID.
+    #[serde(default)]
+    pub ship: bool,
 }
 
 /// Something the director has not been told yet.
@@ -136,6 +161,12 @@ pub enum Happening {
         pull_request: Option<String>,
         /// What its tester and reviewer found that was not fixed.
         findings: Vec<Value>,
+        /// The commit the bead became on its sub-goal's branch, if absorbed.
+        #[serde(default)]
+        commit: Option<String>,
+        /// Whether this was a sub-goal being shipped; `bead` is then its ID.
+        #[serde(default)]
+        ship: bool,
     },
     RequestAnswered {
         approved: bool,
@@ -167,6 +198,8 @@ pub struct Goal {
     /// Bead changes shown in the charter, applied when the owner starts the goal.
     pub charter_edits: Vec<BeadEdit>,
     pub units: Vec<GoalUnit>,
+    #[serde(default)]
+    pub subgoals: Vec<SubGoal>,
     pub inbox: Vec<Happening>,
     pub request: Option<Request>,
     /// The message that carries buttons right now, and its text.
@@ -180,6 +213,19 @@ pub struct Goal {
 }
 
 impl Goal {
+    /// The sub-goal that has not landed yet, if there is one.
+    pub fn current(&self) -> Option<&SubGoal> {
+        self.subgoals.iter().find(|sub| sub.state != "landed")
+    }
+
+    /// The beads the current sub-goal has absorbed: open in the tracker, but
+    /// done as far as the blockers of its other beads go.
+    fn absorbed(&self) -> Vec<String> {
+        self.current()
+            .map(|sub| sub.absorbed.iter().map(|(bead, _)| bead.clone()).collect())
+            .unwrap_or_default()
+    }
+
     fn running(&self) -> usize {
         self.units
             .iter()
@@ -260,6 +306,13 @@ pub fn wake_schema() -> Value {
             "finding": text_schema("Which finding, by its label."),
             "reason": text_schema("Why it is not worth a bead."),
         }))},
+        "open_subgoal": object_schema(json!({
+            "id": text_schema("A short slug for a new sub-goal, such as `signals`: lowercase letters, digits and dashes. It names the branch. Empty to open none."),
+            "title": text_schema("What the sub-goal delivers, as the title its one pull request could carry."),
+            "objective": text_schema("What will be true when it has landed."),
+            "beads": { "type": "array", "items": { "type": "string" }, "description": "The beads you mean it to hold, in the order you would run them." },
+        })),
+        "ship": { "type": "boolean", "description": "True to ship the open sub-goal now: its branch gets the whole verification once, one pull request, and lands. Only when every bead you meant for it is absorbed and no pipeline is running." },
         "ask_owner": text_schema("One question only the owner can answer, or empty."),
         "complete": { "type": "boolean", "description": "True to propose that the stop condition is met. The owner decides." },
         "evidence": text_schema("When complete: how the stop condition is met, point by point, with what you checked. Otherwise empty."),
@@ -319,9 +372,46 @@ pub fn decision_problems(
     let mut problems = Vec::new();
     let known = |id: &str| tracker.iter().any(|bead| bead.id == id);
     let complete = result.get("complete").and_then(Value::as_bool) == Some(true);
+    let ship = result.get("ship").and_then(Value::as_bool) == Some(true);
+    let batched = definition.ship_flow.is_some();
     if strings(result, "summary").trim().is_empty() {
         problems.push("`summary` is empty".to_string());
     }
+
+    // Sub-goals: one at a time, each landing as one pull request.
+    let opening = result
+        .get("open_subgoal")
+        .filter(|sub| !strings(sub, "id").trim().is_empty());
+    let current = goal.current();
+    if let Some(sub) = opening {
+        let id = strings(sub, "id").trim();
+        let slug = id.len() <= 40
+            && id
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+        if !batched {
+            problems.push("open_subgoal: this goal lands every bead as its own pull request and has no sub-goals".to_string());
+        } else if let Some(open) = current {
+            problems.push(format!(
+                "open_subgoal: sub-goal `{}` has not landed yet: ship it before opening another",
+                open.id
+            ));
+        }
+        if !slug {
+            problems.push(format!(
+                "open_subgoal: `{id}` is not a slug of lowercase letters, digits and dashes"
+            ));
+        }
+        if goal.subgoals.iter().any(|earlier| earlier.id == id) {
+            problems.push(format!(
+                "open_subgoal: this goal already had a sub-goal `{id}`"
+            ));
+        }
+        if strings(sub, "title").trim().is_empty() || strings(sub, "objective").trim().is_empty() {
+            problems.push("open_subgoal: it needs a title and an objective".to_string());
+        }
+    }
+    let absorbed = goal.absorbed();
 
     let mut starting: Vec<&str> = Vec::new();
     for start in items(result, "start") {
@@ -331,7 +421,11 @@ pub fn decision_problems(
             continue;
         }
         starting.push(bead);
-        if !known(bead) {
+        if absorbed.iter().any(|done| done == bead) {
+            problems.push(format!(
+                "start: `{bead}` is already absorbed in the open sub-goal"
+            ));
+        } else if !known(bead) {
             problems.push(format!(
                 "start: `{bead}` is not an open bead of this project"
             ));
@@ -345,12 +439,46 @@ pub fn decision_problems(
             }
         }
     }
-    let in_flight = goal.running() + starting.len();
-    if in_flight > definition.max_pipelines as usize {
+    if batched && !starting.is_empty() {
+        match current {
+            None if opening.is_none() => problems.push(
+                "start: a bead runs inside a sub-goal: open one with `open_subgoal` in the same result".to_string(),
+            ),
+            Some(open) if open.state != "open" => problems.push(format!(
+                "start: sub-goal `{}` is being shipped: nothing more can join it",
+                open.id
+            )),
+            _ => {}
+        }
+    }
+    let shipping_now = usize::from(ship);
+    let in_flight = goal.running() + starting.len() + shipping_now;
+    if goal.running() + starting.len() > definition.max_pipelines as usize {
         problems.push(format!(
-            "start: that would make {in_flight} pipelines at once, and this goal may run {}",
+            "start: that would make {} pipelines at once, and this goal may run {}",
+            goal.running() + starting.len(),
             definition.max_pipelines
         ));
+    }
+    if ship {
+        match current {
+            _ if !batched => problems.push("ship: this goal has no sub-goals to ship".to_string()),
+            None => problems.push("ship: no sub-goal is open".to_string()),
+            Some(open) if open.absorbed.is_empty() => problems.push(format!(
+                "ship: sub-goal `{}` has absorbed no bead yet",
+                open.id
+            )),
+            Some(open) if open.state == "shipping" => problems.push(format!(
+                "ship: sub-goal `{}` is already being shipped",
+                open.id
+            )),
+            Some(_) => {}
+        }
+        if goal.running() > 0 || !starting.is_empty() || opening.is_some() {
+            problems.push(
+                "ship: a sub-goal ships when nothing else is running or starting".to_string(),
+            );
+        }
     }
 
     for file in items(result, "file") {
@@ -385,11 +513,17 @@ pub fn decision_problems(
                     .to_string(),
             );
         }
-        if !starting.is_empty() || goal.running() > 0 {
+        if in_flight > 0 {
             problems.push(
                 "complete: a goal cannot be complete while a pipeline is running or being started"
                     .to_string(),
             );
+        }
+        if let Some(open) = current.filter(|open| !open.absorbed.is_empty()) {
+            problems.push(format!(
+                "complete: sub-goal `{}` holds work that has not landed: ship it first",
+                open.id
+            ));
         }
     }
     // A goal must never be left with nothing that can move it.
@@ -400,22 +534,24 @@ pub fn decision_problems(
             && !items(result, "file").is_empty());
     if in_flight == 0 && !asks_owner && !complete && !needs_approval {
         problems.push(
-            "nothing would be running and nobody would be asked: start a pipeline, ask the owner, or propose that the goal is complete"
+            "nothing would be running and nobody would be asked: start a pipeline, ship the sub-goal, ask the owner, or propose that the goal is complete"
                 .to_string(),
         );
     }
     problems
 }
 
-fn table(tracker: &[Summary]) -> String {
+fn table(tracker: &[Summary], done: &[String]) -> String {
     let mut out = String::from("id | P | type | state | title\n");
     for bead in tracker.iter().take(300) {
-        let state = if bead.launchable() {
+        let state = if done.contains(&bead.id) {
+            "absorbed in the open sub-goal".to_string()
+        } else if bead.launchable_given(done) {
             "launchable".to_string()
         } else if bead.status != "open" {
             bead.status.clone()
         } else if bead.blocked {
-            "blocked".to_string()
+            format!("blocked by {}", bead.blockers.join(", "))
         } else if !bead.has_criteria {
             "no acceptance criteria".to_string()
         } else {
@@ -438,8 +574,13 @@ fn permission_text(definition: &GoalDefinition) -> String {
         Permission::Ask => "is put to the owner, who approves or rejects it",
     };
     format!(
-        "- Starting a pipeline: carried out at once, on a launchable bead, up to {} at a time.\n- Filing a new bead {}.\n- Changing a bead that exists (criteria, priority, deferral) {}.\n- Ending the goal: you propose, the owner decides.",
+        "- Starting a pipeline: carried out at once, on a launchable bead, up to {} at a time.{}\n- Filing a new bead {}.\n- Changing a bead that exists (criteria, priority, deferral) {}.\n- Ending the goal: you propose, the owner decides.",
         definition.max_pipelines,
+        if definition.ship_flow.is_some() {
+            "\n- Sub-goals: a bead runs inside a sub-goal, one sub-goal at a time. Its pipeline is light and ends by absorbing the bead's one commit into the sub-goal's branch; the bead stays open. Shipping the sub-goal runs the whole verification once, opens one pull request for all of it, and lands it, which closes its beads. A bead blocked only by beads the open sub-goal has absorbed is launchable."
+        } else {
+            ""
+        },
         say(definition.permissions.file_beads),
         say(definition.permissions.edit_beads),
     )
@@ -484,10 +625,16 @@ pub fn wake_brief(
                 detail,
                 pull_request,
                 findings,
+                ship,
                 ..
             } => {
                 out.push_str(&format!(
-                    "- The pipeline for `{bead}` ended: **{outcome}**. {detail}"
+                    "- {} `{bead}` ended: **{outcome}**. {detail}",
+                    if *ship {
+                        "Shipping the sub-goal"
+                    } else {
+                        "The pipeline for"
+                    }
                 ));
                 if let Some(url) = pull_request {
                     out.push_str(&format!(" Pull request: {url}"));
@@ -509,6 +656,42 @@ pub fn wake_brief(
             }
         }
     }
+    if definition.ship_flow.is_some() {
+        out.push_str("\n## Sub-goals\n\n");
+        if goal.subgoals.is_empty() {
+            out.push_str("None opened yet.\n");
+        }
+        for sub in &goal.subgoals {
+            let absorbed: Vec<&str> = sub.absorbed.iter().map(|(bead, _)| bead.as_str()).collect();
+            let waiting: Vec<&str> = sub
+                .planned
+                .iter()
+                .map(String::as_str)
+                .filter(|bead| !absorbed.contains(bead))
+                .collect();
+            out.push_str(&format!(
+                "- `{}` ({}): {}. Branch `{}`. Absorbed: {}. Planned and not yet absorbed: {}.{}\n",
+                sub.id,
+                sub.state,
+                sub.title,
+                sub.branch,
+                if absorbed.is_empty() {
+                    "none".to_string()
+                } else {
+                    absorbed.join(", ")
+                },
+                if waiting.is_empty() {
+                    "none".to_string()
+                } else {
+                    waiting.join(", ")
+                },
+                sub.pull_request
+                    .as_ref()
+                    .map(|url| format!(" Pull request: {url}"))
+                    .unwrap_or_default(),
+            ));
+        }
+    }
     out.push_str(&format!(
         "\n## Pipelines of this goal\n\n{} running; this goal may run {} at a time.\n",
         goal.running(),
@@ -522,7 +705,7 @@ pub fn wake_brief(
     }
     out.push_str(&format!(
         "\n## The tracker: open work, most urgent first\n\n{}\nOnly a `launchable` bead can be started. Look at any bead in full with `bd show <id>`.\n",
-        table(tracker)
+        table(tracker, &goal.absorbed())
     ));
     for (title, text) in [
         ("Your journal for this goal", journal),
@@ -590,6 +773,29 @@ pub fn check_definitions(config: &ConfigDir) -> Result<Vec<String>, DriverError>
             }
             let (flow, _) = crate::load_flow(config, &factory, &with_flow)
                 .map_err(|err| refuse(format!("its pipeline cannot be used: {err}")))?;
+            if let Some(ship) = &definition.ship_flow {
+                let ends_with = |flow: &factory_flow::Flow, action: &str| {
+                    flow.steps.iter().any(|step| {
+                        matches!(&step.kind, factory_flow::StepKind::Action { action: named } if named == action)
+                    })
+                };
+                if !ends_with(&flow, "absorb") {
+                    return Err(refuse(format!(
+                        "it ships sub-goals, so its bead pipeline `{}` must end by absorbing into one (action `absorb`)",
+                        flow.id
+                    )));
+                }
+                let mut with_ship = project.clone();
+                with_ship.flow = ship.clone();
+                let (ship_flow, _) = crate::load_flow(config, &factory, &with_ship)
+                    .map_err(|err| refuse(format!("its ship pipeline cannot be used: {err}")))?;
+                if !ends_with(&ship_flow, "land") {
+                    return Err(refuse(format!(
+                        "its ship pipeline `{}` never lands (action `land`)",
+                        ship_flow.id
+                    )));
+                }
+            }
             if !factory.allowed_models.contains(&definition.director.model) {
                 return Err(refuse(format!(
                     "the director's model `{}` is not allowed",
@@ -846,6 +1052,21 @@ impl Supervisor {
         }
     }
 
+    /// Open a goal as an owner's message would, without Slack: for driving a
+    /// goal from somewhere other than a channel. Returns its ID.
+    pub fn open_directly(&mut self, project: &str, text: &str) -> Result<String, DriverError> {
+        let owner = self.owners.first().cloned().unwrap_or_default();
+        self.open_goal(project, "", &now_unix().to_string(), &owner, text)?;
+        self.goals
+            .values()
+            .filter(|goal| goal.project == project)
+            .max_by_key(|goal| goal.started_at)
+            .map(|goal| goal.id.clone())
+            .ok_or_else(|| {
+                DriverError::Preflight(format!("project `{project}` has no goal definition"))
+            })
+    }
+
     fn open_goal(
         &mut self,
         project: &str,
@@ -879,6 +1100,7 @@ impl Supervisor {
             charter: None,
             charter_edits: Vec::new(),
             units: Vec::new(),
+            subgoals: Vec::new(),
             inbox: Vec::new(),
             request: None,
             prompt: None,
@@ -1241,7 +1463,7 @@ impl Supervisor {
                         "# A new goal on project `{}`\n\nThe owner opened it with this message:\n\n{}\n{standing}\n## The tracker: open work, most urgent first\n\n{}\n## Project memory\n\n{}\n\n## What the director of this goal may decide once it runs\n\n{}\n",
                         goal.project,
                         quote_plain(owner_text),
-                        table(&tracker),
+                        table(&tracker, &[]),
                         if memory.trim().is_empty() {
                             "(empty)"
                         } else {
@@ -1429,8 +1651,13 @@ impl Supervisor {
         let memory = std::fs::read_to_string(self.memory_path(&goal.project)).unwrap_or_default();
         let brief = wake_brief(&definition, &goal, &tracker, &journal, &memory);
 
+        let done = goal.absorbed();
         let launchable = |bead: &str| match source.read(bead) {
-            Ok(bead) => readiness(&bead, &project.bead_actor),
+            Ok(mut bead) => {
+                // Work the open sub-goal has absorbed counts as done.
+                bead.open_blockers.retain(|blocker| !done.contains(blocker));
+                readiness(&bead, &project.bead_actor)
+            }
             Err(_) => vec!["unknown".to_string()],
         };
         let snapshot = goal.clone();
@@ -1585,42 +1812,227 @@ impl Supervisor {
                 }],
             );
         }
+        // A new sub-goal gets its branch before anything can start in it.
+        let opening = result
+            .get("open_subgoal")
+            .filter(|sub| !strings(sub, "id").trim().is_empty());
+        if let Some(sub) = opening {
+            match self.open_subgoal(&goal, &project, sub) {
+                Ok(sub) => {
+                    self.say(&goal, &format!(
+                        ":seedling: *Sub-goal opened:* {} (`{}`)\n{}\nBranch `{}`. Its beads are absorbed there and it lands as one pull request.",
+                        escape(&sub.title),
+                        sub.id,
+                        quote(&truncate(&sub.objective, 800)),
+                        escape(&sub.branch)
+                    ));
+                    self.log(&goal, "subgoal.opened", json!({ "id": sub.id, "branch": sub.branch, "base": sub.base, "planned": sub.planned }));
+                    goal.subgoals.push(sub);
+                }
+                Err(err) => {
+                    // Nothing can start without the branch: tell the director.
+                    self.say(
+                        &goal,
+                        &format!(
+                            ":x: Could not open the sub-goal: {}",
+                            escape(&err.to_string())
+                        ),
+                    );
+                    goal.inbox.push(Happening::RequestAnswered {
+                        approved: false,
+                        what: format!(
+                            "the factory could not open the sub-goal ({err}); nothing was started"
+                        ),
+                    });
+                    goal.retry_at = Some(now_unix() + 60);
+                    return self.save(goal);
+                }
+            }
+        }
         for start in items(&result, "start") {
             let bead = strings(start, "bead").to_string();
+            let within = match goal.current() {
+                Some(sub) if definition.ship_flow.is_some() => Some(Within::Bead {
+                    tip: factory_git::rev_parse(&sub.worktree, "HEAD")?,
+                    worktree: sub.worktree.clone(),
+                    absorbed: goal.absorbed(),
+                }),
+                _ => None,
+            };
             goal.units.push(GoalUnit {
                 bead: bead.clone(),
                 unit: None,
                 state: "running".to_string(),
                 detail: String::new(),
+                ship: false,
             });
             self.log(
                 &goal,
                 "pipeline.started",
-                json!({ "bead": bead, "reason": strings(start, "reason") }),
+                json!({ "bead": bead, "reason": strings(start, "reason"), "subgoal": goal.current().map(|sub| sub.id.clone()) }),
             );
-            self.launch(&goal, &definition, bead, None);
+            self.launch(&goal, definition.flow.clone(), bead, within, None);
+        }
+        if result.get("ship").and_then(Value::as_bool) == Some(true) {
+            self.ship(&mut goal, &definition, &source)?;
         }
         self.save(goal)
     }
 
+    /// Give a new sub-goal its branch and worktree, from the default branch
+    /// as it is now, and run the project's setup in it.
+    fn open_subgoal(
+        &self,
+        goal: &Goal,
+        project: &Project,
+        spec: &Value,
+    ) -> Result<SubGoal, DriverError> {
+        let id = strings(spec, "id").trim().to_string();
+        let repo = &project.repo;
+        factory_git::fetch(repo, &project.remote)?;
+        let base = factory_git::rev_parse(
+            repo,
+            &format!("{}/{}", project.remote, project.default_branch),
+        )?;
+        let branch = format!("{}/{id}", project.branch_prefix("feature"));
+        if factory_git::branch_exists(repo, &branch)? {
+            return Err(DriverError::Preflight(format!(
+                "the branch `{branch}` already exists in {}",
+                repo.display()
+            )));
+        }
+        let worktree = self
+            .factory
+            .state_dir
+            .join("worktrees")
+            .join(format!("{}-{id}", goal.id));
+        if let Some(parent) = worktree.parent() {
+            std::fs::create_dir_all(parent).map_err(crate::io(parent))?;
+        }
+        factory_git::worktree_add(repo, &worktree, &branch, &base)?;
+        for name in &project.setup {
+            let command = &project.commands[name];
+            let ran = factory_checks::run_command(
+                &command.argv,
+                &worktree,
+                Duration::from_secs(command.timeout_secs),
+            );
+            if ran.verdict != factory_checks::Verdict::Passed {
+                return Err(DriverError::Preflight(format!(
+                    "setup command `{name}` did not pass in the sub-goal's worktree ({:?})",
+                    ran.verdict
+                )));
+            }
+        }
+        Ok(SubGoal {
+            id,
+            title: strings(spec, "title").trim().to_string(),
+            objective: strings(spec, "objective").trim().to_string(),
+            planned: items(spec, "beads")
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect(),
+            branch,
+            worktree,
+            base,
+            state: "open".to_string(),
+            absorbed: Vec::new(),
+            ship_unit: None,
+            pull_request: None,
+        })
+    }
+
+    /// Ship the open sub-goal: the heavy pipeline, once, on its branch. A
+    /// sub-goal whose shipping parked is continued where it stopped.
+    fn ship(
+        &mut self,
+        goal: &mut Goal,
+        definition: &GoalDefinition,
+        source: &Source,
+    ) -> Result<(), DriverError> {
+        let Some(index) = goal.subgoals.iter().position(|sub| sub.state != "landed") else {
+            return Ok(());
+        };
+        let sub = goal.subgoals[index].clone();
+        let closes: Vec<String> = sub.absorbed.iter().map(|(bead, _)| bead.clone()).collect();
+        let mut criteria = String::new();
+        let mut list = String::new();
+        for bead in &closes {
+            if let Ok(bead) = source.read(bead) {
+                list.push_str(&format!("- {}: {}\n", bead.id, bead.title));
+                criteria.push_str(&format!(
+                    "### {}: {}\n\n{}\n\n",
+                    bead.id,
+                    bead.title,
+                    bead.acceptance_criteria.trim()
+                ));
+            }
+        }
+        let ship = Ship {
+            id: format!("{}-{}", goal.project, sub.id),
+            title: sub.title.clone(),
+            description: format!(
+                "{}\n\nThis is a sub-goal of the goal `{}`. Its branch holds one commit for each of these beads, each already built, adversarially tested and reviewed on its own:\n\n{list}",
+                sub.objective, goal.id
+            ),
+            acceptance_criteria: criteria,
+            worktree: sub.worktree.clone(),
+            branch: sub.branch.clone(),
+            base: sub.base.clone(),
+            closes,
+        };
+        goal.units.push(GoalUnit {
+            bead: sub.id.clone(),
+            unit: None,
+            state: "running".to_string(),
+            detail: String::new(),
+            ship: true,
+        });
+        goal.subgoals[index].state = "shipping".to_string();
+        self.log(
+            goal,
+            "subgoal.shipping",
+            json!({ "id": sub.id, "beads": ship.closes, "resumes": sub.ship_unit }),
+        );
+        self.say(goal, &format!(
+            ":package: *Shipping sub-goal* `{}`: {} bead(s), one pull request. The whole verification runs once on its branch.",
+            sub.id,
+            ship.closes.len()
+        ));
+        let flow = definition.ship_flow.clone();
+        self.launch(
+            goal,
+            flow,
+            sub.id.clone(),
+            Some(Within::Ship(ship)),
+            sub.ship_unit.clone(),
+        );
+        Ok(())
+    }
+
     /// Run one pipeline on a thread of its own, and report back when it ends.
+    /// `name` is the bead, or the sub-goal when `within` ships one.
     fn launch(
         &self,
         goal: &Goal,
-        definition: &GoalDefinition,
-        bead: String,
+        flow: Option<String>,
+        name: String,
+        within: Option<Within>,
         resume: Option<String>,
     ) {
         let (config, sender) = (self.config.clone(), self.sender.clone());
         let (goal_id, project) = (goal.id.clone(), goal.project.clone());
+        let ship = matches!(within, Some(Within::Ship(_)));
         let options = Options {
             slack: self.unit_slack,
-            flow: definition.flow.clone(),
+            flow,
+            within,
         };
         std::thread::spawn(move || {
             let ended =
                 |outcome: &str, detail: String, driver: Option<&Driver>| Happening::PipelineEnded {
-                    bead: bead.clone(),
+                    bead: name.clone(),
                     unit: driver.map(|driver| driver.unit().id.to_string()),
                     outcome: outcome.to_string(),
                     detail,
@@ -1641,23 +2053,34 @@ impl Supervisor {
                                 .collect()
                         })
                         .unwrap_or_default(),
+                    commit: driver.and_then(|driver| driver.unit().absorbed.clone()),
+                    ship,
                 };
             let started = match &resume {
                 Some(unit) => Driver::resume(config, unit, &options, None),
-                None => Driver::start(config, &project, &bead, &options),
+                None => Driver::start(config, &project, &name, &options),
             };
             let happening = match started {
                 Err(err) => ended("refused", err.to_string(), None),
                 Ok(mut driver) => {
                     let _ = sender.send(Internal::Began {
                         goal: goal_id.clone(),
-                        bead: bead.clone(),
+                        bead: name.clone(),
                         unit: driver.unit().id.to_string(),
                     });
                     match driver.run() {
                         Ok(Status::Ended) if driver.unit().merged.is_some() => ended(
                             "landed",
-                            "Its change is merged and its bead is closed.".to_string(),
+                            if ship {
+                                "Its pull request is merged and its beads are closed.".to_string()
+                            } else {
+                                "Its change is merged and its bead is closed.".to_string()
+                            },
+                            Some(&driver),
+                        ),
+                        Ok(Status::Ended) if driver.unit().absorbed.is_some() => ended(
+                            "absorbed",
+                            "Its change is one commit on the sub-goal's branch. The bead stays open until the sub-goal lands.".to_string(),
                             Some(&driver),
                         ),
                         Ok(Status::Ended) => ended(
@@ -1710,6 +2133,7 @@ impl Supervisor {
                     let Some(mut goal) = self.goals.get(&goal).cloned() else {
                         continue;
                     };
+                    let mut ship = false;
                     if let Some(entry) = goal
                         .units
                         .iter_mut()
@@ -1717,8 +2141,17 @@ impl Supervisor {
                         .find(|u| u.bead == bead && u.state == "running")
                     {
                         entry.unit = Some(unit.clone());
+                        ship = entry.ship;
                     }
-                    self.say(&goal, &format!(":arrow_forward: Pipeline started for `{}` (run `{unit}`). It reports in its own thread in this channel.", escape(&bead)));
+                    if ship && let Some(sub) = goal.subgoals.iter_mut().find(|sub| sub.id == bead) {
+                        // Remembered, so that shipping can be continued if it parks.
+                        sub.ship_unit = Some(unit.clone());
+                    }
+                    self.say(&goal, &format!(
+                        ":arrow_forward: {} `{}` started (run `{unit}`). It reports in its own thread in this channel.",
+                        if ship { "Shipping of sub-goal" } else { "Pipeline for" },
+                        escape(&bead)
+                    ));
                     self.save(goal)?;
                 }
                 Internal::Ended { goal, happening } => {
@@ -1732,6 +2165,8 @@ impl Supervisor {
                         detail,
                         unit,
                         pull_request,
+                        commit,
+                        ship,
                         ..
                     } = &happening
                     {
@@ -1745,14 +2180,36 @@ impl Supervisor {
                             entry.detail = truncate(detail, 300);
                             entry.unit = unit.clone().or(entry.unit.take());
                         }
+                        if *ship {
+                            if let Some(sub) = goal.subgoals.iter_mut().find(|sub| &sub.id == bead)
+                            {
+                                sub.state = if outcome == "landed" {
+                                    "landed"
+                                } else {
+                                    "parked"
+                                }
+                                .to_string();
+                                sub.pull_request = pull_request.clone().or(sub.pull_request.take());
+                            }
+                        } else if let (Some(commit), Some(sub)) = (
+                            commit,
+                            goal.subgoals.iter_mut().find(|sub| sub.state == "open"),
+                        ) {
+                            sub.absorbed.push((bead.clone(), commit.clone()));
+                        }
                         self.say(
                             &goal,
                             &format!(
-                                "{} Pipeline for `{}` ended: *{outcome}*. {}{}",
-                                if outcome == "landed" {
+                                "{} {} `{}` ended: *{outcome}*. {}{}",
+                                if matches!(outcome.as_str(), "landed" | "absorbed") {
                                     ":white_check_mark:"
                                 } else {
                                     ":double_vertical_bar:"
+                                },
+                                if *ship {
+                                    "Shipping of sub-goal"
+                                } else {
+                                    "Pipeline for"
                                 },
                                 escape(bead),
                                 escape(&truncate(detail, 500)),
@@ -1777,7 +2234,7 @@ impl Supervisor {
     pub fn resume(&mut self) -> Result<(), DriverError> {
         let ids: Vec<String> = self.goals.keys().cloned().collect();
         for id in ids {
-            let goal = self.goals[&id].clone();
+            let mut goal = self.goals[&id].clone();
             if !matches!(goal.phase, Phase::Running | Phase::Stopped) {
                 continue;
             }
@@ -1786,15 +2243,41 @@ impl Supervisor {
             for unit in goal.units.iter().filter(|unit| unit.state == "running") {
                 match &unit.unit {
                     Some(unit_id) => {
-                        self.launch(&goal, &definition, unit.bead.clone(), Some(unit_id.clone()))
+                        let flow = if unit.ship {
+                            definition.ship_flow.clone()
+                        } else {
+                            definition.flow.clone()
+                        };
+                        self.launch(&goal, flow, unit.bead.clone(), None, Some(unit_id.clone()));
                     }
-                    // It never got as far as having a unit: start it again.
+                    // It never got as far as having a unit. The director is
+                    // told, and decides again with the tracker as it is now.
                     None => lost.push(unit.bead.clone()),
                 }
             }
             for bead in lost {
-                self.launch(&goal, &definition, bead, None);
+                if let Some(entry) = goal
+                    .units
+                    .iter_mut()
+                    .find(|u| u.bead == bead && u.state == "running")
+                {
+                    entry.state = "failed".to_string();
+                }
+                if let Some(sub) = goal
+                    .subgoals
+                    .iter_mut()
+                    .find(|sub| sub.id == bead && sub.state == "shipping")
+                {
+                    sub.state = "parked".to_string();
+                }
+                goal.inbox.push(Happening::RequestAnswered {
+                    approved: false,
+                    what: format!(
+                        "the factory restarted before `{bead}` had started; it did not run"
+                    ),
+                });
             }
+            self.save(goal)?;
             self.wake(&id)?;
         }
         Ok(())
@@ -1848,6 +2331,7 @@ mod tests {
             assignee: String::new(),
             has_criteria: criteria,
             blocked: false,
+            blockers: Vec::new(),
         };
         vec![bead("toy-1", true), bead("toy-2", false)]
     }
@@ -1909,6 +2393,7 @@ mod tests {
             unit: None,
             state: "running".into(),
             detail: String::new(),
+            ship: false,
         });
         assert_eq!(
             problems(
@@ -1926,6 +2411,144 @@ mod tests {
                 json!({"start": [{"bead": "toy-1", "reason": ""}]})
             )
             .is_empty()
+        );
+    }
+
+    /// A definition that works in sub-goals.
+    fn batched() -> GoalDefinition {
+        toml::from_str("id = \"d\"\nflow = \"bead\"\nship_flow = \"ship\"\n[director]\nmodel = \"m\"\neffort = \"high\"\n").unwrap()
+    }
+
+    fn with_subgoal(state: &str, absorbed: &[&str]) -> Goal {
+        let mut goal = goal();
+        goal.subgoals.push(SubGoal {
+            id: "signals".into(),
+            title: "Signals".into(),
+            objective: "Signals work.".into(),
+            planned: vec!["toy-1".into(), "toy-2".into()],
+            branch: "feat/signals".into(),
+            worktree: PathBuf::from("/tmp/signals"),
+            base: "abc".into(),
+            state: state.into(),
+            absorbed: absorbed
+                .iter()
+                .map(|bead| (bead.to_string(), "c0ffee".to_string()))
+                .collect(),
+            ship_unit: None,
+            pull_request: None,
+        });
+        goal
+    }
+
+    const OPEN: &str = r#"{"id": "signals", "title": "Signals", "objective": "Signals work.", "beads": ["toy-1"]}"#;
+
+    #[test]
+    fn a_bead_runs_inside_a_sub_goal_and_one_sub_goal_is_open_at_a_time() {
+        let d = batched();
+        let start = json!({"start": [{"bead": "toy-1", "reason": "first"}]});
+        // No sub-goal: the start is refused. Opening one in the same result is the way.
+        assert_eq!(
+            problems(&d, &goal(), start.clone()),
+            [
+                "start: a bead runs inside a sub-goal: open one with `open_subgoal` in the same result"
+            ]
+        );
+        let mut both = start.clone();
+        both["open_subgoal"] = serde_json::from_str(OPEN).unwrap();
+        assert_eq!(problems(&d, &goal(), both.clone()), Vec::<String>::new());
+        // With one open, the start needs nothing more, and a second cannot be opened.
+        assert_eq!(
+            problems(&d, &with_subgoal("open", &[]), start.clone()),
+            Vec::<String>::new()
+        );
+        let mut second = both.clone();
+        second["open_subgoal"]["id"] = json!("timers");
+        assert_eq!(
+            problems(&d, &with_subgoal("open", &[]), second),
+            ["open_subgoal: sub-goal `signals` has not landed yet: ship it before opening another"]
+        );
+        // Once it has landed, the next may open.
+        let mut next = both;
+        next["open_subgoal"]["id"] = json!("timers");
+        assert_eq!(
+            problems(&d, &with_subgoal("landed", &["toy-0"]), next),
+            Vec::<String>::new()
+        );
+        // A goal without a ship pipeline has no sub-goals at all.
+        let plain =
+            json!({"ask_owner": "q", "open_subgoal": serde_json::from_str::<Value>(OPEN).unwrap()});
+        assert_eq!(problems(&definition(1, "ask"), &goal(), plain).len(), 1);
+        // An absorbed bead is not run again, and nothing joins a sub-goal being shipped.
+        assert_eq!(
+            problems(&d, &with_subgoal("open", &["toy-1"]), start.clone()),
+            ["start: `toy-1` is already absorbed in the open sub-goal"]
+        );
+        assert_eq!(
+            problems(&d, &with_subgoal("parked", &["toy-0"]), start),
+            ["start: sub-goal `signals` is being shipped: nothing more can join it"]
+        );
+    }
+
+    #[test]
+    fn a_sub_goal_ships_when_it_holds_work_and_nothing_else_is_running() {
+        let d = batched();
+        let ship = json!({"ship": true});
+        assert_eq!(
+            problems(&d, &with_subgoal("open", &["toy-1"]), ship.clone()),
+            Vec::<String>::new()
+        );
+        // Shipping again after it parked continues it.
+        assert_eq!(
+            problems(&d, &with_subgoal("parked", &["toy-1"]), ship.clone()),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            problems(&d, &with_subgoal("open", &[]), ship.clone()),
+            ["ship: sub-goal `signals` has absorbed no bead yet"]
+        );
+        assert_eq!(
+            problems(&d, &goal(), ship.clone()),
+            ["ship: no sub-goal is open"]
+        );
+        let mut busy = with_subgoal("open", &["toy-1"]);
+        busy.units.push(GoalUnit {
+            bead: "toy-2".into(),
+            unit: None,
+            state: "running".into(),
+            detail: String::new(),
+            ship: false,
+        });
+        assert_eq!(
+            problems(&d, &busy, ship),
+            ["ship: a sub-goal ships when nothing else is running or starting"]
+        );
+        // The goal is not complete while absorbed work has not landed.
+        let done = json!({"complete": true, "evidence": "All of it."});
+        assert_eq!(
+            problems(&d, &with_subgoal("open", &["toy-1"]), done.clone()),
+            ["complete: sub-goal `signals` holds work that has not landed: ship it first"]
+        );
+        assert_eq!(
+            problems(&d, &with_subgoal("landed", &["toy-1"]), done),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn the_brief_shows_each_sub_goal_and_what_it_still_waits_for() {
+        let goal = with_subgoal("open", &["toy-1"]);
+        let brief = wake_brief(&batched(), &goal, &tracker(), "", "");
+        assert!(brief.contains("- `signals` (open): Signals. Branch `feat/signals`. Absorbed: toy-1. Planned and not yet absorbed: toy-2."), "{brief}");
+        assert!(
+            brief.contains("toy-1 | P1 | task | absorbed in the open sub-goal | Bead toy-1"),
+            "{brief}"
+        );
+        assert!(
+            brief.contains("Shipping the sub-goal runs the whole verification once"),
+            "{brief}"
+        );
+        assert!(
+            !wake_brief(&definition(1, "ask"), &goal, &tracker(), "", "").contains("## Sub-goals")
         );
     }
 
@@ -1992,6 +2615,8 @@ mod tests {
                 findings: vec![
                     json!({"step": "review", "severity": "minor", "title": "Doc gap", "location": "a.zig:4"}),
                 ],
+                commit: None,
+                ship: false,
             },
             Happening::OwnerSaid {
                 text: "do toy-2 next".into(),

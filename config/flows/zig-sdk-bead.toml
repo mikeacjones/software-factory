@@ -1,0 +1,126 @@
+# The pipeline of one bead inside a sub-goal of the Zig SDK. It is the light
+# half of a pair: this flow builds one bead, checks it quickly, has it
+# adversarially tested and reviewed, and absorbs it as one commit into the
+# sub-goal's branch. The heavy half, zig-sdk-ship, runs once for the whole
+# sub-goal.
+#
+# Left to the ship pipeline on purpose: the baseline run, the ReleaseSafe
+# tests, the samples against a dev server, the pull request and CI. A bead
+# costs minutes here, not most of an hour.
+id = "zig-sdk-bead"
+start = "build"
+
+[[step]]
+id = "build"
+kind = "agent"
+role = "builder"
+model = "claude-opus-5-5"
+effort = "medium"
+session = "fresh"
+writes = ["code"]
+on.done = "fmt"
+on.already_done = "park"
+on.needs_owner = { to = "ask", max = 3 }
+
+[[step]]
+id = "fmt"
+kind = "command"
+command = "fmt"
+on.pass = "index"
+on.fail = { to = "fix", max = 2 }
+
+[[step]]
+id = "index"
+kind = "command"
+command = "samples-index"
+on.pass = "readme"
+on.fail = { to = "fix", max = 2 }
+
+[[step]]
+id = "readme"
+kind = "command"
+command = "readme"
+on.pass = "changelog"
+on.fail = { to = "fix", max = 2 }
+
+[[step]]
+id = "changelog"
+kind = "command"
+command = "changelog"
+on.pass = "test"
+on.fail = { to = "fix", max = 2 }
+
+[[step]]
+id = "test"
+kind = "command"
+command = "test"
+on.pass = "reports"
+on.fail = { to = "fix", max = 3 }
+
+# The review reports, about this bead's change only: its base is the
+# sub-goal's tip when the bead started.
+[[step]]
+id = "reports"
+kind = "command"
+command = "reports"
+policy = "report-only"
+produces = "reports"
+on.pass = "break"
+on.fail = "park"
+
+[[step]]
+id = "break"
+kind = "agent"
+role = "tester"
+model = "claude-opus-5-5"
+effort = "high"
+session = "fresh"
+workspace = "scratch"
+needs = ["reports"]
+on.held = "review"
+on.broken = { to = "fix", max = 2, then = "review" }
+on.needs_owner = { to = "ask", max = 2 }
+
+[[step]]
+id = "review"
+kind = "agent"
+role = "reviewer"
+model = "claude-opus-5-5"
+effort = "medium"
+session = "fresh"
+workspace = "scratch"
+needs = ["reports"]
+on.approve = "describe"
+on.rework = { to = "fix", max = 2 }
+on.needs_owner = { to = "ask", max = 2 }
+
+[[step]]
+id = "fix"
+kind = "agent"
+role = "builder"
+model = "claude-opus-5-5"
+effort = "medium"
+session = "continue:build"
+writes = ["code"]
+on.done = { to = "fmt", max = 8 }
+on.needs_owner = { to = "ask", max = 2 }
+
+# The bead's commit message. The pull-request text it also writes is not
+# used here: the sub-goal's pull request is written when it ships.
+[[step]]
+id = "describe"
+kind = "agent"
+role = "publisher"
+model = "claude-opus-5-5"
+effort = "medium"
+session = "continue:build"
+on.ready = "absorb"
+
+# One commit onto the sub-goal's branch. Nothing is pushed, and the bead
+# stays open until the sub-goal lands.
+[[step]]
+id = "absorb"
+kind = "action"
+action = "absorb"
+on.done = "end"
+on.failed = { to = "describe", max = 2 }

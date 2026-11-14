@@ -149,6 +149,20 @@ pub struct Unit {
     /// The merge commit, once the pull request has landed.
     #[serde(default)]
     pub merged: Option<String>,
+    /// The sub-goal worktree this unit's change is absorbed into, if it
+    /// belongs to one.
+    #[serde(default)]
+    pub absorb_into: Option<PathBuf>,
+    /// The commit this unit's change became on the sub-goal's branch.
+    #[serde(default)]
+    pub absorbed: Option<String>,
+    /// Whether this unit ships a sub-goal: its branch already holds one
+    /// commit for each bead and is published as it stands.
+    #[serde(default)]
+    pub ship: bool,
+    /// The beads closed when this unit lands. Empty means its own.
+    #[serde(default)]
+    pub closes: Vec<String>,
     pub runs: u32,
     pub started_at: u64,
 }
@@ -178,6 +192,40 @@ pub struct Options {
     pub slack: bool,
     /// The pipeline to run instead of the project's own, when a goal names one.
     pub flow: Option<String>,
+    /// The sub-goal this unit belongs to, if any.
+    pub within: Option<Within>,
+}
+
+/// How a unit relates to a goal's sub-goal.
+#[derive(Clone, Debug)]
+pub enum Within {
+    /// One bead of the sub-goal: it branches from the sub-goal's tip and its
+    /// flow ends by absorbing into the sub-goal's worktree.
+    Bead {
+        tip: String,
+        worktree: PathBuf,
+        /// Beads the sub-goal has absorbed: still open in the tracker, but
+        /// done as far as this bead's blockers go.
+        absorbed: Vec<String>,
+    },
+    /// The sub-goal itself, being shipped as one pull request.
+    Ship(Ship),
+}
+
+/// A sub-goal's branch, ready to ship.
+#[derive(Clone, Debug)]
+pub struct Ship {
+    /// Names the unit, as a bead's ID would.
+    pub id: String,
+    pub title: String,
+    pub description: String,
+    pub acceptance_criteria: String,
+    pub worktree: PathBuf,
+    pub branch: String,
+    /// The commit of the default branch the sub-goal started from.
+    pub base: String,
+    /// The beads whose work it holds, closed when it lands.
+    pub closes: Vec<String>,
 }
 
 pub struct Driver {
@@ -392,14 +440,37 @@ impl Driver {
         preflight(&factory, &project)?;
 
         let source = bead_source(&project);
-        let bead = source.read(bead_id)?;
-        let reasons = readiness(&bead, &project.bead_actor);
-        if !reasons.is_empty() {
-            return Err(DriverError::NotLaunchable {
-                bead: bead.id,
-                reasons,
-            });
-        }
+        let ship = match &options.within {
+            Some(Within::Ship(ship)) => Some(ship.clone()),
+            _ => None,
+        };
+        let bead = match &ship {
+            // A sub-goal is not a bead in the tracker: it stands in for one.
+            Some(ship) => Bead {
+                id: ship.id.clone(),
+                title: ship.title.clone(),
+                description: ship.description.clone(),
+                acceptance_criteria: ship.acceptance_criteria.clone(),
+                status: "open".to_string(),
+                issue_type: "feature".to_string(),
+                ..Bead::default()
+            },
+            None => {
+                let mut bead = source.read(bead_id)?;
+                if let Some(Within::Bead { absorbed, .. }) = &options.within {
+                    bead.open_blockers
+                        .retain(|blocker| !absorbed.contains(blocker));
+                }
+                let reasons = readiness(&bead, &project.bead_actor);
+                if !reasons.is_empty() {
+                    return Err(DriverError::NotLaunchable {
+                        bead: bead.id,
+                        reasons,
+                    });
+                }
+                bead
+            }
+        };
 
         let started_at = now_unix();
         let unit_id = UnitId::new(format!("{}-{started_at}", bead.id));
@@ -449,6 +520,10 @@ impl Driver {
                 pull_request: None,
                 pull_request_number: None,
                 merged: None,
+                absorb_into: None,
+                absorbed: None,
+                ship: false,
+                closes: Vec::new(),
                 runs: 0,
                 started_at,
             },
@@ -467,9 +542,43 @@ impl Driver {
                 "bead": driver.unit.bead, "flow": driver.unit.flow, "branch": driver.unit.branch,
             }),
         )?;
+        match &options.within {
+            Some(Within::Bead { tip, worktree, .. }) => {
+                driver.unit.base = tip.clone();
+                driver.unit.absorb_into = Some(worktree.clone());
+            }
+            Some(Within::Ship(ship)) => {
+                driver.unit.ship = true;
+                driver.unit.closes = ship.closes.clone();
+                driver.unit.worktree = ship.worktree.clone();
+                driver.unit.branch = ship.branch.clone();
+                driver.unit.base = ship.base.clone();
+                driver.unit.checkpoint = factory_git::rev_parse(&ship.worktree, "HEAD")?;
+                // Kept beside the unit, since the tracker has no such bead.
+                let path = driver.dir.join("bead.json");
+                let text = serde_json::to_string_pretty(&driver.bead).map_err(|source| {
+                    DriverError::Json {
+                        path: path.clone(),
+                        source,
+                    }
+                })?;
+                std::fs::write(&path, text).map_err(io(&path))?;
+            }
+            None => {}
+        }
         driver.thread = driver.open_thread(options, None);
         driver.unit.thread = driver.thread.state().cloned();
         driver.save()?;
+        if driver.unit.ship {
+            let commits =
+                factory_git::commit_count(&driver.unit.worktree, &driver.unit.base, "HEAD")?;
+            driver.thread.say(&format!(
+                ":package: *Shipping* · branch `{}` holds {commits} commit(s) for {} bead(s). One pull request, squashed when it lands.",
+                escape(&driver.unit.branch),
+                driver.unit.closes.len()
+            ));
+            return Ok(driver);
+        }
 
         // From here the unit exists; a failure parks it instead of losing it.
         if let Err(err) = driver.prepare(&source) {
@@ -520,7 +629,14 @@ impl Driver {
             }
         };
         preflight(&factory, &project)?;
-        let bead = bead_source(&project).read(&unit.bead)?;
+        let bead = match std::fs::read_to_string(dir.join("bead.json")) {
+            // A unit that ships a sub-goal carries its own stand-in for a bead.
+            Ok(text) => serde_json::from_str(&text).map_err(|source| DriverError::Json {
+                path: dir.join("bead.json"),
+                source,
+            })?,
+            Err(_) => bead_source(&project).read(&unit.bead)?,
+        };
         let log = EventLog::new(
             dir.join("events.jsonl"),
             project.id.clone(),
@@ -666,9 +782,14 @@ impl Driver {
         )?;
 
         let repo = self.project.repo.clone();
-        factory_git::fetch(&repo, &self.project.remote)?;
-        let start = format!("{}/{}", self.project.remote, self.project.default_branch);
-        let base = factory_git::rev_parse(&repo, &start)?;
+        let base = if self.unit.base.is_empty() {
+            factory_git::fetch(&repo, &self.project.remote)?;
+            let start = format!("{}/{}", self.project.remote, self.project.default_branch);
+            factory_git::rev_parse(&repo, &start)?
+        } else {
+            // A bead of a sub-goal starts from the sub-goal's tip.
+            self.unit.base.clone()
+        };
         if factory_git::branch_exists(&repo, &self.unit.branch)? {
             return Err(DriverError::Preflight(format!(
                 "the branch `{}` already exists in {}: an earlier unit for this bead was not cleaned up",
@@ -1051,6 +1172,22 @@ impl Driver {
                 .collect()
         };
         let mut notes = notes;
+        if self.unit.ship {
+            // Nobody in this pipeline built the change: say what it holds.
+            let commits =
+                factory_git::log_messages(&cwd, &self.unit.base, "HEAD").unwrap_or_default();
+            notes.insert(
+                0,
+                Note {
+                    title: "The commits on this branch, one for each bead".to_string(),
+                    body: format!(
+                        "{}\n\nThe beads: {}.",
+                        truncate(commits.trim(), 12_000),
+                        self.unit.closes.join(", ")
+                    ),
+                },
+            );
+        }
         for name in &step.needs {
             match self.artifact_note(name) {
                 Ok(note) => notes.push(note),
@@ -2075,16 +2212,20 @@ impl Driver {
         self.save()?;
 
         let url = self.unit.pull_request.clone().unwrap_or_default();
-        bead_source(&self.project).close(
-            &self.unit.bead,
-            &format!("Merged {url} as {merge_commit}; every CI check passed"),
-            &self.project.bead_actor,
-        )?;
-        self.event(
-            "bead.closed",
-            Some(&step.id),
-            json!({ "bead": self.unit.bead }),
-        )?;
+        // A unit that ships a sub-goal closes every bead whose work it held.
+        let closes = if self.unit.closes.is_empty() {
+            vec![self.unit.bead.clone()]
+        } else {
+            self.unit.closes.clone()
+        };
+        for bead in &closes {
+            bead_source(&self.project).close(
+                bead,
+                &format!("Merged {url} as {merge_commit}; every CI check passed"),
+                &self.project.bead_actor,
+            )?;
+            self.event("bead.closed", Some(&step.id), json!({ "bead": bead }))?;
+        }
 
         // Tidying up. A failure here leaves litter, not a wrong result.
         let mut litter = Vec::new();
@@ -2236,6 +2377,44 @@ impl Driver {
             .cloned()
     }
 
+    /// The `absorb` action: the unit's one commit joins the branch of the
+    /// sub-goal it belongs to. Nothing is pushed, no pull request is opened
+    /// and the bead stays open: all of that happens once, when the sub-goal
+    /// ships.
+    fn absorb(&mut self, step: &Step, commit: &str) -> Result<StepEnd, DriverError> {
+        let Some(target) = self.unit.absorb_into.clone() else {
+            return Ok(StepEnd::Park(format!(
+                "step `{}` absorbs into a sub-goal, but this unit belongs to none",
+                step.id
+            )));
+        };
+        // The unit branched from the sub-goal's tip, so this only moves the
+        // tip forward. If something else moved it, nothing is merged here.
+        factory_git::fast_forward(&target, commit)?;
+        self.unit.absorbed = Some(commit.to_string());
+        self.event(
+            "absorbed",
+            Some(&step.id),
+            json!({ "commit": commit, "into": target }),
+        )?;
+        let repo = self.project.repo.clone();
+        let mut litter = Vec::new();
+        if let Err(err) = factory_git::worktree_remove(&repo, &self.unit.worktree) {
+            litter.push(err.to_string());
+        }
+        if let Err(err) = factory_git::delete_branch(&repo, &self.unit.branch) {
+            litter.push(err.to_string());
+        }
+        self.event("cleanup", Some(&step.id), json!({ "problems": litter }))?;
+        self.thread.say(&format!(
+            ":inbox_tray: *{}* · absorbed into the sub-goal's branch as `{}`. The bead stays open until the sub-goal lands.",
+            step.id,
+            &commit[..commit.len().min(10)]
+        ));
+        self.save()?;
+        Ok(StepEnd::Outcome("done".to_string()))
+    }
+
     /// The `publish` action: one final commit, a push, and the pull request.
     fn publish_step(&mut self, step: &Step) -> Result<StepEnd, DriverError> {
         match self.publish(step) {
@@ -2295,14 +2474,22 @@ impl Driver {
                 "there is nothing to publish: the branch has no changes".to_string(),
             ));
         }
-        // The checkpoints become one commit. The content must not change.
-        let tree = factory_git::tree_of(&worktree, "HEAD")?;
-        let commit = factory_git::squash(&worktree, &self.unit.base, &message)?;
-        if factory_git::tree_of(&worktree, &commit)? != tree {
-            return Ok(StepEnd::Park(
-                "the final commit does not hold what the checks passed on".to_string(),
-            ));
-        }
+        let commit = if self.unit.ship {
+            // A sub-goal's branch already holds one commit for each bead.
+            // They are published as they are and squashed when the pull
+            // request lands, with the message written for the whole.
+            factory_git::rev_parse(&worktree, "HEAD")?
+        } else {
+            // The checkpoints become one commit. The content must not change.
+            let tree = factory_git::tree_of(&worktree, "HEAD")?;
+            let commit = factory_git::squash(&worktree, &self.unit.base, &message)?;
+            if factory_git::tree_of(&worktree, &commit)? != tree {
+                return Ok(StepEnd::Park(
+                    "the final commit does not hold what the checks passed on".to_string(),
+                ));
+            }
+            commit
+        };
         self.unit.checkpoint = commit.clone();
         self.event(
             "published.commit",
@@ -2354,6 +2541,10 @@ impl Driver {
                     });
                 }
             }
+        }
+
+        if matches!(&step.kind, StepKind::Action { action } if action == "absorb") {
+            return self.absorb(step, &commit);
         }
 
         // The URL as the project configured it: that is what the write list is about.

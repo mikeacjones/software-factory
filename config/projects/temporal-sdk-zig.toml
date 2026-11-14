@@ -6,7 +6,7 @@ bead_actor = "factory"
 slack_channel = "temporal-sdk-zig"
 flow = "zig-sdk"
 publication_note = """
-End the commit message with a trailer block: `Bead: <the bead's full ID>`, which is the trailer this repository's history uses (not `Refs:`), and after it the changelog trailer when the change needs one. The pull request is squashed when it lands, so this commit message, with a testing paragraph the factory adds, is what the default branch keeps: write it for someone reading the history a year from now."""
+End the commit message with a trailer block: one `Bead: <full bead ID>` line for each bead the change covers, which is the trailer this repository's history uses (not `Refs:`), and after them the changelog trailer when the change needs one. A pull request is squashed when it lands, so the message written for the whole pull request, with a testing paragraph the factory adds, is what the default branch keeps: write it for someone reading the history a year from now."""
 
 # CI checks out the Rust core as a submodule, so every worktree does too.
 setup = ["submodules"]

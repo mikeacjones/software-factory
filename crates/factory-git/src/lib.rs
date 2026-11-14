@@ -218,6 +218,23 @@ pub fn push(dir: &Path, remote: &str, branch: &str) -> Result<(), GitError> {
     git(dir, &["push", "--no-verify", remote, &refspec], NETWORK).map(|_| ())
 }
 
+/// Move a branch's worktree forward to `commit`, which must descend from
+/// where it is: nothing is merged and nothing is rewritten.
+pub fn fast_forward(dir: &Path, commit: &str) -> Result<(), GitError> {
+    git(dir, &["merge", "--quiet", "--ff-only", commit], LOCAL).map(|_| ())
+}
+
+/// The commits after `from` up to `to`, oldest first, each as its short
+/// hash, its subject and its body.
+pub fn log_messages(dir: &Path, from: &str, to: &str) -> Result<String, GitError> {
+    let range = format!("{from}..{to}");
+    git(
+        dir,
+        &["log", "--reverse", "--format=### %h %s%n%n%b", &range],
+        LOCAL,
+    )
+}
+
 /// The remote's URL exactly as configured, before any `insteadOf` rewriting:
 /// what the project says it pushes to.
 pub fn configured_remote_url(repo: &Path, remote: &str) -> Result<String, GitError> {

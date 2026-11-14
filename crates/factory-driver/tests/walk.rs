@@ -311,6 +311,7 @@ merge_body = \"{{summary}}\\n\\n{{testing}}\\n\\nBead: {{bead}}\"
 const OPTIONS: Options = Options {
     slack: false,
     flow: None,
+    within: None,
 };
 
 #[test]
@@ -524,6 +525,7 @@ fn a_bead_someone_else_holds_is_refused_before_anything_is_created() {
 const SLACK: Options = Options {
     slack: true,
     flow: None,
+    within: None,
 };
 
 #[test]
@@ -1437,4 +1439,292 @@ fn a_run_refused_at_a_limit_continues_its_session_under_another_account() {
     );
     assert_eq!(states["b"].available_at("claude-opus-5-5", now), 0);
     assert_eq!(states["b"].source, "run");
+}
+
+/// A goal worked in a sub-goal: two beads, the second blocked by the first,
+/// each absorbed into the sub-goal's branch by the light pipeline; then the
+/// sub-goal shipped once as one pull request and squashed onto main.
+#[test]
+fn a_sub_goal_absorbs_its_beads_and_ships_as_one_pull_request() {
+    use factory_driver::goal::{Phase, Supervisor};
+    use factory_slack::socket::Incoming;
+    use std::time::{Duration, Instant};
+
+    let world = World::new("subgoal", "true");
+    world.with_github("green");
+    // The second bead is blocked by the first, which stays open until the
+    // sub-goal lands.
+    std::fs::write(
+        world.path("beads/toy-3.json"),
+        r#"{"id":"toy-3","title":"The follow-up","description":"Later.","acceptance_criteria":"- it follows","status":"open","open_blockers":["toy-1"]}"#,
+    )
+    .unwrap();
+    let project = world.path("config/projects/toy.toml");
+    let text = std::fs::read_to_string(&project)
+        .unwrap()
+        .replace(
+            "merge_subject = \"Merge bead/{bead_short}: {title}\"",
+            "merge_method = \"squash\"\nmerge_subject = \"{title} (#{number})\"",
+        )
+        .replace(
+            "merge_body = \"{summary}\\n\\n{testing}\\n\\nBead: {bead}\"",
+            "merge_body = \"{commit_body}\\n\\n{testing}\\n\\n{commit_trailers}\"",
+        );
+    assert!(text.contains("merge_method = \"squash\""));
+    std::fs::write(&project, text).unwrap();
+    std::fs::create_dir_all(world.path("config/goals/toy")).unwrap();
+    std::fs::write(
+        world.path("config/goals/toy/main.toml"),
+        "id = \"main\"\nflow = \"zig-sdk-bead\"\nship_flow = \"zig-sdk-ship\"\n[director]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\n",
+    )
+    .unwrap();
+    let say = |role: &str, n: u32, json: String| {
+        std::fs::create_dir_all(world.path("bin/state")).unwrap();
+        std::fs::write(world.path(&format!("bin/state/{role}-{n}.json")), json).unwrap();
+    };
+    let decide = |fields: &str| {
+        let mut result = serde_json::json!({
+            "summary": "Decided.", "start": [], "file": [], "edit": [], "dropped_findings": [],
+            "open_subgoal": {"id": "", "title": "", "objective": "", "beads": []}, "ship": false,
+            "ask_owner": "", "complete": false, "evidence": "", "journal_entry": "", "project_memory": ""
+        });
+        let extra: serde_json::Value = serde_json::from_str(fields).unwrap();
+        for (key, value) in extra.as_object().unwrap() {
+            result[key] = value.clone();
+        }
+        result.to_string()
+    };
+    say("intake", 1, r#"{"reply":"Here is the charter.","ready":true,"objective":"Ship the feature.","stop_when":"Both beads have landed.","plan":"One sub-goal: toy-1, then toy-3.","edits":[]}"#.to_string());
+    say(
+        "director",
+        1,
+        decide(
+            r#"{"open_subgoal":{"id":"feature","title":"The feature and its follow-up","objective":"Both parts work.","beads":["toy-1","toy-3"]},"start":[{"bead":"toy-1","reason":"first"}]}"#,
+        ),
+    );
+    say(
+        "director",
+        2,
+        decide(r#"{"start":[{"bead":"toy-3","reason":"its blocker is absorbed"}]}"#),
+    );
+    say("director", 3, decide(r#"{"ship":true}"#));
+    say(
+        "director",
+        4,
+        decide(r#"{"complete":true,"evidence":"Both beads landed in one pull request."}"#),
+    );
+
+    let mut sup = Supervisor::new(world.config(), None, vec!["OWNER".to_string()], false).unwrap();
+    // No Slack in this test: the goal is opened directly, as the owner's
+    // message would open it.
+    assert!(
+        sup.projects_listening().is_empty(),
+        "no Slack, so no channel is known"
+    );
+    let id = sup.open_directly("toy", "Ship the feature").unwrap();
+    sup.incoming(Incoming::Action {
+        channel: String::new(),
+        user: "OWNER".to_string(),
+        action_id: "goal_start".to_string(),
+        value: id.clone(),
+        message_ts: String::new(),
+    })
+    .unwrap();
+    let remote = world.path("remote.git");
+    let bead = |id: &str| std::fs::read_to_string(world.path(&format!("beads/{id}.json"))).unwrap();
+    let goal = |sup: &Supervisor| sup.goals().next().unwrap().clone();
+    let wait_for = |sup: &mut Supervisor, wakes: u32| {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while sup.goals().next().unwrap().wakes < wakes {
+            assert!(
+                Instant::now() < deadline,
+                "the goal never reached wake {wakes}"
+            );
+            sup.pump(Duration::from_millis(200)).unwrap();
+        }
+    };
+
+    // The sub-goal has a branch of its own, and the first bead is running in it.
+    let opened = goal(&sup);
+    assert_eq!(opened.subgoals.len(), 1);
+    assert_eq!(opened.subgoals[0].branch, "feat/feature");
+    assert!(opened.subgoals[0].worktree.join("README.md").exists());
+
+    // The first bead is absorbed: one commit on the sub-goal's branch, no
+    // pull request, nothing pushed, and its bead still open.
+    wait_for(&mut sup, 2);
+    let after_one = goal(&sup);
+    let sub = &after_one.subgoals[0];
+    assert_eq!(sub.absorbed.len(), 1);
+    assert_eq!(sub.absorbed[0].0, "toy-1");
+    assert_eq!(
+        run(
+            &sub.worktree,
+            "git",
+            &["rev-list", "--count", &format!("{}..HEAD", sub.base)]
+        ),
+        "1"
+    );
+    assert_eq!(
+        run(&sub.worktree, "git", &["rev-parse", "HEAD"]),
+        sub.absorbed[0].1
+    );
+    assert!(
+        bead("toy-1").contains("\"in_progress\""),
+        "an absorbed bead stays open"
+    );
+    assert!(
+        !world.gh_calls().iter().any(|call| call.starts_with("pr ")),
+        "a bead opens no pull request"
+    );
+    assert_eq!(
+        run(&remote, "git", &["branch", "--list", "feat/*"]),
+        "",
+        "nothing is pushed yet"
+    );
+    // The second bead was started although its blocker is still open,
+    // because the sub-goal has absorbed that blocker.
+    assert_eq!(after_one.units[1].bead, "toy-3");
+
+    // It builds on the first: its commit sits on top of it.
+    wait_for(&mut sup, 3);
+    let after_two = goal(&sup);
+    let sub = &after_two.subgoals[0];
+    assert_eq!(
+        sub.absorbed
+            .iter()
+            .map(|(bead, _)| bead.as_str())
+            .collect::<Vec<_>>(),
+        ["toy-1", "toy-3"]
+    );
+    assert_eq!(
+        run(
+            &sub.worktree,
+            "git",
+            &["rev-list", "--count", &format!("{}..HEAD", sub.base)]
+        ),
+        "2"
+    );
+    assert_eq!(
+        sub.state, "shipping",
+        "the director shipped it at the third wake"
+    );
+    // Each bead ran the light pipeline: no ReleaseSafe tests, no samples, no CI.
+    let first_unit = after_two.units[0].unit.clone().unwrap();
+    let first_log =
+        std::fs::read_to_string(world.path(&format!("state/units/{first_unit}/events.jsonl")))
+            .unwrap();
+    for absent in [
+        "\"step\":\"test-safe\"",
+        "\"step\":\"samples\"",
+        "\"step\":\"ci\"",
+        "published.pushed",
+    ] {
+        assert!(
+            !first_log.contains(absent),
+            "the bead pipeline ran {absent}"
+        );
+    }
+    assert!(first_log.contains("\"kind\":\"absorbed\""));
+
+    // Shipping: the heavy pipeline once, one pull request with both commits,
+    // squashed onto main, and both beads closed.
+    wait_for(&mut sup, 4);
+    let shipped = goal(&sup);
+    assert_eq!(shipped.phase, Phase::ProposedComplete);
+    assert_eq!(shipped.subgoals[0].state, "landed");
+    assert!(shipped.subgoals[0].pull_request.is_some());
+    let gh = world.gh_calls();
+    assert_eq!(
+        gh.iter()
+            .filter(|call| call.starts_with("pr create"))
+            .count(),
+        1
+    );
+    let merges: Vec<&String> = gh
+        .iter()
+        .filter(|call| call.starts_with("pr merge"))
+        .collect();
+    assert_eq!(merges.len(), 1);
+    assert!(merges[0].contains("--squash"));
+    let ship_unit = shipped
+        .units
+        .iter()
+        .find(|unit| unit.ship)
+        .unwrap()
+        .unit
+        .clone()
+        .unwrap();
+    let ship_log =
+        std::fs::read_to_string(world.path(&format!("state/units/{ship_unit}/events.jsonl")))
+            .unwrap();
+    for present in [
+        "\"step\":\"test-safe\"",
+        "\"step\":\"samples\"",
+        "\"kind\":\"ci.green\"",
+        "\"kind\":\"landed\"",
+    ] {
+        assert!(ship_log.contains(present), "shipping did not run {present}");
+    }
+    // The publisher of the whole was told which commits and beads it covers.
+    let calls = world.calls();
+    let publisher = calls
+        .iter()
+        .rposition(|call| call[0] == "publisher")
+        .unwrap();
+    let ship_brief =
+        std::fs::read_to_string(world.path(&format!("bin/state/brief-{}.md", publisher + 1)))
+            .unwrap();
+    assert!(
+        ship_brief.contains("## The commits on this branch, one for each bead"),
+        "{ship_brief}"
+    );
+    assert!(
+        ship_brief.contains("The beads: toy-1, toy-3."),
+        "{ship_brief}"
+    );
+    assert!(
+        ship_brief.contains("### toy-3: The follow-up"),
+        "the beads' criteria are in the brief"
+    );
+
+    assert_eq!(
+        run(&remote, "git", &["rev-list", "--count", "main"]),
+        "2",
+        "one squashed commit on main"
+    );
+    assert_eq!(
+        run(&remote, "git", &["log", "-1", "--format=%s", "main"]),
+        "Add the feature (#7)"
+    );
+    assert!(run(&remote, "git", &["log", "-1", "--format=%b", "main"]).contains("Testing: on "));
+    // Both beads' work is in it: the first bead's build and fix, the second's build.
+    assert_eq!(
+        run(&remote, "git", &["show", "main:feature.txt"])
+            .lines()
+            .count(),
+        3
+    );
+    for id in ["toy-1", "toy-3"] {
+        assert!(
+            bead(id).contains("\"closed\""),
+            "{id} is closed when the sub-goal lands"
+        );
+    }
+    assert!(!shipped.subgoals[0].worktree.exists());
+    assert_eq!(
+        run(&world.path("toy"), "git", &["branch", "--list", "feat/*"]),
+        ""
+    );
+    assert_eq!(run(&remote, "git", &["branch", "--list", "feat/*"]), "");
+
+    sup.incoming(Incoming::Action {
+        channel: String::new(),
+        user: "OWNER".to_string(),
+        action_id: "goal_accept".to_string(),
+        value: id,
+        message_ts: String::new(),
+    })
+    .unwrap();
+    assert_eq!(sup.goals().next().unwrap().phase, Phase::Complete);
 }

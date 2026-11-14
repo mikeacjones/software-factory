@@ -79,12 +79,25 @@ pub struct Summary {
     pub has_criteria: bool,
     /// Whether an open bead blocks it.
     pub blocked: bool,
+    /// The open beads that block it.
+    #[serde(default)]
+    pub blockers: Vec<String>,
 }
 
 impl Summary {
     /// Whether the readiness check would let a pipeline start on it.
     pub fn launchable(&self) -> bool {
-        self.status == "open" && self.assignee.is_empty() && self.has_criteria && !self.blocked
+        self.launchable_given(&[])
+    }
+
+    /// The same, counting the beads in `done` as finished even though they
+    /// are still open: work a sub-goal has absorbed and not yet landed.
+    pub fn launchable_given(&self, done: &[String]) -> bool {
+        self.status == "open"
+            && self.assignee.is_empty()
+            && self.has_criteria
+            && self.blockers.iter().all(|blocker| done.contains(blocker))
+            && (!self.blocked || !self.blockers.is_empty())
     }
 }
 
@@ -311,6 +324,7 @@ impl Source {
                     beads.push(Summary {
                         has_criteria: !bead.acceptance_criteria.trim().is_empty(),
                         blocked: !bead.open_blockers.is_empty(),
+                        blockers: bead.open_blockers.clone(),
                         id: bead.id,
                         title: bead.title,
                         status: bead.status,
@@ -334,8 +348,9 @@ impl Source {
                 self.query(
                     "select i.id, i.title, i.status, i.issue_type, i.priority, coalesce(i.assignee, '') as assignee, \
                      (i.acceptance_criteria <> '') as has_criteria, \
-                     exists (select 1 from dependencies d join issues b on b.id = d.depends_on_issue_id \
-                             where d.issue_id = i.id and d.type = 'blocks' and b.status <> 'closed') as blocked \
+                     coalesce((select group_concat(b.id separator ',') from dependencies d \
+                               join issues b on b.id = d.depends_on_issue_id \
+                               where d.issue_id = i.id and d.type = 'blocks' and b.status <> 'closed'), '') as blockers \
                      from issues i where i.status <> 'closed'",
                 )?
                 .iter()
@@ -354,7 +369,12 @@ impl Source {
                         priority: number(row, "priority"),
                         assignee: text("assignee"),
                         has_criteria: number(row, "has_criteria") != 0,
-                        blocked: number(row, "blocked") != 0,
+                        blocked: !text("blockers").is_empty(),
+                        blockers: text("blockers")
+                            .split(',')
+                            .filter(|id| !id.is_empty())
+                            .map(str::to_string)
+                            .collect(),
                     }
                 })
                 .collect()
@@ -743,6 +763,13 @@ mod tests {
             ["toy-2", "toy-1"]
         );
         assert!(!listed[0].launchable(), "no criteria yet");
+        // A bead blocked only by work a sub-goal has absorbed may be started.
+        let mut blocked = listed[1].clone();
+        blocked.blocked = true;
+        blocked.blockers = vec!["toy-0".to_string(), "toy-9".to_string()];
+        assert!(!blocked.launchable());
+        assert!(!blocked.launchable_given(&["toy-0".to_string()]));
+        assert!(blocked.launchable_given(&["toy-9".to_string(), "toy-0".to_string()]));
         assert!(listed[1].launchable());
 
         // The owner confirmed criteria: now it may be launched.

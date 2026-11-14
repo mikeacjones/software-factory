@@ -61,6 +61,14 @@ command = ["cargo", "test", "--locked", "--offline", "--package", "factory-drive
 timeout_secs = 900
 
 [[check]]
+id = "sub-goals"
+tier = "hermetic"
+bead = "sf-rzb.12"
+claim = "A bead in a sub-goal branches from the sub-goal's tip and is absorbed as one commit, with no pull request and its bead left open; a bead blocked only by absorbed beads may be started; shipping runs the heavy pipeline once, opens one pull request holding a commit per bead, squashes it onto the default branch and closes every bead; and the director cannot start a bead outside an open sub-goal, open two at once, ship an empty one, or call the goal complete with absorbed work unshipped."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-driver", "--package", "factory-beads", "--", "a_sub_goal_absorbs", "a_bead_runs_inside_a_sub_goal", "a_sub_goal_ships_when", "the_brief_shows_each_sub_goal", "beads_are_listed_filed_and_changed"]
+timeout_secs = 900
+
+[[check]]
 id = "accounts"
 tier = "hermetic"
 bead = "sf-rzb.9"
