@@ -67,6 +67,11 @@ pub struct Account {
     /// The Keychain item holding a full login for this account, used only to
     /// read its usage windows without a model call.
     pub usage_keychain: Option<String>,
+    /// Refresh that login when it is about to expire and write it back to
+    /// the same Keychain item. For a login nothing else keeps fresh; leave it
+    /// off for the login Claude Code itself uses.
+    #[serde(default)]
+    pub usage_refresh: bool,
 }
 
 fn default_gh() -> String {

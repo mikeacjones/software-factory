@@ -21,6 +21,8 @@ usage:
                                               and run them on events
   factory accounts                            each Claude account's usage windows, and which
                                               one a run would use now
+  factory accounts refresh                    refresh the usage login of each account marked for
+                                              it now, write it to the Keychain and check it works
   factory slack check                         connect the Slack socket once and say whether it worked
   factory goal check                          check every project's goal definitions
   factory goal list                           the goals the factory knows and where each stands
@@ -134,6 +136,40 @@ fn run(args: &[String]) -> Result<u8, String> {
             );
             supervisor.resume().map_err(|err| fail(&err))?;
             supervisor.serve(&listener);
+            Ok(0)
+        }
+        ["accounts", "refresh"] => {
+            let factory = args.config.factory().map_err(|err| fail(&err))?;
+            let now = factory_core::now_unix();
+            let mut refreshed = 0;
+            for account in factory.accounts.iter().filter(|a| a.usage_refresh) {
+                let Some(service) = &account.usage_keychain else {
+                    continue;
+                };
+                let refresh = factory_claude::accounts::Refresh {
+                    token_url: factory_claude::accounts::TOKEN_URL,
+                    safe_dir: &factory.state_dir,
+                };
+                factory_claude::accounts::refresh_login(&account.id, service, refresh, now)
+                    .map_err(|err| fail(&err))?;
+                // The proof that the new login works: ask with it.
+                factory_claude::accounts::read_usage(
+                    &account.id,
+                    service,
+                    factory_claude::accounts::USAGE_API,
+                    None,
+                    now,
+                )
+                .map_err(|err| fail(&err))?;
+                println!(
+                    "{}: login refreshed, written to the Keychain item `{service}`, and accepted by the usage endpoint",
+                    account.id
+                );
+                refreshed += 1;
+            }
+            if refreshed == 0 {
+                println!("no account is marked `usage_refresh = true`");
+            }
             Ok(0)
         }
         ["accounts"] => {

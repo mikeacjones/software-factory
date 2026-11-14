@@ -19,7 +19,9 @@ use std::time::{Duration, Instant};
 use factory_beads::{Bead, Source, readiness};
 use factory_brief::{Brief, Contract, Note, contract_of, findings_text, render, result_problems};
 use factory_checks::{Verdict, run_command, scope_violations};
-use factory_claude::accounts::{Choice, TokenSource, Tracker, choose, read_usage, session_token};
+use factory_claude::accounts::{
+    Choice, Refresh, TOKEN_URL, TokenSource, Tracker, USAGE_API, choose, read_usage, session_token,
+};
 use factory_claude::{Outcome, RunSpec, Session, Usage};
 use factory_config::{BeadSource, ConfigDir, Factory, Project, read_env_file};
 use factory_core::{EventLog, ProjectId, StepId, UnitId, now_unix};
@@ -2469,7 +2471,6 @@ pub enum AccountPick {
     },
 }
 
-const USAGE_API: &str = "https://api.anthropic.com";
 /// A picture of an account older than this is refreshed from the usage
 /// endpoint before a choice is made, if the account has a login to ask with.
 const STALE_SECS: u64 = 30 * 60;
@@ -2489,7 +2490,16 @@ pub fn pick_account(factory: &Factory, model: &str) -> Result<AccountPick, Drive
         if now.saturating_sub(known.updated_at.max(known.usage_checked_at)) <= STALE_SECS {
             continue;
         }
-        let read = read_usage(&account.id, service, USAGE_API, now);
+        let refresh = account.usage_refresh.then_some(Refresh {
+            token_url: TOKEN_URL,
+            safe_dir: &factory.state_dir,
+        });
+        let read = read_usage(&account.id, service, USAGE_API, refresh, now);
+        if let Err(err) = &read {
+            // Never fatal: runs report the same windows. But a login that
+            // could not be refreshed is something the owner must hear about.
+            eprintln!("accounts: {err}");
+        }
         let _ = tracker.update(&account.id, |state| {
             if let Ok(mut fresh) = read {
                 // Limits a run hit and that have not ended still stand.

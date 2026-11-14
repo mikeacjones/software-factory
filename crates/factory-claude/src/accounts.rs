@@ -1,10 +1,11 @@
 //! Which Claude account a run uses.
 //!
-//! Each account has a five-hour window and a weekly one. A five-hour window
-//! that is open is use-it-or-lose-it, so the factory spends the one that
-//! resets soonest first. An account at a limit is left alone until that
-//! window resets, and when every account is at a limit the answer is to wait
-//! for the earliest reset.
+//! Each account has a five-hour window and a weekly one, and capacity left
+//! in a window when it resets is lost. So the factory spends first the
+//! account whose week resets soonest, and between accounts whose weeks end
+//! together, the one whose five-hour session resets soonest. An account at a
+//! limit is left alone until that window resets, and when every account is
+//! at a limit the answer is to wait for the earliest reset.
 //!
 //! The state is not polled. Every run reports both windows in its rate-limit
 //! event, and that is what keeps this current. An account the factory has
@@ -121,15 +122,22 @@ pub fn choose(
 ) -> Choice {
     let unknown = AccountState::default();
     let state = |id: &String| states.get(id).unwrap_or(&unknown);
-    // An open five-hour window is lost at its reset: spend the one that
-    // resets soonest. An account with no window open keeps until it is needed.
+    // Capacity that is not used before its window resets is lost, so the
+    // account whose capacity expires first is spent first. The week is what
+    // is scarce, so its reset ranks before the five-hour session's. An account
+    // whose window is not open, or not known, has nothing about to expire.
+    let deadline = |resets_at: Option<u64>| resets_at.filter(|at| *at > now).unwrap_or(u64::MAX);
     let best = accounts
         .iter()
         .enumerate()
         .filter(|(_, id)| state(id).available_at(model, now) <= now)
-        .min_by_key(|(order, id)| match state(id).session_resets(now) {
-            Some(resets_at) => (0, resets_at, *order),
-            None => (1, 0, *order),
+        .min_by_key(|(order, id)| {
+            let state = state(id);
+            (
+                deadline(state.seven_day.as_ref().map(|week| week.resets_at)),
+                deadline(state.session_resets(now)),
+                *order,
+            )
         })
         .map(|(_, id)| id.clone());
     match best {
@@ -322,61 +330,302 @@ pub fn state_from_usage(answer: &Value, now: u64) -> Option<AccountState> {
     Some(state)
 }
 
+/// Where the CLI refreshes a login, and the client it does so as. Taken from
+/// the pinned CLI's own code (2.1.325), which is the only authority on them.
+pub const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
+const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+pub const USAGE_API: &str = "https://api.anthropic.com";
+
+/// A login about to expire within this long is refreshed first.
+const REFRESH_MARGIN_SECS: u64 = 5 * 60;
+
+/// How an account's stored login may be kept fresh.
+#[derive(Clone, Copy, Debug)]
+pub struct Refresh<'a> {
+    pub token_url: &'a str,
+    /// Where a refreshed login is kept, readable by the owner only, between
+    /// receiving it and confirming it is in the Keychain.
+    pub safe_dir: &'a Path,
+}
+
+/// The stored login with a refresh's answer applied: new tokens and expiry,
+/// everything else as it was. `None` if the answer carries no access token.
+pub fn refreshed_login(stored: &Value, answer: &Value, now_ms: u64) -> Option<Value> {
+    let mut whole = stored.clone();
+    let login = whole.get_mut("claudeAiOauth")?.as_object_mut()?;
+    let access = answer.get("access_token")?.as_str()?;
+    login.insert("accessToken".to_string(), Value::from(access));
+    // A refresh token that is not replaced stays valid.
+    if let Some(refresh) = answer.get("refresh_token").and_then(Value::as_str) {
+        login.insert("refreshToken".to_string(), Value::from(refresh));
+    }
+    let lifetime = answer.get("expires_in").and_then(Value::as_u64)?;
+    login.insert(
+        "expiresAt".to_string(),
+        Value::from(now_ms + lifetime * 1000),
+    );
+    if let Some(lifetime) = answer
+        .get("refresh_token_expires_in")
+        .and_then(Value::as_u64)
+    {
+        login.insert(
+            "refreshTokenExpiresAt".to_string(),
+            Value::from(now_ms + lifetime * 1000),
+        );
+    }
+    Some(whole)
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// The account name a Keychain item is filed under, from `security`'s listing.
+fn account_of(listing: &str) -> Option<String> {
+    let line = listing
+        .lines()
+        .find(|line| line.contains("\"acct\"<blob>="))?;
+    let value = line.split_once("<blob>=")?.1.trim();
+    Some(value.trim_matches('"').to_string())
+}
+
+/// Replace a Keychain item's secret. The secret is handed to `security` on
+/// its standard input, hex-encoded, as the CLI does: it is never an argument
+/// of a process, where other programs could read it.
+fn keychain_write(service: &str, secret: &str) -> Result<(), String> {
+    let listing = Spec::new(
+        ["security", "find-generic-password", "-s", service],
+        std::env::temp_dir(),
+        Duration::from_secs(30),
+    );
+    let listed = capture(&listing).map_err(|err| err.to_string())?;
+    let account = account_of(&listed.combined())
+        .ok_or_else(|| format!("the Keychain has no item `{service}` to update"))?;
+    if [service, account.as_str()]
+        .iter()
+        .any(|text| text.contains(['"', '\\', '\n']))
+    {
+        return Err("the Keychain item's name cannot be passed safely".to_string());
+    }
+    let line = format!(
+        "add-generic-password -U -a \"{account}\" -s \"{service}\" -X \"{}\"\n",
+        hex(secret.as_bytes())
+    );
+    if line.len() > 4000 {
+        return Err("the login is too long to hand to `security` on its input".to_string());
+    }
+    let mut spec = Spec::new(
+        ["security", "-i"],
+        std::env::temp_dir(),
+        Duration::from_secs(30),
+    );
+    spec.stdin = Some(line);
+    let out = capture(&spec).map_err(|err| err.to_string())?;
+    if !out.success() {
+        return Err("`security` refused the write".to_string());
+    }
+    // `security -i` reports little: the only proof is reading it back.
+    match keychain(service) {
+        Ok(stored) if stored == secret => Ok(()),
+        Ok(_) => Err("the Keychain item did not change".to_string()),
+        Err(reason) => Err(reason),
+    }
+}
+
+/// Refresh the login stored in the Keychain item `service` and write it back.
+///
+/// A refresh token can be replaced by the refresh, after which the old one
+/// is dead. So the new login is first written to a file only the owner can
+/// read, then to the Keychain, and the file is removed once the Keychain is
+/// confirmed to hold it. If the Keychain write fails the file stays, and the
+/// error says where it is.
+pub fn refresh_login(
+    account: &str,
+    service: &str,
+    refresh: Refresh<'_>,
+    now: u64,
+) -> Result<(), AccountError> {
+    let fail = |reason: String| AccountError::Usage {
+        account: account.to_string(),
+        reason,
+    };
+    let stored: Value = serde_json::from_str(&keychain(service).map_err(fail)?).map_err(|_| {
+        fail(format!(
+            "the Keychain item `{service}` is not a Claude login"
+        ))
+    })?;
+    let login = stored.get("claudeAiOauth").unwrap_or(&Value::Null);
+    let refresh_token = login
+        .get("refreshToken")
+        .and_then(Value::as_str)
+        .ok_or_else(|| fail("its stored login has no refresh token: log in again".to_string()))?;
+    let scopes: Vec<&str> = login
+        .get("scopes")
+        .and_then(Value::as_array)
+        .map(|scopes| scopes.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let mut body = serde_json::json!({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": CLIENT_ID,
+    });
+    if !scopes.is_empty() {
+        body["scope"] = Value::from(scopes.join(" "));
+    }
+    let config = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(30)))
+        .http_status_as_error(false)
+        .build();
+    let agent: ureq::Agent = config.into();
+    let mut response = agent
+        .post(refresh.token_url)
+        .header("Content-Type", "application/json")
+        .send_json(&body)
+        .map_err(|err| fail(format!("the refresh request failed: {err}")))?;
+    let status = response.status().as_u16();
+    if status != 200 {
+        // The answer may name the reason; it never carries a token.
+        let reason = response
+            .body_mut()
+            .read_json::<Value>()
+            .ok()
+            .and_then(|answer| {
+                answer
+                    .pointer("/error/message")
+                    .or_else(|| answer.get("error_description"))
+                    .or_else(|| answer.get("error"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
+        return Err(fail(format!(
+            "the refresh was refused (HTTP {status} {reason}): log in again under this account"
+        )));
+    }
+    let answer: Value = response
+        .body_mut()
+        .read_json()
+        .map_err(|err| fail(format!("the refresh answer was not JSON: {err}")))?;
+    let fresh = refreshed_login(&stored, &answer, now * 1000)
+        .ok_or_else(|| fail("the refresh answer has no access token".to_string()))?;
+    let text = fresh.to_string();
+
+    let safe = refresh
+        .safe_dir
+        .join(format!("login-refresh-{account}.json"));
+    let write_safe = || -> std::io::Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::create_dir_all(refresh.safe_dir)?;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&safe)?;
+        file.write_all(text.as_bytes())
+    };
+    let kept = write_safe().is_ok();
+    match keychain_write(service, &text) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&safe);
+            Ok(())
+        }
+        Err(reason) if kept => Err(fail(format!(
+            "its login was refreshed but could not be written to the Keychain ({reason}). The new login is in {}, readable only by you: the old one may no longer work",
+            safe.display()
+        ))),
+        Err(reason) => Err(fail(format!(
+            "its login was refreshed but could not be written to the Keychain ({reason}), and could not be kept anywhere: log in again under this account"
+        ))),
+    }
+}
+
 /// Ask the subscription's usage endpoint about one account, with the full
 /// login kept in the Keychain item `service`. No model is called and no
-/// tokens are used. The endpoint is undocumented: every failure is an error
-/// the caller can ignore, since runs report the same windows anyway.
+/// tokens are used. With `refresh`, a login that is about to expire, or that
+/// the endpoint refuses, is refreshed once first. The endpoint is
+/// undocumented: every failure is an error the caller can ignore, since runs
+/// report the same windows anyway.
 pub fn read_usage(
     account: &str,
     service: &str,
     api_url: &str,
+    refresh: Option<Refresh<'_>>,
     now: u64,
 ) -> Result<AccountState, AccountError> {
     let fail = |reason: String| AccountError::Usage {
         account: account.to_string(),
         reason,
     };
-    let credential: Value =
-        serde_json::from_str(&keychain(service).map_err(fail)?).map_err(|_| {
-            fail(format!(
-                "the Keychain item `{service}` is not a Claude login"
-            ))
-        })?;
-    let login = credential.get("claudeAiOauth").unwrap_or(&Value::Null);
-    let token = login
-        .get("accessToken")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            fail(format!(
-                "the Keychain item `{service}` holds no access token"
-            ))
-        })?;
-    let expires = login.get("expiresAt").and_then(Value::as_u64).unwrap_or(0) / 1000;
-    if expires != 0 && expires <= now {
-        return Err(fail(
-            "its stored login has expired and needs refreshing".to_string(),
-        ));
+    let stored_login = || -> Result<(String, u64), AccountError> {
+        let credential: Value =
+            serde_json::from_str(&keychain(service).map_err(fail)?).map_err(|_| {
+                fail(format!(
+                    "the Keychain item `{service}` is not a Claude login"
+                ))
+            })?;
+        let login = credential.get("claudeAiOauth").unwrap_or(&Value::Null);
+        let token = login
+            .get("accessToken")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                fail(format!(
+                    "the Keychain item `{service}` holds no access token"
+                ))
+            })?;
+        let expires = login.get("expiresAt").and_then(Value::as_u64).unwrap_or(0) / 1000;
+        Ok((token.to_string(), expires))
+    };
+    let (mut token, expires) = stored_login()?;
+    let mut refreshed = false;
+    if expires != 0 && expires <= now + REFRESH_MARGIN_SECS {
+        match refresh {
+            Some(refresh) => {
+                refresh_login(account, service, refresh, now)?;
+                token = stored_login()?.0;
+                refreshed = true;
+            }
+            None if expires <= now => {
+                return Err(fail(
+                    "its stored login has expired and needs refreshing".to_string(),
+                ));
+            }
+            None => {}
+        }
     }
     let config = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(20)))
         .http_status_as_error(false)
         .build();
     let agent: ureq::Agent = config.into();
-    let mut response = agent
-        .get(&format!("{api_url}/api/oauth/usage"))
-        .header("Authorization", &format!("Bearer {token}"))
-        .header("anthropic-beta", "oauth-2025-04-20")
-        .call()
-        .map_err(|err| fail(format!("the request failed: {err}")))?;
-    let status = response.status().as_u16();
-    if status != 200 {
-        return Err(fail(format!("the endpoint answered HTTP {status}")));
+    loop {
+        let mut response = agent
+            .get(&format!("{api_url}/api/oauth/usage"))
+            .header("Authorization", &format!("Bearer {token}"))
+            .header("anthropic-beta", "oauth-2025-04-20")
+            .call()
+            .map_err(|err| fail(format!("the request failed: {err}")))?;
+        let status = response.status().as_u16();
+        if status == 401
+            && !refreshed
+            && let Some(refresh) = refresh
+        {
+            refresh_login(account, service, refresh, now)?;
+            token = stored_login()?.0;
+            refreshed = true;
+            continue;
+        }
+        if status != 200 {
+            return Err(fail(format!("the endpoint answered HTTP {status}")));
+        }
+        let answer: Value = response
+            .body_mut()
+            .read_json()
+            .map_err(|err| fail(format!("the answer was not JSON: {err}")))?;
+        return state_from_usage(&answer, now)
+            .ok_or_else(|| fail("the answer has no `limits`".to_string()));
     }
-    let answer: Value = response
-        .body_mut()
-        .read_json()
-        .map_err(|err| fail(format!("the answer was not JSON: {err}")))?;
-    state_from_usage(&answer, now).ok_or_else(|| fail("the answer has no `limits`".to_string()))
 }
 
 #[cfg(test)]
@@ -426,6 +675,39 @@ mod tests {
             ("b", state(window(0.6, 3600), window(0.8, 86_400))),
         ];
         assert_eq!(pick(&states, "claude-opus-5-5"), used("b"));
+    }
+
+    #[test]
+    fn the_week_that_ends_soonest_is_spent_before_the_session_that_does() {
+        // The owner's own accounts on 2026-11-14: one has half its week left
+        // and six hours to use it; the other's session ends sooner, but its
+        // week runs for three more days.
+        let states = [
+            (
+                "claude2",
+                state(window(0.23, 2 * 3600), window(0.86, 82 * 3600)),
+            ),
+            (
+                "claude",
+                state(window(0.0, 4 * 3600), window(0.52, 6 * 3600)),
+            ),
+        ];
+        assert_eq!(pick(&states, "claude-opus-5-5"), used("claude"));
+        // Once that week has reset, its next reset is the further one.
+        let after = [
+            ("claude2", state(window(0.4, 3600), window(0.9, 76 * 3600))),
+            (
+                "claude",
+                state(window(0.1, 4 * 3600), window(0.02, 168 * 3600)),
+            ),
+        ];
+        assert_eq!(pick(&after, "claude-opus-5-5"), used("claude2"));
+        // A week the factory knows nothing about has nothing known to lose.
+        let unknown = [
+            ("a", state(window(0.1, 600), None)),
+            ("b", state(window(0.1, 9000), window(0.5, 86_400))),
+        ];
+        assert_eq!(pick(&unknown, "m"), used("b"));
     }
 
     #[test]
@@ -553,6 +835,46 @@ mod tests {
             state_from_usage(&serde_json::json!({"error": "x"}), now),
             None
         );
+    }
+
+    #[test]
+    fn a_refresh_replaces_the_tokens_and_keeps_the_rest_of_the_login() {
+        let stored = serde_json::json!({"claudeAiOauth": {
+            "accessToken": "old-access", "refreshToken": "old-refresh", "expiresAt": 1000,
+            "refreshTokenExpiresAt": 2000, "scopes": ["user:profile"], "subscriptionType": "max"
+        }});
+        let rotated = serde_json::json!({
+            "access_token": "new-access", "refresh_token": "new-refresh",
+            "expires_in": 3600, "refresh_token_expires_in": 86_400
+        });
+        let fresh = refreshed_login(&stored, &rotated, 10_000).unwrap();
+        let login = &fresh["claudeAiOauth"];
+        assert_eq!(login["accessToken"], "new-access");
+        assert_eq!(login["refreshToken"], "new-refresh");
+        assert_eq!(login["expiresAt"], 3_610_000);
+        assert_eq!(login["refreshTokenExpiresAt"], 86_410_000);
+        assert_eq!(login["scopes"], serde_json::json!(["user:profile"]));
+        assert_eq!(login["subscriptionType"], "max");
+
+        // A refresh that does not replace the refresh token keeps the old one.
+        let kept = serde_json::json!({"access_token": "new-access", "expires_in": 60});
+        let fresh = refreshed_login(&stored, &kept, 0).unwrap();
+        assert_eq!(fresh["claudeAiOauth"]["refreshToken"], "old-refresh");
+        assert_eq!(fresh["claudeAiOauth"]["refreshTokenExpiresAt"], 2000);
+        // An answer with no access token changes nothing.
+        assert_eq!(
+            refreshed_login(&stored, &serde_json::json!({"error": "invalid_grant"}), 0),
+            None
+        );
+        assert_eq!(refreshed_login(&serde_json::json!({}), &rotated, 0), None);
+    }
+
+    #[test]
+    fn a_keychain_write_is_addressed_and_encoded_like_the_clis() {
+        assert_eq!(hex(b"{\"a\":1}"), "7b2261223a317d");
+        let listing = "keychain: \"login.keychain-db\"\nattributes:\n    \"acct\"<blob>=\"owner\"\n    \"svce\"<blob>=\"Claude Code-credentials\"\n";
+        assert_eq!(account_of(listing).as_deref(), Some("owner"));
+        assert_eq!(account_of("no such item"), None);
     }
 
     #[test]

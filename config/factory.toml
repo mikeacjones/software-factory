@@ -4,10 +4,11 @@ claude_bin = "claude"
 cli_version = "2.1.325"
 allowed_models = ["claude-fable-5-2", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"]
 
-# The Claude accounts workers run under. Each run uses the account whose
-# five-hour session resets soonest; an account at a limit is left until its
-# window resets; when all are at a limit the factory waits for the earliest
-# reset. The windows are learned from every run. `usage_keychain` names a
+# The Claude accounts workers run under. Capacity left in a window when it
+# resets is lost, so each run uses the account whose week resets soonest, and
+# between accounts whose weeks end together, the one whose five-hour session
+# resets soonest. An account at a limit is left until its window resets; when
+# all are at a limit the factory waits for the earliest reset. The windows are learned from every run. `usage_keychain` names a
 # full login the factory may ask about an account's windows with, without a
 # model call, when it has not heard from the account for half an hour.
 [[account]]
@@ -19,6 +20,10 @@ usage_keychain = "Claude Code-credentials"
 id = "claude2"
 token_keychain = "claude2-oauth-token"
 usage_keychain = "Claude Code-credentials-8351f113"
+# This login exists only for reading usage and nothing else keeps it fresh,
+# so the factory refreshes it when it is about to expire and writes it back
+# to the same Keychain item.
+usage_refresh = true
 
 [slack]
 # Holds SLACK_BOT_TOKEN and SLACK_OWNER_USER_ID. Readable by the owner only.
