@@ -948,7 +948,10 @@ impl Driver {
         let diff_stat = factory_git::diff_stat(&cwd, &self.unit.base, "HEAD").unwrap_or_default();
         // A fresh session is given what earlier steps produced, in flow order.
         // A continued one already has its own history, and gets only feedback.
-        let notes: Vec<Note> = if continuing {
+        // The publisher is the exception: it continues the builder's session,
+        // which never saw the factory's checks or the reports, and the text it
+        // writes must describe them truthfully.
+        let notes: Vec<Note> = if continuing && contract != Contract::Publication {
             Vec::new()
         } else {
             self.flow
@@ -1311,6 +1314,19 @@ impl Driver {
                 }
             }
             Workspace::Scratch => {}
+        }
+        if contract == Contract::Review && !asking {
+            let summary = result.get("summary").and_then(Value::as_str).unwrap_or("");
+            self.unit.notes.insert(
+                step.id.clone(),
+                Note {
+                    title: format!("Review (step `{}`, round {round})", step.id),
+                    body: format!(
+                        "Outcome: `{outcome}`.\n\n{summary}\n\n{}",
+                        findings_text(&result)
+                    ),
+                },
+            );
         }
 
         match (contract, outcome.as_str()) {

@@ -176,7 +176,9 @@ pub enum StreamEvent {
     /// A tool finished.
     ToolResult,
     RateLimit(RateLimit),
-    Result(ResultEvent, Usage),
+    /// A result, what it used, and whether that is a part to add up (true)
+    /// or a running total that replaces what came before (false).
+    Result(ResultEvent, Usage, bool),
     /// A type this parser does not read. Tolerated and counted.
     Other(String),
 }
@@ -249,7 +251,8 @@ pub fn parse_line(line: &str) -> Option<StreamEvent> {
                     .filter(|output| !output.is_null())
                     .cloned(),
             };
-            StreamEvent::Result(result, usage(&value))
+            let (used, incremental) = usage(&value);
+            StreamEvent::Result(result, used, incremental)
         }
         other => StreamEvent::Other(other.to_string()),
     })
@@ -291,28 +294,44 @@ fn rate_limit(info: &Value) -> RateLimit {
     }
 }
 
-fn usage(result: &Value) -> Usage {
+/// What one result event says was used since the result before it.
+///
+/// `modelUsage` and `total_cost_usd` are running totals for the whole
+/// session, so on a resumed session they include every earlier run. The CLI
+/// also reports the part since the last result, and that is what is counted.
+/// The second value is false when only the running totals were present.
+fn usage(result: &Value) -> (Usage, bool) {
+    let (source, incremental) = match result
+        .get("model_usage_since_last_result")
+        .and_then(Value::as_object)
+    {
+        Some(map) => (Some(map), true),
+        None => (result.get("modelUsage").and_then(Value::as_object), false),
+    };
     let mut models = BTreeMap::new();
-    if let Some(map) = result.get("modelUsage").and_then(Value::as_object) {
-        for (model, entry) in map {
-            let count = |key: &str| entry.get(key).and_then(Value::as_u64).unwrap_or(0);
-            models.insert(
-                model.clone(),
-                ModelUsage {
-                    input_tokens: count("inputTokens"),
-                    output_tokens: count("outputTokens"),
-                    cache_read_tokens: count("cacheReadInputTokens"),
-                    cache_write_tokens: count("cacheCreationInputTokens"),
-                    cost_usd: entry.get("costUSD").and_then(Value::as_f64).unwrap_or(0.0),
-                },
-            );
-        }
+    for (model, entry) in source.into_iter().flatten() {
+        let count = |key: &str| entry.get(key).and_then(Value::as_u64).unwrap_or(0);
+        models.insert(
+            model.clone(),
+            ModelUsage {
+                input_tokens: count("inputTokens"),
+                output_tokens: count("outputTokens"),
+                cache_read_tokens: count("cacheReadInputTokens"),
+                cache_write_tokens: count("cacheCreationInputTokens"),
+                cost_usd: entry.get("costUSD").and_then(Value::as_f64).unwrap_or(0.0),
+            },
+        );
     }
-    Usage {
-        cost_usd: result
+    let cost_usd = if incremental {
+        models.values().map(|model| model.cost_usd).sum()
+    } else {
+        result
             .get("total_cost_usd")
             .and_then(Value::as_f64)
-            .unwrap_or(0.0),
+            .unwrap_or(0.0)
+    };
+    let usage = Usage {
+        cost_usd,
         turns: result.get("num_turns").and_then(Value::as_u64).unwrap_or(0),
         duration_ms: result
             .get("duration_ms")
@@ -320,7 +339,8 @@ fn usage(result: &Value) -> Usage {
             .unwrap_or(0),
         models,
         rate_limit: None,
-    }
+    };
+    (usage, incremental)
 }
 
 /// What a run's stream said, gathered line by line.
@@ -330,7 +350,12 @@ pub struct Transcript {
     pub model: Option<String>,
     pub version: Option<String>,
     pub rate_limit: Option<RateLimit>,
-    pub result: Option<(ResultEvent, Usage)>,
+    /// The last result event. One run can emit several: work the model left
+    /// in the background wakes it again, and each time it returns a result.
+    pub result: Option<ResultEvent>,
+    /// What every result of this run used, added up.
+    pub used: Usage,
+    pub results: u64,
     pub tool_calls: u64,
     /// The most recent thing the model said or did, for a status line.
     pub last_activity: Option<String>,
@@ -363,18 +388,22 @@ impl Transcript {
             }
             Some(StreamEvent::ToolResult) => {}
             Some(StreamEvent::RateLimit(info)) => self.rate_limit = Some(info),
-            Some(StreamEvent::Result(result, usage)) => self.result = Some((result, usage)),
+            Some(StreamEvent::Result(result, used, incremental)) => {
+                if incremental {
+                    self.used.add(&used);
+                } else {
+                    self.used = used;
+                }
+                self.results += 1;
+                self.result = Some(result);
+            }
             Some(StreamEvent::Other(kind)) => *self.unknown.entry(kind).or_insert(0) += 1,
         }
     }
 
     /// What the run used, with the account's windows as last reported.
     pub fn usage(&self) -> Usage {
-        let mut usage = self
-            .result
-            .as_ref()
-            .map(|(_, usage)| usage.clone())
-            .unwrap_or_default();
+        let mut usage = self.used.clone();
         usage.rate_limit = self.rate_limit.clone();
         usage
     }
@@ -445,7 +474,7 @@ pub fn classify(transcript: &Transcript, exit: &StreamExit) -> Outcome {
     if exit.timed_out {
         return Outcome::TimedOut;
     }
-    let Some((result, _)) = &transcript.result else {
+    let Some(result) = &transcript.result else {
         return Outcome::Crashed { code: exit.code };
     };
     let rejected = transcript
@@ -581,7 +610,7 @@ mod tests {
     fn a_run_refused_at_the_limit_is_limited_whatever_its_subtype_says() {
         let transcript = transcript(REJECTED);
         // The result claims subtype "success"; is_error is the authority.
-        assert_eq!(transcript.result.as_ref().unwrap().0.subtype, "success");
+        assert_eq!(transcript.result.as_ref().unwrap().subtype, "success");
         assert_eq!(
             classify(&transcript, &exited(1)),
             Outcome::Limited {
@@ -700,6 +729,48 @@ mod tests {
         let command = command(&spec(Session::Resume("abc-123".to_string())));
         let argv = command.argv.join(" ");
         assert!(argv.contains("--resume abc-123"));
+    }
+
+    /// The last result of a real resumed Opus session: its running totals
+    /// include the 17-minute build that came before this 12-second run.
+    const RESUMED: &str = include_str!("../fixtures/resumed-result-opus-2.1.325.jsonl");
+
+    #[test]
+    fn a_resumed_session_is_charged_only_for_this_run() {
+        let usage = transcript(RESUMED).usage();
+        let opus = &usage.models["claude-opus-5-5"];
+        assert_eq!(opus.output_tokens, 1528, "not the session's 24189");
+        assert!(
+            (usage.cost_usd - 0.099163).abs() < 1e-9,
+            "not the session's 2.54"
+        );
+        assert_eq!(usage.turns, 3);
+    }
+
+    #[test]
+    fn several_results_in_one_run_add_up_and_the_last_one_decides() {
+        let part = |turns: u64, cost: f64, outcome: &str| {
+            format!(
+                r#"{{"type":"result","subtype":"success","is_error":false,"num_turns":{turns},"duration_ms":1000,"total_cost_usd":99.0,"modelUsage":{{"m":{{"outputTokens":9999,"costUSD":99.0}}}},"model_usage_since_last_result":{{"m":{{"outputTokens":10,"costUSD":{cost}}}}},"structured_output":{{"outcome":"{outcome}"}}}}"#
+            )
+        };
+        let text = [
+            part(32, 1.25, "early"),
+            part(5, 0.5, "middle"),
+            part(3, 0.25, "done"),
+        ]
+        .join("\n");
+        let transcript = transcript(&text);
+        assert_eq!(transcript.results, 3);
+        let usage = transcript.usage();
+        assert_eq!(usage.turns, 40);
+        assert_eq!(usage.duration_ms, 3000);
+        assert!((usage.cost_usd - 2.0).abs() < 1e-9);
+        assert_eq!(usage.models["m"].output_tokens, 30);
+        let Outcome::Completed(result) = classify(&transcript, &exited(0)) else {
+            panic!("expected Completed");
+        };
+        assert_eq!(result["outcome"], "done");
     }
 
     #[test]

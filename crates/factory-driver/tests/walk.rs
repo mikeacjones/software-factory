@@ -329,6 +329,14 @@ fn a_unit_is_built_broken_fixed_reviewed_and_published() {
     assert!(review_brief.contains("Adversarial testing"));
     assert!(!review_brief.contains("Added a line to feature.txt"));
 
+    // The publisher continues the builder's session but is told what the
+    // factory checked and what the tester and reviewer reported.
+    let describe_brief = std::fs::read_to_string(world.path("bin/state/brief-6.md")).unwrap();
+    assert!(describe_brief.contains("## Check `test`"));
+    assert!(describe_brief.contains("Adversarial testing"));
+    assert!(describe_brief.contains("## Review (step `review`, round 1)"));
+    assert!(!describe_brief.contains("## Acceptance criteria"));
+
     // What was published: one commit on the unit's branch, without the probes.
     let remote = world.path("remote.git");
     let branch = format!("refs/heads/{}", unit.branch);
