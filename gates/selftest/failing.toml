@@ -1,0 +1,17 @@
+# Fixture for `cargo xtask selftest gate`: one check exits non-zero, so the gate fails.
+id = "failing"
+title = "Fixture: one check fails"
+
+[[check]]
+id = "passes"
+tier = "hermetic"
+claim = "A passing check beside a failing one does not rescue the gate."
+command = ["true"]
+timeout_secs = 10
+
+[[check]]
+id = "fails"
+tier = "hermetic"
+claim = "A command that exits non-zero fails the gate."
+command = ["false"]
+timeout_secs = 10

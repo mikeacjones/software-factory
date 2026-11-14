@@ -1,0 +1,19 @@
+# Fixture for `cargo xtask selftest gate`: with `--tier hermetic` the host check
+# is skipped and the gate is incomplete. Run in full, the host check fails,
+# which proves it really was skipped the first time.
+id = "tiers"
+title = "Fixture: two tiers"
+
+[[check]]
+id = "hermetic-passes"
+tier = "hermetic"
+claim = "The selected tier runs."
+command = ["true"]
+timeout_secs = 10
+
+[[check]]
+id = "host-fails"
+tier = "host"
+claim = "A tier that is not selected is skipped, and skipping leaves the gate incomplete."
+command = ["false"]
+timeout_secs = 10

@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://software-factory.invalid/gates/report.schema.json",
+  "title": "Gate report",
+  "description": "What `cargo xtask gate <id>` writes to target/gates/<id>.json.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "gate",
+    "title",
+    "bead",
+    "status",
+    "reason",
+    "tiers_skipped",
+    "git",
+    "tools",
+    "started_at_unix",
+    "duration_ms",
+    "checks"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "gate": { "type": "string", "pattern": "^[a-z0-9-]+(/[a-z0-9-]+)*$" },
+    "title": { "type": "string" },
+    "bead": { "type": ["string", "null"] },
+    "status": { "enum": ["passed", "failed", "incomplete"] },
+    "reason": { "type": ["string", "null"] },
+    "tiers_skipped": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/tier" },
+      "uniqueItems": true
+    },
+    "git": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["commit", "dirty"],
+      "properties": {
+        "commit": { "type": ["string", "null"], "pattern": "^[0-9a-f]{40}$" },
+        "dirty": { "type": "boolean" }
+      }
+    },
+    "tools": {
+      "type": "object",
+      "required": ["rustc", "cargo"],
+      "additionalProperties": { "type": "string" }
+    },
+    "started_at_unix": { "type": "integer", "minimum": 0 },
+    "duration_ms": { "type": "integer", "minimum": 0 },
+    "checks": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/check" }
+    }
+  },
+  "$defs": {
+    "tier": { "enum": ["hermetic", "host", "live", "owner"] },
+    "check": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "tier",
+        "bead",
+        "claim",
+        "command",
+        "status",
+        "exit_code",
+        "duration_ms",
+        "log"
+      ],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z0-9-]+$" },
+        "tier": { "$ref": "#/$defs/tier" },
+        "bead": { "type": ["string", "null"] },
+        "claim": { "type": "string", "minLength": 1 },
+        "command": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+        "status": { "enum": ["passed", "failed", "timed_out", "skipped"] },
+        "exit_code": { "type": ["integer", "null"] },
+        "duration_ms": { "type": "integer", "minimum": 0 },
+        "log": { "type": ["string", "null"] }
+      }
+    }
+  }
+}

@@ -1,0 +1,11 @@
+# Fixture for `cargo xtask selftest gate`: a check outlives its timeout, so the gate fails.
+# The check leaves a background child, which the runner must remove as well.
+id = "timeout"
+title = "Fixture: one check times out"
+
+[[check]]
+id = "hangs"
+tier = "hermetic"
+claim = "A command still running at its timeout is killed and fails the gate."
+command = ["sh", "-c", "sleep 300 & echo $! > target/gates/selftest/timeout/child.pid; wait"]
+timeout_secs = 1

@@ -60,18 +60,16 @@ This protocol applies when ending a Beads implementation workflow. It is subordi
 
 ## Build & Test
 
-_Add your build and test commands here_
+The exact commands are in [AGENTS.md](AGENTS.md). The one to run before handing off:
 
 ```bash
-# Example:
-# npm install
-# npm test
+cargo xtask check
 ```
 
 ## Architecture Overview
 
-_Add a brief overview of your project architecture_
+See [docs/architecture.md](docs/architecture.md). Use terms as [docs/glossary.md](docs/glossary.md) defines them.
 
 ## Conventions & Patterns
 
-_Add your project-specific conventions here_
+See the rules in [AGENTS.md](AGENTS.md).

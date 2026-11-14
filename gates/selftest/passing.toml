@@ -1,0 +1,17 @@
+# Fixture for `cargo xtask selftest gate`: every check passes, so the gate passes.
+id = "passing"
+title = "Fixture: every check passes"
+
+[[check]]
+id = "first"
+tier = "hermetic"
+claim = "A command that exits 0 passes."
+command = ["true"]
+timeout_secs = 10
+
+[[check]]
+id = "second"
+tier = "host"
+claim = "A second tier that ran does not make the gate incomplete."
+command = ["true"]
+timeout_secs = 10

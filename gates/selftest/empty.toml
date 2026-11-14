@@ -1,0 +1,3 @@
+# Fixture for `cargo xtask selftest gate`: a gate with no checks proves nothing, so it fails.
+id = "empty"
+title = "Fixture: no checks"

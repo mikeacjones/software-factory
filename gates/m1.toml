@@ -1,0 +1,21 @@
+# M1: host assumptions proven. Each check is an acceptance line of a bead in
+# epic E01. Beads that have not landed yet add their checks when they do.
+id = "m1"
+title = "Host assumptions proven"
+bead = "sf-be1"
+
+[[tool]]
+name = "dolt"
+command = ["dolt", "version"]
+
+[[tool]]
+name = "bd"
+command = ["bd", "--version"]
+
+[[check]]
+id = "bead-backup-restores"
+tier = "host"
+bead = "sf-l47"
+claim = "A timestamped backup of every database on the Dolt server exists outside the server's data directory, and each one restores into a scratch database with the bead count recorded when it was taken."
+command = ["proofs/backup_beads.sh", "verify"]
+timeout_secs = 600

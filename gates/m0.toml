@@ -1,0 +1,69 @@
+# M0: the harness proves itself. Each check is an acceptance line of a bead in
+# epic E00. Beads that have not landed yet add their checks when they do.
+id = "m0"
+title = "The harness proves itself"
+bead = "sf-4q5"
+
+[[check]]
+id = "docs"
+tier = "hermetic"
+bead = "sf-e3b"
+claim = "docs/architecture.md and docs/glossary.md exist, AGENTS.md links both, lists the check commands and is under 80 lines outside its generated blocks, every glossary term is defined once, and no doc links to a missing file."
+command = ["cargo", "xtask", "docs"]
+timeout_secs = 300
+
+[[check]]
+id = "docs-check-says-no"
+tier = "hermetic"
+bead = "sf-e3b"
+claim = "The docs check fails on a glossary term defined twice and on a link to a missing file."
+command = ["cargo", "test", "--locked", "--offline", "--package", "xtask", "docs::tests"]
+timeout_secs = 600
+
+[[check]]
+id = "toolchain-pinned"
+tier = "hermetic"
+bead = "sf-a82"
+claim = "rust-toolchain.toml pins an exact version and Cargo.lock is committed."
+command = ["sh", "-c", "grep -Eq '^channel = \"[0-9]+\\.[0-9]+\\.[0-9]+\"$' rust-toolchain.toml && git ls-files --error-unmatch Cargo.lock"]
+timeout_secs = 30
+
+[[check]]
+id = "workspace-check"
+tier = "hermetic"
+bead = "sf-a82"
+claim = "`cargo xtask check` runs the format check, clippy with warnings denied and every test, and exits 0."
+command = ["cargo", "xtask", "check"]
+timeout_secs = 1800
+
+[[check]]
+id = "workspace-check-offline"
+tier = "hermetic"
+bead = "sf-a82"
+claim = "With the network denied by the operating system, `cargo xtask check --offline` passes."
+command = ["sandbox-exec", "-p", "(version 1)(allow default)(deny network*)", "cargo", "xtask", "check", "--offline"]
+timeout_secs = 1800
+
+[[check]]
+id = "check-says-no"
+tier = "hermetic"
+bead = "sf-a82"
+claim = "A failing test and a failing lint each make `cargo xtask check` fail, in that stage and no other."
+command = ["cargo", "xtask", "selftest", "check", "--offline"]
+timeout_secs = 1800
+
+[[check]]
+id = "gate-says-no"
+tier = "hermetic"
+bead = "sf-udd"
+claim = "A gate with no checks fails, a failing check fails it, a timed-out check fails it, a skipped tier leaves it incomplete, `--list` covers every gate, and every report matches the committed schema."
+command = ["cargo", "xtask", "selftest", "gate"]
+timeout_secs = 600
+
+[[check]]
+id = "gate-exit-codes"
+tier = "hermetic"
+bead = "sf-udd"
+claim = "From the command line, a passing gate exits 0, a failing gate exits 1 and `--tier hermetic` on a two-tier gate exits 2."
+command = ["sh", "-c", "cargo xtask gate selftest/passing >/dev/null; a=$?; cargo xtask gate selftest/failing >/dev/null; b=$?; cargo xtask gate selftest/tiers --tier hermetic >/dev/null; c=$?; echo \"exit codes: $a $b $c\"; test \"$a $b $c\" = \"0 1 2\""]
+timeout_secs = 300

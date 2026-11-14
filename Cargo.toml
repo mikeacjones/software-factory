@@ -1,0 +1,23 @@
+[workspace]
+resolver = "3"
+members = ["xtask"]
+# Each fixture is its own tiny workspace, checked by `cargo xtask selftest`.
+exclude = ["xtask/fixtures"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.100"
+publish = false
+
+# Conventions every crate follows (see docs/architecture.md and AGENTS.md):
+# errors are typed enums, and nothing panics outside tests.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"

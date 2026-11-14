@@ -1,0 +1,8 @@
+# A fixture for `cargo xtask selftest`. Not part of the factory.
+[workspace]
+
+[package]
+name = "fixture-failing-test"
+version = "0.0.0"
+edition = "2024"
+publish = false
