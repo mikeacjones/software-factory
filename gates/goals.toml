@@ -69,6 +69,14 @@ command = ["cargo", "test", "--locked", "--offline", "--package", "factory-drive
 timeout_secs = 900
 
 [[check]]
+id = "issues"
+tier = "hermetic"
+bead = "sf-rzb.15"
+claim = "A bead with no GitHub issue gets one, linked in the tracker, when its pipeline starts; the publisher is told the issues to close; a pull-request body that leaves one out is refused; a sub-goal's pull request closes the issue of every bead it absorbed; and no issue is created in a repository outside the write list."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-driver", "--package", "factory-github", "--package", "factory-beads", "--", "a_sub_goal_absorbs", "an_issue_is_closed_only", "an_issue_outside_the_write_list", "beads_are_listed_filed_and_changed"]
+timeout_secs = 900
+
+[[check]]
 id = "accounts"
 tier = "hermetic"
 bead = "sf-rzb.9"

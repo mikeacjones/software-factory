@@ -11,6 +11,7 @@
 #                      minor-finding the reviewer approves with one finding left open
 #                      bogus-finding the tester's first reproduction passes when run
 #                      lazy-fix      the builder's first fix leaves the regression test failing
+#                      forget-closes the publisher first leaves the issues out of the pull request
 #                      limit-default-once
 #                                    the first run without an account token is refused
 #                                    at the five-hour limit
@@ -135,11 +136,18 @@ case "$role" in
     output='{"outcome":"approve","summary":"Meets the criteria.",'$common',"findings":'$findings'}'
     ;;
   publisher)
+    # Close the issues the brief names, as a real publisher is told to.
+    closes=$(printf '%s' "$brief" | grep -o -E 'Closes #[0-9]+' | sort -u | tr '\n' ' ')
+    case "$scenario" in
+      *forget-closes*)
+        # The first time it has issues to close, it leaves them out.
+        if [ -n "$closes" ] && [ ! -f "$state/forgot" ]; then touch "$state/forgot"; closes=""; fi ;;
+    esac
     trailer=""
     case "$brief" in
       *"publish check"*) trailer='\nChangelog: none (test)\n' ;;
     esac
-    output='{"outcome":"ready","summary":"Wrote the text.",'$common',"commit_message":"Add the feature\n\nIt adds lines to feature.txt.\n'$trailer'","pr_title":"Add the feature","pr_body":"Adds the feature for toy-1.","merge_summary":"The branch adds feature.txt, which the bead asked for."}'
+    output='{"outcome":"ready","summary":"Wrote the text.",'$common',"commit_message":"Add the feature\n\nIt adds lines to feature.txt.\n'$trailer'","pr_title":"Add the feature","pr_body":"Adds the feature for toy-1. '"$closes"'","merge_summary":"The branch adds feature.txt, which the bead asked for."}'
     ;;
 esac
 

@@ -33,6 +33,10 @@ database = "temporal-sdk-zig"
 [github]
 repo = "mikeacjones/temporal-sdk-zig"
 write = ["mikeacjones/temporal-sdk-zig"]
+# Every bead has a GitHub issue, and a pull request closes the issues of the
+# beads it lands. A bead filed without one gets an issue from the factory.
+issues = true
+issue_labels = ["type::{type}", "priority::{priority}"]
 ci_poll_secs = 30
 ci_timeout_secs = 10800
 ci_settle_secs = 60

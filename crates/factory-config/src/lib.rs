@@ -238,6 +238,16 @@ pub struct GitHub {
     /// Green must still be green this long after it is first seen.
     #[serde(default = "default_ci_settle")]
     pub ci_settle_secs: u64,
+    /// Keep GitHub issues in step with beads: a bead with no issue gets one
+    /// when the factory files it or starts work on it, and a pull request
+    /// must close the issue of every bead it lands.
+    #[serde(default)]
+    pub issues: bool,
+    /// Labels for an issue the factory creates. `{type}` is the bead's type
+    /// and `{priority}` its priority as a word (critical, high, medium, low,
+    /// none). A label the repository does not have is left off.
+    #[serde(default)]
+    pub issue_labels: Vec<String>,
     /// How a pull request reaches the default branch.
     #[serde(default)]
     pub merge_method: MergeMethod,

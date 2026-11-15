@@ -61,6 +61,9 @@ pub struct Bead {
     /// Beads that block this one and are not closed.
     #[serde(default)]
     pub open_blockers: Vec<String>,
+    /// Where the bead is tracked outside the tracker: its GitHub issue's URL.
+    #[serde(default)]
+    pub external_ref: String,
 }
 
 fn default_type() -> String {
@@ -212,7 +215,8 @@ impl Source {
                 // The ID was checked above, so it is safe inside the quotes.
                 let rows = self.query(&format!(
                     "select id, title, description, design, acceptance_criteria, notes, status, \
-                     issue_type, coalesce(assignee, '') as assignee, priority from issues where id = '{id}'"
+                     issue_type, coalesce(assignee, '') as assignee, priority, \
+                     coalesce(external_ref, '') as external_ref from issues where id = '{id}'"
                 ))?;
                 let row = rows
                     .first()
@@ -257,6 +261,7 @@ impl Source {
                         .unwrap_or(0),
                     labels: column(labels, "label"),
                     open_blockers: column(blockers, "id"),
+                    external_ref: text("external_ref"),
                 })
             }
         }
@@ -550,6 +555,30 @@ impl Source {
         Ok(bead)
     }
 
+    /// Record where a bead is tracked outside the tracker, and read it back.
+    pub fn link(&self, id: &str, external_ref: &str, actor: &str) -> Result<Bead, BeadError> {
+        check_id(id)?;
+        match self {
+            Source::Files { dir } => {
+                let mut bead = self.read(id)?;
+                bead.external_ref = external_ref.to_string();
+                self.write_file(dir, &bead)?;
+            }
+            Source::Dolt { repo, .. } => {
+                self.bd(repo, &["update", id, "--external-ref", external_ref], actor)?;
+            }
+        }
+        let bead = self.read(id)?;
+        if bead.external_ref != external_ref {
+            return Err(BeadError::ClaimNotVisible {
+                id: id.to_string(),
+                status: bead.status,
+                assignee: bead.assignee,
+            });
+        }
+        Ok(bead)
+    }
+
     /// Close a bead, and confirm it in the project's database.
     pub fn close(&self, id: &str, reason: &str, actor: &str) -> Result<Bead, BeadError> {
         check_id(id)?;
@@ -815,6 +844,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(back.status, "open");
+        let linked = source
+            .link(&filed.id, "https://github.com/me/toy/issues/9", "factory")
+            .unwrap();
+        assert_eq!(linked.external_ref, "https://github.com/me/toy/issues/9");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

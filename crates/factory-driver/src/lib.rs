@@ -163,6 +163,10 @@ pub struct Unit {
     /// The beads closed when this unit lands. Empty means its own.
     #[serde(default)]
     pub closes: Vec<String>,
+    /// The GitHub issues this unit's pull request must close: its bead's, or
+    /// those of every bead of the sub-goal it ships.
+    #[serde(default)]
+    pub issues: Vec<u64>,
     /// The adversarial tester's regression tests that are now part of the
     /// unit's branch. Every one must pass before a fix is accepted.
     #[serde(default)]
@@ -265,6 +269,8 @@ pub struct Ship {
     pub base: String,
     /// The beads whose work it holds, closed when it lands.
     pub closes: Vec<String>,
+    /// The GitHub issues of those beads, which its pull request must close.
+    pub issues: Vec<u64>,
 }
 
 pub struct Driver {
@@ -563,6 +569,7 @@ impl Driver {
                 absorbed: None,
                 ship: false,
                 closes: Vec::new(),
+                issues: Vec::new(),
                 regressions: Vec::new(),
                 history: Vec::new(),
                 runs: 0,
@@ -590,6 +597,7 @@ impl Driver {
             }
             Some(Within::Ship(ship)) => {
                 driver.unit.ship = true;
+                driver.unit.issues = ship.issues.clone();
                 driver.unit.closes = ship.closes.clone();
                 driver.unit.worktree = ship.worktree.clone();
                 driver.unit.branch = ship.branch.clone();
@@ -821,6 +829,20 @@ impl Driver {
             None,
             json!({ "actor": self.project.bead_actor }),
         )?;
+        // The bead's GitHub issue, which the pull request will close. A bead
+        // that has none gets one now.
+        if let Some(url) = ensure_issue(&self.factory, &self.project, source, &self.bead)? {
+            if self.bead.external_ref != url {
+                self.event("issue.created", None, json!({ "url": url }))?;
+            }
+            self.bead.external_ref = url;
+        }
+        if let Some(github) = &self.project.github
+            && let Some(number) =
+                factory_github::issue_number(&self.bead.external_ref, &github.repo)
+        {
+            self.unit.issues = vec![number];
+        }
 
         let repo = self.project.repo.clone();
         let base = if self.unit.base.is_empty() {
@@ -1269,6 +1291,23 @@ impl Driver {
                 },
             );
         }
+        if contract == Contract::Publication
+            && self.unit.absorb_into.is_none()
+            && !self.unit.issues.is_empty()
+        {
+            notes.push(Note {
+                title: "GitHub issues this pull request closes".to_string(),
+                body: format!(
+                    "Write these in the pull-request body, where it says what the pull request closes, each exactly like this so that GitHub closes the issue when it merges: {}. The factory refuses a body that leaves one out.",
+                    self.unit
+                        .issues
+                        .iter()
+                        .map(|number| format!("`Closes #{number}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            });
+        }
         if self.unit.ship {
             // Nobody in this pipeline built the change: say what it holds.
             let commits =
@@ -1470,6 +1509,22 @@ impl Driver {
                     {
                         // A fix is not done while a regression test still fails.
                         problems.extend(self.check_regressions(&cwd)?);
+                    }
+                    if contract == Contract::Publication
+                        && self.unit.absorb_into.is_none()
+                        && self
+                            .project
+                            .github
+                            .as_ref()
+                            .is_some_and(|github| github.issues)
+                    {
+                        // The pull request must close the issues of the beads it lands.
+                        let body = result.get("pr_body").and_then(Value::as_str).unwrap_or("");
+                        for number in factory_github::unclosed_issues(body, &self.unit.issues) {
+                            problems.push(format!(
+                                "`pr_body` does not close issue #{number}: write `Closes #{number}` in it, so that GitHub closes the issue when the pull request merges"
+                            ));
+                        }
                     }
                     if contract == Contract::Publication {
                         let own = self
@@ -3119,6 +3174,52 @@ pub fn observe_account(
         let _ = Tracker::new(&factory.state_dir)
             .update(account, |state| state.observe(limit, model, now_unix()));
     }
+}
+
+/// The URL of a bead's GitHub issue, creating the issue if the project keeps
+/// issues in step with beads and the bead has none. `None` if the project
+/// does not keep them.
+pub fn ensure_issue(
+    factory: &Factory,
+    project: &Project,
+    source: &Source,
+    bead: &Bead,
+) -> Result<Option<String>, DriverError> {
+    let Some(settings) = project.github.as_ref().filter(|github| github.issues) else {
+        return Ok(None);
+    };
+    if !bead.external_ref.trim().is_empty() {
+        return Ok(Some(bead.external_ref.clone()));
+    }
+    let priority = match bead.priority {
+        0 => "critical",
+        1 => "high",
+        2 => "medium",
+        3 => "low",
+        _ => "none",
+    };
+    let labels: Vec<String> = settings
+        .issue_labels
+        .iter()
+        .map(|label| {
+            label
+                .replace("{type}", &bead.issue_type)
+                .replace("{priority}", priority)
+        })
+        .collect();
+    let mut body = bead.description.trim().to_string();
+    if !bead.acceptance_criteria.trim().is_empty() {
+        body.push_str(&format!(
+            "\n\n## Acceptance criteria\n\n{}",
+            bead.acceptance_criteria.trim()
+        ));
+    }
+    body.push_str(&format!("\n\nTracked as bead `{}`.", bead.id));
+    let (_, url) = github_client(factory, settings)
+        .create_issue(&project.repo, &settings.repo, &bead.title, &body, &labels)
+        .map_err(|err| DriverError::Preflight(err.to_string()))?;
+    source.link(&bead.id, &url, &project.bead_actor)?;
+    Ok(Some(url))
 }
 
 fn github_client(factory: &Factory, settings: &factory_config::GitHub) -> GitHub {

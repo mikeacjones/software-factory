@@ -282,10 +282,87 @@ impl GitHub {
         self.gh(cwd, &args, None).map(|_| ())
     }
 
+    /// Open an issue. Labels the repository does not have make `gh` refuse,
+    /// so a refusal is tried once more without them: an issue without labels
+    /// is better than a bead without an issue.
+    pub fn create_issue(
+        &self,
+        cwd: &Path,
+        repo: &str,
+        title: &str,
+        body: &str,
+        labels: &[String],
+    ) -> Result<(u64, String), GitHubError> {
+        self.check_allowed(repo)?;
+        let attempt = |labels: &[String]| {
+            let mut args = vec![
+                "issue",
+                "create",
+                "--repo",
+                repo,
+                "--title",
+                title,
+                "--body-file",
+                "-",
+            ];
+            for label in labels {
+                args.extend(["--label", label.as_str()]);
+            }
+            self.gh(cwd, &args, Some(body))
+        };
+        let out = match attempt(labels) {
+            Err(GitHubError::Failed { .. }) if !labels.is_empty() => attempt(&[])?,
+            other => other?,
+        };
+        out.lines()
+            .rev()
+            .find_map(|line| {
+                issue_number(line.trim(), repo).map(|number| (number, line.trim().to_string()))
+            })
+            .ok_or_else(|| GitHubError::Answer {
+                command: "gh issue create".to_string(),
+                detail: format!("no issue URL in `{}`", out.trim()),
+            })
+    }
+
     /// Whether `gh` is logged in at all.
     pub fn authenticated(&self, cwd: &Path) -> bool {
         self.gh(cwd, &["auth", "status"], None).is_ok()
     }
+}
+
+/// The number of an issue of `repo`, from its URL.
+pub fn issue_number(url: &str, repo: &str) -> Option<u64> {
+    url.strip_prefix(&format!("https://github.com/{repo}/issues/"))?
+        .trim_end_matches('/')
+        .parse()
+        .ok()
+}
+
+/// Which of `issues` a pull-request body does not close. GitHub closes an
+/// issue when the pull request merges only if the body names it after one of
+/// its closing words, so "see #12" or "N/A" closes nothing.
+pub fn unclosed_issues(body: &str, issues: &[u64]) -> Vec<u64> {
+    let body = body.to_lowercase();
+    issues
+        .iter()
+        .copied()
+        .filter(|number| {
+            let closes = |word: &str| {
+                let needle = format!("{word} #{number}");
+                body.match_indices(&needle).any(|(at, _)| {
+                    // Not the start of a longer number, such as #123 for #12.
+                    !body[at + needle.len()..].starts_with(|c: char| c.is_ascii_digit())
+                })
+            };
+            ![
+                "close", "closes", "closed", "fix", "fixes", "fixed", "resolve", "resolves",
+                "resolved",
+            ]
+            .iter()
+            .any(|word| closes(word))
+        })
+        .collect()
 }
 
 /// How a pull request's commits reach the default branch.
@@ -679,6 +756,35 @@ mod tests {
         assert_eq!(status("PENDING").state, CheckState::Pending);
         assert_eq!(status("ERROR").state, CheckState::Failed);
         assert_eq!(status("SUCCESS").name, "ci/x");
+    }
+
+    #[test]
+    fn an_issue_is_closed_only_by_a_closing_word() {
+        let body = "1. Closes #113 (bead a), closes #134. Also see #12 and fixes #1200.";
+        assert_eq!(unclosed_issues(body, &[113, 134]), Vec::<u64>::new());
+        assert_eq!(unclosed_issues(body, &[12, 120, 1200]), [12, 120]);
+        assert_eq!(
+            unclosed_issues("1. Closes: N/A, tracked in beads.", &[7]),
+            [7]
+        );
+        assert_eq!(unclosed_issues("Resolves #7", &[7]), Vec::<u64>::new());
+        assert_eq!(
+            issue_number("https://github.com/me/toy/issues/84", "me/toy"),
+            Some(84)
+        );
+        assert_eq!(
+            issue_number("https://github.com/other/toy/issues/84", "me/toy"),
+            None
+        );
+        assert_eq!(issue_number("gh-9", "me/toy"), None);
+    }
+
+    #[test]
+    fn an_issue_outside_the_write_list_is_refused() {
+        let mut github = GitHub::new(vec!["me/toy".to_string()]);
+        github.gh_bin = "no-such-gh-anywhere".to_string();
+        let result = github.create_issue(&std::env::temp_dir(), "someone/else", "t", "b", &[]);
+        assert!(matches!(result, Err(GitHubError::NotAllowed(_))));
     }
 
     #[test]

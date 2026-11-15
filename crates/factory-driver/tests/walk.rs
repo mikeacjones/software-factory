@@ -1481,6 +1481,7 @@ fn a_sub_goal_absorbs_its_beads_and_ships_as_one_pull_request() {
 
     let world = World::new("subgoal", "true");
     world.with_github("green");
+    world.scenario("forget-closes");
     // The second bead is blocked by the first, which stays open until the
     // sub-goal lands.
     std::fs::write(
@@ -1500,6 +1501,11 @@ fn a_sub_goal_absorbs_its_beads_and_ships_as_one_pull_request() {
             "merge_body = \"{commit_body}\\n\\n{testing}\\n\\n{commit_trailers}\"",
         );
     assert!(text.contains("merge_method = \"squash\""));
+    // Every bead gets a GitHub issue, and the pull request must close them.
+    let text = text.replace(
+        "write = [\"me/toy\"]",
+        "write = [\"me/toy\"]\nissues = true",
+    );
     std::fs::write(&project, text).unwrap();
     std::fs::create_dir_all(world.path("config/goals/toy")).unwrap();
     std::fs::write(
@@ -1700,11 +1706,12 @@ fn a_sub_goal_absorbs_its_beads_and_ships_as_one_pull_request() {
         assert!(ship_log.contains(present), "shipping did not run {present}");
     }
     // The publisher of the whole was told which commits and beads it covers.
+    // (Its last call is the retry after its first text was refused.)
     let calls = world.calls();
-    let publisher = calls
-        .iter()
-        .rposition(|call| call[0] == "publisher")
-        .unwrap();
+    let publishers: Vec<usize> = (0..calls.len())
+        .filter(|&i| calls[i][0] == "publisher")
+        .collect();
+    let publisher = publishers[publishers.len() - 2];
     let ship_brief =
         std::fs::read_to_string(world.path(&format!("bin/state/brief-{}.md", publisher + 1)))
             .unwrap();
@@ -1721,6 +1728,31 @@ fn a_sub_goal_absorbs_its_beads_and_ships_as_one_pull_request() {
         "the beads' criteria are in the brief"
     );
 
+    // Neither bead had a GitHub issue: each got one when its pipeline
+    // started, and the one pull request closes both.
+    assert_eq!(
+        gh.iter()
+            .filter(|call| call.starts_with("issue create"))
+            .count(),
+        2
+    );
+    assert!(bead("toy-1").contains("https://github.com/me/toy/issues/1"));
+    assert!(bead("toy-3").contains("https://github.com/me/toy/issues/2"));
+    assert!(
+        ship_brief.contains("## GitHub issues this pull request closes"),
+        "{ship_brief}"
+    );
+    // The publisher first left them out: code refused the text.
+    assert!(
+        ship_log.contains("`pr_body` does not close issue #1")
+            && ship_log.contains("does not close issue #2"),
+        "a pull request that closes no issue must be refused"
+    );
+    let pr_body = std::fs::read_to_string(world.path("bin/state-gh/pr-body")).unwrap();
+    assert!(
+        pr_body.contains("Closes #1") && pr_body.contains("Closes #2"),
+        "{pr_body}"
+    );
     assert_eq!(
         run(&remote, "git", &["rev-list", "--count", "main"]),
         "2",

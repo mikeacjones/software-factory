@@ -1586,6 +1586,20 @@ impl Supervisor {
         };
         match source.create(&new, &project.bead_actor) {
             Ok(bead) => {
+                // A bead the factory files has a GitHub issue from the start.
+                match crate::ensure_issue(&self.factory, project, source, &bead) {
+                    Ok(Some(url)) => self.log(
+                        goal,
+                        "issue.created",
+                        json!({ "bead": bead.id, "url": url }),
+                    ),
+                    Ok(None) => {}
+                    Err(err) => self.log(
+                        goal,
+                        "issue.failed",
+                        json!({ "bead": bead.id, "error": err.to_string() }),
+                    ),
+                }
                 self.log(
                     goal,
                     "bead.filed",
@@ -1969,7 +1983,17 @@ impl Supervisor {
                 ));
             }
         }
+        let project = self.config.project(&goal.project)?;
+        let issues: Vec<u64> = closes
+            .iter()
+            .filter_map(|bead| source.read(bead).ok())
+            .filter_map(|bead| {
+                let github = project.github.as_ref()?;
+                factory_github::issue_number(&bead.external_ref, &github.repo)
+            })
+            .collect();
         let ship = Ship {
+            issues,
             id: format!("{}-{}", goal.project, sub.id),
             title: sub.title.clone(),
             description: format!(
