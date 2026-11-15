@@ -5,10 +5,14 @@ cli_version = "2.1.325"
 allowed_models = ["claude-fable-5-2", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"]
 
 # launchd keeps the service running, as an agent of this user's desktop
-# session (`factory service install`). `path` is where the service and the
-# tools it starts are looked for, since launchd gives a job almost none.
+# session (`factory service install`). launchd gives a job almost no
+# environment, so the service is started through this user's login shell
+# (`login_shell`): it, and every agent and command it starts, then has the
+# `PATH` and the rest of what the shell's profile sets up, as a terminal
+# does. `path` is what that shell itself starts from.
 [service]
 label = "software-factory"
+login_shell = true
 path = ["~/.local/bin", "/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
 
 # The Claude accounts workers run under. Capacity left in a window when it

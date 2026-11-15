@@ -130,11 +130,29 @@ fn xml(text: &str) -> String {
 /// any other kind of session could not use the login Keychain. It is
 /// started at login and again whenever it exits, which is also how it is
 /// restarted on purpose: the service ends at a safe point and launchd
-/// starts the current release. `path` is the `PATH` its tools are found on,
-/// since launchd gives a job almost none.
-pub fn plist(label: &str, state_dir: &Path, path: &[String]) -> String {
+/// starts the current release.
+///
+/// launchd gives a job almost no environment, and none of what the user's
+/// shell profile sets up: tools installed under the home directory are not
+/// on its `PATH`. With `shell`, the user's login shell, the service is
+/// started through it (`-lic`, so the profile and the interactive setup
+/// both run) and it, and every agent and command it starts, has what the
+/// user's own terminal has. `path` is what the shell itself starts from,
+/// and all there is without one.
+pub fn plist(label: &str, state_dir: &Path, path: &[String], shell: Option<&str>) -> String {
     let current = current(state_dir);
     let text = |value: &Path| xml(&value.to_string_lossy());
+    // The shell replaces itself with the service, so launchd watches the
+    // service's own process.
+    let through_shell = shell
+        .map(|shell| {
+            format!(
+                "        <string>{}</string>\n        <string>-lic</string>\n        <string>exec \"$@\"</string>\n        <string>{}</string>\n",
+                xml(shell),
+                xml(label)
+            )
+        })
+        .unwrap_or_default();
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -144,7 +162,7 @@ pub fn plist(label: &str, state_dir: &Path, path: &[String]) -> String {
     <string>{label}</string>
     <key>ProgramArguments</key>
     <array>
-        <string>{factory}</string>
+{through_shell}        <string>{factory}</string>
         <string>serve</string>
         <string>--config</string>
         <string>{config}</string>
@@ -446,11 +464,9 @@ mod tests {
 
     #[test]
     fn the_launchd_job_runs_the_current_release_in_the_desktop_session() {
-        let text = plist(
-            "software-factory",
-            Path::new("/Users/agent/.local/state/a&b"),
-            &["/opt/homebrew/bin".to_string(), "/usr/bin".to_string()],
-        );
+        let path = ["/opt/homebrew/bin".to_string(), "/usr/bin".to_string()];
+        let state = Path::new("/Users/agent/.local/state/a&b");
+        let text = plist("software-factory", state, &path, None);
         for expected in [
             "<key>Label</key>\n    <string>software-factory</string>",
             "<string>/Users/agent/.local/state/a&amp;b/current/factory</string>\n        <string>serve</string>\n        <string>--config</string>\n        <string>/Users/agent/.local/state/a&amp;b/current/config</string>",
@@ -462,6 +478,17 @@ mod tests {
         ] {
             assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
         }
+        // Through the user's login shell, the service has what the user's
+        // terminal has. The shell runs its profile and then becomes the
+        // service, so the process launchd watches is still the service.
+        let through = plist("software-factory", state, &path, Some("/bin/zsh"));
+        assert!(
+            through.contains(
+                "<array>\n        <string>/bin/zsh</string>\n        <string>-lic</string>\n        <string>exec \"$@\"</string>\n        <string>software-factory</string>\n        <string>/Users/agent/.local/state/a&amp;b/current/factory</string>\n        <string>serve</string>"
+            ),
+            "{through}"
+        );
+        assert!(!text.contains("-lic"));
         assert_eq!(
             release_name(1_794_747_600, Some("1d73d42\n")),
             "2026-11-15T130000Z-1d73d42"

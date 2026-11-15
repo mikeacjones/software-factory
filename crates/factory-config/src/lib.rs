@@ -71,6 +71,12 @@ pub struct ServiceSettings {
     /// How many releases to keep.
     #[serde(default = "default_releases_kept")]
     pub releases_kept: usize,
+    /// Start the service through the user's login shell, so that it and
+    /// every agent and command it starts have the environment the user's
+    /// own terminal has: the `PATH` and whatever else the shell's profile
+    /// sets. Without it they have only `path`.
+    #[serde(default = "default_login_shell")]
+    pub login_shell: bool,
 }
 
 fn default_service_label() -> String {
@@ -97,12 +103,17 @@ fn default_releases_kept() -> usize {
     5
 }
 
+fn default_login_shell() -> bool {
+    true
+}
+
 impl Default for ServiceSettings {
     fn default() -> Self {
         ServiceSettings {
             label: default_service_label(),
             path: default_service_path(),
             releases_kept: default_releases_kept(),
+            login_shell: default_login_shell(),
         }
     }
 }

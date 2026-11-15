@@ -286,7 +286,38 @@ fn run(args: &[String]) -> Result<u8, String> {
             }
             let release = release_this_build(&factory, &args.config.0).map_err(|err| fail(&err))?;
             println!("release: {}", release.display());
-            let text = plist(&job.label, &factory.state_dir, &factory.service.path);
+            let shell = factory
+                .service
+                .login_shell
+                .then(|| std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string()));
+            let text = plist(
+                &job.label,
+                &factory.state_dir,
+                &factory.service.path,
+                shell.as_deref(),
+            );
+            // Loading a job again stops the one that is running. If it is,
+            // it is first asked to stop at a safe point, and the new
+            // description is loaded the moment it has: launchd starts it
+            // again at once under the old description, and that start is
+            // replaced before it has begun anything.
+            if let Some(old) = job.state().pid {
+                let flag = factory_driver::drain_flag(&factory.state_dir);
+                std::fs::write(&flag, "").map_err(|err| format!("{}: {err}", flag.display()))?;
+                println!(
+                    "the service is running (process {old}): waiting for it to stop at a safe point, {} step(s) in flight",
+                    factory_driver::service::children(old).len()
+                );
+                let started = std::time::Instant::now();
+                while job.state().pid == Some(old) {
+                    if started.elapsed() >= std::time::Duration::from_secs(4 * 3600) {
+                        return Err(
+                            "it had not stopped after four hours; nothing was changed".to_string()
+                        );
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+            }
             job.load(&text).map_err(|err| fail(&err))?;
             println!(
                 "launchd job `{}` loaded from {}",
