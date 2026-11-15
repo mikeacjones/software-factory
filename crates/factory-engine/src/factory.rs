@@ -12,7 +12,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use factory_config::ConfigDir;
+use factory_driver::goal::{Event, RunningPipeline, Supervisor, Turned};
 use factory_driver::{Driver, DriverError, Options, Stepped};
+use factory_slack::socket::Incoming;
 
 use crate::accounts::{CheckCall, Picture};
 use crate::steps::{
@@ -200,6 +202,72 @@ impl StepRunner for FactoryRunner {
         Driver::resume(self.config.clone(), unit, &self.options(None, None), None)
             .and_then(|mut driver| driver.finish())
             .map_err(|err| err.to_string())
+    }
+
+    fn turn(&self, project: &str, event: &Event) -> Result<Turned, String> {
+        // The supervisor for one turn reads the goals as their records
+        // stand, applies the event, and leaves the records as the tiers
+        // decided. It lives no longer than that.
+        let mut supervisor = Supervisor::for_turn(self.config.clone(), Some(project))
+            .map_err(|err| err.to_string())?;
+        Ok(supervisor.turn(event.clone()))
+    }
+
+    fn listen(&self, heard: &dyn Fn(String, Incoming), stop: &AtomicBool) -> Result<(), String> {
+        // Only for which channel is which project's.
+        let supervisor =
+            Supervisor::for_turn(self.config.clone(), None).map_err(|err| err.to_string())?;
+        let route = |incoming: Incoming| {
+            let channel = match &incoming {
+                Incoming::Message { channel, .. } | Incoming::Action { channel, .. } => channel,
+            };
+            // What is said elsewhere is not for any project's tiers.
+            if let Some(project) = supervisor.project_of(channel) {
+                heard(project.to_string(), incoming);
+            }
+        };
+        // What was kept when it could not be handed on, or when the
+        // service that listened before stopped.
+        for incoming in Supervisor::parked(&self.config) {
+            route(incoming);
+        }
+        let Some(listener) = Supervisor::listener(&self.config).map_err(|err| err.to_string())?
+        else {
+            // A factory without Slack hears nothing.
+            while !stop.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            return Ok(());
+        };
+        while !stop.load(Ordering::Relaxed) {
+            match listener.incoming.recv_timeout(Duration::from_millis(250)) {
+                Ok(incoming) => route(incoming),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err("the Slack listener stopped by itself".to_string());
+                }
+            }
+        }
+        listener.stop();
+        // What arrived as it stopped.
+        for incoming in listener.incoming.try_iter() {
+            route(incoming);
+        }
+        Ok(())
+    }
+
+    fn keep(&self, incoming: &Incoming) {
+        Supervisor::keep(&self.config, incoming);
+    }
+
+    fn running(&self) -> Result<Vec<RunningPipeline>, String> {
+        Supervisor::running_pipelines(&self.config).map_err(|err| err.to_string())
+    }
+
+    fn draining(&self) -> bool {
+        self.config
+            .factory()
+            .is_ok_and(|factory| factory_driver::draining(&factory.state_dir))
     }
 
     fn accounts(&self, call: &CheckCall) -> Result<Picture, String> {

@@ -84,6 +84,12 @@ pub struct Temporal {
     /// engine's own command. Off, the service runs them itself.
     #[serde(default)]
     pub pipelines: bool,
+    /// The tiers are on the engine too: each project's executive,
+    /// directors and foremen take their turns in a workflow, which is
+    /// signalled what the owner does in Slack and how the pipelines are
+    /// doing. The service then only starts the engine's worker.
+    #[serde(default)]
+    pub tiers: bool,
     /// The engine's command, when it is not `bin/factory-engine` under
     /// the state directory. Reaching the server from this machine is
     /// allowed to a program by its path, so it does not move.

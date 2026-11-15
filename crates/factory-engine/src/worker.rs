@@ -15,7 +15,8 @@ use temporalio_sdk::{Runtime, Worker, WorkerOptions};
 use crate::accounts::{ACCOUNTS_ID, Accounts, AccountsInput};
 use crate::describe;
 use crate::engine::{Pipeline, PipelineInput};
-use crate::steps::{StepRunner, Steps};
+use crate::steps::{Gate, StepRunner, Steps};
+use crate::tiers::{INTAKE_RUN_SECS, Intake, IntakeInput, Project, Reach, intake_options};
 
 /// Where a worker connects and what it calls itself.
 #[derive(Clone, Debug)]
@@ -104,7 +105,34 @@ pub async fn ensure_accounts(
         .map_err(|err| format!("the accounts workflow could not be started: {err}"))
 }
 
+/// See that the tiers are on the engine: the intake, which listens and
+/// watches, and the workflow of each project named. Those that are
+/// running already are left as they are.
+pub async fn ensure_tiers(
+    client: &Client,
+    reach: &Reach,
+    projects: &[String],
+) -> Result<(), String> {
+    for project in projects {
+        crate::tiers::ensure_project(client, reach, project).await?;
+    }
+    let input = IntakeInput {
+        reach: reach.clone(),
+        run_secs: INTAKE_RUN_SECS,
+    };
+    client
+        .start_workflow(Intake::run, input, intake_options(&reach.task_queue))
+        .await
+        .map(|_| ())
+        .map_err(|err| format!("the intake workflow could not be started: {err}"))
+}
+
 /// Run a worker until it is told to stop, or for ever.
+///
+/// It stops at a safe point when its runner says the worker is to go:
+/// it takes on nothing new, lets every step and turn it is in the middle
+/// of finish, and then returns. What it did not take on waits on the
+/// server for the worker that starts next.
 pub async fn run(settings: WorkerSettings, runner: Arc<dyn StepRunner>) -> Result<(), String> {
     let runtime = Runtime::from_current_tokio(Default::default())
         .map_err(|err| format!("the runtime could not be set up: {err}"))?;
@@ -123,16 +151,39 @@ pub async fn run(settings: WorkerSettings, runner: Arc<dyn StepRunner>) -> Resul
     } else {
         WorkerDeploymentOptions::new(version).build()
     };
+    let gate = Arc::new(Gate::default());
     let options = WorkerOptions::new(settings.task_queue.clone())
         .deployment_options(deployment)
-        .register_activities(Steps::new(runner))
+        .register_activities(Steps::with_gate(runner.clone(), gate.clone()))
         .register_workflow::<Pipeline>()
         .map_err(|err| format!("the engine could not be registered: {err}"))?
         .register_workflow::<Accounts>()
         .map_err(|err| format!("the accounts could not be registered: {err}"))?
+        .register_workflow::<Project>()
+        .map_err(|err| format!("the projects could not be registered: {err}"))?
+        .register_workflow::<Intake>()
+        .map_err(|err| format!("the intake could not be registered: {err}"))?
         .build();
     let mut worker = Worker::new(&runtime, client, options)
         .map_err(|err| format!("the worker could not be made: {err}"))?;
+    let stop = worker.shutdown_handle();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            if !runner.draining() {
+                continue;
+            }
+            // Nothing new is taken on from here.
+            stop();
+            while gate.busy() > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            // What only listens and watches ends too, and with it the
+            // worker's run.
+            gate.leave();
+            return;
+        }
+    });
     worker
         .run()
         .await

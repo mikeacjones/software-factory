@@ -383,6 +383,10 @@ pub struct Front {
     pub said: Vec<(String, String)>,
     /// The goal it became. From then the thread is that goal's.
     pub goal: Option<String>,
+    /// The owner's last message has not been answered yet, because every
+    /// account was at a limit, and is handed in again when one is back.
+    #[serde(default)]
+    pub waiting: bool,
 }
 
 /// Where an agent of the supervisor sits: the directory its runs, its
@@ -490,6 +494,98 @@ fn engine_ended(
     }
 }
 
+/// Something that happened, for the tiers of a project to deal with.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Event {
+    /// The owner wrote or pressed something in Slack.
+    Slack(Incoming),
+    /// A pipeline has a unit.
+    Began {
+        goal: String,
+        bead: String,
+        unit: String,
+    },
+    /// A pipeline ended. `word` and `rest` are what the engine said of
+    /// it: `end` with how as JSON, `refused` or `failed` with why.
+    Ended {
+        goal: String,
+        bead: String,
+        ship: bool,
+        unit: Option<String>,
+        word: String,
+        rest: String,
+    },
+    /// Nothing happened, but something may have come due.
+    Tick,
+    /// The first thing a project's tiers are handed when they move to
+    /// whatever hands them events: pick up what was running before.
+    Resume,
+    /// Open a goal as an owner's message in the project's channel would,
+    /// without Slack.
+    Open { project: String, text: String },
+    /// Say something to the project's executive as the owner would in
+    /// the thread `thread` of its channel, without Slack.
+    Tell {
+        project: String,
+        thread: String,
+        text: String,
+    },
+}
+
+/// What one turn of the tiers leaves for whoever ran it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Turned {
+    /// The pipelines to start, each as `factory-engine run` takes it,
+    /// with the goal it belongs to and whether it ships a sub-goal.
+    pub launches: Vec<Value>,
+    /// When something next comes due by itself.
+    pub due_at: Option<u64>,
+    /// When to hand the same event in again: an owner's message that
+    /// could not be answered because every account was at a limit.
+    pub again_at: Option<u64>,
+    /// What went wrong, if the turn could not be finished. What it had
+    /// asked for by then is in `launches` all the same.
+    #[serde(default)]
+    pub trouble: Option<String>,
+}
+
+/// The Slack settings as the factory uses them: the client, the owners,
+/// the app token for the socket and the API's address.
+fn slack_of(
+    settings: &factory_config::SlackSettings,
+) -> Result<(Slack, Vec<String>, String, String), DriverError> {
+    let env = read_env_file(&settings.env_file)?;
+    let need = |key: &str| {
+        env.get(key).cloned().ok_or_else(|| {
+            DriverError::Preflight(format!("{} has no {key}", settings.env_file.display()))
+        })
+    };
+    let api = env
+        .get("SLACK_API_URL")
+        .cloned()
+        .unwrap_or_else(|| "https://slack.com/api".to_string());
+    let owners: Vec<String> = need("SLACK_OWNER_USER_ID")?
+        .split(',')
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .collect();
+    let slack = Slack::with_base_url(need("SLACK_BOT_TOKEN")?, api.clone());
+    Ok((slack, owners, need("SLACK_APP_TOKEN")?, api))
+}
+
+/// A pipeline a goal's record says is running.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunningPipeline {
+    pub project: String,
+    pub goal: String,
+    pub bead: String,
+    pub ship: bool,
+    /// Its unit, once the goal has been told of it.
+    pub unit: Option<String>,
+    /// What the pipeline is called on the engine.
+    pub name: String,
+}
+
 /// What a goal's pipeline is called on the engine. It is made from what
 /// the goal's record says of the pipeline, so that the same name is asked
 /// for after a restart and the pipeline that is there is found: which
@@ -504,6 +600,57 @@ fn pipeline_name(goal: &Goal, name: &str) -> String {
         .find(|unit| unit.bead == name)
         .map_or(0, |unit| unit.continued);
     format!("pipeline-{}-{name}-{started}-{continued}", goal.id)
+}
+
+/// What the tiers are told of a pipeline the engine says has ended.
+/// `word` and `rest` are the engine's own: `end` with how it ended as
+/// JSON, `refused` or `failed` with why. The rest comes from the unit's
+/// record.
+fn engine_report(
+    config: &ConfigDir,
+    name: &str,
+    ship: bool,
+    unit_id: Option<&str>,
+    word: &str,
+    rest: &str,
+) -> Happening {
+    let unit = unit_id.and_then(|id| crate::Driver::read_unit(config, id).ok());
+    let unit = unit.as_ref();
+    match word {
+        "end" => {
+            let end: Value = serde_json::from_str(rest).unwrap_or_default();
+            if let Some(reason) = end["parked"].as_str() {
+                engine_ended(name, ship, "parked", format!("Parked: {reason}"), unit)
+            } else if end["ended"] != json!(true) {
+                engine_ended(name, ship, "failed", "It was given up.".to_string(), unit)
+            } else if unit.is_some_and(|unit| unit.merged.is_some()) {
+                let detail = if ship {
+                    "Its pull request is merged and its beads are closed."
+                } else {
+                    "Its change is merged and its bead is closed."
+                };
+                engine_ended(name, ship, "landed", detail.to_string(), unit)
+            } else if unit.is_some_and(|unit| unit.absorbed.is_some()) {
+                engine_ended(
+                    name,
+                    ship,
+                    "absorbed",
+                    "Its change is one commit on the sub-goal's branch. The bead stays open until the sub-goal lands.".to_string(),
+                    unit,
+                )
+            } else {
+                engine_ended(
+                    name,
+                    ship,
+                    "published",
+                    "Its pull request is open.".to_string(),
+                    unit,
+                )
+            }
+        }
+        "refused" => engine_ended(name, ship, "refused", rest.to_string(), unit),
+        _ => engine_ended(name, ship, "failed", rest.to_string(), unit),
+    }
 }
 
 /// Run one pipeline on the engine and follow it to its end. The engine's
@@ -565,47 +712,16 @@ fn on_engine(
             .wait_with_output()
             .map(|out| String::from_utf8_lossy(&out.stderr).trim().to_string())
             .unwrap_or_default();
-        let unit = unit_id
-            .as_deref()
-            .and_then(|id| crate::Driver::read_unit(config, id).ok());
         match end {
-            Some((word, rest)) if word == "end" => {
-                let end: Value = serde_json::from_str(&rest).unwrap_or_default();
-                let unit = unit.as_ref();
-                return Some(if let Some(reason) = end["parked"].as_str() {
-                    engine_ended(name, ship, "parked", format!("Parked: {reason}"), unit)
-                } else if end["ended"] != json!(true) {
-                    engine_ended(name, ship, "failed", "It was given up.".to_string(), unit)
-                } else if unit.is_some_and(|unit| unit.merged.is_some()) {
-                    let detail = if ship {
-                        "Its pull request is merged and its beads are closed."
-                    } else {
-                        "Its change is merged and its bead is closed."
-                    };
-                    engine_ended(name, ship, "landed", detail.to_string(), unit)
-                } else if unit.is_some_and(|unit| unit.absorbed.is_some()) {
-                    engine_ended(
-                        name,
-                        ship,
-                        "absorbed",
-                        "Its change is one commit on the sub-goal's branch. The bead stays open until the sub-goal lands.".to_string(),
-                        unit,
-                    )
-                } else {
-                    engine_ended(
-                        name,
-                        ship,
-                        "published",
-                        "Its pull request is open.".to_string(),
-                        unit,
-                    )
-                });
-            }
-            Some((word, rest)) if word == "refused" => {
-                return Some(engine_ended(name, ship, "refused", rest, unit.as_ref()));
-            }
-            Some((_, rest)) => {
-                return Some(engine_ended(name, ship, "failed", rest, unit.as_ref()));
+            Some((word, rest)) => {
+                return Some(engine_report(
+                    config,
+                    name,
+                    ship,
+                    unit_id.as_deref(),
+                    &word,
+                    &rest,
+                ));
             }
             // The command ended without saying how the pipeline did: the
             // server could not be reached, or the command was stopped.
@@ -2443,6 +2559,12 @@ pub struct Supervisor {
     /// Whether the service has been asked to stop at a safe point. No agent
     /// is woken and nothing new is started while it is.
     draining: bool,
+    /// Set when something else starts the pipelines this supervisor asks
+    /// for: what it wants started is kept here for it to take.
+    collecting: Option<std::sync::Mutex<Vec<Value>>>,
+    /// When an owner's message could not be answered because every
+    /// account is at a limit: the time to hand the same message in again.
+    again_at: Option<u64>,
 }
 
 impl Supervisor {
@@ -2454,9 +2576,32 @@ impl Supervisor {
         owners: Vec<String>,
         unit_slack: bool,
     ) -> Result<Supervisor, DriverError> {
+        Supervisor::build(config, slack, owners, unit_slack, false)
+    }
+
+    /// `remembered` takes each project's channel from where the last
+    /// supervisor that asked Slack for it left it, and asks Slack only
+    /// for one that is not there: for a supervisor that is made often.
+    fn build(
+        config: ConfigDir,
+        slack: Option<Slack>,
+        owners: Vec<String>,
+        unit_slack: bool,
+        remembered: bool,
+    ) -> Result<Supervisor, DriverError> {
         let factory = config.factory()?;
         // A definition that cannot run must not be able to open a goal.
         check_definitions(&config)?;
+        let known_at = factory.state_dir.join("channels.json");
+        let mut known: BTreeMap<String, String> = if remembered {
+            std::fs::read_to_string(&known_at)
+                .ok()
+                .and_then(|text| serde_json::from_str(&text).ok())
+                .unwrap_or_default()
+        } else {
+            BTreeMap::new()
+        };
+        let before = known.clone();
         let mut channels = BTreeMap::new();
         for id in config.projects()? {
             let project = config.project(&id)?;
@@ -2464,11 +2609,23 @@ impl Supervisor {
                 continue;
             }
             if let (Some(slack), Some(name)) = (&slack, &project.slack_channel) {
+                if let Some(channel) = known.get(name) {
+                    channels.insert(channel.clone(), id);
+                    continue;
+                }
                 match slack.ensure_channel(name, &owners) {
-                    Ok(channel) => drop(channels.insert(channel, id)),
+                    Ok(channel) => {
+                        known.insert(name.clone(), channel.clone());
+                        channels.insert(channel, id);
+                    }
                     Err(err) => factory_core::note!("goals: project {id}: channel #{name}: {err}"),
                 }
             }
+        }
+        if known != before
+            && let Ok(text) = serde_json::to_string_pretty(&known)
+        {
+            let _ = std::fs::write(&known_at, text);
         }
         let mut goals = BTreeMap::new();
         let dir = factory.state_dir.join("goals");
@@ -2510,7 +2667,96 @@ impl Supervisor {
             receiver,
             live: Arc::new(AtomicUsize::new(0)),
             draining: false,
+            collecting: None,
+            again_at: None,
         })
+    }
+
+    /// A supervisor for one turn: it applies one event to the goals as
+    /// their records stand, and is then dropped. It starts no pipeline
+    /// and listens to nothing itself; whoever runs it does both.
+    ///
+    /// `project` leaves it with that project's goals and executive only,
+    /// so that two projects' turns, which may run at the same time, never
+    /// write the same record.
+    pub fn for_turn(config: ConfigDir, project: Option<&str>) -> Result<Supervisor, DriverError> {
+        let factory = config.factory()?;
+        let mut supervisor = match &factory.slack {
+            Some(settings) => {
+                let (slack, owners, _, _) = slack_of(settings)?;
+                Supervisor::build(config, Some(slack), owners, true, true)?
+            }
+            None => Supervisor::build(config, None, vec!["OWNER".to_string()], false, true)?,
+        };
+        if let Some(project) = project {
+            supervisor.goals.retain(|_, goal| goal.project == project);
+            supervisor
+                .executives
+                .retain(|_, executive| executive.project == project);
+            supervisor.channels.retain(|_, id| id == project);
+        }
+        supervisor.collect_launches();
+        Ok(supervisor)
+    }
+
+    /// Apply one event, and whatever has come due, and say what is to
+    /// be started and when to come back. A turn that goes wrong part-way
+    /// still says what it had asked for: the records already show it.
+    pub fn turn(&mut self, event: Event) -> Turned {
+        let trouble = self.apply(event).err().map(|err| err.to_string());
+        Turned {
+            launches: self.take_launches(),
+            due_at: self.next_due(),
+            again_at: self.again_at(),
+            trouble,
+        }
+    }
+
+    fn apply(&mut self, event: Event) -> Result<(), DriverError> {
+        match event {
+            Event::Slack(incoming) => self.incoming(incoming)?,
+            Event::Began { goal, bead, unit } => self.pipeline_began(&goal, &bead, &unit),
+            Event::Ended {
+                goal,
+                bead,
+                ship,
+                unit,
+                word,
+                rest,
+            } => self.pipeline_ended(&goal, &bead, ship, unit.as_deref(), &word, &rest),
+            Event::Tick => {}
+            Event::Resume => self.resume()?,
+            Event::Open { project, text } => drop(self.open_directly(&project, &text)?),
+            Event::Tell {
+                project,
+                thread,
+                text,
+            } => drop(self.tell_executive(&project, Some(&thread), &text)?),
+        }
+        // Whatever that set going, and whatever has come due. An agent
+        // that keeps failing is put off by its own record, so this ends;
+        // the bound is for a mistake in that.
+        let mut rounds = 0;
+        while self.pump(Duration::ZERO)? && rounds < 20 {
+            rounds += 1;
+        }
+        Ok(())
+    }
+
+    /// The Slack listener for this factory, and the channels it hears
+    /// goals on, each with its project.
+    pub fn listener(config: &ConfigDir) -> Result<Option<Listener>, DriverError> {
+        let factory = config.factory()?;
+        let Some(settings) = &factory.slack else {
+            return Ok(None);
+        };
+        let (_, _, app_token, api) = slack_of(settings)?;
+        Ok(Some(factory_slack::socket::listen(app_token, api)))
+    }
+
+    /// The project a Slack channel belongs to, if goals are heard there.
+    pub fn project_of(&self, channel: &str) -> Option<&str> {
+        self.channels.get(channel).map(String::as_str)
     }
 
     /// Build a supervisor from the factory's Slack settings, with its socket.
@@ -2901,16 +3147,27 @@ impl Supervisor {
                 opened_by: user.to_string(),
                 ..Front::default()
             });
-        front.said.push(("owner".to_string(), text.to_string()));
+        // A message handed in again, after a wait for an account, is
+        // the one already on record.
+        let again = front.waiting
+            && front
+                .said
+                .last()
+                .is_some_and(|(who, said)| who == "owner" && said == text);
+        if !again {
+            front.said.push(("owner".to_string(), text.to_string()));
+        }
         // Its seat has to exist before it runs.
         executive.threads.insert(root.to_string(), front.clone());
         self.save_executive(executive.clone())?;
         let seat = self.executive_seat(project_id);
-        self.log_at(
-            &seat,
-            "owner.message",
-            json!({ "thread": root, "text": text }),
-        );
+        if !again {
+            self.log_at(
+                &seat,
+                "owner.message",
+                json!({ "thread": root, "text": text }),
+            );
+        }
 
         let (session, prompt) = match &front.session {
             Some(session) => (
@@ -2980,19 +3237,43 @@ impl Supervisor {
         let (result, session) = match self.run_agent(&seat, &mut executive.usage, turn, &check) {
             Ok(done) => done,
             Err(reason) => {
-                self.post(
-                    channel,
-                    root,
-                    &format!(
-                        ":warning: I could not answer ({}). Reply again to retry.",
-                        escape(&reason)
+                // Every account is at a limit, and something outlives
+                // this supervisor that can hand the message in again:
+                // the owner is told when, and need not repeat it.
+                let until = reason
+                    .strip_prefix(LIMITED)
+                    .and_then(|until| until.trim().parse::<u64>().ok())
+                    .filter(|_| self.collecting.is_some());
+                match until {
+                    Some(until) => {
+                        if self.again_at.is_none() && !front.waiting {
+                            self.post(
+                                channel,
+                                root,
+                                &format!(
+                                    ":hourglass_flowing_sand: Every account is at its usage limit. I will answer this at <!date^{until}^{{time}}|{until}> without being asked again."
+                                ),
+                            );
+                        }
+                        front.waiting = true;
+                        self.again_at = Some(until);
+                    }
+                    None => self.post(
+                        channel,
+                        root,
+                        &format!(
+                            ":warning: I could not answer ({}). Reply again to retry.",
+                            escape(&reason)
+                        ),
                     ),
-                );
+                }
+                executive.threads.insert(root.to_string(), front);
                 self.save_executive(executive)?;
                 return Ok(None);
             }
         };
         executive.wakes += 1;
+        front.waiting = false;
         front.session = Some(session);
         let reply = strings(&result, "reply").to_string();
         front.said.push(("executive".to_string(), reply.clone()));
@@ -5190,6 +5471,27 @@ impl Supervisor {
         let (config, sender) = (self.config.clone(), self.sender.clone());
         let (goal_id, project) = (goal.id.clone(), goal.project.clone());
         let ship = recorded || matches!(within, Some(Within::Ship(_)));
+        if let Some(collected) = &self.collecting {
+            // Whoever runs this supervisor starts the pipeline, under the
+            // name the goal's record gives it.
+            let spec = json!({
+                "id": pipeline_name(goal, &name),
+                "goal": goal.id,
+                "ship": ship,
+                "project": project,
+                "bead": name,
+                "flow_name": flow,
+                "within": within,
+                "unit": resume,
+                "adopt": again.as_ref().map(|again| json!({
+                    "from": again.from, "note": again.note, "ruling": again.ruling,
+                })),
+            });
+            if let Ok(mut collected) = collected.lock() {
+                collected.push(spec);
+            }
+            return;
+        }
         if let Some(engine) = self.engine_command() {
             // The pipeline is a workflow on the engine. Its name is made
             // from what the goal's record says of it, so that after a
@@ -5342,6 +5644,117 @@ impl Supervisor {
         });
     }
 
+    /// Have this supervisor start no pipeline itself: what it wants
+    /// started is kept, for whoever runs it to take with
+    /// [`Supervisor::take_launches`] and start. For a supervisor that
+    /// lives for one turn inside something that outlives it.
+    pub fn collect_launches(&mut self) {
+        self.collecting = Some(std::sync::Mutex::new(Vec::new()));
+    }
+
+    /// The pipelines asked for since the last time this was called. Each
+    /// is what `factory-engine run` takes, with the goal it belongs to and
+    /// whether it ships a sub-goal.
+    pub fn take_launches(&self) -> Vec<Value> {
+        self.collecting
+            .as_ref()
+            .and_then(|collected| {
+                collected
+                    .lock()
+                    .ok()
+                    .map(|mut all| std::mem::take(&mut *all))
+            })
+            .unwrap_or_default()
+    }
+
+    /// A pipeline that something else runs has a unit now.
+    pub fn pipeline_began(&self, goal: &str, bead: &str, unit: &str) {
+        let _ = self.sender.send(Internal::Began {
+            goal: goal.to_string(),
+            bead: bead.to_string(),
+            unit: unit.to_string(),
+        });
+    }
+
+    /// A pipeline that something else runs has ended. `word` and `rest`
+    /// are what the engine said of it: `end` with how, `refused` or
+    /// `failed` with why.
+    pub fn pipeline_ended(
+        &self,
+        goal: &str,
+        bead: &str,
+        ship: bool,
+        unit: Option<&str>,
+        word: &str,
+        rest: &str,
+    ) {
+        let _ = self.sender.send(Internal::Ended {
+            goal: goal.to_string(),
+            happening: engine_report(&self.config, bead, ship, unit, word, rest),
+        });
+    }
+
+    /// When this supervisor next has something to do by itself: an agent
+    /// to try again, a note to an executive to deal with, a bead waiting
+    /// to be closed. `None` if only an event can move it.
+    pub fn next_due(&self) -> Option<u64> {
+        let goals = self.goals.values().filter_map(|goal| goal.retry_at);
+        let foremen = self
+            .goals
+            .values()
+            .filter(|goal| goal.phase == Phase::Running)
+            .flat_map(|goal| goal.subgoals.iter())
+            .filter(|sub| sub.state == "open")
+            .filter_map(|sub| sub.foreman.as_ref().and_then(|foreman| foreman.retry_at));
+        let desks = self.executives.values().flat_map(|executive| {
+            let memos = (!executive.memos.is_empty()).then_some(executive.desk_retry_at);
+            // A bead waiting for another to land is looked at when
+            // something ends, and now and then besides.
+            let pending =
+                (!executive.pending.is_empty()).then_some(executive.pending_checked_at + 300);
+            memos.into_iter().chain(pending)
+        });
+        goals.chain(foremen).chain(desks).min()
+    }
+
+    /// When to hand the last owner's message in again, if it could not be
+    /// answered because every account was at a limit.
+    pub fn again_at(&self) -> Option<u64> {
+        self.again_at
+    }
+
+    /// The pipelines the goals' records say are running, each with the
+    /// name it has on the engine.
+    pub fn running_pipelines(config: &ConfigDir) -> Result<Vec<RunningPipeline>, DriverError> {
+        let factory = config.factory()?;
+        let mut all = Vec::new();
+        let Ok(entries) = std::fs::read_dir(factory.state_dir.join("goals")) else {
+            return Ok(all);
+        };
+        for entry in entries.flatten() {
+            let Ok(text) = std::fs::read_to_string(entry.path().join("goal.json")) else {
+                continue;
+            };
+            let Ok(goal) = serde_json::from_str::<Goal>(&text) else {
+                continue;
+            };
+            if !matches!(goal.phase, Phase::Running | Phase::Stopped) {
+                continue;
+            }
+            for unit in goal.units.iter().filter(|unit| unit.state == "running") {
+                all.push(RunningPipeline {
+                    project: goal.project.clone(),
+                    goal: goal.id.clone(),
+                    bead: unit.bead.clone(),
+                    ship: unit.ship,
+                    unit: unit.unit.clone(),
+                    name: pipeline_name(&goal, &unit.bead),
+                });
+            }
+        }
+        Ok(all)
+    }
+
     /// Where what was asked of the engine for a pipeline is kept.
     fn pipeline_file(&self, goal: &Goal, name: &str) -> PathBuf {
         self.dir(&goal.id)
@@ -5454,8 +5867,16 @@ impl Supervisor {
                         .rev()
                         .find(|u| u.bead == bead && u.state == "running")
                     {
+                        // Told a second time, as it may be by whoever
+                        // watches the pipeline.
+                        if entry.unit.as_ref() == Some(&unit) {
+                            continue;
+                        }
                         entry.unit = Some(unit.clone());
                         ship = entry.ship;
+                    } else if self.collecting.is_some() {
+                        // It has ended already, or was never this goal's.
+                        continue;
                     }
                     if ship && let Some(sub) = goal.subgoals.iter_mut().find(|sub| sub.id == bead) {
                         // Remembered, so that shipping can be continued if it parks.
@@ -5473,6 +5894,17 @@ impl Supervisor {
                         continue;
                     };
                     let id = goal.id.clone();
+                    // Told a second time of a pipeline whose end is on
+                    // record: nobody is told twice.
+                    if self.collecting.is_some()
+                        && let Happening::PipelineEnded { bead, .. } = &happening
+                        && !goal
+                            .units
+                            .iter()
+                            .any(|u| &u.bead == bead && u.state == "running")
+                    {
+                        continue;
+                    }
                     let mut happening = happening;
                     mark_shipping(&goal, &mut happening);
                     let shipped = matches!(&happening, Happening::PipelineEnded { ship: true, .. });
@@ -5660,6 +6092,9 @@ impl Supervisor {
                             None,
                         );
                     }
+                    // Whoever runs this supervisor watches the pipelines
+                    // the records say are running, and tells it of each.
+                    None if self.collecting.is_some() => {}
                     // Asked of the engine before the restart: it may be
                     // running there, and is found by its name.
                     None if self
@@ -5759,6 +6194,37 @@ impl Supervisor {
 
     fn parked_incoming(&self) -> PathBuf {
         self.factory.state_dir.join("incoming.jsonl")
+    }
+
+    /// Keep something a person did in Slack for whoever listens next:
+    /// it could not be handed on.
+    pub fn keep(config: &ConfigDir, incoming: &Incoming) {
+        let Ok(factory) = config.factory() else {
+            return;
+        };
+        let path = factory.state_dir.join("incoming.jsonl");
+        let mut text = std::fs::read_to_string(&path).unwrap_or_default();
+        text.push_str(&(incoming_value(incoming).to_string() + "\n"));
+        if let Err(err) = std::fs::write(&path, text) {
+            factory_core::note!("goals: {}: {err}", path.display());
+        }
+    }
+
+    /// What people did in Slack that was kept for whoever listens next,
+    /// in the order it arrived. It is taken: asked again, it is not there.
+    pub fn parked(config: &ConfigDir) -> Vec<Incoming> {
+        let Ok(factory) = config.factory() else {
+            return Vec::new();
+        };
+        let path = factory.state_dir.join("incoming.jsonl");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return Vec::new();
+        };
+        let _ = std::fs::remove_file(&path);
+        text.lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter_map(|value| incoming_from(&value))
+            .collect()
     }
 
     /// Keep what people did in Slack and the service has not handled, for

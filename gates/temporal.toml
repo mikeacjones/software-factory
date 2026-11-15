@@ -49,6 +49,22 @@ command = ["cargo", "test", "--locked", "--offline", "--package", "factory-engin
 timeout_secs = 900
 
 [[check]]
+id = "engine-tiers"
+tier = "host"
+bead = "sf-9a0.9"
+claim = "With `tiers = true` in the factory's [temporal] table no supervisor runs anywhere: the engine's worker sees that the project's workflow and the intake are running, and a goal is opened, started by the owner's button, worked in a sub-goal, shipped as one merged pull request and proposed complete through signals to the project's workflow alone, each dealt with as one turn, an activity. The pipelines a turn asks for are child workflows named from the goal's record, and the project hears that each has its unit and has ended from the watcher. The project's workflow, the intake and both pipelines say of everything they started what it is for. Asked to stop at a safe point, the worker leaves by itself with status 0, though its listener and watcher never end otherwise."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-engine", "--test", "pipeline", "--", "--test-threads=1", "a_goal_runs_from_its_opening_to_its_end_with_its_tiers_on_the_engine"]
+timeout_secs = 900
+
+[[check]]
+id = "engine-owner-message-kept"
+tier = "host"
+bead = "sf-9a0.10"
+claim = "What the owner writes to a project's executive while every account is at its usage limit is neither dropped nor to be written again: the turn ends with nobody asked and the message on record once, the project's workflow keeps it and waits on a timer with nothing running, and when the account is back the executive is asked once and its answer is on record after the one message."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-engine", "--test", "pipeline", "--", "--test-threads=1", "what_the_owner_writes_while_no_account_is_free_is_answered_when_one_is"]
+timeout_secs = 900
+
+[[check]]
 id = "engine-described"
 tier = "host"
 bead = "sf-9a0.6"

@@ -663,6 +663,7 @@ dependencies = [
  "factory-driver",
  "factory-flow",
  "factory-slack",
+ "factory-supervise",
  "futures",
  "serde",
  "serde_json",
@@ -705,6 +706,7 @@ name = "factory-slack"
 version = "0.0.0"
 dependencies = [
  "rustls",
+ "serde",
  "serde_json",
  "thiserror",
  "tungstenite",

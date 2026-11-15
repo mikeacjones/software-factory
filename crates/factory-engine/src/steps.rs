@@ -7,19 +7,28 @@
 //! the ID back from the heartbeat and resumes the session. The work the run
 //! had done is not done again.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use factory_driver::Within;
+use factory_driver::goal::{Event, RunningPipeline, Turned};
 use factory_flow::Position;
+use factory_slack::socket::Incoming;
 use serde::{Deserialize, Serialize};
-use temporalio_client::WorkflowExecuteUpdateOptions;
+use temporalio_client::errors::WorkflowInteractionError;
+use temporalio_client::{
+    WorkflowDescribeOptions, WorkflowExecuteUpdateOptions, WorkflowExecutionStatus,
+    WorkflowGetResultOptions, WorkflowQueryOptions,
+};
 use temporalio_macros::activities;
 use temporalio_sdk::ApplicationFailure;
 use temporalio_sdk::activities::{ActivityContext, ActivityError};
 
 use crate::accounts::{AccountCall, Accounts, Ask, CheckCall, Lease, Picture};
+use crate::engine::Pipeline;
+use crate::tiers::{self, Reach};
 
 /// One step of one unit's flow, to be run.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,6 +132,36 @@ pub struct ParkCall {
     pub reason: String,
 }
 
+/// One thing that happened to a project, for its tiers to deal with.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TurnCall {
+    pub project: String,
+    pub event: Event,
+    /// How often the turn says it is alive, in seconds.
+    pub beat_secs: u64,
+}
+
+/// What the listener and the watcher are started with.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PumpCall {
+    /// How long to go on for, in seconds, before handing over to a run
+    /// that starts afresh.
+    pub secs: u64,
+    /// How often to say it is alive, in seconds.
+    pub beat_secs: u64,
+    /// How a project's workflow is reached, and started if it is not there.
+    pub reach: Reach,
+}
+
+/// How long a pipeline a goal's record says is running may be unknown to
+/// the server before its goal is told it never started, in seconds. The
+/// record is written a moment before the pipeline is started.
+const NEVER_STARTED_SECS: u64 = 120;
+
+/// How long the watcher takes a project to have heard what it told it,
+/// before it tells it again, in seconds.
+const TOLD_AGAIN_SECS: u64 = 600;
+
 /// Why a unit was not made ready.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NotPrepared {
@@ -183,6 +222,85 @@ pub trait StepRunner: Send + Sync + 'static {
     fn accounts(&self, _call: &CheckCall) -> Result<Picture, String> {
         Err("this runner knows no accounts".to_string())
     }
+
+    /// Hand one thing that happened to a project's tiers: its executive,
+    /// its goals' directors and their foremen decide, and what they
+    /// decided is on their records when this returns. What comes back is
+    /// what is left for the engine to do.
+    fn turn(&self, project: &str, _event: &Event) -> Result<Turned, String> {
+        Err(format!("this runner has no tiers for `{project}`"))
+    }
+
+    /// Listen for what the owner does, until `stop` is set: each thing is
+    /// handed to `heard` with the project it is for, as soon as it
+    /// arrives. First of all, what [`StepRunner::keep`] kept.
+    fn listen(&self, _heard: &dyn Fn(String, Incoming), stop: &AtomicBool) -> Result<(), String> {
+        while !stop.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        Ok(())
+    }
+
+    /// Keep something the owner did that could not be handed on, for the
+    /// next time someone listens.
+    fn keep(&self, _incoming: &Incoming) {}
+
+    /// The pipelines the goals' records say are running.
+    fn running(&self) -> Result<Vec<RunningPipeline>, String> {
+        Ok(Vec::new())
+    }
+
+    /// Whether the worker has been asked to stop at a safe point: it then
+    /// takes on nothing new, and leaves when what it is doing is done.
+    fn draining(&self) -> bool {
+        false
+    }
+}
+
+/// What a worker is in the middle of, for stopping it at a safe point.
+#[derive(Default)]
+pub struct Gate {
+    busy: AtomicUsize,
+    leaving: AtomicBool,
+}
+
+impl Gate {
+    /// How many steps and turns are running in this worker right now.
+    pub fn busy(&self) -> usize {
+        self.busy.load(Ordering::SeqCst)
+    }
+
+    /// Have what only listens and watches end: the worker is leaving.
+    pub fn leave(&self) {
+        self.leaving.store(true, Ordering::SeqCst);
+    }
+
+    pub fn leaving(&self) -> bool {
+        self.leaving.load(Ordering::SeqCst)
+    }
+
+    fn enter(self: &Arc<Self>) -> Busy {
+        self.busy.fetch_add(1, Ordering::SeqCst);
+        Busy(self.clone())
+    }
+}
+
+/// One step or turn in flight.
+struct Busy(Arc<Gate>);
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        self.0.busy.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Sets a flag when it goes, however the code that holds it is left.
+struct SetOnDrop(Arc<AtomicBool>);
+
+impl Drop for SetOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
 }
 
 /// How a runner says which session an agent run is, from whatever thread
@@ -192,11 +310,41 @@ pub type Started = Arc<dyn Fn(&str) + Send + Sync>;
 /// The activities of a worker, over whatever does the work.
 pub struct Steps {
     runner: Arc<dyn StepRunner>,
+    gate: Arc<Gate>,
 }
 
 impl Steps {
     pub fn new(runner: Arc<dyn StepRunner>) -> Steps {
-        Steps { runner }
+        Steps::with_gate(runner, Arc::new(Gate::default()))
+    }
+
+    /// The activities of a worker that can be stopped at a safe point:
+    /// `gate` is how it knows what is in flight.
+    pub fn with_gate(runner: Arc<dyn StepRunner>, gate: Arc<Gate>) -> Steps {
+        Steps { runner, gate }
+    }
+
+    /// Tell a project of one of its pipelines, unless it was told the
+    /// same a little while ago.
+    async fn report(
+        &self,
+        client: &temporalio_client::Client,
+        reach: &Reach,
+        told: &mut HashMap<String, Instant>,
+        project: &str,
+        event: Event,
+    ) {
+        let key = format!("{project} {event:?}");
+        if told
+            .get(&key)
+            .is_some_and(|at| at.elapsed() < Duration::from_secs(TOLD_AGAIN_SECS))
+        {
+            return;
+        }
+        // One that could not be told is told on the next look.
+        if tiers::tell(client, reach, project, event).await.is_ok() {
+            told.insert(key, Instant::now());
+        }
     }
 }
 
@@ -214,6 +362,7 @@ impl Steps {
         ctx: ActivityContext,
         call: StepCall,
     ) -> Result<StepDone, ActivityError> {
+        let _busy = self.gate.enter();
         // A run cut off with its worker left its session in the last
         // heartbeat. One that stopped at a usage limit handed it back.
         let cut_off: Option<String> = ctx
@@ -272,6 +421,7 @@ impl Steps {
         ctx: ActivityContext,
         call: StepCall,
     ) -> Result<StepDone, ActivityError> {
+        let _busy = self.gate.enter();
         let runner = self.runner.clone();
         let every = Duration::from_secs(call.beat_secs.max(1));
         let mut work = tokio::task::spawn_blocking(move || runner.plain(&call));
@@ -299,6 +449,7 @@ impl Steps {
         _ctx: ActivityContext,
         call: PrepareCall,
     ) -> Result<Prepared, ActivityError> {
+        let _busy = self.gate.enter();
         let runner = self.runner.clone();
         match tokio::task::spawn_blocking(move || runner.prepare(&call)).await {
             Ok(Ok(prepared)) => Ok(prepared),
@@ -319,6 +470,7 @@ impl Steps {
         _ctx: ActivityContext,
         call: AdoptCall,
     ) -> Result<Adopted, ActivityError> {
+        let _busy = self.gate.enter();
         let runner = self.runner.clone();
         match tokio::task::spawn_blocking(move || runner.adopt(&call)).await {
             Ok(Ok(adopted)) => Ok(adopted),
@@ -337,6 +489,7 @@ impl Steps {
         _ctx: ActivityContext,
         call: ParkCall,
     ) -> Result<bool, ActivityError> {
+        let _busy = self.gate.enter();
         let runner = self.runner.clone();
         match tokio::task::spawn_blocking(move || runner.park(&call)).await {
             Ok(Ok(())) => Ok(true),
@@ -390,11 +543,246 @@ impl Steps {
         _ctx: ActivityContext,
         unit: String,
     ) -> Result<bool, ActivityError> {
+        let _busy = self.gate.enter();
         let runner = self.runner.clone();
         match tokio::task::spawn_blocking(move || runner.finish(&unit)).await {
             Ok(Ok(())) => Ok(true),
             Ok(Err(reason)) => Err(failed(reason)),
             Err(join) => Err(failed(format!("finishing the unit was lost: {join}"))),
+        }
+    }
+
+    /// One turn of a project's tiers. It says it is alive while an agent
+    /// of theirs runs, so that one whose worker died is noticed and the
+    /// turn taken again.
+    #[activity]
+    pub async fn turn(
+        self: Arc<Self>,
+        ctx: ActivityContext,
+        call: TurnCall,
+    ) -> Result<Turned, ActivityError> {
+        let _busy = self.gate.enter();
+        let runner = self.runner.clone();
+        let every = Duration::from_secs(call.beat_secs.max(1));
+        let mut work = tokio::task::spawn_blocking(move || runner.turn(&call.project, &call.event));
+        let mut beat = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+        loop {
+            tokio::select! {
+                done = &mut work => {
+                    return match done {
+                        Ok(Ok(turned)) => Ok(turned),
+                        // The tiers could not be asked at all. Whoever
+                        // handed the event in decides what becomes of it.
+                        Ok(Err(reason)) => Ok(Turned {
+                            trouble: Some(reason),
+                            ..Turned::default()
+                        }),
+                        Err(join) => Err(failed(format!("the turn was lost: {join}"))),
+                    };
+                }
+                _ = beat.tick() => {
+                    ctx.record_heartbeat(String::new()).await?;
+                }
+            }
+        }
+    }
+
+    /// Listen for what the owner does, and signal each thing to its
+    /// project's workflow as soon as it arrives. It runs for as long as
+    /// it is told to, or until the worker leaves.
+    #[activity]
+    pub async fn listen(
+        self: Arc<Self>,
+        ctx: ActivityContext,
+        call: PumpCall,
+    ) -> Result<bool, ActivityError> {
+        let client = ctx.client();
+        let stop = Arc::new(AtomicBool::new(false));
+        // The listener stops however this is left.
+        let _stopped = SetOnDrop(stop.clone());
+        let (said, mut heard) = tokio::sync::mpsc::unbounded_channel::<(String, Incoming)>();
+        let (runner, flag) = (self.runner.clone(), stop.clone());
+        let mut work = tokio::task::spawn_blocking(move || {
+            runner.listen(
+                &|project, incoming| {
+                    let _ = said.send((project, incoming));
+                },
+                &flag,
+            )
+        });
+        let began = Instant::now();
+        let every = Duration::from_secs(call.beat_secs.max(1));
+        let mut beat = tokio::time::interval(every);
+        // The first thing that could not be handed on ends the run: it
+        // is kept, and the run that takes this one's place hands it on.
+        let mut undelivered: Option<String> = None;
+        loop {
+            tokio::select! {
+                Some((project, incoming)) = heard.recv() => {
+                    if undelivered.is_some() {
+                        self.runner.keep(&incoming);
+                    } else if let Err(reason) =
+                        tiers::tell(&client, &call.reach, &project, Event::Slack(incoming.clone())).await
+                    {
+                        self.runner.keep(&incoming);
+                        undelivered = Some(reason);
+                        stop.store(true, Ordering::Relaxed);
+                    }
+                }
+                done = &mut work => {
+                    // What arrived as the listener stopped.
+                    while let Ok((project, incoming)) = heard.try_recv() {
+                        if undelivered.is_some()
+                            || tiers::tell(&client, &call.reach, &project, Event::Slack(incoming.clone()))
+                                .await
+                                .is_err()
+                        {
+                            self.runner.keep(&incoming);
+                        }
+                    }
+                    return match (done, undelivered) {
+                        (_, Some(reason)) => Err(failed(format!(
+                            "something the owner did could not be handed to its project, and is kept: {reason}"
+                        ))),
+                        (Ok(Ok(())), None) => Ok(true),
+                        (Ok(Err(reason)), None) => Err(failed(reason)),
+                        (Err(join), None) => Err(failed(format!("the listener was lost: {join}"))),
+                    };
+                }
+                _ = beat.tick() => {
+                    ctx.record_heartbeat(String::new()).await?;
+                    if ctx.is_cancelled()
+                        || self.gate.leaving()
+                        || began.elapsed() >= Duration::from_secs(call.secs)
+                    {
+                        stop.store(true, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Watch the pipelines the goals' records say are running, and tell
+    /// each one's project when it has a unit and when it has ended,
+    /// however it ended. It runs for as long as it is told to, or until
+    /// the worker leaves.
+    #[activity]
+    pub async fn watch(
+        self: Arc<Self>,
+        ctx: ActivityContext,
+        call: PumpCall,
+    ) -> Result<bool, ActivityError> {
+        let client = ctx.client();
+        let began = Instant::now();
+        // What each project was told, and when: it hears a thing again
+        // only if its record still does not show it a while later.
+        let mut told: HashMap<String, Instant> = HashMap::new();
+        // Pipelines the server does not know, and since when.
+        let mut missing: HashMap<String, Instant> = HashMap::new();
+        loop {
+            if ctx.is_cancelled()
+                || self.gate.leaving()
+                || began.elapsed() >= Duration::from_secs(call.secs)
+            {
+                return Ok(true);
+            }
+            let runner = self.runner.clone();
+            let running = match tokio::task::spawn_blocking(move || runner.running()).await {
+                Ok(Ok(running)) => running,
+                Ok(Err(reason)) => return Err(failed(reason)),
+                Err(join) => return Err(failed(format!("the records could not be read: {join}"))),
+            };
+            missing.retain(|name, _| running.iter().any(|pipeline| &pipeline.name == name));
+            for pipeline in running {
+                let handle = client.get_workflow_handle::<Pipeline>(pipeline.name.clone());
+                let ended = |unit: Option<String>, word: &str, rest: String| Event::Ended {
+                    goal: pipeline.goal.clone(),
+                    bead: pipeline.bead.clone(),
+                    ship: pipeline.ship,
+                    unit: unit
+                        .filter(|unit| !unit.is_empty())
+                        .or(pipeline.unit.clone()),
+                    word: word.to_string(),
+                    rest,
+                };
+                let status = match handle.describe(WorkflowDescribeOptions::default()).await {
+                    Ok(description) => description.status(),
+                    Err(WorkflowInteractionError::NotFound(_)) => {
+                        let since = *missing
+                            .entry(pipeline.name.clone())
+                            .or_insert_with(Instant::now);
+                        if since.elapsed() >= Duration::from_secs(NEVER_STARTED_SECS) {
+                            let event = ended(
+                                None,
+                                "failed",
+                                "The engine has no pipeline for it: it was never started."
+                                    .to_string(),
+                            );
+                            self.report(&client, &call.reach, &mut told, &pipeline.project, event)
+                                .await;
+                        }
+                        continue;
+                    }
+                    // The server could not be asked: the next look asks again.
+                    Err(_) => continue,
+                };
+                missing.remove(&pipeline.name);
+                let standing = || async {
+                    handle
+                        .query(Pipeline::standing, (), WorkflowQueryOptions::default())
+                        .await
+                        .ok()
+                };
+                let event = match status {
+                    WorkflowExecutionStatus::Running | WorkflowExecutionStatus::Paused => {
+                        if pipeline.unit.is_some() {
+                            continue;
+                        }
+                        match standing().await {
+                            Some(standing) if !standing.unit.is_empty() => Event::Began {
+                                goal: pipeline.goal.clone(),
+                                bead: pipeline.bead.clone(),
+                                unit: standing.unit,
+                            },
+                            _ => continue,
+                        }
+                    }
+                    WorkflowExecutionStatus::Completed => {
+                        match handle.get_result(WorkflowGetResultOptions::default()).await {
+                            Ok(end) => match serde_json::to_string(&end) {
+                                Ok(rest) => ended(Some(end.unit.clone()), "end", rest),
+                                Err(_) => continue,
+                            },
+                            Err(_) => continue,
+                        }
+                    }
+                    WorkflowExecutionStatus::Unspecified
+                    | WorkflowExecutionStatus::ContinuedAsNew
+                    | WorkflowExecutionStatus::Unknown => continue,
+                    // It failed, or someone ended it by hand.
+                    closed => {
+                        let standing = standing().await;
+                        let unit = standing.as_ref().map(|standing| standing.unit.clone());
+                        match standing.and_then(|standing| standing.refused) {
+                            Some(reason) => ended(unit, "refused", reason.replace('\n', " ")),
+                            None => {
+                                let why = match handle
+                                    .get_result(WorkflowGetResultOptions::default())
+                                    .await
+                                {
+                                    Err(err) => err.to_string().replace('\n', " "),
+                                    Ok(_) => format!("it is closed as {closed:?}"),
+                                };
+                                ended(unit, "failed", why)
+                            }
+                        }
+                    }
+                };
+                self.report(&client, &call.reach, &mut told, &pipeline.project, event)
+                    .await;
+            }
+            ctx.record_heartbeat(String::new()).await?;
+            tokio::time::sleep(Duration::from_secs(call.beat_secs.clamp(1, 3))).await;
         }
     }
 }

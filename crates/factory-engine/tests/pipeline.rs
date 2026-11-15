@@ -51,6 +51,17 @@ impl Shop {
         scenario: &str,
         prepare: impl FnOnce(&World),
     ) -> Option<Shop> {
+        Shop::open_with(name, test_command, scenario, prepare, "").await
+    }
+
+    /// The same, with more said in the factory's `[temporal]` table.
+    async fn open_with(
+        name: &str,
+        test_command: &str,
+        scenario: &str,
+        prepare: impl FnOnce(&World),
+        temporal: &str,
+    ) -> Option<Shop> {
         let Some(cli) = temporal_cli() else {
             eprintln!("no `temporal` CLI on the PATH: skipped");
             return None;
@@ -77,7 +88,7 @@ impl Shop {
         std::fs::write(
             &factory,
             format!(
-                "{text}\n[temporal]\naddress = \"http://127.0.0.1:{port}\"\nnamespace = \"default\"\ntask_queue = \"factory-{name}\"\nbeat_secs = 1\n"
+                "{text}\n[temporal]\naddress = \"http://127.0.0.1:{port}\"\nnamespace = \"default\"\ntask_queue = \"factory-{name}\"\nbeat_secs = 1\n{temporal}"
             ),
         )
         .unwrap();
@@ -85,7 +96,11 @@ impl Shop {
             .args(["worker", "--config"])
             .arg(world.path("config"))
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(if std::env::var_os("FACTORY_TEST_WORKER_LOG").is_some() {
+                Stdio::inherit()
+            } else {
+                Stdio::null()
+            })
             .spawn()
             .unwrap();
         Some(Shop {
@@ -119,6 +134,57 @@ impl Shop {
             env.shutdown().await.unwrap();
         }
     }
+}
+
+/// Fail unless everything a workflow started says what it is for: the
+/// workflow itself, and every activity, timer, signal and child workflow.
+/// Returns how many of those there were.
+async fn assert_described(client: &Client, workflow: &str) -> usize {
+    let json = client
+        .get_workflow_handle::<temporalio_client::UntypedWorkflow>(workflow.to_string())
+        .fetch_history(WorkflowFetchHistoryOptions::default())
+        .to_json()
+        .await
+        .unwrap();
+    let history: serde_json::Value = serde_json::from_slice(&json).unwrap();
+    let mut seen = 0;
+    for event in history["events"].as_array().unwrap() {
+        let kind = event["attributes"]
+            .as_object()
+            .and_then(|attributes| attributes.keys().next().cloned())
+            .unwrap_or_default();
+        if ![
+            "WorkflowExecutionStarted",
+            "ActivityTaskScheduled",
+            "TimerStarted",
+            "SignalExternalWorkflowExecutionInitiated",
+            "StartChildWorkflowExecutionInitiated",
+        ]
+        .iter()
+        .any(|name| kind.starts_with(name))
+        {
+            continue;
+        }
+        seen += 1;
+        let summary = &event["user_metadata"]["summary"]["data"];
+        assert!(
+            summary.as_str().is_some_and(|data| !data.is_empty())
+                || summary.as_array().is_some_and(|data| !data.is_empty()),
+            "`{workflow}` started something that does not say what it is for: {event}"
+        );
+    }
+    seen
+}
+
+/// A goal's record, as it stands on disk.
+fn goal_records(world: &World) -> Vec<factory_driver::goal::Goal> {
+    std::fs::read_dir(world.path("state/goals"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| std::fs::read_to_string(entry.path().join("goal.json")).ok())
+        .filter_map(|text| serde_json::from_str(&text).ok())
+        .collect()
 }
 
 fn unit_record(world: &World, unit: &str) -> serde_json::Value {
@@ -635,6 +701,321 @@ async fn a_goals_bead_and_its_sub_goals_shipping_run_as_workflows_on_the_engine(
         let record = unit_record(world, &end.unit);
         assert_eq!(record["status"], "ended");
     }
+    shop.close().await;
+}
+
+/// The tiers on the engine: no supervisor runs anywhere. The worker sees
+/// that the project's workflow and the intake are running; the goal is
+/// opened, started and taken to its end by signals to the project's
+/// workflow, each dealt with as one turn; the pipelines a turn asks for
+/// are child workflows; and the project hears of each from the watcher.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_goal_runs_from_its_opening_to_its_end_with_its_tiers_on_the_engine() {
+    use factory_driver::goal::{Event, Phase};
+    use factory_engine::tiers::{INTAKE_ID, Project, Reach, project_id, tell};
+    use factory_slack::socket::Incoming;
+
+    let prepare = |world: &World| {
+        world.with_github("green");
+        let project = world.path("config/projects/toy.toml");
+        let text = std::fs::read_to_string(&project)
+            .unwrap()
+            .replace(
+                "merge_subject = \"Merge bead/{bead_short}: {title}\"",
+                "merge_method = \"squash\"\nmerge_subject = \"{title} (#{number})\"",
+            )
+            .replace(
+                "merge_body = \"{summary}\\n\\n{testing}\\n\\nBead: {bead}\"",
+                "merge_body = \"{commit_body}\\n\\n{testing}\\n\\n{commit_trailers}\"",
+            );
+        assert!(text.contains("merge_method = \"squash\""));
+        std::fs::write(&project, text).unwrap();
+        std::fs::create_dir_all(world.path("config/goals/toy")).unwrap();
+        std::fs::write(
+            world.path("config/goals/toy/main.toml"),
+            "id = \"main\"\nflow = \"zig-sdk-bead\"\nship_flow = \"zig-sdk-ship\"\n[director]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\n",
+        )
+        .unwrap();
+        let say = |role: &str, n: u32, json: String| {
+            std::fs::create_dir_all(world.path("bin/state")).unwrap();
+            std::fs::write(world.path(&format!("bin/state/{role}-{n}.json")), json).unwrap();
+        };
+        let decide = |fields: &str| {
+            let mut result = serde_json::json!({
+                "summary": "Decided.", "start": [], "file": [], "edit": [], "dropped_findings": [],
+                "open_subgoal": {"id": "", "title": "", "objective": "", "beads": []}, "ship": false,
+                "ask_owner": "", "complete": false, "evidence": "", "journal_entry": "", "project_memory": ""
+            });
+            let extra: serde_json::Value = serde_json::from_str(fields).unwrap();
+            for (key, value) in extra.as_object().unwrap() {
+                result[key] = value.clone();
+            }
+            result.to_string()
+        };
+        say("intake", 1, r#"{"reply":"Here is the charter.","ready":true,"objective":"Ship the feature.","stop_when":"The bead has landed.","plan":"One sub-goal: toy-1.","edits":[]}"#.to_string());
+        say(
+            "director",
+            1,
+            decide(
+                r#"{"open_subgoal":{"id":"feature","title":"The feature","objective":"It works.","beads":["toy-1"]},"start":[{"bead":"toy-1","reason":"first"}]}"#,
+            ),
+        );
+        say("director", 2, decide(r#"{"ship":true}"#));
+        say(
+            "director",
+            3,
+            decide(r#"{"complete":true,"evidence":"The bead landed in one pull request."}"#),
+        );
+    };
+    let Some(shop) = Shop::open_with("engine-tiers", "true", "", prepare, "tiers = true\n").await
+    else {
+        return;
+    };
+    let world = &shop.world;
+    let client = shop.client();
+    let reach = Reach {
+        task_queue: "factory-engine-tiers".to_string(),
+        beat_secs: 1,
+        accounts: ACCOUNTS_ID.to_string(),
+    };
+    let wait = |what: &str, done: &dyn Fn() -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(240);
+        while !done() {
+            assert!(
+                Instant::now() < deadline,
+                "{what}: {:?}",
+                goal_records(world)
+                    .iter()
+                    .map(|goal| (goal.phase.clone(), goal.units.clone()))
+                    .collect::<Vec<_>>()
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    };
+
+    // The owner opens a goal, and presses the button that starts it.
+    let open = Event::Open {
+        project: "toy".to_string(),
+        text: "Ship the feature".to_string(),
+    };
+    tell(&client, &reach, "toy", open).await.unwrap();
+    wait("the goal was never opened", &|| {
+        !goal_records(world).is_empty()
+    });
+    let id = goal_records(world)[0].id.clone();
+    let press = Event::Slack(Incoming::Action {
+        channel: String::new(),
+        user: "OWNER".to_string(),
+        action_id: "goal_start".to_string(),
+        value: id.clone(),
+        message_ts: String::new(),
+    });
+    tell(&client, &reach, "toy", press).await.unwrap();
+    wait("the goal never reached its end", &|| {
+        goal_records(world)[0].phase == Phase::ProposedComplete
+    });
+
+    let goal = goal_records(world).remove(0);
+    assert_eq!(goal.subgoals[0].state, "landed");
+    assert!(goal.subgoals[0].pull_request.is_some());
+    let states: Vec<(&str, &str)> = goal
+        .units
+        .iter()
+        .map(|unit| (unit.bead.as_str(), unit.state.as_str()))
+        .collect();
+    assert_eq!(states, [("toy-1", "absorbed"), ("feature", "landed")]);
+    assert_eq!(goal.wakes, 3);
+    let gh = world.gh_calls();
+    for call in ["pr create", "pr merge"] {
+        assert_eq!(gh.iter().filter(|said| said.starts_with(call)).count(), 1);
+    }
+    // Each pipeline was a workflow the project's own started, named from
+    // the goal's record of it, and ran to its end.
+    for (name, unit) in [("toy-1", &goal.units[0]), ("feature", &goal.units[1])] {
+        let workflow = format!("pipeline-{}-{name}-1-0", goal.id);
+        let end = client
+            .get_workflow_handle::<Pipeline>(workflow.clone())
+            .get_result(WorkflowGetResultOptions::default())
+            .await
+            .unwrap();
+        assert!(end.ended, "{workflow}: {end:?}");
+        assert_eq!(Some(&end.unit), unit.unit.as_ref());
+        assert_eq!(unit_record(world, &end.unit)["status"], "ended");
+        assert!(assert_described(&client, &workflow).await > 3);
+    }
+    // The project's workflow took a turn for each thing that happened,
+    // and says of every one what it was for. So does the intake.
+    let standing = client
+        .get_workflow_handle::<Project>(project_id("toy"))
+        .query(Project::standing, (), WorkflowQueryOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(standing.trouble, None, "{standing:?}");
+    assert_eq!(standing.waiting, 0, "{standing:?}");
+    let lately = standing.lately.join("\n");
+    for expected in [
+        "pick up what was running before",
+        "open a goal for the owner: “Ship the feature”",
+        "the owner pressed `goal_start`",
+        "the pipeline for `toy-1`",
+        "→ started `toy-1`",
+        "→ started `feature`",
+        "the shipping of sub-goal `feature`",
+    ] {
+        assert!(
+            lately.contains(expected),
+            "missing {expected:?} in:\n{lately}"
+        );
+    }
+    assert!(assert_described(&client, &project_id("toy")).await > 8);
+    assert_eq!(assert_described(&client, INTAKE_ID).await, 3);
+
+    // Asked to stop at a safe point, the worker leaves by itself: the
+    // listener and the watcher, which never end otherwise, do not hold it.
+    let mut shop = shop;
+    std::fs::write(factory_driver::drain_flag(&shop.world.path("state")), "").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let left = loop {
+        if let Some(status) = shop.worker.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "the worker never left");
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    assert!(left.success(), "the worker left as {left}");
+    shop.close().await;
+}
+
+/// What the owner writes while every account is at its limit is not
+/// dropped and need not be written again: the project's workflow keeps
+/// it and hands it in again when an account is back.
+#[tokio::test(flavor = "multi_thread")]
+async fn what_the_owner_writes_while_no_account_is_free_is_answered_when_one_is() {
+    use factory_driver::goal::Event;
+    use factory_engine::tiers::{Project, Reach, project_id, tell};
+
+    let until = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 12;
+    let prepare = |world: &World| {
+        world.with_github("green");
+        let project = world.path("config/projects/toy.toml");
+        let text = std::fs::read_to_string(&project).unwrap()
+            + "\n[executive]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\nslots = 2\n";
+        std::fs::write(&project, text).unwrap();
+        std::fs::create_dir_all(world.path("config/goals/toy")).unwrap();
+        std::fs::write(
+            world.path("config/goals/toy/main.toml"),
+            "id = \"main\"\nflow = \"zig-sdk-bead\"\nship_flow = \"zig-sdk-ship\"\n[director]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\n",
+        )
+        .unwrap();
+        // One account, at its limit for a few seconds more.
+        let factory = world.path("config/factory.toml");
+        let text = std::fs::read_to_string(&factory).unwrap();
+        std::fs::write(
+            &factory,
+            format!("limit_grace_secs = 0\n{text}\n[[account]]\nid = \"a\"\n"),
+        )
+        .unwrap();
+        std::fs::create_dir_all(world.path("state")).unwrap();
+        std::fs::write(
+            world.path("state/accounts.json"),
+            serde_json::json!({"a": {"blocked": {"*": until}, "updated_at": until - 12, "source": "test"}})
+                .to_string(),
+        )
+        .unwrap();
+        std::fs::create_dir_all(world.path("bin/state")).unwrap();
+        std::fs::write(
+            world.path("bin/state/executive-1.json"),
+            r#"{"reply":"Nothing is running.","open_goal":{"definition":"","handoff":""}}"#,
+        )
+        .unwrap();
+    };
+    let Some(shop) = Shop::open_with("engine-waits", "true", "", prepare, "tiers = true\n").await
+    else {
+        return;
+    };
+    let world = &shop.world;
+    let client = shop.client();
+    let reach = Reach {
+        task_queue: "factory-engine-waits".to_string(),
+        beat_secs: 1,
+        accounts: ACCOUNTS_ID.to_string(),
+    };
+    let asked = || {
+        world
+            .calls()
+            .iter()
+            .filter(|call| call[0] == "executive")
+            .count()
+    };
+    let standing = || async {
+        client
+            .get_workflow_handle::<Project>(project_id("toy"))
+            .query(Project::standing, (), WorkflowQueryOptions::default())
+            .await
+            .unwrap()
+    };
+    let said = || -> Vec<(String, String)> {
+        std::fs::read_to_string(world.path("state/projects/toy/executive.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .and_then(|executive| {
+                serde_json::from_value(executive["threads"]["7.7"]["said"].clone()).ok()
+            })
+            .unwrap_or_default()
+    };
+
+    let write = Event::Tell {
+        project: "toy".to_string(),
+        thread: "7.7".to_string(),
+        text: "What is running?".to_string(),
+    };
+    tell(&client, &reach, "toy", write).await.unwrap();
+    // The turn is over, nobody was asked, and the message is kept.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !standing()
+        .await
+        .lately
+        .iter()
+        .any(|line| line.contains("put off"))
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the message was never put off: {:?}",
+            standing().await
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(asked(), 0);
+    assert_eq!(
+        said(),
+        [("owner".to_string(), "What is running?".to_string())]
+    );
+    assert!(standing().await.trouble.is_none());
+
+    // When the account is back it is answered, once, and the owner's
+    // message is on record once.
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while said().len() < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "the message was never answered: {:?}",
+            standing().await
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(asked(), 1);
+    assert_eq!(
+        said(),
+        [
+            ("owner".to_string(), "What is running?".to_string()),
+            ("executive".to_string(), "Nothing is running.".to_string()),
+        ]
+    );
+    assert!(assert_described(&client, &project_id("toy")).await > 4);
     shop.close().await;
 }
 

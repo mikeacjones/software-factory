@@ -8,6 +8,10 @@
 //!   factory-engine go-on <pipeline> <step> <note>
 //!                                             continue a parked pipeline from a step
 //!   factory-engine give-up <pipeline>         end a parked pipeline
+//!   factory-engine project <project>          where a project's tiers stand: what they
+//!                                             are doing, and what waits its turn
+//!   factory-engine open <project> <text>      open a goal as the owner's message in the
+//!                                             project's channel would
 //!   factory-engine accounts                   what every account has left, and who waits
 //!   factory-engine accounts recheck           look at every account again now, as after
 //!                                             a usage reset; those waiting are released
@@ -23,7 +27,10 @@ use factory_config::{ConfigDir, Temporal};
 use factory_engine::accounts::{ACCOUNTS_ID, Accounts};
 use factory_engine::engine::{Adopt, GoOn, Pipeline, PipelineInput};
 use factory_engine::factory::FactoryRunner;
-use factory_engine::worker::{WorkerSettings, connect, ensure_accounts, pipeline_options, run};
+use factory_engine::tiers::{Project, Reach, project_id, tell};
+use factory_engine::worker::{
+    WorkerSettings, connect, ensure_accounts, ensure_tiers, pipeline_options, run,
+};
 use temporalio_client::errors::WorkflowStartError;
 use temporalio_client::{
     WorkflowGetResultOptions, WorkflowIdReusePolicy, WorkflowQueryOptions, WorkflowSignalOptions,
@@ -35,16 +42,29 @@ use temporalio_client::{
 /// seconds.
 const START_LOOK_SECS: u64 = 90;
 
-fn build_id() -> String {
+fn build_id(config: &ConfigDir) -> String {
+    // The engine's command stays where it is allowed to reach the server
+    // from, so the release is told by the config it was started with.
+    let release_of = |path: std::path::PathBuf| {
+        let path = std::fs::canonicalize(path).ok()?;
+        let mut parts = path.components().rev().skip(1);
+        let release = parts.next()?.as_os_str().to_string_lossy().into_owned();
+        (parts.next()?.as_os_str() == "releases").then_some(release)
+    };
     std::env::current_exe()
         .ok()
-        .and_then(|path| std::fs::canonicalize(path).ok())
-        .and_then(|path| {
-            let mut parts = path.components().rev().skip(1);
-            let release = parts.next()?.as_os_str().to_string_lossy().into_owned();
-            (parts.next()?.as_os_str() == "releases").then_some(release)
-        })
+        .and_then(release_of)
+        .or_else(|| release_of(config.0.clone()))
         .unwrap_or_else(|| "unreleased".to_string())
+}
+
+/// How a project's workflow is reached, as this factory is set up.
+fn reach(temporal: &Temporal) -> Reach {
+    Reach {
+        task_queue: temporal.task_queue.clone(),
+        beat_secs: temporal.beat_secs,
+        accounts: ACCOUNTS_ID.to_string(),
+    }
 }
 
 /// A pipeline for something that runs goals to start, as the file it
@@ -158,20 +178,88 @@ async fn command(args: &[String]) -> Result<(), String> {
                 namespace: temporal.namespace.clone(),
                 task_queue: temporal.task_queue.clone(),
                 deployment: temporal.deployment.clone(),
-                build_id: build_id(),
+                build_id: build_id(&config),
                 versioned: false,
             };
             eprintln!(
                 "factory-engine: worker of build `{}` on {} / {} / {}",
                 settings.build_id, settings.address, settings.namespace, settings.task_queue
             );
+            // What a worker that died left running would work beside what
+            // this one is handed in its place. From here on, what this one
+            // starts is noted, for the worker after it.
+            let live_runs = factory_driver::service::live_runs(&factory.state_dir);
+            for left in factory_supervise::reap_leftovers(&live_runs) {
+                eprintln!("factory-engine: killed a run left by an earlier worker: {left}");
+            }
+            factory_supervise::track_long_runs(&live_runs);
+            // A request to stop at a safe point was for the worker before.
+            let _ = std::fs::remove_file(factory_driver::drain_flag(&factory.state_dir));
+            let client = connect(&temporal.address, &temporal.namespace).await?;
+            ensure_accounts(&client, &temporal.task_queue, temporal.accounts_check_secs).await?;
+            if temporal.tiers {
+                // A definition that cannot run must not be able to open a goal.
+                factory_driver::goal::check_definitions(&config).map_err(|err| err.to_string())?;
+                let mut projects = Vec::new();
+                for id in config.projects().map_err(|err| err.to_string())? {
+                    if !config
+                        .goal_definitions(&id)
+                        .map_err(|err| err.to_string())?
+                        .is_empty()
+                    {
+                        projects.push(id);
+                    }
+                }
+                ensure_tiers(&client, &reach(&temporal), &projects).await?;
+                eprintln!(
+                    "factory-engine: the tiers are on the engine, for: {}",
+                    projects.join(", ")
+                );
+            }
             let runner = Arc::new(FactoryRunner {
                 config,
                 slack: factory.slack.is_some(),
             });
+            run(settings, runner).await?;
+            eprintln!("factory-engine: stopped at a safe point, as asked");
+            Ok(())
+        }
+        ["project", project] => {
             let client = connect(&temporal.address, &temporal.namespace).await?;
-            ensure_accounts(&client, &temporal.task_queue, temporal.accounts_check_secs).await?;
-            run(settings, runner).await
+            let standing = client
+                .get_workflow_handle::<Project>(project_id(project))
+                .query(Project::standing, (), WorkflowQueryOptions::default())
+                .await
+                .map_err(|err| format!("the project could not be asked: {err}"))?;
+            println!("now: {}", standing.doing);
+            println!(
+                "{} turn(s) taken, {} thing(s) waiting",
+                standing.turns, standing.waiting
+            );
+            if let Some(at) = standing.due_at {
+                println!(
+                    "next due by itself in {}s",
+                    at.saturating_sub(factory_core_now())
+                );
+            }
+            if let Some(trouble) = &standing.trouble {
+                println!("the last turn that failed: {trouble}");
+            }
+            for line in &standing.lately {
+                println!("  {line}");
+            }
+            Ok(())
+        }
+        ["open", project, text @ ..] if !text.is_empty() => {
+            config.project(project).map_err(|err| err.to_string())?;
+            let client = connect(&temporal.address, &temporal.namespace).await?;
+            let event = factory_driver::goal::Event::Open {
+                project: project.to_string(),
+                text: text.join(" "),
+            };
+            tell(&client, &reach(&temporal), project, event).await?;
+            println!("handed to project `{project}`: its tiers open the goal in their turn");
+            Ok(())
         }
         ["start", project, bead] => {
             // Refuse a project the factory does not know before anything
@@ -390,7 +478,7 @@ async fn command(args: &[String]) -> Result<(), String> {
             println!("told the accounts to look again");
             Ok(())
         }
-        _ => Err("usage: factory-engine worker | start <project> <bead> [--wait] | run <spec.json> | watch <pipeline> | standing <pipeline> | go-on <pipeline> <step> <note> | give-up <pipeline> | accounts [recheck]   [--config <dir>]".to_string()),
+        _ => Err("usage: factory-engine worker | start <project> <bead> [--wait] | run <spec.json> | watch <pipeline> | standing <pipeline> | go-on <pipeline> <step> <note> | give-up <pipeline> | project <project> | open <project> <text> | accounts [recheck]   [--config <dir>]".to_string()),
     }
 }
 

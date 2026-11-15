@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use tungstenite::{Connector, Message, WebSocket, stream::MaybeTlsStream};
 
 /// Something a person did in Slack.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Incoming {
     /// A message someone wrote. Messages from bots, edits and joins are left out.
     Message {

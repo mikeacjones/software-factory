@@ -12,6 +12,7 @@ workspace = true
 rustls.workspace = true
 tungstenite.workspace = true
 webpki-roots.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 ureq.workspace = true

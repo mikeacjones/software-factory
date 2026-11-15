@@ -15,4 +15,5 @@ pub mod describe;
 pub mod engine;
 pub mod factory;
 pub mod steps;
+pub mod tiers;
 pub mod worker;

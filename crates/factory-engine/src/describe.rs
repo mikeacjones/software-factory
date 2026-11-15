@@ -238,6 +238,94 @@ pub fn accounts_static() -> String {
         .to_string()
 }
 
+/// What one thing handed to a project's tiers is, as the summary of
+/// the turn that deals with it.
+pub fn event(event: &factory_driver::goal::Event) -> String {
+    use factory_driver::goal::Event;
+    use factory_slack::socket::Incoming;
+    let quoted = |text: &str| cut(&line(text), 90);
+    match event {
+        Event::Slack(Incoming::Message {
+            text, thread_ts, ..
+        }) => format!(
+            "the owner wrote {}: “{}”",
+            if thread_ts.is_some() {
+                "in a thread"
+            } else {
+                "in the channel"
+            },
+            quoted(text)
+        ),
+        Event::Slack(Incoming::Action {
+            action_id, value, ..
+        }) => format!("the owner pressed `{action_id}` on `{value}`"),
+        Event::Began { goal, bead, unit } => {
+            format!("the pipeline for `{bead}` of goal `{goal}` has its unit, `{unit}`")
+        }
+        Event::Ended {
+            goal,
+            bead,
+            ship,
+            word,
+            ..
+        } => format!(
+            "{} `{bead}` of goal `{goal}` is over ({}): whoever started it decides what is next",
+            if *ship {
+                "the shipping of sub-goal"
+            } else {
+                "the pipeline for"
+            },
+            match word.as_str() {
+                "end" => "it ran to its end or parked",
+                "refused" => "the bead was refused",
+                _ => "it failed",
+            }
+        ),
+        Event::Tick => {
+            "see to what has come due: an agent to try again, a note to deal with, a bead waiting to be closed".to_string()
+        }
+        Event::Resume => {
+            "pick up what was running before: ask again for the pipelines the records say are running, and wake whoever is owed an event".to_string()
+        }
+        Event::Open { text, .. } => format!("open a goal for the owner: “{}”", quoted(text)),
+        Event::Tell { text, .. } => {
+            format!("the owner told the executive: “{}”", quoted(text))
+        }
+    }
+}
+
+/// A project's workflow's details as it starts.
+pub fn project_static(project: &str) -> String {
+    format!(
+        "Everything that happens to project `{project}` comes here as a signal and waits its \
+         turn: what the owner writes or presses in Slack, a pipeline that has its unit or has \
+         ended, a time that has come due.\n\n\
+         Each is one activity, a turn: the project's executive, its goals' directors and their \
+         foremen read what happened and decide, and what they decided is on the goals' records \
+         when the turn is over. One turn runs at a time. The pipelines a turn asks for are \
+         started from here as workflows of their own (`pipeline-<goal>-<bead>-…`), and go on \
+         whatever becomes of this one.\n\n\
+         A message that cannot be answered because every account is at its usage limit is kept \
+         here and handed in again when one is back. Nothing waits in a process.\n\n\
+         `factory-engine project {project}` shows where it stands. It continues as a new run \
+         from time to time to keep its history short."
+    )
+}
+
+/// The intake workflow's details as it starts.
+pub fn intake_static() -> String {
+    "There is one of these in a namespace. It keeps two activities running, and starts them \
+     again whenever one ends.\n\n\
+     The listener holds the socket to Slack and signals each thing the owner does to the \
+     workflow of the project whose channel it was in (`project-<id>`), as soon as it \
+     arrives.\n\n\
+     The watcher looks at the pipelines the goals' records say are running, and signals each \
+     one's project when it has a unit and when it has ended, however it ended: also when it \
+     failed, was ended by hand, or was never started.\n\n\
+     Neither decides anything. It continues as a new run once a day."
+        .to_string()
+}
+
 fn percent(part: f64) -> String {
     format!("{:.0}%", part * 100.0)
 }

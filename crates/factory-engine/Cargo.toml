@@ -14,6 +14,8 @@ factory-claude.workspace = true
 factory-config.workspace = true
 factory-driver.workspace = true
 factory-flow.workspace = true
+factory-slack.workspace = true
+factory-supervise.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 # The SDK compiles its protocol definitions when it is built. With
@@ -29,5 +31,4 @@ temporalio-sdk = { version = "=1.2.0", default-features = false, features = ["en
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 
 [dev-dependencies]
-factory-slack.workspace = true
 temporalio-sdk = { version = "=1.2.0", default-features = false, features = ["envconfig", "testing"] }
