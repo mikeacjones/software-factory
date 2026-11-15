@@ -14,6 +14,7 @@ pub mod thread;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use factory_beads::{Bead, Source, readiness};
@@ -175,6 +176,17 @@ pub struct Unit {
     /// what a fresh agent is told, since it shares no session with the rest.
     #[serde(default)]
     pub history: Vec<String>,
+    /// The files and directories set aside for this unit while other beads
+    /// of its sub-goal are built beside it. Empty when it runs alone.
+    #[serde(default)]
+    pub declared_paths: Vec<String>,
+    /// Files it changed outside them.
+    #[serde(default)]
+    pub strayed: Vec<String>,
+    /// Files left with conflict markers when the sub-goal's branch was
+    /// merged into this unit's, for the builder to resolve.
+    #[serde(default)]
+    pub conflicts: Vec<String>,
     pub runs: u32,
     pub started_at: u64,
 }
@@ -239,6 +251,22 @@ pub struct Options {
     pub within: Option<Within>,
 }
 
+/// One absorb at a time, across every pipeline of the process: a sub-goal's
+/// branch must not move between a unit reading where it is and adding to it.
+static ABSORBING: Mutex<()> = Mutex::new(());
+
+/// Whether `file` is one of `paths` or lies under one of them. Paths are
+/// relative to the repository, with `/` between their parts.
+pub fn under(file: &str, paths: &[String]) -> bool {
+    paths.iter().any(|path| {
+        let path = path.trim_end_matches('/');
+        file == path
+            || file
+                .strip_prefix(path)
+                .is_some_and(|rest| rest.starts_with('/'))
+    })
+}
+
 /// How a unit relates to a goal's sub-goal.
 #[derive(Clone, Debug)]
 pub enum Within {
@@ -250,6 +278,9 @@ pub enum Within {
         /// Beads the sub-goal has absorbed: still open in the tracker, but
         /// done as far as this bead's blockers go.
         absorbed: Vec<String>,
+        /// The files and directories set aside for it, when other beads of
+        /// the sub-goal run beside it. Empty when it runs alone.
+        paths: Vec<String>,
     },
     /// The sub-goal itself, being shipped as one pull request.
     Ship(Ship),
@@ -572,6 +603,9 @@ impl Driver {
                 issues: Vec::new(),
                 regressions: Vec::new(),
                 history: Vec::new(),
+                declared_paths: Vec::new(),
+                strayed: Vec::new(),
+                conflicts: Vec::new(),
                 runs: 0,
                 started_at,
             },
@@ -591,9 +625,21 @@ impl Driver {
             }),
         )?;
         match &options.within {
-            Some(Within::Bead { tip, worktree, .. }) => {
+            Some(Within::Bead {
+                tip,
+                worktree,
+                paths,
+                ..
+            }) => {
                 driver.unit.base = tip.clone();
                 driver.unit.absorb_into = Some(worktree.clone());
+                if !paths.is_empty() {
+                    driver.unit.declared_paths = paths.clone();
+                    driver.unit.history.push(format!(
+                        "This bead is being built at the same time as others of its sub-goal, each in a worktree of its own. The paths set aside for this one: {}. Keep your changes inside them wherever the bead allows. A file you change outside them may be one another bead is changing too, and the two will then have to be merged.",
+                        paths.join(", ")
+                    ));
+                }
             }
             Some(Within::Ship(ship)) => {
                 driver.unit.ship = true;
@@ -1694,6 +1740,26 @@ impl Driver {
                             truncate(&removed.join(" | "), 1500)
                         ));
                     }
+                }
+                // Beads built side by side were each given paths. Leaving
+                // them is not refused, since the bead may need to, but it is
+                // recorded: whoever set the paths should know.
+                let strays: Vec<String> = changed
+                    .iter()
+                    .filter(|file| {
+                        !self.unit.declared_paths.is_empty()
+                            && !under(file, &self.unit.declared_paths)
+                            && !self.unit.strayed.contains(file)
+                    })
+                    .cloned()
+                    .collect();
+                if !strays.is_empty() {
+                    self.event(
+                        "paths.strayed",
+                        Some(&step.id),
+                        json!({ "files": strays, "declared": self.unit.declared_paths }),
+                    )?;
+                    self.unit.strayed.extend(strays);
                 }
                 let allowed: Vec<String> = writes
                     .iter()
@@ -2851,8 +2917,104 @@ impl Driver {
         Ok(StepEnd::Outcome("done".to_string()))
     }
 
+    /// Before a unit is absorbed: if another bead of its sub-goal was
+    /// absorbed since this one branched, merge the sub-goal's branch into
+    /// the unit's. Returns how the step ends when the unit is not ready to
+    /// be absorbed yet, and `None` when it is.
+    fn reconcile(&mut self, step: &Step) -> Result<Option<StepEnd>, DriverError> {
+        let Some(target) = self.unit.absorb_into.clone() else {
+            return Ok(None);
+        };
+        let worktree = self.unit.worktree.clone();
+        // Conflicts handed to the builder must be gone before anything else.
+        let unresolved = factory_git::with_conflict_markers(&worktree, &self.unit.conflicts);
+        if !unresolved.is_empty() {
+            let reason = format!(
+                "These files still hold conflict markers from merging the sub-goal's branch into yours: {}. Resolve each one so that both changes do what they were for, and remove the markers.",
+                unresolved.join(", ")
+            );
+            return self.send_back(step, "conflict", reason).map(Some);
+        }
+        self.unit.conflicts.clear();
+        let tip = factory_git::rev_parse(&target, "HEAD")?;
+        if tip == self.unit.base {
+            return Ok(None);
+        }
+        let conflicted = factory_git::merge_keeping_conflicts(
+            &worktree,
+            &tip,
+            &format!(
+                "checkpoint: merge the sub-goal's branch ({})",
+                self.unit.bead
+            ),
+        )?;
+        let head = factory_git::rev_parse(&worktree, "HEAD")?;
+        // From here the unit's own change is what it adds to the new tip.
+        let from = std::mem::replace(&mut self.unit.base, tip.clone());
+        self.unit.checkpoint = head.clone();
+        self.event(
+            "tip.merged",
+            Some(&step.id),
+            json!({ "from": from, "onto": tip, "commit": head, "conflicts": conflicted }),
+        )?;
+        if conflicted.is_empty() {
+            self.unit.history.push(format!(
+                "{}: another bead of the sub-goal was absorbed first, so the sub-goal's branch ({}) was merged into this one. It merged cleanly, and the project's checks run again on the two together.",
+                step.id,
+                &tip[..tip.len().min(10)]
+            ));
+            self.save()?;
+            return self
+                .send_back(
+                    step,
+                    "moved",
+                    "Another bead of the sub-goal was absorbed first. Its work merged cleanly into this branch, and the checks have to pass on the two together before this one is absorbed.".to_string(),
+                )
+                .map(Some);
+        }
+        self.unit.conflicts = conflicted.clone();
+        let reason = format!(
+            "While this bead was in its pipeline, another bead of the same sub-goal was absorbed into the sub-goal's branch. That branch has been merged into yours, and these files conflicted: {}.\n\nEach holds git's conflict markers (`<<<<<<<`, `=======`, `>>>>>>>`), committed as a checkpoint: there is no merge in progress and nothing to abort or continue. Resolve every one so that both changes do what they were for: yours, and the other bead's (`git log -p {}..{}` shows what it did). Do not drop the other bead's work to make yours fit. Then make sure the result builds and its tests pass.",
+            conflicted.join(", "),
+            &from[..from.len().min(10)],
+            &tip[..tip.len().min(10)]
+        );
+        self.send_back(step, "conflict", reason).map(Some)
+    }
+
+    /// End an action with an outcome that leads back into the flow, with
+    /// what the step it leads to needs to know. A flow that does not route
+    /// the outcome parks the unit instead.
+    fn send_back(
+        &mut self,
+        step: &Step,
+        outcome: &str,
+        reason: String,
+    ) -> Result<StepEnd, DriverError> {
+        self.thread.say(&format!(
+            ":twisted_rightwards_arrows: *{}* · {}",
+            step.id,
+            escape(&truncate(&reason, 600))
+        ));
+        if !step.on.contains_key(outcome) {
+            self.save()?;
+            return Ok(StepEnd::Park(format!(
+                "{reason}\n\nThe flow has no `{outcome}` route from `{}`, so the unit stops here.",
+                step.id
+            )));
+        }
+        if outcome == "conflict" {
+            self.unit.feedback = Some(reason);
+        }
+        self.save()?;
+        Ok(StepEnd::Outcome(outcome.to_string()))
+    }
+
     /// The `publish` action: one final commit, a push, and the pull request.
     fn publish_step(&mut self, step: &Step) -> Result<StepEnd, DriverError> {
+        // A unit joining a sub-goal's branch does so alone.
+        let absorbing = matches!(&step.kind, StepKind::Action { action } if action == "absorb");
+        let _alone = absorbing.then(|| ABSORBING.lock().unwrap_or_else(PoisonError::into_inner));
         match self.publish(step) {
             Ok(end) => Ok(end),
             Err(err) => {
@@ -2900,6 +3062,11 @@ impl Driver {
         };
         let (message, title, body) = (field("commit_message"), field("pr_title"), field("pr_body"));
         let worktree = self.unit.worktree.clone();
+        if matches!(&step.kind, StepKind::Action { action } if action == "absorb")
+            && let Some(end) = self.reconcile(step)?
+        {
+            return Ok(end);
+        }
         self.thread.status(&format!(
             ":arrows_counterclockwise: *{}* · commit, push, pull request",
             step.id

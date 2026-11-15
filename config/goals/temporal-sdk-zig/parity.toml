@@ -8,7 +8,8 @@ default = true
 # the heavy pipeline runs once when the director ships the sub-goal.
 flow = "zig-sdk-bead"
 ship_flow = "zig-sdk-ship"
-max_pipelines = 1
+# The most pipelines the whole goal may have running at once.
+max_pipelines = 2
 
 # The standing objective, for a goal the owner opens without saying more. The
 # opening conversation turns it into a charter the owner agrees to.
@@ -18,9 +19,14 @@ stop_when = "All GA features and capabilities match."
 # Two tiers of agents run a goal. The director plans the goal in sub-goals,
 # opens them, and ships each as one pull request. Each sub-goal's foreman
 # starts its beads, rules on their findings and reports to the director when
-# the sub-goal is ready or when it needs an answer. `slots` is the most work a
-# tier may have running below it at once; it is 1 until work run side by
-# side can be folded back together.
+# the sub-goal is ready or when it needs an answer.
+#
+# `slots` is the most work a tier may have running below it at once. It is a
+# limit, never a target: the foreman runs two beads together only when it has
+# declared for each the paths it will change and code finds no overlap, and
+# otherwise one after the other. The bead absorbed second has the first
+# merged into it and its checks run again. A director's slots stay at 1 until
+# sub-goals can be landed side by side.
 [director]
 model = "claude-fable-5-2"
 effort = "high"
@@ -30,6 +36,7 @@ timeout_secs = 2400
 model = "claude-opus-5-5"
 effort = "high"
 timeout_secs = 1800
+slots = 2
 
 [permissions]
 # New beads, with their type, priority and deferral, are the director's call.

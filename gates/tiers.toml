@@ -38,6 +38,38 @@ command = ["cargo", "test", "--locked", "--offline", "--package", "factory-drive
 timeout_secs = 900
 
 [[check]]
+id = "side-by-side-rules"
+tier = "hermetic"
+bead = "sf-7nv.2"
+claim = "A foreman may start beads together only within its slots, only when every bead that would run at once has declared plain paths inside the repository, and only when no two declarations overlap, a directory counting as everything under it; a bead running with no paths keeps everything else waiting; and a bead that runs alone needs none. A foreman's slots may not exceed the pipelines the goal allows."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-driver", "--package", "factory-config", "--", "beads_run_side_by_side_only", "goal_definitions_load"]
+timeout_secs = 900
+
+[[check]]
+id = "merge"
+tier = "hermetic"
+bead = "sf-7nv.2"
+claim = "Merging another branch into a unit's is clean when the two changed different files; when they changed the same lines the merge is committed with its conflict markers, the worktree is left clean, the conflicted files are named, and a file counts as resolved once it holds no marker."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-git", "a_branch_takes_in_another"]
+timeout_secs = 900
+
+[[check]]
+id = "side-by-side-run"
+tier = "hermetic"
+bead = "sf-7nv.2"
+claim = "With scripted agents and real pipelines: two beads started by one decision are built at the same time in worktrees of their own; the second to finish has the first merged into it, the project's checks run again with no agent, and it is absorbed onto the first, leaving one commit for each in a line; a bead that changed files outside its declared paths is reported to the foreman. When the two changed the same file, the conflict goes to the second bead's builder in its own session, an answer that leaves markers in is refused by code, and after the fix the whole pipeline runs again before it is absorbed."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-driver", "--test", "walk", "two_beads_"]
+timeout_secs = 900
+
+[[check]]
+id = "zig-side-by-side"
+tier = "owner"
+bead = "sf-7nv.2"
+claim = "On temporal-sdk-zig, a foreman ran two beads of a real sub-goal at the same time, both were absorbed, and the sub-goal landed."
+command = ["proofs/tiers_zig_verify.sh", "--side-by-side"]
+timeout_secs = 300
+
+[[check]]
 id = "zig-foreman"
 tier = "owner"
 bead = "sf-7nv.1"

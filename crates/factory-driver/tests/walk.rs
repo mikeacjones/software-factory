@@ -2314,6 +2314,332 @@ fn a_foreman_that_cannot_run_is_retried_and_then_handed_to_the_director() {
     assert_eq!(foreman(&sup).waiting.as_deref(), Some("ready"));
 }
 
+/// A goal whose foreman may run two beads at once, started, with both of
+/// its beads running side by side on the paths given. Returns the supervisor.
+fn two_beads_side_by_side(
+    world: &World,
+    scenario: &str,
+    paths: [&str; 2],
+) -> factory_driver::goal::Supervisor {
+    use factory_driver::goal::Supervisor;
+    use factory_slack::socket::Incoming;
+
+    world.with_github("green");
+    world.scenario(scenario);
+    // No tester breaks anything here: the beads themselves are the subject.
+    std::fs::create_dir_all(world.path("bin/state")).unwrap();
+    std::fs::write(world.path("bin/state/broke"), "").unwrap();
+    std::fs::write(
+        world.path("beads/toy-3.json"),
+        r#"{"id":"toy-3","title":"The other part","description":"Beside it.","acceptance_criteria":"- it is there","status":"open"}"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(world.path("config/goals/toy")).unwrap();
+    std::fs::write(
+        world.path("config/goals/toy/main.toml"),
+        "id = \"main\"\nflow = \"zig-sdk-bead\"\nship_flow = \"zig-sdk-ship\"\nmax_pipelines = 2\n[director]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\n[foreman]\nmodel = \"claude-opus-5-5\"\neffort = \"medium\"\nslots = 2\n",
+    )
+    .unwrap();
+    let say = |role: &str, n: u32, json: serde_json::Value| {
+        std::fs::write(
+            world.path(&format!("bin/state/{role}-{n}.json")),
+            json.to_string(),
+        )
+        .unwrap();
+    };
+    let direct = |fields: serde_json::Value| {
+        let mut result = serde_json::json!({
+            "summary": "Decided.", "start": [], "file": [], "edit": [], "dropped_findings": [],
+            "open_subgoal": {"id": "", "title": "", "objective": "", "beads": []}, "ship": false,
+            "tell_foreman": "", "ask_owner": "", "complete": false, "evidence": "",
+            "journal_entry": "", "project_memory": ""
+        });
+        for (key, value) in fields.as_object().unwrap() {
+            result[key] = value.clone();
+        }
+        result
+    };
+    let foreman = |fields: serde_json::Value| {
+        let mut result = serde_json::json!({
+            "summary": "Decided.", "start": [], "file": [], "dropped_findings": [],
+            "report": "working", "message": "", "journal_entry": ""
+        });
+        for (key, value) in fields.as_object().unwrap() {
+            result[key] = value.clone();
+        }
+        result
+    };
+    say(
+        "intake",
+        1,
+        serde_json::json!({"reply": "Here is the charter.", "ready": true, "objective": "Ship both parts.", "stop_when": "Both beads have landed.", "plan": "One sub-goal, its two beads side by side.", "edits": []}),
+    );
+    say(
+        "director",
+        1,
+        direct(
+            serde_json::json!({"open_subgoal": {"id": "feature", "title": "Both parts", "objective": "Both parts work.", "beads": ["toy-1", "toy-3"]}}),
+        ),
+    );
+    say(
+        "foreman",
+        1,
+        foreman(serde_json::json!({"start": [
+            {"bead": "toy-1", "reason": "independent of the other", "paths": [paths[0]]},
+            {"bead": "toy-3", "reason": "independent of the other", "paths": [paths[1]]},
+        ]})),
+    );
+    // The first to end leaves the other running; the second makes it whole.
+    say("foreman", 2, foreman(serde_json::json!({})));
+    say(
+        "foreman",
+        3,
+        foreman(serde_json::json!({"report": "ready", "message": "Both are absorbed."})),
+    );
+    say(
+        "director",
+        2,
+        direct(serde_json::json!({"ask_owner": "Ship it now?"})),
+    );
+
+    let mut sup = Supervisor::new(world.config(), None, vec!["OWNER".to_string()], false).unwrap();
+    let id = sup.open_directly("toy", "Ship both parts").unwrap();
+    sup.incoming(Incoming::Action {
+        channel: String::new(),
+        user: "OWNER".to_string(),
+        action_id: "goal_start".to_string(),
+        value: id,
+        message_ts: String::new(),
+    })
+    .unwrap();
+    // Both were started by the one decision, each on its own paths.
+    let goal = sup.goals().next().unwrap().clone();
+    assert_eq!(goal.units.len(), 2);
+    for (unit, path) in goal.units.iter().zip(paths) {
+        assert_eq!(unit.state, "running");
+        assert_eq!(unit.paths, [path]);
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+    while sup.goals().next().unwrap().wakes < 2 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the two beads were never both absorbed"
+        );
+        sup.pump(std::time::Duration::from_millis(200)).unwrap();
+    }
+    sup
+}
+
+/// The event logs of a goal's two units: the one absorbed first, then the other.
+fn in_order_absorbed(world: &World, goal: &factory_driver::goal::Goal) -> [String; 2] {
+    let log = |bead: &str| {
+        let unit = goal
+            .units
+            .iter()
+            .find(|unit| unit.bead == bead)
+            .and_then(|unit| unit.unit.clone())
+            .unwrap();
+        std::fs::read_to_string(world.path(&format!("state/units/{unit}/events.jsonl"))).unwrap()
+    };
+    let absorbed = &goal.subgoals[0].absorbed;
+    assert_eq!(absorbed.len(), 2, "{absorbed:?}");
+    [log(&absorbed[0].0), log(&absorbed[1].0)]
+}
+
+#[test]
+fn two_beads_built_side_by_side_are_absorbed_one_onto_the_other() {
+    let world = World::new("side-by-side", "true");
+    // The second declaration is wrong on purpose: toy-3 writes under `toy-3`.
+    let sup = two_beads_side_by_side(&world, "own-file", ["toy-1", "elsewhere"]);
+    let goal = sup.goals().next().unwrap().clone();
+    let sub = &goal.subgoals[0];
+    assert_eq!(
+        sub.foreman.clone().unwrap().waiting.as_deref(),
+        Some("ready")
+    );
+
+    // Each ran in a worktree of its own from the same tip, at the same time:
+    // both builders were called before either bead was absorbed.
+    let calls = world.calls();
+    let builders: Vec<&Vec<String>> = calls.iter().filter(|call| call[0] == "builder").collect();
+    assert_eq!(builders.len(), 2);
+    assert_ne!(builders[0][2], builders[1][2], "one worktree each");
+    let [first, second] = in_order_absorbed(&world, &goal);
+
+    // The first was absorbed as it stood. The second found the branch moved:
+    // the first was merged into it, the checks ran again with no agent, and
+    // only then was it absorbed.
+    assert!(!first.contains("\"kind\":\"tip.merged\""));
+    assert!(second.contains("\"kind\":\"tip.merged\""), "{second}");
+    assert!(second.contains("\"conflicts\":[]"));
+    let after: Vec<&str> = second
+        .lines()
+        .skip_while(|line| !line.contains("\"kind\":\"tip.merged\""))
+        .filter(|line| line.contains("\"kind\":\"step.ended\""))
+        .filter_map(|line| line.split("\"step\":\"").nth(1)?.split('"').next())
+        .collect();
+    assert_eq!(
+        after,
+        [
+            "absorb",
+            "recheck-fmt",
+            "recheck-index",
+            "recheck-readme",
+            "recheck-changelog",
+            "recheck-test",
+            "recheck-test-safe",
+            "absorb"
+        ]
+    );
+    // The sub-goal's branch holds one commit for each, in a line, with both
+    // beads' files.
+    assert_eq!(
+        run(
+            &sub.worktree,
+            "git",
+            &["rev-list", "--count", &format!("{}..HEAD", sub.base)]
+        ),
+        "2"
+    );
+    assert_eq!(
+        run(
+            &sub.worktree,
+            "git",
+            &[
+                "rev-list",
+                "--count",
+                "--merges",
+                &format!("{}..HEAD", sub.base)
+            ]
+        ),
+        "0"
+    );
+    assert_eq!(
+        run(&sub.worktree, "git", &["rev-parse", "HEAD"]),
+        sub.absorbed[1].1
+    );
+    assert_eq!(
+        run(&sub.worktree, "git", &["rev-parse", "HEAD~1"]),
+        sub.absorbed[0].1
+    );
+    for bead in ["toy-1", "toy-3"] {
+        assert!(sub.worktree.join(bead).join("feature.txt").exists());
+    }
+
+    // Each builder was told which paths were its own, and the foreman was
+    // told that toy-3 left the ones declared for it.
+    let brief = |index: usize| {
+        std::fs::read_to_string(world.path(&format!("bin/state/brief-{}.md", index + 1))).unwrap()
+    };
+    let told: Vec<String> = (0..calls.len())
+        .filter(|&i| calls[i][0] == "builder")
+        .map(brief)
+        .collect();
+    assert!(
+        told.iter()
+            .any(|text| text.contains("The paths set aside for this one: toy-1.")),
+        "{}",
+        told[0]
+    );
+    let reports: String = (0..calls.len())
+        .filter(|&i| calls[i][0] == "foreman")
+        .map(brief)
+        .collect();
+    assert!(
+        reports
+            .contains("  It changed files outside the paths declared for it: toy-3/feature.txt."),
+        "{reports}"
+    );
+    assert!(!reports.contains("declared for it: toy-1/feature.txt"));
+}
+
+#[test]
+fn two_beads_that_collide_are_merged_by_the_builder_of_the_second() {
+    let world = World::new("collide", "true");
+    // Both builders write the same file, whatever the foreman declared, and
+    // the builder's first try at the conflict leaves the markers in.
+    let sup = two_beads_side_by_side(&world, "lazy-merge", ["a", "b"]);
+    let goal = sup.goals().next().unwrap().clone();
+    let sub = &goal.subgoals[0];
+    let [first, second] = in_order_absorbed(&world, &goal);
+    assert!(!first.contains("\"kind\":\"tip.merged\""));
+    assert!(
+        second.contains("\"conflicts\":[\"feature.txt\"]"),
+        "{second}"
+    );
+
+    // The conflict went to the second bead's builder, in the session that
+    // built it. Its first answer still had markers, which code found before
+    // anything was absorbed, and sent back.
+    let conflicts = second.matches("\"outcome\":\"conflict\"").count();
+    assert_eq!(conflicts, 2, "{second}");
+    let calls = world.calls();
+    let fixes: Vec<usize> = (0..calls.len())
+        .filter(|&i| calls[i][0] == "builder")
+        .skip(2)
+        .collect();
+    assert_eq!(fixes.len(), 2, "two fixes, by the builder");
+    let brief = |index: usize| {
+        std::fs::read_to_string(world.path(&format!("bin/state/brief-{}.md", index + 1))).unwrap()
+    };
+    assert!(
+        brief(fixes[0]).contains("these files conflicted: feature.txt."),
+        "{}",
+        brief(fixes[0])
+    );
+    assert!(
+        brief(fixes[1]).contains("These files still hold conflict markers"),
+        "{}",
+        brief(fixes[1])
+    );
+    let builders: Vec<&Vec<String>> = calls.iter().filter(|call| call[0] == "builder").collect();
+    assert!(
+        builders[..2].iter().any(|built| built[1] == builders[2][1]),
+        "the fix continues a builder's session"
+    );
+    // After the builder's change the whole pipeline ran again on it.
+    let after: Vec<&str> = second
+        .lines()
+        .rev()
+        .take_while(|line| !line.contains("\"outcome\":\"conflict\""))
+        .filter(|line| line.contains("\"kind\":\"step.ended\""))
+        .filter_map(|line| line.split("\"step\":\"").nth(1)?.split('"').next())
+        .collect();
+    for step in ["fix", "test", "break", "review", "describe", "absorb"] {
+        assert!(after.contains(&step), "{step} did not run again: {after:?}");
+    }
+
+    // What was absorbed has both beads' lines and no marker, as two commits
+    // in a line.
+    let merged = std::fs::read_to_string(sub.worktree.join("feature.txt")).unwrap();
+    assert!(
+        !merged.contains("<<<<<<<") && !merged.contains(">>>>>>>"),
+        "{merged}"
+    );
+    assert!(merged.lines().count() >= 2, "{merged}");
+    assert_eq!(
+        run(
+            &sub.worktree,
+            "git",
+            &["rev-list", "--count", &format!("{}..HEAD", sub.base)]
+        ),
+        "2"
+    );
+    assert_eq!(
+        run(
+            &sub.worktree,
+            "git",
+            &[
+                "rev-list",
+                "--count",
+                "--merges",
+                &format!("{}..HEAD", sub.base)
+            ]
+        ),
+        "0"
+    );
+}
+
 #[test]
 fn a_finding_is_proved_by_a_failing_test_and_a_fix_by_that_test_passing() {
     let world = World::new("proof", "true");

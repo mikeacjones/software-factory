@@ -232,10 +232,14 @@ pub const ACTIONS: [ActionSpec; 4] = [
         required: &["green", "red"],
     },
     // Add the unit's change, as one commit, to the branch of the sub-goal it
-    // belongs to. Nothing is pushed and the bead stays open.
+    // belongs to. Nothing is pushed and the bead stays open. When another
+    // bead was absorbed first, the sub-goal's branch is merged into the
+    // unit's instead and nothing is absorbed yet: `moved` if that was clean,
+    // so the checks can run on the two together, and `conflict` if it left
+    // conflicts to resolve.
     ActionSpec {
         name: "absorb",
-        outcomes: &["done", "failed"],
+        outcomes: &["done", "failed", "moved", "conflict"],
         required: &["done"],
     },
     // Merge the pull request, confirm it, close the bead.

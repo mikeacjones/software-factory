@@ -82,6 +82,10 @@ The agent that runs one sub-goal under the director: it starts the sub-goal's be
 
 One level of the agents that run a goal, defined by a model, an effort, a time limit and its slots: the most pieces of work it may have running below it at once. The director is the tier of a goal and the foreman the tier of a sub-goal. Each is woken by events from the level below, and a slot count is a maximum, never a target.
 
+## paths
+
+The files and directories a foreman sets aside for a bead that runs beside others of its sub-goal. Beads may run at the same time only when each has paths and no two overlap, which code checks before anything starts.
+
 ## tick
 
 One pass of the driver: preflight, observe, step every unit, execute actions with at most one landing, dispatch, write the heartbeat.

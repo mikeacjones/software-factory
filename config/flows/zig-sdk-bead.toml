@@ -142,3 +142,57 @@ kind = "action"
 action = "absorb"
 on.done = "end"
 on.failed = { to = "describe", max = 2 }
+# Beads of one sub-goal may be built side by side. When another was absorbed
+# while this one was in its pipeline, the sub-goal's branch is merged into
+# this one's and nothing is absorbed yet. A clean merge has the checks run
+# again on the two together; a conflict goes back to this bead's builder,
+# and from there through the whole pipeline again.
+on.moved = "recheck-fmt"
+on.conflict = { to = "fix", max = 3 }
+
+# The checks again, after another bead's work was merged in cleanly. No agent
+# runs: this bead's own change is what the tester and the reviewer already
+# passed, and the two beads are reviewed together when the sub-goal ships.
+[[step]]
+id = "recheck-fmt"
+kind = "command"
+command = "fmt"
+on.pass = "recheck-index"
+on.fail = { to = "fix", max = 2 }
+
+[[step]]
+id = "recheck-index"
+kind = "command"
+command = "samples-index"
+on.pass = "recheck-readme"
+on.fail = { to = "fix", max = 2 }
+
+[[step]]
+id = "recheck-readme"
+kind = "command"
+command = "readme"
+on.pass = "recheck-changelog"
+on.fail = { to = "fix", max = 2 }
+
+[[step]]
+id = "recheck-changelog"
+kind = "command"
+command = "changelog"
+on.pass = "recheck-test"
+on.fail = { to = "fix", max = 2 }
+
+[[step]]
+id = "recheck-test"
+kind = "command"
+command = "test"
+on.pass = "recheck-test-safe"
+on.fail = { to = "fix", max = 2 }
+
+[[step]]
+id = "recheck-test-safe"
+kind = "command"
+command = "test-releasesafe"
+when_changed = ["runtime"]
+# Back to the absorb. If yet another bead got there first, round again.
+on.pass = { to = "absorb", max = 6 }
+on.fail = { to = "fix", max = 2 }

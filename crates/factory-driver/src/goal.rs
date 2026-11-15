@@ -41,7 +41,7 @@ use factory_supervise::Control;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::{Driver, DriverError, Options, Ship, Status, Within, bead_source};
+use crate::{Driver, DriverError, Options, Ship, Status, Within, bead_source, under};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -187,6 +187,10 @@ pub struct GoalUnit {
     /// The sub-goal a bead's pipeline runs in.
     #[serde(default)]
     pub subgoal: Option<String>,
+    /// The files and directories set aside for it while it runs beside
+    /// other beads. Empty when nothing was declared.
+    #[serde(default)]
+    pub paths: Vec<String>,
 }
 
 /// Something a director or a foreman has not been told yet.
@@ -232,6 +236,9 @@ pub enum Happening {
         /// Whether this was a sub-goal being shipped; `bead` is then its ID.
         #[serde(default)]
         ship: bool,
+        /// Files it changed outside the paths declared for it.
+        #[serde(default)]
+        strayed: Vec<String>,
     },
     RequestAnswered {
         approved: bool,
@@ -380,11 +387,15 @@ pub fn intake_schema() -> Value {
     }))
 }
 
-fn start_schema() -> Value {
-    json!({ "type": "array", "description": "Pipelines to start now.", "items": object_schema(json!({
+fn start_schema(foreman: bool) -> Value {
+    let mut properties = json!({
         "bead": text_schema("The ID of a launchable bead."),
         "reason": text_schema("Why this one next."),
-    }))})
+    });
+    if foreman {
+        properties["paths"] = json!({ "type": "array", "items": { "type": "string" }, "description": "The files and directories this bead will change, relative to the repository, such as `src/worker` or `docs/timers.md`. Required for every bead that runs while another does, and no two may overlap. Leave empty for a bead that runs alone." });
+    }
+    json!({ "type": "array", "description": "Pipelines to start now.", "items": object_schema(properties) })
 }
 
 /// A new bead to file. A foreman's may also join its sub-goal.
@@ -416,7 +427,7 @@ fn dropped_schema() -> Value {
 pub fn foreman_schema() -> Value {
     object_schema(json!({
         "summary": text_schema("What you concluded and decided, for the owner and the director, in a few plain sentences."),
-        "start": start_schema(),
+        "start": start_schema(true),
         "file": file_schema(true),
         "dropped_findings": dropped_schema(),
         "report": { "enum": ["working", "ready", "escalate"], "description": "`working` while a pipeline of this sub-goal is running or being started. `ready` when everything meant for it is absorbed and the director should ship it. `escalate` when you need the director: a bead that cannot run, a question, work that does not belong." },
@@ -429,7 +440,7 @@ pub fn foreman_schema() -> Value {
 pub fn wake_schema() -> Value {
     object_schema(json!({
         "summary": text_schema("What you concluded and decided, for the owner, in a few plain sentences."),
-        "start": start_schema(),
+        "start": start_schema(false),
         "file": file_schema(false),
         "edit": { "type": "array", "description": "Changes to beads that exist.", "items": edit_schema() },
         "dropped_findings": dropped_schema(),
@@ -734,6 +745,85 @@ fn file_problems(files: &[Value], launchable: &dyn Fn(&str) -> Vec<String>) -> V
     problems
 }
 
+/// The paths a foreman declared for a bead it starts.
+fn paths_of(start: &Value) -> Vec<String> {
+    items(start, "paths")
+        .iter()
+        .filter_map(Value::as_str)
+        .map(|path| path.trim().trim_end_matches('/').to_string())
+        .collect()
+}
+
+/// Why the beads a foreman wants to start may not run beside each other and
+/// beside what is already running in the sub-goal. Beads run side by side
+/// only when each has declared the paths it will change and no two
+/// declarations overlap: that is what makes it safe before any of them runs.
+fn path_problems(goal: &Goal, sub: &SubGoal, starts: &[Value]) -> Vec<String> {
+    let mut problems = Vec::new();
+    let mut claims: Vec<(String, Vec<String>, bool)> = goal
+        .units
+        .iter()
+        .filter(|unit| {
+            unit.state == "running"
+                && !unit.ship
+                && unit.subgoal.as_deref().is_none_or(|own| own == sub.id)
+        })
+        .map(|unit| (unit.bead.clone(), unit.paths.clone(), true))
+        .collect();
+    for start in starts {
+        let bead = strings(start, "bead");
+        let paths = paths_of(start);
+        for path in &paths {
+            let plain = !path.is_empty()
+                && path != "."
+                && !path.starts_with('/')
+                && !path.split('/').any(|part| part == ".." || part.is_empty())
+                && !path.contains(['*', '?', '[', '\\']);
+            if !plain {
+                problems.push(format!(
+                    "start: `{path}`, declared for `{bead}`, is not a plain path inside the repository: name files and directories, with no patterns"
+                ));
+            }
+        }
+        claims.push((bead.to_string(), paths, false));
+    }
+    if claims.len() < 2 || starts.is_empty() {
+        return problems;
+    }
+    for (bead, paths, running) in &claims {
+        if paths.is_empty() {
+            problems.push(if *running {
+                format!(
+                    "start: `{bead}` is running with no paths declared, so nothing may start beside it: wait for it to end"
+                )
+            } else {
+                format!(
+                    "start: `{bead}` would run beside another bead, so it needs `paths`: the files and directories it will change"
+                )
+            });
+        }
+    }
+    for (index, (bead, paths, _)) in claims.iter().enumerate() {
+        for (other, theirs, _) in &claims[index + 1..] {
+            let clash = paths.iter().find_map(|path| {
+                theirs
+                    .iter()
+                    .find(|their| {
+                        under(path, std::slice::from_ref(their))
+                            || under(their, std::slice::from_ref(path))
+                    })
+                    .map(|their| (path, their))
+            });
+            if let Some((path, their)) = clash {
+                problems.push(format!(
+                    "start: `{bead}` (`{path}`) and `{other}` (`{their}`) would change the same files: beads whose paths overlap run one after the other"
+                ));
+            }
+        }
+    }
+    problems
+}
+
 fn flag(value: &Value, key: &str) -> bool {
     value.get(key).and_then(Value::as_bool) == Some(true)
 }
@@ -808,6 +898,9 @@ pub fn foreman_problems(
             goal.running() + starting.len(),
             definition.max_pipelines
         ));
+    } else {
+        // Within the limits: may these run beside each other?
+        problems.extend(path_problems(goal, sub, items(result, "start")));
     }
 
     let files = items(result, "file");
@@ -988,6 +1081,7 @@ fn told(inbox: &[Happening]) -> String {
                 pull_request,
                 findings,
                 ship,
+                strayed,
                 ..
             } => {
                 out.push_str(&format!(
@@ -1002,6 +1096,12 @@ fn told(inbox: &[Happening]) -> String {
                     out.push_str(&format!(" Pull request: {url}"));
                 }
                 out.push('\n');
+                if !strayed.is_empty() {
+                    out.push_str(&format!(
+                        "  It changed files outside the paths declared for it: {}. Declare wider next time, or run such beads alone.\n",
+                        strayed.join(", ")
+                    ));
+                }
                 if !findings.is_empty() {
                     out.push_str("  Findings its tester and reviewer left unfixed. Decide for each: file a bead (with the right type and priority, deferred if it can wait) or drop it.\n");
                 }
@@ -1182,8 +1282,15 @@ pub fn foreman_brief(
         .filter(|unit| !unit.ship && unit.subgoal.as_deref() == Some(sub.id.as_str()))
     {
         out.push_str(&format!(
-            "- `{}`: {} {}\n",
-            unit.bead, unit.state, unit.detail
+            "- `{}`: {} {}{}\n",
+            unit.bead,
+            unit.state,
+            unit.detail,
+            if unit.state == "running" && !unit.paths.is_empty() {
+                format!("(paths: {})", unit.paths.join(", "))
+            } else {
+                String::new()
+            }
         ));
     }
     let own: Vec<Summary> = tracker
@@ -1214,7 +1321,12 @@ pub fn foreman_brief(
         ));
     }
     out.push_str(&format!(
-        "\n## What you may decide\n\n- Starting a pipeline: carried out at once, on a launchable bead of this sub-goal, up to {slots} at a time. A bead blocked only by beads this sub-goal has absorbed is launchable.\n- Filing a new bead: {}\n- Reporting: `working` while a pipeline runs; `ready` hands the sub-goal to the director to ship; `escalate` asks the director, and you are woken with the answer.\n- Not yours: shipping, changing a bead that exists, and talking to the owner. Those are the director's; escalate.\n\nReturn the structured result. Code checks every decision against the tracker before carrying it out, and sends back what it refuses.\n",
+        "\n## What you may decide\n\n- Starting a pipeline: carried out at once, on a launchable bead of this sub-goal, up to {slots} at a time. A bead blocked only by beads this sub-goal has absorbed is launchable.{}\n- Filing a new bead: {}\n- Reporting: `working` while a pipeline runs; `ready` hands the sub-goal to the director to ship; `escalate` asks the director, and you are woken with the answer.\n- Not yours: shipping, changing a bead that exists, and talking to the owner. Those are the director's; escalate.\n\nReturn the structured result. Code checks every decision against the tracker before carrying it out, and sends back what it refuses.\n",
+        if slots > 1 {
+            "\n- Side by side: beads may run at the same time only when each has `paths`, the files and directories it will change, and no two declarations overlap. Code checks that before anything starts. The count above is a maximum, not a target: start beads together only when you have read the code each will touch and are certain they cannot collide, and one after the other whenever you are not. Each is built from the branch as it is now; the one absorbed second has the first merged into it and its checks run again, and a conflict goes back to its builder."
+        } else {
+            ""
+        },
         match definition.permissions.file_beads {
             Permission::Allow =>
                 "carried out at once. One filed with `run_here` joins this sub-goal, and you are woken again to start it.",
@@ -1283,6 +1395,22 @@ pub fn check_definitions(config: &ConfigDir) -> Result<Vec<String>, DriverError>
                         matches!(&step.kind, factory_flow::StepKind::Action { action: named } if named == action)
                     })
                 };
+                let reconciles = flow.steps.iter().any(|step| {
+                    matches!(&step.kind, factory_flow::StepKind::Action { action } if action == "absorb")
+                        && step.on.contains_key("moved")
+                        && step.on.contains_key("conflict")
+                });
+                if definition
+                    .foreman
+                    .as_ref()
+                    .is_some_and(|tier| tier.slots > 1)
+                    && !reconciles
+                {
+                    return Err(refuse(format!(
+                        "its foreman may run beads side by side, so the `absorb` step of its bead pipeline `{}` must route `moved` and `conflict`",
+                        flow.id
+                    )));
+                }
                 if !ends_with(&flow, "absorb") {
                     return Err(refuse(format!(
                         "it ships sub-goals, so its bead pipeline `{}` must end by absorbing into one (action `absorb`)",
@@ -2544,6 +2672,7 @@ impl Supervisor {
                 open.as_deref(),
                 strings(start, "bead"),
                 strings(start, "reason"),
+                Vec::new(),
             )?;
         }
         if result.get("ship").and_then(Value::as_bool) == Some(true) {
@@ -2562,6 +2691,7 @@ impl Supervisor {
         subgoal: Option<&str>,
         bead: &str,
         reason: &str,
+        paths: Vec<String>,
     ) -> Result<(), DriverError> {
         let mut within = None;
         if let Some(sub) = goal
@@ -2573,6 +2703,7 @@ impl Supervisor {
                 tip: factory_git::rev_parse(&sub.worktree, "HEAD")?,
                 worktree: sub.worktree.clone(),
                 absorbed: sub.absorbed.iter().map(|(bead, _)| bead.clone()).collect(),
+                paths: paths.clone(),
             });
             if let Some(foreman) = sub.foreman.as_mut() {
                 // Work has started: the talking has got somewhere.
@@ -2586,11 +2717,12 @@ impl Supervisor {
             detail: String::new(),
             ship: false,
             subgoal: subgoal.map(str::to_string),
+            paths: paths.clone(),
         });
         self.log(
             goal,
             "pipeline.started",
-            json!({ "bead": bead, "reason": reason, "subgoal": subgoal }),
+            json!({ "bead": bead, "reason": reason, "subgoal": subgoal, "paths": paths }),
         );
         self.launch(
             goal,
@@ -2770,6 +2902,7 @@ impl Supervisor {
                 Some(sub_id),
                 strings(start, "bead"),
                 strings(start, "reason"),
+                paths_of(start),
             )?;
         }
         self.save(goal)?;
@@ -2973,6 +3106,7 @@ impl Supervisor {
             detail: String::new(),
             ship: true,
             subgoal: Some(sub.id.clone()),
+            paths: Vec::new(),
         });
         goal.subgoals[index].state = "shipping".to_string();
         self.log(
@@ -3048,6 +3182,9 @@ impl Supervisor {
                         .unwrap_or_default(),
                     commit: driver.and_then(|driver| driver.unit().absorbed.clone()),
                     ship,
+                    strayed: driver
+                        .map(|driver| driver.unit().strayed.clone())
+                        .unwrap_or_default(),
                 };
             let started = match &resume {
                 Some(unit) => Driver::resume(config, unit, &options, None),
@@ -3471,6 +3608,7 @@ mod tests {
             detail: String::new(),
             ship: false,
             subgoal: None,
+            paths: Vec::new(),
         });
         assert_eq!(
             problems(
@@ -3665,6 +3803,7 @@ mod tests {
             detail: String::new(),
             ship: false,
             subgoal: Some("signals".into()),
+            paths: Vec::new(),
         });
         assert!(foreman_says(&d, &busy, json!({})).is_empty());
         assert_eq!(
@@ -3745,6 +3884,137 @@ mod tests {
     }
 
     #[test]
+    fn beads_run_side_by_side_only_on_declared_paths_that_do_not_overlap() {
+        // A foreman with two slots, on a goal allowed two pipelines.
+        let d: GoalDefinition = toml::from_str(
+            "id = \"d\"\nflow = \"bead\"\nship_flow = \"ship\"\nmax_pipelines = 2\n[director]\nmodel = \"m\"\neffort = \"high\"\n[foreman]\nmodel = \"f\"\neffort = \"high\"\nslots = 2\n",
+        )
+        .unwrap();
+        // Two beads that can both be launched.
+        let both = |goal: &Goal, first: Value, second: Value| {
+            let result = json!({
+                "summary": "Decided.", "file": [], "dropped_findings": [],
+                "report": "working", "message": "", "journal_entry": "",
+                "start": [
+                    {"bead": "toy-1", "reason": "", "paths": first},
+                    {"bead": "toy-3", "reason": "", "paths": second},
+                ],
+            });
+            let mut tracker = tracker();
+            tracker.push(Summary {
+                id: "toy-3".into(),
+                ..tracker[0].clone()
+            });
+            foreman_problems(
+                &d,
+                goal,
+                &goal.subgoals[0],
+                &tracker,
+                &|_| Vec::new(),
+                &result,
+            )
+        };
+        let mut goal = with_foreman(&[], None);
+        goal.subgoals[0].planned = vec!["toy-1".into(), "toy-3".into()];
+
+        assert!(
+            both(
+                &goal,
+                json!(["src/worker"]),
+                json!(["src/client", "docs/client.md"])
+            )
+            .is_empty()
+        );
+        // Without paths nothing is known about either, so they take turns.
+        assert_eq!(
+            both(&goal, json!(["src/worker"]), json!([])),
+            [
+                "start: `toy-3` would run beside another bead, so it needs `paths`: the files and directories it will change"
+            ]
+        );
+        // A directory holds the files under it; the same name further along does not count.
+        assert_eq!(
+            both(
+                &goal,
+                json!(["src/worker/"]),
+                json!(["src/worker/poll.zig"])
+            ),
+            [
+                "start: `toy-1` (`src/worker`) and `toy-3` (`src/worker/poll.zig`) would change the same files: beads whose paths overlap run one after the other"
+            ]
+        );
+        assert!(both(&goal, json!(["src/worker"]), json!(["src/worker_pool"])).is_empty());
+        // Paths are plain: inside the repository, and no patterns.
+        for bad in ["../other", "/etc", "src/**", "."] {
+            let problems = both(&goal, json!([bad]), json!(["docs"]));
+            assert!(
+                problems
+                    .iter()
+                    .any(|problem| problem.contains("is not a plain path")),
+                "{bad}: {problems:?}"
+            );
+        }
+
+        // What is already running counts: by its paths, or by having none.
+        let start_one = |goal: &Goal, paths: Value| {
+            let result = json!({
+                "summary": "Decided.", "file": [], "dropped_findings": [],
+                "report": "working", "message": "", "journal_entry": "",
+                "start": [{"bead": "toy-1", "reason": "", "paths": paths}],
+            });
+            foreman_problems(
+                &d,
+                goal,
+                &goal.subgoals[0],
+                &tracker(),
+                &launchable,
+                &result,
+            )
+        };
+        let running = |paths: &[&str]| {
+            let mut goal = goal.clone();
+            goal.units.push(GoalUnit {
+                bead: "toy-0".into(),
+                unit: None,
+                state: "running".into(),
+                detail: String::new(),
+                ship: false,
+                subgoal: Some("signals".into()),
+                paths: paths.iter().map(|path| path.to_string()).collect(),
+            });
+            goal
+        };
+        assert!(start_one(&running(&["src/client"]), json!(["src/worker"])).is_empty());
+        assert_eq!(
+            start_one(&running(&["src"]), json!(["src/worker"])),
+            [
+                "start: `toy-0` (`src`) and `toy-1` (`src/worker`) would change the same files: beads whose paths overlap run one after the other"
+            ]
+        );
+        assert_eq!(
+            start_one(&running(&[]), json!(["src/worker"])),
+            [
+                "start: `toy-0` is running with no paths declared, so nothing may start beside it: wait for it to end"
+            ]
+        );
+        // Alone, a bead needs no paths at all.
+        assert!(start_one(&goal, json!([])).is_empty());
+        // And two slots are a limit like any other.
+        let mut full = running(&["src/client"]);
+        full.units.push(GoalUnit {
+            bead: "toy-9".into(),
+            paths: vec!["docs".into()],
+            ..full.units[0].clone()
+        });
+        assert_eq!(
+            start_one(&full, json!(["src/worker"])),
+            [
+                "start: that would make 3 pipelines at once in this sub-goal, and its foreman may run 2"
+            ]
+        );
+    }
+
+    #[test]
     fn each_tier_is_briefed_on_the_other() {
         let d = tiered("allow");
         let mut goal = with_foreman(&["toy-1"], None);
@@ -3765,6 +4035,7 @@ mod tests {
                 ],
                 commit: Some("c0ffee".into()),
                 ship: false,
+                strayed: vec!["build.zig".into()],
             },
         ];
         let sub = goal.subgoals[0].clone();
@@ -3780,6 +4051,7 @@ mod tests {
             "- The director wrote to you:\n\n> Leave toy-2 out.",
             "- The pipeline for `toy-1` ended: **absorbed**.",
             "  - F1 (review, minor): The doc omits the timeout at `a.zig:1`",
+            "  It changed files outside the paths declared for it: build.zig.",
             "- Absorbed, one commit each on the branch: toy-1.",
             "- Not yet absorbed: toy-2.",
             "toy-1 | P1 | task | absorbed in the open sub-goal",
@@ -3890,6 +4162,7 @@ mod tests {
             detail: String::new(),
             ship: false,
             subgoal: None,
+            paths: Vec::new(),
         });
         assert_eq!(
             problems(&d, &busy, ship),
@@ -3919,6 +4192,7 @@ mod tests {
             detail: String::new(),
             ship: true,
             subgoal: None,
+            paths: Vec::new(),
         });
         let ended = |bead: &str| Happening::PipelineEnded {
             bead: bead.into(),
@@ -3929,6 +4203,7 @@ mod tests {
             findings: Vec::new(),
             commit: None,
             ship: false,
+            strayed: Vec::new(),
         };
         let mut report = ended("signals");
         mark_shipping(&goal, &mut report);
@@ -4028,6 +4303,7 @@ mod tests {
                 ],
                 commit: None,
                 ship: false,
+                strayed: Vec::new(),
             },
             Happening::OwnerSaid {
                 text: "do toy-2 next".into(),

@@ -268,6 +268,65 @@ pub fn fast_forward(dir: &Path, commit: &str) -> Result<(), GitError> {
     git(dir, &["merge", "--quiet", "--ff-only", commit], LOCAL).map(|_| ())
 }
 
+/// Merge `commit` into the branch checked out in `dir`, which must be clean.
+/// Returns the files that conflicted: none when the merge was clean.
+///
+/// A merge that conflicts is committed as it stands, conflict markers and
+/// all. The worktree is then in an ordinary state, with nothing half done,
+/// and the markers are the work left for whoever resolves it.
+pub fn merge_keeping_conflicts(
+    dir: &Path,
+    commit: &str,
+    message: &str,
+) -> Result<Vec<String>, GitError> {
+    let merged = git_raw(
+        dir,
+        &["merge", "--no-ff", "--no-verify", "-m", message, commit],
+        LOCAL,
+    )?;
+    if merged.success() {
+        return Ok(Vec::new());
+    }
+    let conflicted: Vec<String> = git(
+        dir,
+        &["diff", "--name-only", "--diff-filter=U", "--no-renames"],
+        LOCAL,
+    )?
+    .lines()
+    .map(str::to_string)
+    .collect();
+    if conflicted.is_empty() {
+        // It failed for some other reason: nothing was merged.
+        let _ = git_raw(dir, &["merge", "--abort"], LOCAL);
+        return Err(GitError::Failed {
+            command: format!("merge {commit}"),
+            dir: dir.to_path_buf(),
+            detail: merged.combined().trim().to_string(),
+        });
+    }
+    git(dir, &["add", "--all"], LOCAL)?;
+    git(
+        dir,
+        &["commit", "--no-verify", "--quiet", "-m", message],
+        LOCAL,
+    )?;
+    Ok(conflicted)
+}
+
+/// Which of `files` still hold a conflict marker at the start of a line.
+pub fn with_conflict_markers(dir: &Path, files: &[String]) -> Vec<String> {
+    files
+        .iter()
+        .filter(|file| {
+            std::fs::read_to_string(dir.join(file)).is_ok_and(|text| {
+                text.lines()
+                    .any(|line| line.starts_with("<<<<<<< ") || line.starts_with(">>>>>>> "))
+            })
+        })
+        .cloned()
+        .collect()
+}
+
 /// The commits after `from` up to `to`, oldest first, each as its short
 /// hash, its subject and its body.
 pub fn log_messages(dir: &Path, from: &str, to: &str) -> Result<String, GitError> {
@@ -363,6 +422,52 @@ mod tests {
         );
         assert_eq!(github_slug("/tmp/bare.git"), None);
         assert_eq!(github_slug("git@example.com:me/toy.git"), None);
+    }
+
+    #[test]
+    fn a_branch_takes_in_another_cleanly_or_keeps_the_conflict_to_resolve() {
+        let repo = repo("merge");
+        let write = |name: &str, text: &str| std::fs::write(repo.join(name), text).unwrap();
+        let commit = |message: &str| checkpoint(&repo, message).unwrap().0;
+        write("shared.txt", "one\n");
+        let base = commit("base");
+        // Two lines of work from the same start: ours and a sibling's.
+        git(&repo, &["checkout", "--quiet", "-b", "sibling"], LOCAL).unwrap();
+        write("theirs.txt", "theirs\n");
+        let clean = commit("sibling adds a file");
+        write("shared.txt", "one\ntheirs\n");
+        let clashing = commit("sibling edits the shared file");
+        git(&repo, &["checkout", "--quiet", "-b", "ours", &base], LOCAL).unwrap();
+        write("shared.txt", "one\nours\n");
+        commit("we edit the shared file");
+
+        // Work in different files merges, and both are there.
+        assert!(
+            merge_keeping_conflicts(&repo, &clean, "take in the sibling")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(repo.join("theirs.txt").exists());
+        assert!(is_ancestor(&repo, &clean, "HEAD").unwrap());
+
+        // Work in the same lines conflicts: the merge is committed with its
+        // markers, the worktree is clean, and the file is named.
+        let conflicted = merge_keeping_conflicts(&repo, &clashing, "take in the sibling").unwrap();
+        assert_eq!(conflicted, ["shared.txt"]);
+        assert!(is_ancestor(&repo, &clashing, "HEAD").unwrap());
+        assert_eq!(git(&repo, &["status", "--porcelain"], LOCAL).unwrap(), "");
+        assert_eq!(with_conflict_markers(&repo, &conflicted), ["shared.txt"]);
+        // Resolved, it no longer counts.
+        write("shared.txt", "one\nours\ntheirs\n");
+        assert!(with_conflict_markers(&repo, &conflicted).is_empty());
+        // One commit over the sibling's tip holds exactly our side of it.
+        commit("resolve");
+        let one = squash(&repo, &clashing, "ours, on the sibling").unwrap();
+        assert_eq!(
+            changed_files(&repo, &clashing, &one).unwrap(),
+            ["shared.txt"]
+        );
+        std::fs::remove_dir_all(&repo).unwrap();
     }
 
     #[test]

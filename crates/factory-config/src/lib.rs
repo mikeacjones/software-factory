@@ -626,15 +626,23 @@ impl ConfigDir {
             if definition.max_pipelines == 0 {
                 return Err(invalid("max_pipelines must be at least 1".to_string()));
             }
-            // Work that runs side by side has to be folded back together,
-            // and nothing does that yet.
-            for (name, tier) in [
-                ("director", Some(&definition.director)),
-                ("foreman", definition.foreman.as_ref()),
-            ] {
-                if tier.is_some_and(|tier| tier.slots != 1) {
+            // Work that runs side by side has to be folded back together.
+            // A foreman can do that for the beads of its sub-goal; nothing
+            // does it yet for sub-goals.
+            if definition.director.slots != 1 {
+                return Err(invalid(
+                    "director.slots must be 1: running sub-goals side by side is not built yet"
+                        .to_string(),
+                ));
+            }
+            if let Some(foreman) = &definition.foreman {
+                if foreman.slots == 0 {
+                    return Err(invalid("foreman.slots must be at least 1".to_string()));
+                }
+                if foreman.slots > definition.max_pipelines {
                     return Err(invalid(format!(
-                        "{name}.slots must be 1: running work side by side is not built yet"
+                        "foreman.slots is {} but max_pipelines, the limit for the whole goal, is {}",
+                        foreman.slots, definition.max_pipelines
                     )));
                 }
             }
@@ -899,6 +907,7 @@ timeout_secs = 60
                 .to_string()
                 .contains("needs a ship_flow")
         );
+        // A foreman may run beads side by side, within the goal's own limit.
         std::fs::write(
             goals.join("bugs.toml"),
             with_foreman("ship_flow = \"ship\"", "slots = 2\n"),
@@ -908,7 +917,33 @@ timeout_secs = 60
             dir.goal_definitions("toy")
                 .unwrap_err()
                 .to_string()
-                .contains("foreman.slots must be 1")
+                .contains(
+                    "foreman.slots is 2 but max_pipelines, the limit for the whole goal, is 1"
+                )
+        );
+        std::fs::write(
+            goals.join("bugs.toml"),
+            with_foreman("ship_flow = \"ship\"\nmax_pipelines = 2", "slots = 2\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            dir.goal_definitions("toy").unwrap()[0]
+                .foreman
+                .as_ref()
+                .map(|tier| tier.slots),
+            Some(2)
+        );
+        // A director cannot yet: nothing reconciles sub-goals.
+        std::fs::write(
+            goals.join("bugs.toml"),
+            definition("bugs", "") + "slots = 2\n",
+        )
+        .unwrap();
+        assert!(
+            dir.goal_definitions("toy")
+                .unwrap_err()
+                .to_string()
+                .contains("director.slots must be 1")
         );
         std::fs::remove_dir_all(&dir.0).unwrap();
     }

@@ -3,13 +3,19 @@
 # foreman started its beads and reported it ready, the director shipped it,
 # and it landed. Reads the goal's own record and event log.
 #
-#   proofs/tiers_zig_verify.sh [GOAL_ID]    default: the newest goal with one
+#   proofs/tiers_zig_verify.sh [--side-by-side] [GOAL_ID]
+#                                    default: the newest goal with one
+#
+# With --side-by-side it also requires that two of the sub-goal's beads ran
+# at the same time and were both absorbed.
 #
 # Read-only.
 set -euo pipefail
 
 state="${FACTORY_STATE_DIR:-$HOME/.local/state/software-factory}"
 fail() { echo "FAIL: $*" >&2; exit 1; }
+together=0
+if [ "${1:-}" = "--side-by-side" ]; then together=1; shift; fi
 # A landed sub-goal that had a foreman which ran at least once.
 ran='[.subgoals[]? | select(.state == "landed" and (.foreman.wakes // 0) > 0)]'
 
@@ -40,5 +46,16 @@ started="$(jq -s --arg s "$sub" '[.[] | select(.kind == "pipeline.started" and .
 [ "$started" -ge 1 ] || fail "no pipeline was started in $sub"
 jq -s -e --arg s "$sub" '[.[] | select(.kind == "subgoal.shipping" and .data.id == $s)] | length > 0' "$events" >/dev/null || fail "$sub was never shipped"
 wakes="$(jq --arg s "$sub" '.subgoals[] | select(.id == $s) | .foreman.wakes' "$dir/goal.json")"
+if [ "$together" = 1 ]; then
+  # A unit whose branch had a sibling merged into it ran beside that sibling.
+  merged=0
+  for unit in $(jq -r --arg s "$sub" '.units[] | select(.subgoal == $s and .ship != true and .state == "absorbed") | .unit' "$dir/goal.json"); do
+    if jq -e 'select(.kind == "tip.merged")' "$state/units/$unit/events.jsonl" >/dev/null 2>&1; then merged=$((merged + 1)); fi
+  done
+  declared="$(jq --arg s "$sub" '[.units[] | select(.subgoal == $s and .ship != true and (.paths | length) > 0)] | length' "$dir/goal.json")"
+  [ "$declared" -ge 2 ] || fail "fewer than two beads of $sub were started with declared paths"
+  [ "$merged" -ge 1 ] || fail "no bead of $sub had a sibling merged into it: none finished beside another"
+  echo "ok   $declared bead(s) ran on declared paths; $merged had a sibling merged in before being absorbed"
+fi
 echo "ok   sub-goal $sub: $started pipeline(s) started and $absorbed bead(s) absorbed over $wakes foreman wakes; reported ready, shipped and landed"
 echo "PASS"

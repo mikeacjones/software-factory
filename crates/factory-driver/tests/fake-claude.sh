@@ -12,6 +12,9 @@
 #                      bogus-finding the tester's first reproduction passes when run
 #                      lazy-fix      the builder's first fix leaves the regression test failing
 #                      forget-closes the publisher first leaves the issues out of the pull request
+#                      own-file      the builder writes under a directory named after its bead,
+#                                    not to the one file every bead shares
+#                      lazy-merge    the builder's first try at a merge conflict leaves the markers in
 #                      limit-default-once
 #                                    the first run without an account token is refused
 #                                    at the five-hour limit
@@ -40,8 +43,6 @@ while [ $# -gt 0 ]; do
 done
 brief=$(cat)
 
-count=$(( $(cat "$state/count" 2>/dev/null || echo 0) + 1 ))
-echo "$count" > "$state/count"
 scenario=$(cat "$state/scenario" 2>/dev/null)
 
 case "$system" in
@@ -53,8 +54,16 @@ case "$system" in
   *"You are the reviewer"*) role=reviewer ;;
   *) role=publisher ;;
 esac
+# Pipelines may run side by side: number the calls one at a time, so that
+# line N of `calls` is the call whose brief is brief-N.
+while ! mkdir "$state/lock" 2>/dev/null; do sleep 0.01; done
+count=$(( $(cat "$state/count" 2>/dev/null || echo 0) + 1 ))
+echo "$count" > "$state/count"
 session=${resume:-fake-$role-$count}
 echo "$role $session $(pwd) ${CLAUDE_CODE_OAUTH_TOKEN:-default}" >> "$state/calls"
+rmdir "$state/lock"
+# The bead a pipeline's agent is working on.
+bead=$(printf '%s' "$brief" | grep -o -E '(toy|filed)-[0-9]+' | head -1)
 
 # The CLI's own login is at its five-hour limit, once: the run is refused.
 case "$scenario" in
@@ -85,7 +94,21 @@ case "$role" in
   builder)
     case "$brief" in
       *"Your result was not accepted"*) ;;
-      *) echo "line $count" >> feature.txt ;;
+      *"conflict markers"*)
+        # The sub-goal's branch was merged in and conflicted: keep both sides.
+        resolve=1
+        case "$scenario" in
+          *lazy-merge*) [ -f "$state/lazy-merge" ] || { touch "$state/lazy-merge"; resolve=0; } ;;
+        esac
+        if [ "$resolve" = 1 ]; then
+          grep -v -E '^(<<<<<<<|=======|>>>>>>>)' feature.txt > feature.tmp
+          mv feature.tmp feature.txt
+        fi ;;
+      *)
+        case "$scenario" in
+          *own-file*) mkdir -p "$bead"; echo "line $count" >> "$bead/feature.txt" ;;
+          *) echo "line $count" >> feature.txt ;;
+        esac ;;
     esac
     # A fix: make the tester's regression test, or the report's gate, pass.
     case "$brief" in
