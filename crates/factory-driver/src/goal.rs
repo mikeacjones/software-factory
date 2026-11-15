@@ -38,6 +38,9 @@ use crate::{Driver, DriverError, Options, Ship, Status, Within, bead_source};
 pub enum Phase {
     /// The owner and the director are still agreeing what the goal is.
     Intake,
+    /// Started by the owner, and waiting for a running goal of its project
+    /// to end.
+    Queued,
     Running,
     /// The director says the stop condition is met. The owner decides.
     ProposedComplete,
@@ -210,6 +213,9 @@ pub struct Goal {
     pub retry_at: Option<u64>,
     pub usage: Usage,
     pub started_at: u64,
+    /// When the owner started it while its project was at its limit.
+    #[serde(default)]
+    pub queued_at: Option<u64>,
 }
 
 impl Goal {
@@ -1073,12 +1079,7 @@ impl Supervisor {
     /// goal from somewhere other than a channel. Returns its ID.
     pub fn open_directly(&mut self, project: &str, text: &str) -> Result<String, DriverError> {
         let owner = self.owners.first().cloned().unwrap_or_default();
-        self.open_goal(project, "", &now_unix().to_string(), &owner, text)?;
-        self.goals
-            .values()
-            .filter(|goal| goal.project == project)
-            .max_by_key(|goal| goal.started_at)
-            .map(|goal| goal.id.clone())
+        self.open_goal(project, "", &now_unix().to_string(), &owner, text)?
             .ok_or_else(|| {
                 DriverError::Preflight(format!("project `{project}` has no goal definition"))
             })
@@ -1091,7 +1092,7 @@ impl Supervisor {
         ts: &str,
         user: &str,
         text: &str,
-    ) -> Result<(), DriverError> {
+    ) -> Result<Option<String>, DriverError> {
         let definitions = self.config.goal_definitions(project)?;
         // "name: what I want" picks a definition by name.
         let named = text
@@ -1103,10 +1104,17 @@ impl Supervisor {
                 .find(|d| d.default)
                 .or(definitions.first())
         }) else {
-            return Ok(());
+            return Ok(None);
         };
+        // Two goals opened in the same second must not share a name.
+        let mut name = format!("{project}-g{}", now_unix());
+        let mut copy = 1;
+        while self.goals.contains_key(&name) {
+            copy += 1;
+            name = format!("{project}-g{}-{copy}", now_unix());
+        }
         let goal = Goal {
-            id: format!("{project}-g{}", now_unix()),
+            id: name,
             project: project.to_string(),
             definition: definition.id.clone(),
             phase: Phase::Intake,
@@ -1127,6 +1135,7 @@ impl Supervisor {
             retry_at: None,
             usage: Usage::default(),
             started_at: now_unix(),
+            queued_at: None,
         };
         let id = goal.id.clone();
         self.save(goal.clone())?;
@@ -1135,7 +1144,51 @@ impl Supervisor {
             "goal.opened",
             json!({ "text": text, "definition": goal.definition }),
         );
-        self.intake_turn(&id, text)
+        self.intake_turn(&id, text)?;
+        Ok(Some(id))
+    }
+
+    /// The goals of a project that hold one of its places: running, or
+    /// proposed as complete and not yet accepted.
+    fn active(&self, project: &str) -> Vec<&Goal> {
+        self.goals
+            .values()
+            .filter(|goal| {
+                goal.project == project
+                    && matches!(goal.phase, Phase::Running | Phase::ProposedComplete)
+            })
+            .collect()
+    }
+
+    /// Start the goals that have waited longest, while their project has a
+    /// place free. Called whenever a goal ends.
+    fn start_queued(&mut self, project: &str) -> Result<(), DriverError> {
+        let limit = self.config.project(project)?.max_goals.max(1) as usize;
+        loop {
+            if self.active(project).len() >= limit {
+                return Ok(());
+            }
+            let next = self
+                .goals
+                .values()
+                .filter(|goal| goal.project == project && goal.phase == Phase::Queued)
+                .min_by_key(|goal| (goal.queued_at.unwrap_or(u64::MAX), goal.id.clone()))
+                .cloned();
+            let Some(mut goal) = next else {
+                return Ok(());
+            };
+            let id = goal.id.clone();
+            goal.phase = Phase::Running;
+            goal.inbox.insert(0, Happening::Started);
+            self.log(
+                &goal,
+                "goal.unqueued",
+                json!({ "queued_at": goal.queued_at }),
+            );
+            self.say(&goal, ":rocket: *Goal started.* The goal ahead of it has ended. It now moves on events: a pipeline ending, or a message from you here. `stop` ends it.");
+            self.save(goal)?;
+            self.wake(&id)?;
+        }
     }
 
     /// The owner wrote in a goal's thread.
@@ -1170,6 +1223,17 @@ impl Supervisor {
                 });
                 self.save(goal)?;
                 self.wake(id)
+            }
+            Phase::Queued => {
+                // Kept for the director, who reads it when the goal starts.
+                goal.inbox.push(Happening::OwnerSaid {
+                    text: text.to_string(),
+                });
+                self.say(
+                    &goal,
+                    "Noted. The director reads this when the goal starts.",
+                );
+                self.save(goal)
             }
             Phase::Complete | Phase::Stopped => {
                 self.say(
@@ -1206,6 +1270,24 @@ impl Supervisor {
                     self.log(&goal, "bead.changed", json!({ "edit": edit }));
                 }
                 self.settle_prompt(&mut goal, &format!("Started by {who}."));
+                // A project runs only so many goals at once. Beyond that
+                // the goal waits its turn, and starts by itself.
+                let ahead: Vec<String> = self
+                    .active(&goal.project)
+                    .iter()
+                    .map(|other| format!("`{}`", other.id))
+                    .collect();
+                if ahead.len() >= project.max_goals.max(1) as usize {
+                    goal.phase = Phase::Queued;
+                    goal.queued_at = Some(now_unix());
+                    self.log(&goal, "goal.queued", json!({ "behind": ahead }));
+                    self.say(&goal, &format!(
+                        ":hourglass_flowing_sand: *Goal queued.* This project runs {} goal(s) at a time, and {} is running. This one starts by itself when that ends. What you write here meanwhile is kept for its director; `stop` takes it out of the queue.",
+                        project.max_goals.max(1),
+                        ahead.join(", ")
+                    ));
+                    return self.save(goal);
+                }
                 goal.phase = Phase::Running;
                 goal.inbox.push(Happening::Started);
                 self.say(&goal, ":rocket: *Goal started.* It now moves on events: a pipeline ending, or a message from you here. `stop` ends it.");
@@ -1220,7 +1302,9 @@ impl Supervisor {
                     &goal,
                     &format!(":checkered_flag: *Goal complete*, accepted by {who}."),
                 );
-                self.save(goal)
+                let project = goal.project.clone();
+                self.save(goal)?;
+                self.start_queued(&project)
             }
             ("request_approve" | "request_reject", Phase::Running) if goal.request.is_some() => {
                 let approved = action == "request_approve";
@@ -1267,7 +1351,9 @@ impl Supervisor {
                 self.settle_prompt(&mut goal, "The goal was stopped.");
                 goal.phase = Phase::Stopped;
                 self.say(&goal, ":octagonal_sign: *Goal stopped.* A pipeline already running finishes by itself; nothing new starts.");
-                self.save(goal)
+                let project = goal.project.clone();
+                self.save(goal)?;
+                self.start_queued(&project)
             }
             // A stale button: the goal has moved on.
             _ => Ok(()),
@@ -1446,7 +1532,13 @@ impl Supervisor {
                 ),
             );
         }
-        self.save(goal)
+        // A goal that stopped has given up its place on the project.
+        let (project, stopped) = (goal.project.clone(), goal.phase == Phase::Stopped);
+        self.save(goal)?;
+        if stopped {
+            self.start_queued(&project)?;
+        }
+        Ok(())
     }
 
     /// One turn of the opening conversation.
@@ -2330,6 +2422,15 @@ impl Supervisor {
             }
             self.save(goal)?;
             self.wake(&id)?;
+        }
+        // A goal may have ended just before the restart.
+        let projects: std::collections::BTreeSet<String> = self
+            .goals
+            .values()
+            .map(|goal| goal.project.clone())
+            .collect();
+        for project in projects {
+            self.start_queued(&project)?;
         }
         Ok(())
     }

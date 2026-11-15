@@ -1904,3 +1904,98 @@ fn a_report_line_that_must_not_pass_goes_back_to_the_builder() {
         "{fix_brief}"
     );
 }
+
+/// A second goal on a project waits for the first, and starts by itself.
+#[test]
+fn a_goal_started_while_another_runs_is_queued_and_starts_when_that_ends() {
+    use factory_driver::goal::{Phase, Supervisor};
+    use factory_slack::socket::Incoming;
+
+    let world = World::new("queue", "true");
+    std::fs::create_dir_all(world.path("config/goals/toy")).unwrap();
+    std::fs::write(
+        world.path("config/goals/toy/main.toml"),
+        "id = \"main\"\n[director]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(world.path("bin/state")).unwrap();
+    let say = |role: &str, n: u32, json: &str| {
+        std::fs::write(world.path(&format!("bin/state/{role}-{n}.json")), json).unwrap();
+    };
+    let charter = r#"{"reply":"Here is the charter.","ready":true,"objective":"Do it.","stop_when":"It is done.","plan":"toy-1.","edits":[]}"#;
+    // Each director, when it wakes, asks the owner something: a goal that is
+    // running without a pipeline.
+    let ask = r#"{"summary":"Thinking.","start":[],"file":[],"edit":[],"dropped_findings":[],"open_subgoal":{"id":"","title":"","objective":"","beads":[]},"ship":false,"ask_owner":"Which first?","complete":false,"evidence":"","journal_entry":"","project_memory":""}"#;
+    say("intake", 1, charter);
+    say("intake", 2, charter);
+    say("director", 1, ask);
+    say("director", 2, ask);
+
+    let mut sup = Supervisor::new(world.config(), None, vec!["OWNER".to_string()], false).unwrap();
+    let act = |action: &str, goal: &str| Incoming::Action {
+        channel: String::new(),
+        user: "OWNER".to_string(),
+        action_id: action.to_string(),
+        value: goal.to_string(),
+        message_ts: String::new(),
+    };
+    let phase = |sup: &Supervisor, id: &str| {
+        sup.goals()
+            .find(|goal| goal.id == id)
+            .unwrap()
+            .phase
+            .clone()
+    };
+    let directors = || {
+        world
+            .calls()
+            .iter()
+            .filter(|call| call[0] == "director")
+            .count()
+    };
+
+    // Two goals opened in the same second are still two goals.
+    let first = sup.open_directly("toy", "The first thing").unwrap();
+    let second = sup.open_directly("toy", "The second thing").unwrap();
+    assert_ne!(first, second);
+    assert_eq!(sup.goals().count(), 2);
+
+    sup.incoming(act("goal_start", &first)).unwrap();
+    assert_eq!(phase(&sup, &first), Phase::Running);
+    assert_eq!(directors(), 1);
+
+    // The project runs one goal at a time: the second waits, and no director
+    // runs for it.
+    sup.incoming(act("goal_start", &second)).unwrap();
+    assert_eq!(phase(&sup, &second), Phase::Queued);
+    assert_eq!(directors(), 1, "a queued goal runs nothing");
+    // A restart does not let it jump the queue.
+    drop(sup);
+    let mut sup = Supervisor::new(world.config(), None, vec!["OWNER".to_string()], false).unwrap();
+    sup.resume().unwrap();
+    assert_eq!(phase(&sup, &second), Phase::Queued);
+    assert_eq!(directors(), 1);
+
+    // When the first ends, the second starts by itself.
+    sup.incoming(act("goal_stop", &first)).unwrap();
+    assert_eq!(phase(&sup, &first), Phase::Stopped);
+    assert_eq!(phase(&sup, &second), Phase::Running);
+    assert_eq!(
+        directors(),
+        2,
+        "the queued goal's director woke when its turn came"
+    );
+    let log =
+        std::fs::read_to_string(world.path(&format!("state/goals/{second}/events.jsonl"))).unwrap();
+    assert!(log.contains(r#""kind":"goal.queued""#) && log.contains(r#""kind":"goal.unqueued""#));
+
+    // With room for two, a third goal would not wait.
+    let project = world.path("config/projects/toy.toml");
+    let text = std::fs::read_to_string(&project).unwrap();
+    std::fs::write(&project, text.replace("flow = ", "max_goals = 2\nflow = ")).unwrap();
+    say("intake", 3, charter);
+    say("director", 3, ask);
+    let third = sup.open_directly("toy", "The third thing").unwrap();
+    sup.incoming(act("goal_start", &third)).unwrap();
+    assert_eq!(phase(&sup, &third), Phase::Running);
+}

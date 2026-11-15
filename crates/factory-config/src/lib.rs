@@ -123,6 +123,10 @@ pub struct Project {
     pub slack_channel: Option<String>,
     /// The flow units of this project run.
     pub flow: String,
+    /// The most goals that may run on this project at once. A goal started
+    /// beyond that waits in a queue and starts when a running one ends.
+    #[serde(default = "default_goals")]
+    pub max_goals: u32,
     /// What the publication step should know about this project's commit
     /// messages and pull requests, such as the trailers it expects.
     pub publication_note: Option<String>,
@@ -154,6 +158,10 @@ pub struct Project {
     pub publish_checks: Vec<String>,
     #[serde(default)]
     pub limits: Limits,
+}
+
+fn default_goals() -> u32 {
+    1
 }
 
 fn default_remote() -> String {

@@ -77,6 +77,14 @@ command = ["cargo", "test", "--locked", "--offline", "--package", "factory-drive
 timeout_secs = 900
 
 [[check]]
+id = "queue"
+tier = "hermetic"
+bead = "sf-rzb.16"
+claim = "A goal started while its project is at its limit of running goals is queued and runs no director; it stays queued across a restart; when a running goal ends the longest-waiting one starts by itself; a project that allows two runs two; and two goals opened in the same second get different IDs."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-driver", "--test", "walk", "a_goal_started_while_another_runs"]
+timeout_secs = 900
+
+[[check]]
 id = "accounts"
 tier = "hermetic"
 bead = "sf-rzb.9"
