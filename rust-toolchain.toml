@@ -1,4 +1,7 @@
 [toolchain]
 channel = "1.100.0"
-components = ["rustfmt", "clippy"]
+# rust-analyzer and rust-src are for editors and agents: with a pinned
+# toolchain, `rust-analyzer` on the PATH is rustup's stand-in, and it runs
+# only if this toolchain has the component.
+components = ["rustfmt", "clippy", "rust-analyzer", "rust-src"]
 profile = "minimal"
