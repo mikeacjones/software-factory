@@ -25,6 +25,142 @@ pub enum GitHubError {
 
 const TIMEOUT: Duration = Duration::from_secs(120);
 
+/// What an issue should carry in the repository's own type and fields.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IssueFields {
+    /// The name of an issue type of the repository, such as `Bug`.
+    pub issue_type: Option<String>,
+    /// A single-select field and the option to choose, such as `Priority`
+    /// and `High`.
+    pub select: Option<(String, String)>,
+}
+
+/// One read of everything needed to set an issue's type and fields: the
+/// types and fields the repository has, and what the issue has now.
+const ISSUE_FIELDS_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){issueTypes(first:50){nodes{id name isEnabled}} issueFields(first:50){nodes{... on IssueFieldSingleSelect{id name options{id name}}}} issue(number:$number){id issueType{name} issueFieldValues(first:50){nodes{... on IssueFieldSingleSelectValue{name field{... on IssueFieldSingleSelect{name}}}}}}}}";
+
+/// The changes that bring an issue to what is wanted, as the IDs the
+/// mutations take.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IssueFieldPlan {
+    /// The issue's node ID.
+    pub issue: String,
+    /// The type to set: its ID and its name. `None` if it is already set.
+    pub issue_type: Option<(String, String)>,
+    /// The option to choose: the field's ID, the option's ID, and what it
+    /// is as words. `None` if it is already chosen.
+    pub select: Option<(String, String, String)>,
+}
+
+/// Work out what to change on an issue from the answer to
+/// [`ISSUE_FIELDS_QUERY`]. A type or option the repository does not have is
+/// an error that names what it does have: names are matched without regard
+/// to case.
+pub fn issue_field_plan(
+    answer: &serde_json::Value,
+    want: &IssueFields,
+) -> Result<IssueFieldPlan, String> {
+    let text = |value: &serde_json::Value, key: &str| {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
+    let nodes = |value: &serde_json::Value, key: &str| {
+        value
+            .get(key)
+            .and_then(|list| list.get("nodes"))
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    };
+    let same = |a: &str, b: &str| a.eq_ignore_ascii_case(b);
+    let repository = answer
+        .get("data")
+        .and_then(|data| data.get("repository"))
+        .filter(|repository| !repository.is_null())
+        .ok_or("the answer names no repository")?;
+    let issue = repository
+        .get("issue")
+        .filter(|issue| !issue.is_null())
+        .ok_or("the repository has no such issue")?;
+    let mut plan = IssueFieldPlan {
+        issue: text(issue, "id"),
+        ..IssueFieldPlan::default()
+    };
+    if let Some(wanted) = &want.issue_type {
+        let has = issue
+            .get("issueType")
+            .map(|kind| text(kind, "name"))
+            .unwrap_or_default();
+        if !same(&has, wanted) {
+            let types = nodes(repository, "issueTypes");
+            let found = types.iter().find(|kind| {
+                same(&text(kind, "name"), wanted)
+                    && kind.get("isEnabled").and_then(serde_json::Value::as_bool) != Some(false)
+            });
+            let Some(found) = found else {
+                return Err(format!(
+                    "the repository has no issue type `{wanted}`; it has: {}",
+                    types
+                        .iter()
+                        .map(|kind| text(kind, "name"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            };
+            plan.issue_type = Some((text(found, "id"), text(found, "name")));
+        }
+    }
+    if let Some((field, option)) = &want.select {
+        let has = nodes(issue, "issueFieldValues")
+            .iter()
+            .find(|value| {
+                value
+                    .get("field")
+                    .is_some_and(|of| same(&text(of, "name"), field))
+            })
+            .map(|value| text(value, "name"))
+            .unwrap_or_default();
+        if !same(&has, option) {
+            let fields = nodes(repository, "issueFields");
+            let Some(found) = fields
+                .iter()
+                .find(|candidate| same(&text(candidate, "name"), field))
+            else {
+                return Err(format!(
+                    "the repository has no single-select issue field `{field}`"
+                ));
+            };
+            let options = found
+                .get("options")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let Some(chosen) = options
+                .iter()
+                .find(|candidate| same(&text(candidate, "name"), option))
+            else {
+                return Err(format!(
+                    "the issue field `{field}` has no option `{option}`; it has: {}",
+                    options
+                        .iter()
+                        .map(|candidate| text(candidate, "name"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            };
+            plan.select = Some((
+                text(found, "id"),
+                text(chosen, "id"),
+                format!("{} {}", text(found, "name"), text(chosen, "name")),
+            ));
+        }
+    }
+    Ok(plan)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PullRequest {
     pub number: u64,
@@ -323,6 +459,109 @@ impl GitHub {
                 command: "gh issue create".to_string(),
                 detail: format!("no issue URL in `{}`", out.trim()),
             })
+    }
+
+    /// Set an issue's type and a single-select field, such as its priority,
+    /// to what `want` names, leaving alone what already agrees. These are the
+    /// repository's own type and fields, not labels. Returns what it changed.
+    pub fn set_issue_fields(
+        &self,
+        cwd: &Path,
+        repo: &str,
+        number: u64,
+        want: &IssueFields,
+    ) -> Result<Vec<String>, GitHubError> {
+        self.check_allowed(repo)?;
+        if want.issue_type.is_none() && want.select.is_none() {
+            return Ok(Vec::new());
+        }
+        let command = "gh api graphql".to_string();
+        let Some((owner, name)) = repo.split_once('/') else {
+            return Err(GitHubError::Answer {
+                command,
+                detail: format!("`{repo}` is not an owner and a name"),
+            });
+        };
+        let query = |args: &[&str]| -> Result<serde_json::Value, GitHubError> {
+            let mut all = vec!["api", "graphql"];
+            all.extend(args);
+            let out = self.gh(cwd, &all, None)?;
+            serde_json::from_str(&out).map_err(|err| GitHubError::Answer {
+                command: "gh api graphql".to_string(),
+                detail: err.to_string(),
+            })
+        };
+        let state = query(&[
+            "-f",
+            &format!("query={ISSUE_FIELDS_QUERY}"),
+            "-f",
+            &format!("owner={owner}"),
+            "-f",
+            &format!("name={name}"),
+            "-F",
+            &format!("number={number}"),
+        ])?;
+        // The type and the field are set each by itself: a name the
+        // repository lacks for one must not keep the other from being set.
+        let mut changed = Vec::new();
+        let mut problems = Vec::new();
+        let only_type = IssueFields {
+            issue_type: want.issue_type.clone(),
+            select: None,
+        };
+        match issue_field_plan(&state, &only_type) {
+            Ok(plan) => {
+                if let Some((id, name)) = &plan.issue_type {
+                    query(&[
+                        "-f",
+                        "query=mutation($issue:ID!,$type:ID!){updateIssueIssueType(input:{issueId:$issue,issueTypeId:$type}){issue{id}}}",
+                        "-f",
+                        &format!("issue={}", plan.issue),
+                        "-f",
+                        &format!("type={id}"),
+                    ])?;
+                    changed.push(format!("type {name}"));
+                }
+            }
+            Err(problem) => problems.push(problem),
+        }
+        let only_field = IssueFields {
+            issue_type: None,
+            select: want.select.clone(),
+        };
+        match issue_field_plan(&state, &only_field) {
+            Ok(plan) => {
+                if let Some((field, option, name)) = &plan.select {
+                    query(&[
+                        "-f",
+                        "query=mutation($issue:ID!,$field:ID!,$option:ID!){setIssueFieldValue(input:{issueId:$issue,issueFields:[{fieldId:$field,singleSelectOptionId:$option}]}){issue{id}}}",
+                        "-f",
+                        &format!("issue={}", plan.issue),
+                        "-f",
+                        &format!("field={field}"),
+                        "-f",
+                        &format!("option={option}"),
+                    ])?;
+                    changed.push(name.clone());
+                }
+            }
+            Err(problem) => problems.push(problem),
+        }
+        if !problems.is_empty() {
+            return Err(GitHubError::Answer {
+                command,
+                detail: format!(
+                    "issue #{number}: {}{}",
+                    problems.join("; "),
+                    if changed.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (set: {})", changed.join(", "))
+                    }
+                ),
+            });
+        }
+        Ok(changed)
     }
 
     /// Whether `gh` is logged in at all.
@@ -626,6 +865,116 @@ mod tests {
     use super::*;
 
     const OWN: Option<&str> = Some("me/toy");
+
+    /// The answer GitHub gives about a repository with its own issue types
+    /// and a priority field, and one issue: in the shape recorded from a
+    /// real repository.
+    fn issue_state(issue_type: &str, priority: &str) -> serde_json::Value {
+        let kind = if issue_type.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::json!({ "name": issue_type })
+        };
+        let values = if priority.is_empty() {
+            serde_json::json!([])
+        } else {
+            serde_json::json!([{ "name": priority, "field": { "name": "Priority" } }])
+        };
+        serde_json::json!({"data": {"repository": {
+            "issueTypes": {"nodes": [
+                {"id": "IT_task", "name": "Task", "isEnabled": true},
+                {"id": "IT_bug", "name": "Bug", "isEnabled": true},
+                {"id": "IT_old", "name": "Chore", "isEnabled": false},
+            ]},
+            "issueFields": {"nodes": [
+                {},
+                {"id": "IFSS_priority", "name": "Priority", "options": [
+                    {"id": "O_critical", "name": "Critical"},
+                    {"id": "O_low", "name": "Low"},
+                ]},
+            ]},
+            "issue": {"id": "I_7", "issueType": kind, "issueFieldValues": {"nodes": values}},
+        }}})
+    }
+
+    #[test]
+    fn an_issue_gets_the_repositorys_own_type_and_priority_once() {
+        let want = IssueFields {
+            issue_type: Some("bug".to_string()),
+            select: Some(("Priority".to_string(), "Low".to_string())),
+        };
+        // An issue with only labels: both are set, by their IDs.
+        assert_eq!(
+            issue_field_plan(&issue_state("", ""), &want).unwrap(),
+            IssueFieldPlan {
+                issue: "I_7".to_string(),
+                issue_type: Some(("IT_bug".to_string(), "Bug".to_string())),
+                select: Some((
+                    "IFSS_priority".to_string(),
+                    "O_low".to_string(),
+                    "Priority Low".to_string()
+                )),
+            }
+        );
+        // What already agrees is left alone; what differs is changed.
+        let agreed = issue_field_plan(&issue_state("Bug", "Low"), &want).unwrap();
+        assert_eq!((agreed.issue_type, agreed.select), (None, None));
+        let partly = issue_field_plan(&issue_state("Task", "Low"), &want).unwrap();
+        assert!(partly.issue_type.is_some() && partly.select.is_none());
+        let raised = issue_field_plan(&issue_state("Bug", "Critical"), &want).unwrap();
+        assert!(raised.issue_type.is_none() && raised.select.is_some());
+        // Nothing wanted, nothing planned.
+        let none = issue_field_plan(&issue_state("", ""), &IssueFields::default()).unwrap();
+        assert_eq!((none.issue_type, none.select), (None, None));
+
+        // A name the repository does not have is an error that says what it has.
+        let wrong = |issue_type: &str, field: &str, option: &str| {
+            issue_field_plan(
+                &issue_state("", ""),
+                &IssueFields {
+                    issue_type: Some(issue_type.to_string()),
+                    select: Some((field.to_string(), option.to_string())),
+                },
+            )
+            .unwrap_err()
+        };
+        assert_eq!(
+            wrong("Epic", "Priority", "Low"),
+            "the repository has no issue type `Epic`; it has: Task, Bug, Chore"
+        );
+        assert!(
+            wrong("Chore", "Priority", "Low")
+                .starts_with("the repository has no issue type `Chore`")
+        );
+        assert_eq!(
+            wrong("Bug", "Severity", "Low"),
+            "the repository has no single-select issue field `Severity`"
+        );
+        assert_eq!(
+            wrong("Bug", "Priority", "Medium"),
+            "the issue field `Priority` has no option `Medium`; it has: Critical, Low"
+        );
+        assert_eq!(
+            issue_field_plan(
+                &serde_json::json!({"data": {"repository": {"issue": null}}}),
+                &want
+            )
+            .unwrap_err(),
+            "the repository has no such issue"
+        );
+    }
+
+    #[test]
+    fn an_issues_fields_are_not_set_outside_the_write_list() {
+        let mut github = GitHub::new(vec!["me/toy".to_string()]);
+        github.gh_bin = "no-such-gh-anywhere".to_string();
+        let want = IssueFields {
+            issue_type: Some("Bug".to_string()),
+            select: None,
+        };
+        let result = github.set_issue_fields(&std::env::temp_dir(), "someone/else", 7, &want);
+        assert!(matches!(result, Err(GitHubError::NotAllowed(_))));
+    }
 
     #[test]
     fn ordinary_text_may_be_published() {

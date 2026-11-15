@@ -77,6 +77,22 @@ command = ["cargo", "test", "--locked", "--offline", "--package", "factory-drive
 timeout_secs = 900
 
 [[check]]
+id = "issue-fields"
+tier = "hermetic"
+bead = "sf-rzb.17"
+claim = "An issue gets the repository's own issue type and priority option beside its labels: both are found by name and set by ID, what already agrees is left alone, each is set whether or not the other can be, a name the repository lacks is an error that says what it has, and nothing is set in a repository outside the write list. A bead's issue gets them when the pipeline that starts work on it creates the issue."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-github", "--package", "factory-driver", "--", "an_issue_gets_the_repositorys_own_type", "an_issues_fields_are_not_set_outside", "a_sub_goal_absorbs"]
+timeout_secs = 900
+
+[[check]]
+id = "issue-fields-live"
+tier = "owner"
+bead = "sf-rzb.17"
+claim = "On temporal-sdk-zig, every open bead that has a GitHub issue has that issue's type and Priority field in step with the bead."
+command = ["cargo", "run", "--quiet", "--locked", "--package", "factory-cli", "--", "issues", "sync", "temporal-sdk-zig", "--config", "config"]
+timeout_secs = 900
+
+[[check]]
 id = "queue"
 tier = "hermetic"
 bead = "sf-rzb.16"

@@ -3268,11 +3268,16 @@ impl Supervisor {
             Ok(bead) => {
                 // A bead the factory files has a GitHub issue from the start.
                 match crate::ensure_issue(&self.factory, project, source, &bead) {
-                    Ok(Some(url)) => self.log(
-                        goal,
-                        "issue.created",
-                        json!({ "bead": bead.id, "url": url }),
-                    ),
+                    Ok(Some(url)) => {
+                        self.log(
+                            goal,
+                            "issue.created",
+                            json!({ "bead": bead.id, "url": url }),
+                        );
+                        let mut linked = bead.clone();
+                        linked.external_ref = url;
+                        self.sync_issue(goal, project, &linked);
+                    }
                     Ok(None) => {}
                     Err(err) => self.log(
                         goal,
@@ -3306,6 +3311,24 @@ impl Supervisor {
         }
     }
 
+    /// Set a bead's issue to the bead's type and priority, and record how
+    /// that went. It never holds anything else up.
+    fn sync_issue(&self, goal: &Goal, project: &Project, bead: &factory_beads::Bead) {
+        match crate::sync_issue_fields(&self.factory, project, bead) {
+            Ok(changed) if changed.is_empty() => {}
+            Ok(changed) => self.log(
+                goal,
+                "issue.fields",
+                json!({ "bead": bead.id, "set": changed }),
+            ),
+            Err(err) => self.log(
+                goal,
+                "issue.fields_failed",
+                json!({ "bead": bead.id, "error": err.to_string() }),
+            ),
+        }
+    }
+
     fn edit_bead(
         &self,
         goal: &Goal,
@@ -3316,6 +3339,12 @@ impl Supervisor {
         match source.change(&edit.bead, &edit.change(), &project.bead_actor) {
             Ok(_) => {
                 self.log(goal, "bead.changed", json!({ "edit": edit }));
+                // A new priority shows on the bead's issue too.
+                if edit.priority >= 0
+                    && let Ok(bead) = source.read(&edit.bead)
+                {
+                    self.sync_issue(goal, project, &bead);
+                }
                 format!("changed `{}`", edit.bead)
             }
             Err(err) => {

@@ -7,7 +7,8 @@ use factory_beads::readiness;
 use factory_config::ConfigDir;
 use factory_driver::goal::{Supervisor, check_definitions};
 use factory_driver::{
-    AccountPick, Driver, Options, Status, bead_source, load_flow, pick_account, usage_report,
+    AccountPick, Driver, Options, Status, bead_source, load_flow, pick_account, sync_issue_fields,
+    usage_report,
 };
 
 const USAGE: &str = "\
@@ -19,6 +20,8 @@ usage:
   factory serve                               the always-on service: listen to Slack over a
                                               socket, open goals from the owner's messages,
                                               and run them on events
+  factory issues sync <project>               set the type and priority of every open bead's
+                                              GitHub issue to the bead's, where they differ
   factory accounts                            each Claude account's usage windows, and which
                                               one a run would use now
   factory accounts refresh                    refresh the usage login of each account marked for
@@ -172,6 +175,34 @@ fn run(args: &[String]) -> Result<u8, String> {
                 println!("no account is marked `usage_refresh = true`");
             }
             Ok(0)
+        }
+        ["issues", "sync", project] => {
+            let factory = args.config.factory().map_err(|err| fail(&err))?;
+            let project = args.config.project(project).map_err(|err| fail(&err))?;
+            let source = bead_source(&project);
+            let (mut seen, mut changed, mut failed) = (0, 0, 0);
+            for summary in source.list_open().map_err(|err| fail(&err))? {
+                let bead = source.read(&summary.id).map_err(|err| fail(&err))?;
+                if bead.external_ref.trim().is_empty() {
+                    continue;
+                }
+                seen += 1;
+                match sync_issue_fields(&factory, &project, &bead) {
+                    Ok(set) if set.is_empty() => {}
+                    Ok(set) => {
+                        changed += 1;
+                        println!("{}  {}: set {}", bead.id, bead.external_ref, set.join(", "));
+                    }
+                    Err(err) => {
+                        failed += 1;
+                        println!("{}  {}: {err}", bead.id, bead.external_ref);
+                    }
+                }
+            }
+            println!(
+                "{seen} open beads have an issue: {changed} brought into step, {failed} failed, the rest already agreed"
+            );
+            Ok(if failed == 0 { 0 } else { 1 })
         }
         ["accounts"] => {
             let factory = args.config.factory().map_err(|err| fail(&err))?;

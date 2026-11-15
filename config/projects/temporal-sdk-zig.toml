@@ -49,6 +49,13 @@ write = ["mikeacjones/temporal-sdk-zig"]
 # beads it lands. A bead filed without one gets an issue from the factory.
 issues = true
 issue_labels = ["type::{type}", "priority::{priority}"]
+# The repository's own issue type and Priority field, which GitHub sorts and
+# filters by. They are set beside the labels, when a bead's issue is created
+# and again whenever work starts on the bead or its priority changes.
+# `factory issues sync temporal-sdk-zig` brings every open bead's issue into
+# step.
+issue_types = { bug = "Bug", feature = "Feature", epic = "Epic", "*" = "Task" }
+issue_priority = { field = "Priority", options = ["Critical", "High", "Medium", "Low", "None"] }
 ci_poll_secs = 30
 ci_timeout_secs = 10800
 ci_settle_secs = 60

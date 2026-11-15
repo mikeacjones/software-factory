@@ -262,6 +262,13 @@ pub struct GitHub {
     /// none). A label the repository does not have is left off.
     #[serde(default)]
     pub issue_labels: Vec<String>,
+    /// The repository's own issue type for each bead type, by name, such as
+    /// `bug = "Bug"`; `"*"` is for every type not listed. Set on an issue
+    /// the factory creates, beside its labels. Empty sets none.
+    #[serde(default)]
+    pub issue_types: BTreeMap<String, String>,
+    /// The repository's own issue field that holds the priority.
+    pub issue_priority: Option<IssuePriority>,
     /// How a pull request reaches the default branch.
     #[serde(default)]
     pub merge_method: MergeMethod,
@@ -280,6 +287,38 @@ pub struct GitHub {
     /// Remove the unit's branch from the remote once it has merged.
     #[serde(default = "default_true")]
     pub delete_branch_after_merge: bool,
+}
+
+/// A single-select issue field of the repository that holds an issue's
+/// priority, such as GitHub's `Priority`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IssuePriority {
+    /// The field's name.
+    pub field: String,
+    /// The option for each bead priority, from 0 (most urgent) up.
+    pub options: Vec<String>,
+}
+
+impl GitHub {
+    /// The repository's issue type and priority option for a bead: the
+    /// type's name, and the priority field with its option.
+    pub fn issue_fields(
+        &self,
+        bead_type: &str,
+        priority: i64,
+    ) -> (Option<String>, Option<(String, String)>) {
+        let issue_type = self
+            .issue_types
+            .get(bead_type)
+            .or_else(|| self.issue_types.get("*"))
+            .cloned();
+        let option = self.issue_priority.as_ref().and_then(|setting| {
+            let option = setting.options.get(usize::try_from(priority).ok()?)?;
+            Some((setting.field.clone(), option.clone()))
+        });
+        (issue_type, option)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]

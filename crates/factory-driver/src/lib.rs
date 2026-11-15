@@ -882,6 +882,17 @@ impl Driver {
                 self.event("issue.created", None, json!({ "url": url }))?;
             }
             self.bead.external_ref = url;
+            // Its type and priority on GitHub follow the bead's, each time
+            // work starts on it. A failure here does not hold the work up.
+            match sync_issue_fields(&self.factory, &self.project, &self.bead) {
+                Ok(changed) if changed.is_empty() => {}
+                Ok(changed) => self.event("issue.fields", None, json!({ "set": changed }))?,
+                Err(err) => self.event(
+                    "issue.fields_failed",
+                    None,
+                    json!({ "error": err.to_string() }),
+                )?,
+            }
         }
         if let Some(github) = &self.project.github
             && let Some(number) =
@@ -3413,6 +3424,33 @@ pub fn observe_account(
         let _ = Tracker::new(&factory.state_dir)
             .update(account, |state| state.observe(limit, model, now_unix()));
     }
+}
+
+/// Bring a bead's GitHub issue into step with the bead in the repository's
+/// own issue type and priority field, where the project names them. Labels
+/// are set when the issue is created; these are what GitHub itself sorts
+/// and filters by. Returns what was changed: nothing if the issue already
+/// agreed, the project names neither, or the bead has no issue.
+pub fn sync_issue_fields(
+    factory: &Factory,
+    project: &Project,
+    bead: &Bead,
+) -> Result<Vec<String>, DriverError> {
+    let Some(settings) = project.github.as_ref().filter(|github| github.issues) else {
+        return Ok(Vec::new());
+    };
+    let Some(number) = factory_github::issue_number(&bead.external_ref, &settings.repo) else {
+        return Ok(Vec::new());
+    };
+    let (issue_type, select) = settings.issue_fields(&bead.issue_type, bead.priority);
+    github_client(factory, settings)
+        .set_issue_fields(
+            &project.repo,
+            &settings.repo,
+            number,
+            &factory_github::IssueFields { issue_type, select },
+        )
+        .map_err(|err| DriverError::Preflight(err.to_string()))
 }
 
 /// The URL of a bead's GitHub issue, creating the issue if the project keeps

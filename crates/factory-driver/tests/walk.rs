@@ -1504,7 +1504,7 @@ fn a_sub_goal_absorbs_its_beads_and_ships_as_one_pull_request() {
     // Every bead gets a GitHub issue, and the pull request must close them.
     let text = text.replace(
         "write = [\"me/toy\"]",
-        "write = [\"me/toy\"]\nissues = true",
+        "write = [\"me/toy\"]\nissues = true\nissue_types = { bug = \"Bug\", \"*\" = \"Task\" }\nissue_priority = { field = \"Priority\", options = [\"Critical\", \"High\", \"Medium\"] }",
     );
     std::fs::write(&project, text).unwrap();
     std::fs::create_dir_all(world.path("config/goals/toy")).unwrap();
@@ -1738,6 +1738,34 @@ fn a_sub_goal_absorbs_its_beads_and_ships_as_one_pull_request() {
     );
     assert!(bead("toy-1").contains("https://github.com/me/toy/issues/1"));
     assert!(bead("toy-3").contains("https://github.com/me/toy/issues/2"));
+    // Each issue also got the repository's own type and priority, by ID:
+    // a task of the most urgent priority, which these beads are.
+    let mutations: Vec<&String> = gh
+        .iter()
+        .filter(|call| call.starts_with("api graphql") && call.contains("mutation"))
+        .collect();
+    assert_eq!(
+        mutations
+            .iter()
+            .filter(|call| call.contains("updateIssueIssueType") && call.contains("type=IT_task"))
+            .count(),
+        2,
+        "{mutations:?}"
+    );
+    assert_eq!(
+        mutations
+            .iter()
+            .filter(|call| call.contains("setIssueFieldValue")
+                && call.contains("field=IFSS_priority")
+                && call.contains("option=O_critical"))
+            .count(),
+        2,
+        "{mutations:?}"
+    );
+    assert!(
+        first_log.contains("\"kind\":\"issue.fields\""),
+        "{first_log}"
+    );
     assert!(
         ship_brief.contains("## GitHub issues this pull request closes"),
         "{ship_brief}"
