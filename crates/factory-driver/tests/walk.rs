@@ -766,6 +766,12 @@ fn a_failing_ci_run_is_waited_out_and_every_failure_goes_back_together() {
     // One check fails with another still running, twice over; then that
     // one fails too. After the fix everything passes.
     world.with_github("pending failing failing red-both green");
+    // The project says how a failure that happens only in CI can be
+    // reproduced here, with a tool the factory keeps in its config.
+    let project = world.path("config/projects/toy.toml");
+    let text = std::fs::read_to_string(&project).unwrap()
+        + "ci_failure_note = \"To see it fail here, run `sh {config}/tools/linux.sh`.\"\n";
+    std::fs::write(&project, text).unwrap();
     let mut driver = Driver::start(world.config(), "toy", "toy-1", &OPTIONS).unwrap();
     assert_eq!(driver.run().unwrap(), Status::Ended);
     let unit = driver.unit().id.to_string();
@@ -816,6 +822,78 @@ fn a_failing_ci_run_is_waited_out_and_every_failure_goes_back_together() {
             "missing {expected:?} in:\n{brief}"
         );
     }
+    let note = format!(
+        "To see it fail here, run `sh {}/tools/linux.sh`.",
+        world.path("config").display()
+    );
+    assert!(brief.contains(&note), "missing {note:?} in:\n{brief}");
+}
+
+/// A project command may be a tool the factory keeps for the project in its
+/// own config directory. It is run from there, people are shown the name
+/// the project gives it, and a builder it fails for is given the command as
+/// it can be typed.
+#[test]
+fn a_command_can_be_a_tool_kept_in_the_factorys_config() {
+    let world = World::new("config-tool", "true");
+    std::fs::create_dir_all(world.path("config/tools")).unwrap();
+    // It fails the first time it is run and passes after that.
+    std::fs::write(
+        world.path("config/tools/check.sh"),
+        "#!/bin/sh\nhere=$(dirname \"$0\")\n[ -f \"$here/ran\" ] && exit 0\ntouch \"$here/ran\"\necho 'not on Linux'\nexit 1\n",
+    )
+    .unwrap();
+    let project = world.path("config/projects/toy.toml");
+    let text = std::fs::read_to_string(&project).unwrap();
+    let old = "[commands.test]\nargv = [\"sh\", \"-c\", \"true\"]\n";
+    assert!(text.contains(old), "{text}");
+    std::fs::write(
+        &project,
+        text.replace(
+            old,
+            "[commands.test]\nargv = [\"sh\", \"{config}/tools/check.sh\"]\nshown = \"the check, on Linux\"\n",
+        ),
+    )
+    .unwrap();
+    let mut driver = Driver::start(world.config(), "toy", "toy-1", &OPTIONS).unwrap();
+    assert_eq!(driver.run().unwrap(), Status::Ended);
+    let unit = driver.unit().id.to_string();
+    let events = events_of(&world, &unit);
+    let tool = format!("{}/tools/check.sh", world.path("config").display());
+
+    // It ran from the config directory, failed once, and passed after that.
+    let ran: Vec<&(String, String, serde_json::Value)> = events
+        .iter()
+        .filter(|(kind, step, _)| kind == "command.ran" && step == "test")
+        .collect();
+    assert!(ran.len() >= 2, "{ran:?}");
+    assert_eq!(ran[0].2["argv"], serde_json::json!(["sh", tool]));
+    assert_eq!(ran[0].2["verdict"], "Failed { code: Some(1) }");
+    assert_eq!(ran.last().unwrap().2["verdict"], "Passed");
+    // The thread has the project's name for it, the builder the command.
+    let said: Vec<String> = events
+        .iter()
+        .filter(|(kind, _, _)| kind == "slack.say")
+        .map(|(_, _, data)| data["text"].as_str().unwrap_or("").to_string())
+        .collect();
+    assert!(
+        said.iter()
+            .any(|text| text.contains("`the check, on Linux` failed")),
+        "{said:?}"
+    );
+    assert!(
+        !said.iter().any(|text| text.contains("check.sh")),
+        "{said:?}"
+    );
+    let calls = world.calls();
+    let told = format!("The command `test` (`sh {tool}`) failed");
+    let briefed = (0..calls.len())
+        .filter(|&i| calls[i][0] == "builder")
+        .map(|i| {
+            std::fs::read_to_string(world.path(&format!("bin/state/brief-{}.md", i + 1))).unwrap()
+        })
+        .any(|brief| brief.contains(&told));
+    assert!(briefed, "no builder was told: {told}");
 }
 
 #[test]
@@ -841,6 +919,7 @@ fn a_red_check_goes_back_to_the_builder_and_green_is_merged_without_asking_anyon
             "test:pass",
             "test-safe:pass",
             "samples:pass",
+            "test-linux:pass",
             "reports:pass",
             "break:held",
             "review:approve",

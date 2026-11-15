@@ -74,6 +74,15 @@ on.fail = { to = "fix", max = 3 }
 id = "samples"
 kind = "command"
 command = "samples-test"
+on.pass = "test-linux"
+on.fail = { to = "fix", max = 3 }
+
+# Everything above ran on this machine's own platform. CI also tests Linux,
+# and what fails only there is found here first, before anything is pushed.
+[[step]]
+id = "test-linux"
+kind = "command"
+command = "test-linux"
 on.pass = "reports"
 on.fail = { to = "fix", max = 3 }
 

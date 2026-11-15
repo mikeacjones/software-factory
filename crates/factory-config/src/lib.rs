@@ -367,6 +367,10 @@ pub struct GitHub {
     /// Green must still be green this long after it is first seen.
     #[serde(default = "default_ci_settle")]
     pub ci_settle_secs: u64,
+    /// What a builder handed a CI failure should know besides the failing
+    /// logs: how a failure that does not happen on this machine can be
+    /// reproduced on it. `{config}` is the factory's config directory.
+    pub ci_failure_note: Option<String>,
     /// Once a check has failed, how long to go on waiting for the checks
     /// still running, so that every failure of the run is handed back
     /// together and fixed in one round. Zero hands the first one back at once.
@@ -476,11 +480,15 @@ fn default_true() -> bool {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CommandSpec {
-    /// `{base}` is replaced by the commit the unit's branch started from, and
+    /// `{base}` is replaced by the commit the unit's branch started from,
     /// `{out}` by the directory the factory made for the artifact the step
-    /// produces.
+    /// produces, and `{config}` by the factory's config directory, for a
+    /// tool the factory keeps for the project and the project does not have.
     pub argv: Vec<String>,
     pub timeout_secs: u64,
+    /// What to call the command where people read it, such as a thread or a
+    /// commit message, when its argv would mean nothing to them.
+    pub shown: Option<String>,
     /// For a command that produces an artifact: the file in it to show the
     /// steps that need it, such as an index.
     pub summary: Option<String>,
@@ -497,6 +505,19 @@ pub struct CommandSpec {
 }
 
 impl CommandSpec {
+    /// The command as people are shown it.
+    pub fn display(&self) -> String {
+        self.shown.clone().unwrap_or_else(|| self.argv.join(" "))
+    }
+
+    /// The command as it can be typed: its argv, with the factory's config
+    /// directory filled in. `{base}` and `{out}` stay as they are written.
+    pub fn runnable(&self, config: &Path) -> String {
+        self.argv
+            .join(" ")
+            .replace("{config}", &config.to_string_lossy())
+    }
+
     /// Whether the command writes an artifact the factory must make room for.
     pub fn wants_out(&self) -> bool {
         self.argv.iter().any(|arg| arg.contains("{out}"))

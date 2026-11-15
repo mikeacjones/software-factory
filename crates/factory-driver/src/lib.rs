@@ -2471,15 +2471,19 @@ impl Driver {
             .argv
             .iter()
             .map(|arg| {
-                let arg = arg.replace("{base}", &self.unit.base);
+                let arg = arg
+                    .replace("{base}", &self.unit.base)
+                    .replace("{config}", &self.config.0.to_string_lossy());
                 match &out_dir {
                     Some(dir) => arg.replace("{out}", &dir.to_string_lossy()),
                     None => arg,
                 }
             })
             .collect();
-        // What people are shown: the command as configured, not the long paths.
-        let shown = command.argv.join(" ");
+        // What people are shown: the command as configured, not the long
+        // paths. What the builder is given is the command it can run.
+        let shown = command.display();
+        let runnable = command.runnable(&self.config.0);
         self.thread.status(&format!(
             ":arrows_counterclockwise: *{}* · running `{}`",
             step.id,
@@ -2624,7 +2628,7 @@ impl Driver {
             return Ok(StepEnd::Outcome("pass".to_string()));
         }
         self.unit.feedback = Some(format!(
-            "The command `{name}` (`{shown}`) {how}, run by the factory in your worktree on commit `{short}`.\n\nThe end of its output:\n\n```\n{}\n```\n\nThe full output is in `{}`.",
+            "The command `{name}` (`{runnable}`) {how}, run by the factory in your worktree on commit `{short}`.\n\nThe end of its output:\n\n```\n{}\n```\n\nThe full output is in `{}`.",
             tail(&result.output, 150),
             output_path.display()
         ));
@@ -2841,6 +2845,13 @@ impl Driver {
                     }
                     if failed.len() > 1 {
                         feedback.push_str("\nMore than one check failed. They may share one cause or have several: account for each before you return.\n");
+                    }
+                    if let Some(note) = &settings.ci_failure_note {
+                        feedback.push_str(&format!(
+                            "\n{}\n",
+                            note.trim()
+                                .replace("{config}", &self.config.0.to_string_lossy())
+                        ));
                     }
                     feedback.push_str("\nReproduce the failure if you can, fix its cause, and run the project's commands before you return.");
                     self.unit.feedback = Some(feedback);
@@ -3136,8 +3147,7 @@ impl Driver {
                 && let Some(spec) = self.project.commands.get(command)
             {
                 let shown = spec
-                    .argv
-                    .join(" ")
+                    .display()
                     .replace("{base}", &self.project.default_branch);
                 if !commands.contains(&shown) {
                     commands.push(shown);

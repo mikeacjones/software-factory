@@ -243,6 +243,10 @@ timeout_secs = 30
 argv = [\"true\"]
 timeout_secs = 30
 
+[commands.test-linux]
+argv = [\"true\"]
+timeout_secs = 30
+
 [commands.reports]
 argv = [\"sh\", \"-c\", \"echo scanned $1 > $0/INDEX.txt; echo No check failed. >> $0/INDEX.txt\", \"{{out}}\", \"{{base}}\"]
 timeout_secs = 30

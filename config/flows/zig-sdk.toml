@@ -83,8 +83,17 @@ on.fail = { to = "fix", max = 2 }
 id = "samples"
 kind = "command"
 command = "samples-test"
-on.pass = "reports"
+on.pass = "test-linux"
 on.fail = { to = "fix", max = 2 }
+
+# Everything above ran on this machine's own platform. CI also tests Linux,
+# and what fails only there is found here first, before anything is pushed.
+[[step]]
+id = "test-linux"
+kind = "command"
+command = "test-linux"
+on.pass = "reports"
+on.fail = { to = "fix", max = 3 }
 
 # The project's own review reports: scanners, the public API diff, hazard
 # scans of the added lines. Written by tools, with no model, into a directory

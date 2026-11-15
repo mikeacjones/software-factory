@@ -66,6 +66,10 @@ issue_priority = { field = "Priority", options = ["Critical", "High", "Medium", 
 ci_poll_secs = 30
 ci_timeout_secs = 10800
 ci_settle_secs = 60
+# The factory's own checks run on macOS. What fails only on GitHub's Linux
+# runners can be made to fail, and then to pass, on this machine.
+ci_failure_note = """
+A check that failed only on Linux can be reproduced on this machine. From the root of your worktree, `sh {config}/tools/temporal-sdk-zig/test-linux.sh Debug` (or `ReleaseSafe`) runs `zig build test` on Linux arm64 in a container, set up as CI's Linux runners are, on your worktree as it stands, uncommitted changes included. Further arguments go to `zig build test`. It takes a few minutes. Before you change anything, run it and see the failure CI reported. Do not return until it passes: a fix you have not seen pass on Linux costs a whole round of CI to find out about."""
 # Squash and merge: the default branch gets one commit per bead. Its subject
 # is the change's own, with the pull request's number; its body is the
 # change's own body, then what was tested, then the commit's trailers.
@@ -133,6 +137,15 @@ timeout_secs = 3600
 [commands.test-releasesafe]
 argv = ["zig", "build", "test", "-Doptimize=ReleaseSafe"]
 timeout_secs = 3600
+
+# The unit tests on Linux arm64, in a container on this machine, with a tool
+# the factory keeps for this project. GitHub's CI is still what gates a
+# merge; this is so that a Linux-only failure is found, and its fix seen to
+# work, before a pull request is opened or pushed to.
+[commands.test-linux]
+argv = ["sh", "{config}/tools/temporal-sdk-zig/test-linux.sh", "Debug"]
+timeout_secs = 3600
+shown = "zig build test on Linux arm64 (in a container)"
 
 # The project's own review tooling (.review/). --quick leaves the test suites
 # out: the flow runs them as steps of their own, where a failure goes straight
