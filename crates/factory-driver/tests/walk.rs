@@ -240,6 +240,213 @@ fn a_run_cut_off_by_the_death_of_the_factory_resumes_its_session() {
     assert!(!brief.starts_with("You were interrupted"), "{brief}");
 }
 
+/// Turn on keeping branches on the remote for the test project.
+fn keep_branches_on_the_remote(world: &World) {
+    let project = world.path("config/projects/toy.toml");
+    let text = std::fs::read_to_string(&project).unwrap();
+    assert!(text.contains("\nflow = "));
+    std::fs::write(
+        &project,
+        text.replacen("\nflow = ", "\nsync_branches = true\nflow = ", 1),
+    )
+    .unwrap();
+}
+
+/// A unit's events, as (kind, step, data).
+fn events_of(world: &World, unit: &str) -> Vec<(String, String, serde_json::Value)> {
+    std::fs::read_to_string(world.path(&format!("state/units/{unit}/events.jsonl")))
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let event: serde_json::Value = serde_json::from_str(line).unwrap();
+            (
+                event["kind"].as_str().unwrap_or("").to_string(),
+                event["step"].as_str().unwrap_or("").to_string(),
+                event["data"].clone(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn a_units_branch_is_on_the_remote_as_it_changes_and_while_its_agent_works() {
+    let world = World::new("sync", "test -f feature.txt");
+    keep_branches_on_the_remote(&world);
+    // The builder commits what it has and goes on working, as it is told to.
+    world.scenario("commit-as-you-go");
+    let mut driver = Driver::start(world.config(), "toy", "toy-1", &OPTIONS).unwrap();
+    assert_eq!(driver.run().unwrap(), Status::Ended);
+    let unit = driver.unit().id.to_string();
+    let events = events_of(&world, &unit);
+    let remote = world.path("remote.git");
+
+    // The builder's commit reached the remote while the builder was still
+    // at work: before its run had ended, and so before the factory had
+    // looked at anything it did.
+    let first_sync = events
+        .iter()
+        .position(|(kind, _, _)| kind == "branch.synced")
+        .expect("the branch was never pushed");
+    let first_run_end = events
+        .iter()
+        .position(|(kind, _, _)| kind == "run.ended")
+        .unwrap();
+    assert!(first_sync < first_run_end, "{events:?}");
+    let (_, step, data) = &events[first_sync];
+    assert_eq!(
+        (step.as_str(), data["when"].as_str()),
+        ("build", Some("during the run"))
+    );
+    let early = data["commit"].as_str().unwrap();
+    assert_eq!(run(&remote, "git", &["cat-file", "-t", early]), "commit");
+    assert_eq!(
+        run(&remote, "git", &["log", "-1", "--format=%s", early]),
+        "wip: a line"
+    );
+
+    // What the factory itself puts on the branch goes there too: the
+    // tester's regression test, as soon as the step that found it ended.
+    let after: Vec<&str> = events
+        .iter()
+        .filter(|(kind, _, data)| kind == "branch.synced" && data["when"] == "after the step")
+        .map(|(_, step, _)| step.as_str())
+        .collect();
+    assert!(after.contains(&"break"), "{after:?}");
+    for (_, _, data) in events.iter().filter(|(kind, _, _)| kind == "branch.synced") {
+        let commit = data["commit"].as_str().unwrap();
+        assert_eq!(run(&remote, "git", &["cat-file", "-t", commit]), "commit");
+    }
+    assert!(
+        !events
+            .iter()
+            .any(|(kind, _, _)| kind == "branch.sync_failed")
+    );
+
+    // Publishing is unchanged: the branch ends as the one commit of the bead.
+    let branch = driver.unit().branch.clone();
+    assert_eq!(
+        run(
+            &remote,
+            "git",
+            &["rev-list", "--count", &format!("main..{branch}")]
+        ),
+        "1"
+    );
+    assert_eq!(
+        run(&remote, "git", &["log", "-1", "--format=%s", &branch]),
+        "Add the feature"
+    );
+}
+
+#[test]
+fn an_absorbed_beads_branch_leaves_the_remote_once_its_sub_goals_branch_is_there() {
+    use factory_driver::goal::Supervisor;
+    use factory_slack::socket::Incoming;
+    use serde_json::json;
+    use std::time::{Duration, Instant};
+
+    let world = World::new("sync-subgoal", "true");
+    world.with_github("green");
+    keep_branches_on_the_remote(&world);
+    std::fs::create_dir_all(world.path("bin/state")).unwrap();
+    std::fs::write(world.path("bin/state/broke"), "").unwrap();
+    std::fs::create_dir_all(world.path("config/goals/toy")).unwrap();
+    std::fs::write(
+        world.path("config/goals/toy/main.toml"),
+        "id = \"main\"\nflow = \"zig-sdk-bead\"\nship_flow = \"zig-sdk-ship\"\n[director]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\n",
+    )
+    .unwrap();
+    let say = |role: &str, n: u32, json: serde_json::Value| {
+        std::fs::write(
+            world.path(&format!("bin/state/{role}-{n}.json")),
+            json.to_string(),
+        )
+        .unwrap();
+    };
+    let direct = |fields: serde_json::Value| {
+        let mut result = json!({
+            "summary": "Decided.", "start": [], "continue": [], "file": [], "edit": [],
+            "dropped_findings": [], "open_subgoals": [], "ship": [], "tell_foreman": [],
+            "ask_owner": "", "complete": false, "evidence": "", "journal_entry": "",
+            "project_memory": ""
+        });
+        for (key, value) in fields.as_object().unwrap() {
+            result[key] = value.clone();
+        }
+        result
+    };
+    say(
+        "intake",
+        1,
+        json!({"reply": "Here is the charter.", "ready": true, "objective": "Ship the feature.", "stop_when": "toy-1 has landed.", "plan": "One sub-goal.", "paths": [], "edits": []}),
+    );
+    say(
+        "director",
+        1,
+        direct(json!({
+            "open_subgoals": [{"id": "feature", "title": "The feature", "objective": "It works.", "beads": ["toy-1"], "paths": []}],
+            "start": [{"bead": "toy-1", "reason": "the only one"}],
+        })),
+    );
+    say("director", 2, direct(json!({"ask_owner": "Ship it now?"})));
+
+    let mut sup = Supervisor::new(world.config(), None, vec!["OWNER".to_string()], false).unwrap();
+    let id = sup.open_directly("toy", "Ship the feature").unwrap();
+    sup.incoming(Incoming::Action {
+        channel: String::new(),
+        user: "OWNER".to_string(),
+        action_id: "goal_start".to_string(),
+        value: id,
+        message_ts: String::new(),
+    })
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while sup.goals().next().unwrap().wakes < 2 {
+        assert!(Instant::now() < deadline, "the bead was never absorbed");
+        sup.pump(Duration::from_millis(200)).unwrap();
+    }
+    let goal = sup.goals().next().unwrap().clone();
+    let sub = &goal.subgoals[0];
+    assert_eq!(sub.absorbed.len(), 1);
+    let remote = world.path("remote.git");
+
+    // The sub-goal's branch is on the remote with the bead's commit, and
+    // nothing else of the factory's is: the bead's own branch was there
+    // while it was being worked on, and is gone now that it is not needed.
+    let branches = run(
+        &remote,
+        "git",
+        &["branch", "--list", "--format=%(refname:short)"],
+    );
+    let mut branches: Vec<&str> = branches.lines().collect();
+    branches.sort_unstable();
+    assert_eq!(branches, ["feat/feature", "main"]);
+    assert_eq!(
+        run(&remote, "git", &["rev-parse", "feat/feature"]),
+        sub.absorbed[0].1
+    );
+    // In that order: the bead's branch was pushed as it changed; when the
+    // bead was absorbed the sub-goal's branch was pushed; only then was
+    // the bead's branch taken off the remote.
+    let unit = goal.units[0].unit.clone().unwrap();
+    let events = events_of(&world, &unit);
+    let at = |kind: &str| {
+        events
+            .iter()
+            .position(|(found, _, _)| found == kind)
+            .unwrap_or_else(|| panic!("no {kind} in the unit's log"))
+    };
+    assert!(at("branch.synced") < at("absorbed"));
+    assert!(at("absorbed") < at("subgoal.synced"));
+    assert!(at("subgoal.synced") < at("branch.unsynced"));
+    let (_, _, gone) = &events[at("branch.unsynced")];
+    assert!(gone["error"].is_null(), "{gone}");
+    let (_, _, kept) = &events[at("subgoal.synced")];
+    assert_eq!(kept["branch"], "feat/feature");
+    // No pull request yet: that is still the sub-goal's shipping to do.
+    assert!(!world.gh_calls().iter().any(|call| call.starts_with("pr ")));
+}
+
 #[test]
 fn a_parked_unit_continues_from_the_step_it_stopped_at() {
     let world = World::new("resume", "test -f $ALLOW || exit 127");

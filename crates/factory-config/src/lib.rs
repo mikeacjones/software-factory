@@ -232,6 +232,14 @@ pub struct Project {
     /// Without it a top-level message opens a goal with its director at
     /// once, and goals queue by `max_goals`.
     pub executive: Option<Tier>,
+    /// Keep every branch the factory is working on pushed to the remote as
+    /// it changes: a unit's after each step and whenever its agent commits
+    /// during one, and a sub-goal's after each bead it absorbs. Work in
+    /// hand then survives the loss of this machine. A bead's branch is
+    /// removed from the remote once its work is in its sub-goal's branch
+    /// and that branch has been pushed.
+    #[serde(default)]
+    pub sync_branches: bool,
     /// What the publication step should know about this project's commit
     /// messages and pull requests, such as the trailers it expects.
     pub publication_note: Option<String>,

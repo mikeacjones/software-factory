@@ -262,6 +262,13 @@ pub fn push(dir: &Path, remote: &str, branch: &str) -> Result<(), GitError> {
     git(dir, &["push", "--no-verify", remote, &refspec], NETWORK).map(|_| ())
 }
 
+/// The branch checked out in a worktree.
+pub fn current_branch(dir: &Path) -> Result<String, GitError> {
+    Ok(git(dir, &["rev-parse", "--abbrev-ref", "HEAD"], LOCAL)?
+        .trim()
+        .to_string())
+}
+
 /// Move a branch's worktree forward to `commit`, which must descend from
 /// where it is: nothing is merged and nothing is rewritten.
 pub fn fast_forward(dir: &Path, commit: &str) -> Result<(), GitError> {

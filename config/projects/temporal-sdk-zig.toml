@@ -5,6 +5,13 @@ default_branch = "main"
 bead_actor = "factory"
 slack_channel = "temporal-sdk-zig"
 flow = "zig-sdk"
+# Every branch the factory is working on is kept on the remote as it changes:
+# a bead's after each step and whenever its agent commits, a sub-goal's after
+# each bead it absorbs. Work in hand then survives the loss of this machine.
+# A bead's branch leaves the remote once its work is on its sub-goal's branch
+# and that branch has been pushed. CI here runs on pull requests and on main,
+# so these pushes start none.
+sync_branches = true
 publication_note = """
 End the commit message with a trailer block: one `Bead: <full bead ID>` line for each bead the change covers, which is the trailer this repository's history uses (not `Refs:`), and after them the changelog trailer when the change needs one. A pull request is squashed when it lands, so the message written for the whole pull request, with a testing paragraph the factory adds, is what the default branch keeps: write it for someone reading the history a year from now."""
 

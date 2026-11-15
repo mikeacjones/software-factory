@@ -109,6 +109,14 @@ command = ["cargo", "run", "--quiet", "--locked", "--package", "factory-cli", "-
 timeout_secs = 900
 
 [[check]]
+id = "branch-sync"
+tier = "hermetic"
+bead = "sf-rzb.19"
+claim = "For a project that keeps its branches on the remote: a builder's commit is on the remote while the builder is still at work; what the factory itself commits is pushed when the step ends; when a bead is absorbed its sub-goal's branch is pushed and only then is the bead's branch removed from the remote, leaving the sub-goal's branch as the factory's only one there; and publishing still leaves the bead as one commit."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-driver", "--test", "walk", "--", "a_units_branch_is_on_the_remote", "an_absorbed_beads_branch"]
+timeout_secs = 900
+
+[[check]]
 id = "queue"
 tier = "hermetic"
 bead = "sf-rzb.16"

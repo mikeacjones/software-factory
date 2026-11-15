@@ -159,6 +159,10 @@ pub struct Unit {
     /// The commit this unit's change became on the sub-goal's branch.
     #[serde(default)]
     pub absorbed: Option<String>,
+    /// The commit of the unit's branch that was last pushed to the remote,
+    /// for a project that keeps its branches there as they change.
+    #[serde(default)]
+    pub synced: Option<String>,
     /// Whether this unit ships a sub-goal: its branch already holds one
     /// commit for each bead and is published as it stands.
     #[serde(default)]
@@ -297,6 +301,38 @@ pub struct Options {
     /// time: the engine. The unit then does no waiting of its own for a
     /// usage limit, and does not announce each time it is picked up.
     pub engine: bool,
+}
+
+/// Push a branch to the project's remote if its worktree is not at the
+/// commit last pushed. `None` if the project does not keep its branches on
+/// the remote, or there is nothing new. Otherwise the commit pushed, or why
+/// it could not be. The write list is respected as it is for publishing.
+fn push_if_moved(
+    factory: &Factory,
+    project: &Project,
+    worktree: &Path,
+    branch: &str,
+    synced: Option<&str>,
+) -> Option<Result<String, String>> {
+    if !project.sync_branches {
+        return None;
+    }
+    let head = factory_git::rev_parse(worktree, "HEAD").ok()?;
+    if synced == Some(head.as_str()) {
+        return None;
+    }
+    let push = || -> Result<(), String> {
+        let url = factory_git::configured_remote_url(&project.repo, &project.remote)
+            .map_err(|err| err.to_string())?;
+        if let Some(github) = &project.github {
+            let slug = factory_git::github_slug(&url).unwrap_or_default();
+            github_client(factory, github)
+                .check_allowed(&slug)
+                .map_err(|err| format!("push to `{url}`: {err}"))?;
+        }
+        factory_git::push(worktree, &project.remote, branch).map_err(|err| err.to_string())
+    };
+    Some(push().map(|()| head))
 }
 
 /// One absorb at a time, across every pipeline of the process: a sub-goal's
@@ -649,6 +685,7 @@ impl Driver {
                 merged: None,
                 absorb_into: None,
                 absorbed: None,
+                synced: None,
                 ship: false,
                 closes: Vec::new(),
                 issues: Vec::new(),
@@ -1198,7 +1235,45 @@ impl Driver {
         if !matches!(step.kind, StepKind::Agent { .. }) {
             used.runs += 1;
         }
+        // Whatever the step left on the branch goes to the remote.
+        self.sync_branch(step_id);
         Ok((step, round, started, end))
+    }
+
+    /// Push the unit's branch to the remote if it has moved, for a project
+    /// that keeps its branches there. A failure is recorded and holds
+    /// nothing up: the work is still here.
+    fn sync_branch(&mut self, step: &str) {
+        // A unit that was absorbed or landed has no branch left to keep.
+        if self.unit.absorbed.is_some()
+            || self.unit.merged.is_some()
+            || !self.unit.worktree.exists()
+        {
+            return;
+        }
+        let pushed = push_if_moved(
+            &self.factory,
+            &self.project,
+            &self.unit.worktree,
+            &self.unit.branch,
+            self.unit.synced.as_deref(),
+        );
+        let _ = match pushed {
+            None => Ok(()),
+            Some(Ok(commit)) => {
+                self.unit.synced = Some(commit.clone());
+                self.event(
+                    "branch.synced",
+                    Some(step),
+                    json!({ "branch": self.unit.branch, "commit": commit, "when": "after the step" }),
+                )
+            }
+            Some(Err(error)) => self.event(
+                "branch.sync_failed",
+                Some(step),
+                json!({ "branch": self.unit.branch, "error": error }),
+            ),
+        };
     }
 
     /// Add a step that ended to what a fresh agent is told has happened.
@@ -1697,12 +1772,51 @@ impl Driver {
 
             let started = Instant::now();
             let mut heard: Vec<String> = Vec::new();
+            // An agent that works in the unit's own worktree may commit as
+            // it goes. Each commit goes to the remote while it works.
+            let keeps = (*workspace == Workspace::Unit).then(|| {
+                (
+                    self.factory.clone(),
+                    self.project.clone(),
+                    self.unit.worktree.clone(),
+                    self.unit.branch.clone(),
+                    self.log.clone(),
+                )
+            });
+            let mut synced = self.unit.synced.clone();
             let finished = {
                 let thread = &mut self.thread;
                 let step_id = step.id.clone();
                 let mut last_poll = Instant::now();
                 let mut last_status = Instant::now();
+                let mut last_sync = Instant::now();
                 factory_claude::run(&spec, &log_path, &mut |transcript| {
+                    if let Some((factory, project, worktree, branch, log)) = &keeps
+                        && last_sync.elapsed() >= Duration::from_secs(2)
+                    {
+                        last_sync = Instant::now();
+                        let step = StepId::new(step_id.clone());
+                        match push_if_moved(factory, project, worktree, branch, synced.as_deref()) {
+                            None => {}
+                            Some(Ok(commit)) => {
+                                let _ = log.append(
+                                    "branch.synced",
+                                    Some(&step),
+                                    json!({ "branch": branch, "commit": commit, "when": "during the run" }),
+                                );
+                                synced = Some(commit);
+                            }
+                            Some(Err(error)) => {
+                                let _ = log.append(
+                                    "branch.sync_failed",
+                                    Some(&step),
+                                    json!({ "branch": branch, "error": error }),
+                                );
+                                // Not again for the same commit every two seconds.
+                                last_sync = Instant::now() + Duration::from_secs(60);
+                            }
+                        }
+                    }
                     if last_poll.elapsed() >= Duration::from_secs(poll_secs) {
                         last_poll = Instant::now();
                         for message in thread.poll() {
@@ -1724,6 +1838,7 @@ impl Driver {
                     Control::Continue
                 })?
             };
+            self.unit.synced = synced;
             // The run is over, however it ended: nothing is in flight.
             let _ = std::fs::remove_file(&in_flight);
             // Said while the step ran: for the next agent step.
@@ -3137,6 +3252,38 @@ impl Driver {
             Some(&step.id),
             json!({ "commit": commit, "into": target }),
         )?;
+        // The bead's work is now on the sub-goal's branch. That branch goes
+        // to the remote, and only when it is there does the bead's own
+        // branch leave it: until then it is the only copy off this machine.
+        if let Ok(subgoal) = factory_git::current_branch(&target) {
+            match push_if_moved(&self.factory, &self.project, &target, &subgoal, None) {
+                None => {}
+                Some(Ok(pushed)) => {
+                    self.event(
+                        "subgoal.synced",
+                        Some(&step.id),
+                        json!({ "branch": subgoal, "commit": pushed }),
+                    )?;
+                    if self.unit.synced.take().is_some() {
+                        let gone = factory_git::delete_remote_branch(
+                            &self.project.repo,
+                            &self.project.remote,
+                            &self.unit.branch,
+                        );
+                        self.event(
+                            "branch.unsynced",
+                            Some(&step.id),
+                            json!({ "branch": self.unit.branch, "error": gone.err().map(|err| err.to_string()) }),
+                        )?;
+                    }
+                }
+                Some(Err(error)) => self.event(
+                    "subgoal.sync_failed",
+                    Some(&step.id),
+                    json!({ "branch": subgoal, "error": error }),
+                )?,
+            }
+        }
         let repo = self.project.repo.clone();
         let mut litter = Vec::new();
         if let Err(err) = factory_git::worktree_remove(&repo, &self.unit.worktree) {

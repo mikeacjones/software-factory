@@ -12,6 +12,8 @@
 #                      bogus-finding the tester's first reproduction passes when run
 #                      lazy-fix      the builder's first fix leaves the regression test failing
 #                      forget-closes the publisher first leaves the issues out of the pull request
+#                      commit-as-you-go
+#                                    the builder commits its work and goes on working for a while
 #                      own-file      the builder writes under a directory named after its bead,
 #                                    not to the one file every bead shares
 #                      lazy-merge    the builder's first try at a merge conflict leaves the markers in
@@ -111,6 +113,11 @@ case "$role" in
           *own-file*) mkdir -p "$bead"; echo "line $count" >> "$bead/feature.txt" ;;
           *) echo "line $count" >> feature.txt ;;
         esac ;;
+    esac
+    # It commits what it has, as a builder is told to, and is not done yet.
+    case "$scenario" in
+      *commit-as-you-go*)
+        git add -A && git commit --no-verify --quiet -m "wip: a line" && sleep 5 ;;
     esac
     # A fix: make the tester's regression test, or the report's gate, pass.
     case "$brief" in
