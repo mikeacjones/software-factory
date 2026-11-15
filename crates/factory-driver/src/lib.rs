@@ -21,7 +21,8 @@ use factory_beads::{Bead, Source, readiness};
 use factory_brief::{Brief, Contract, Note, contract_of, findings_text, render, result_problems};
 use factory_checks::{Verdict, first_match, run_command, scope_violations, weakened_tests};
 use factory_claude::accounts::{
-    Choice, Refresh, TOKEN_URL, TokenSource, Tracker, USAGE_API, choose, read_usage, session_token,
+    AccountError, Choice, Known, Refresh, TOKEN_URL, TokenSource, Tracker, USAGE_API, Vault,
+    choose, read_usage, session_token,
 };
 use factory_claude::{Outcome, RunSpec, Session, Usage};
 use factory_config::{BeadSource, ConfigDir, Factory, Project, read_env_file};
@@ -3398,22 +3399,49 @@ pub fn pick_account(factory: &Factory, model: &str) -> Result<AccountPick, Drive
         let refresh = account.usage_refresh.then_some(Refresh {
             token_url: TOKEN_URL,
             safe_dir: &factory.state_dir,
+            lock_dir: account.usage_lock_dir.as_deref(),
+            lock_tries: factory_claude::accounts::LOCK_TRIES,
         });
-        let read = read_usage(&account.id, service, USAGE_API, refresh, now);
+        let whose = Known {
+            identity: known.identity.as_deref(),
+            login: known.identity_login,
+        };
+        let vault = Vault::keychain(service);
+        let read = read_usage(&account.id, &vault, USAGE_API, refresh, whose, now);
         if let Err(err) = &read {
             // Never fatal: runs report the same windows. But a login that
             // could not be refreshed is something the owner must hear about.
             eprintln!("accounts: {err}");
         }
         let _ = tracker.update(&account.id, |state| {
-            if let Ok(mut fresh) = read {
-                // Limits a run hit and that have not ended still stand.
-                for (scope, until) in &state.blocked {
-                    if *until > now {
-                        fresh.blocked.entry(scope.clone()).or_insert(*until);
+            match read {
+                Ok(mut fresh) => {
+                    // Limits a run hit and that have not ended still stand.
+                    for (scope, until) in &state.blocked {
+                        if *until > now {
+                            fresh.blocked.entry(scope.clone()).or_insert(*until);
+                        }
                     }
+                    // The login is this account's. If its week is not the
+                    // one the runs reported, the runs are another account's.
+                    fresh.concern = state
+                        .week_moved(fresh.seven_day.as_ref(), now)
+                        .or(state.concern.take());
+                    *state = fresh;
                 }
-                *state = fresh;
+                // The stored login is someone else's: say so until the
+                // owner has put it right or accepted it.
+                Err(AccountError::Identity { reason, .. }) => state.concern = Some(reason),
+                // No windows this time, but the login was confirmed.
+                Err(AccountError::Unanswered {
+                    identity: Some(identity),
+                    identity_login,
+                    ..
+                }) => {
+                    state.identity = Some(identity);
+                    state.identity_login = identity_login;
+                }
+                Err(_) => {}
             }
             state.usage_checked_at = now;
         });

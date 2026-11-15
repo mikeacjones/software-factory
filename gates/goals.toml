@@ -109,6 +109,14 @@ command = ["cargo", "test", "--locked", "--offline", "--package", "factory-claud
 timeout_secs = 900
 
 [[check]]
+id = "account-logins"
+tier = "hermetic"
+bead = "sf-rzb.18"
+claim = "Against stand-in endpoints: the refresh lock is the pair of directories Claude Code keeps, it is not taken while Claude Code holds either, and one abandoned for over a minute is taken over; an expired login is refreshed with Claude Code's own request under that lock and written back with everything else kept; a login refreshed meanwhile, or one whose lock is held, is left untouched; a refused refresh changes nothing; a login not seen before is asked whose it is, and one that has become another account's is refused before its usage is read; and a weekly window that moves, or two accounts that are one subscription, are reported."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-claude", "--package", "factory-config", "--", "the_refresh_lock_is_the_one", "an_expired_login_is_refreshed", "a_login_someone_else_refreshed", "a_refused_refresh_changes_nothing", "a_login_that_has_become_another", "a_week_that_moves", "an_account_that_refreshes"]
+timeout_secs = 900
+
+[[check]]
 id = "accounts-live"
 tier = "owner"
 bead = "sf-rzb.9"

@@ -26,6 +26,8 @@ usage:
                                               one a run would use now
   factory accounts refresh                    refresh the usage login of each account marked for
                                               it now, write it to the Keychain and check it works
+  factory accounts pin <account>              accept whichever account the stored login of this
+                                              account now belongs to, after a deliberate change
   factory slack check                         connect the Slack socket once and say whether it worked
   factory goal check                          check every project's goal definitions
   factory goal list                           the goals the factory knows and where each stands
@@ -144,37 +146,83 @@ fn run(args: &[String]) -> Result<u8, String> {
             Ok(0)
         }
         ["accounts", "refresh"] => {
+            use factory_claude::accounts::{
+                Known, Refresh, Refreshed, Renew, TOKEN_URL, USAGE_API, Vault, read_usage,
+                refresh_login,
+            };
             let factory = args.config.factory().map_err(|err| fail(&err))?;
             let now = factory_core::now_unix();
-            let mut refreshed = 0;
+            let tracker = factory_claude::accounts::Tracker::new(&factory.state_dir);
+            let states = tracker.load();
+            let mut marked = 0;
             for account in factory.accounts.iter().filter(|a| a.usage_refresh) {
                 let Some(service) = &account.usage_keychain else {
                     continue;
                 };
-                let refresh = factory_claude::accounts::Refresh {
-                    token_url: factory_claude::accounts::TOKEN_URL,
+                marked += 1;
+                let refresh = Refresh {
+                    token_url: TOKEN_URL,
                     safe_dir: &factory.state_dir,
+                    lock_dir: account.usage_lock_dir.as_deref(),
+                    lock_tries: factory_claude::accounts::LOCK_TRIES,
                 };
-                factory_claude::accounts::refresh_login(&account.id, service, refresh, now)
+                // A login Claude Code also uses is refreshed only when it
+                // is due; one nothing else touches, whenever asked.
+                let renew = match account.usage_lock_dir {
+                    Some(_) => Renew::IfDue { refused: None },
+                    None => Renew::Always,
+                };
+                let vault = Vault::keychain(service);
+                let done = refresh_login(&account.id, &vault, refresh, renew, now)
                     .map_err(|err| fail(&err))?;
-                // The proof that the new login works: ask with it.
-                factory_claude::accounts::read_usage(
-                    &account.id,
-                    service,
-                    factory_claude::accounts::USAGE_API,
-                    None,
-                    now,
-                )
-                .map_err(|err| fail(&err))?;
-                println!(
-                    "{}: login refreshed, written to the Keychain item `{service}`, and accepted by the usage endpoint",
-                    account.id
-                );
-                refreshed += 1;
+                // The proof that the login works and is this account's: ask with it.
+                let known = states.get(&account.id).cloned().unwrap_or_default();
+                let whose = Known {
+                    identity: known.identity.as_deref(),
+                    login: known.identity_login,
+                };
+                let proof = match read_usage(&account.id, &vault, USAGE_API, None, whose, now) {
+                    Ok(_) => "the usage endpoint accepts it".to_string(),
+                    // The endpoint turns callers away for a while at times:
+                    // that says nothing about the login.
+                    Err(factory_claude::accounts::AccountError::Unanswered { reason, .. }) => {
+                        format!(
+                            "it is this account's login, but its usage could not be read just now ({reason})"
+                        )
+                    }
+                    Err(err) => return Err(fail(&err)),
+                };
+                match done {
+                    Refreshed::Done => println!(
+                        "{}: login refreshed and written to the Keychain item `{service}`; {proof}",
+                        account.id
+                    ),
+                    Refreshed::NotNeeded { minutes_left } => println!(
+                        "{}: the login in the Keychain item `{service}` is good for another {minutes_left} minutes and was left alone; {proof}",
+                        account.id
+                    ),
+                }
             }
-            if refreshed == 0 {
+            if marked == 0 {
                 println!("no account is marked `usage_refresh = true`");
             }
+            Ok(0)
+        }
+        ["accounts", "pin", id] => {
+            let factory = args.config.factory().map_err(|err| fail(&err))?;
+            if !factory.accounts.iter().any(|account| &account.id == id) {
+                return Err(format!("the factory has no account `{id}`"));
+            }
+            factory_claude::accounts::Tracker::new(&factory.state_dir)
+                .update(id, |state| {
+                    state.identity = None;
+                    state.identity_login = 0;
+                    state.concern = None;
+                })
+                .map_err(|err| fail(&err))?;
+            println!(
+                "{id}: whoever its stored login belongs to at the next check is taken to be this account"
+            );
             Ok(0)
         }
         ["issues", "sync", project] => {
@@ -257,6 +305,23 @@ fn run(args: &[String]) -> Result<u8, String> {
                             (now - state.updated_at) / 60
                         )
                     }
+                );
+                println!(
+                    "  login:         {}",
+                    match (&account.usage_keychain, &state.identity) {
+                        (None, _) => "none to read usage with".to_string(),
+                        (Some(_), Some(_)) => "confirmed to be this account's".to_string(),
+                        (Some(_), None) => "not yet checked".to_string(),
+                    }
+                );
+                if let Some(concern) = &state.concern {
+                    println!("  LOOK AT THIS:  {concern}");
+                }
+            }
+            let ids: Vec<String> = factory.accounts.iter().map(|a| a.id.clone()).collect();
+            for (first, second) in factory_claude::accounts::same_subscription(&ids, &states, now) {
+                println!(
+                    "LOOK AT THIS: `{first}` and `{second}` look like one subscription listed twice: their logins or their weekly windows are the same. Balancing between them spends one subscription while counting two."
                 );
             }
             for line in choices {

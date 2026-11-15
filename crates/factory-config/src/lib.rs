@@ -68,10 +68,15 @@ pub struct Account {
     /// read its usage windows without a model call.
     pub usage_keychain: Option<String>,
     /// Refresh that login when it is about to expire and write it back to
-    /// the same Keychain item. For a login nothing else keeps fresh; leave it
-    /// off for the login Claude Code itself uses.
+    /// the same Keychain item. A login Claude Code itself also uses needs
+    /// `usage_lock_dir` as well.
     #[serde(default)]
     pub usage_refresh: bool,
+    /// For a login Claude Code itself keeps fresh too: its configuration
+    /// directory (`~/.claude` for the default login). The factory then
+    /// refreshes as Claude Code does, under the lock Claude Code keeps
+    /// there, and only a login that has not been refreshed meanwhile.
+    pub usage_lock_dir: Option<PathBuf>,
 }
 
 fn default_gh() -> String {
@@ -548,6 +553,16 @@ impl ConfigDir {
         let mut seen = std::collections::BTreeSet::new();
         for account in &mut factory.accounts {
             account.token_file = account.token_file.as_deref().map(expand_home);
+            account.usage_lock_dir = account.usage_lock_dir.as_deref().map(expand_home);
+            if account.usage_refresh && account.usage_keychain.is_none() {
+                return Err(ConfigError::Invalid {
+                    path,
+                    reason: format!(
+                        "account `{}` has `usage_refresh` but no `usage_keychain` to refresh",
+                        account.id
+                    ),
+                });
+            }
             if !seen.insert(account.id.clone()) {
                 return Err(ConfigError::Invalid {
                     path,
@@ -1000,6 +1015,39 @@ timeout_secs = 60
         )
         .unwrap();
         assert_eq!(dir.goal_definitions("toy").unwrap()[0].director.slots, 2);
+        std::fs::remove_dir_all(&dir.0).unwrap();
+    }
+
+    #[test]
+    fn an_account_that_refreshes_its_login_names_one_and_may_share_claude_codes_lock() {
+        let dir = dir_with(PROJECT);
+        let factory = |accounts: &str| {
+            std::fs::write(
+                dir.0.join("factory.toml"),
+                format!("state_dir = \"/tmp/s\"\ncli_version = \"1\"\nallowed_models = [\"m\"]\n{accounts}"),
+            )
+            .unwrap();
+            dir.factory()
+        };
+        let loaded = factory(
+            "[[account]]\nid = \"claude\"\nusage_keychain = \"Claude Code-credentials\"\nusage_refresh = true\nusage_lock_dir = \"~/.claude\"\n",
+        )
+        .unwrap();
+        let account = &loaded.accounts[0];
+        assert!(account.usage_refresh);
+        let lock_dir = account.usage_lock_dir.clone().unwrap();
+        assert!(
+            lock_dir.ends_with(".claude") && !lock_dir.starts_with("~"),
+            "{lock_dir:?}"
+        );
+        // Refreshing needs a login to refresh.
+        let refused = factory("[[account]]\nid = \"claude\"\nusage_refresh = true\n").unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("no `usage_keychain` to refresh"),
+            "{refused}"
+        );
         std::fs::remove_dir_all(&dir.0).unwrap();
     }
 

@@ -8,13 +8,23 @@ allowed_models = ["claude-fable-5-2", "claude-opus-5-5", "claude-sonnet-5-5", "c
 # resets is lost, so each run uses the account whose week resets soonest, and
 # between accounts whose weeks end together, the one whose five-hour session
 # resets soonest. An account at a limit is left until its window resets; when
-# all are at a limit the factory waits for the earliest reset. The windows are learned from every run. `usage_keychain` names a
-# full login the factory may ask about an account's windows with, without a
-# model call, when it has not heard from the account for half an hour.
+# all are at a limit the factory waits for the earliest reset. The windows are
+# learned from every run. `usage_keychain` names a full login the factory may
+# ask about an account's windows with, without a model call, when it has not
+# heard from the account for half an hour. The first time such a login is
+# used the factory notes whose it is, and it refuses one that later belongs
+# to another account (`factory accounts pin <id>` accepts a deliberate change).
 [[account]]
 id = "claude"
 # No token: the CLI's own login.
 usage_keychain = "Claude Code-credentials"
+# Claude Code keeps this login fresh only while it runs under it. When the
+# factory works under another account for hours, nothing does, and the usage
+# reads fail. So the factory refreshes it too, the way Claude Code does:
+# under the lock Claude Code keeps in its configuration directory, and only
+# if the login has not been refreshed meanwhile.
+usage_refresh = true
+usage_lock_dir = "~/.claude"
 
 [[account]]
 id = "claude2"
