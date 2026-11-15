@@ -78,6 +78,30 @@ command = ["cargo", "test", "--locked", "--offline", "--package", "factory-drive
 timeout_secs = 900
 
 [[check]]
+id = "executive-rules"
+tier = "hermetic"
+bead = "sf-7nv.4"
+claim = "A waiting goal may start beside a running one only within the project's slots and only when both charters name paths and none overlap; a goal without paths runs alone on either side; leaving goals waiting is always allowed; a goal with paths keeps its sub-goals inside them; and the executive's briefing is the same text for the same inputs."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-driver", "--lib", "goals_run_side_by_side_only"]
+timeout_secs = 900
+
+[[check]]
+id = "executive-run"
+tier = "hermetic"
+bead = "sf-7nv.4"
+claim = "With scripted agents: the owner's message goes to the project's executive, which answers a question without opening anything, and in the same session opens a goal under a definition the project has, a made-up one being refused; the goal's director is briefed with the handoff and what was said, and the thread is the goal's from then on; a goal started with nothing else running starts with no one asked; one started beside a running goal waits for the executive and starts on its word when their paths are apart; at the project's limit a goal queues; a goal with no paths is refused a start beside another whatever the executive says, and starts by itself when nothing else runs; and the executive's record survives a restart."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-driver", "--test", "walk", "the_owner_talks_to_the_executive"]
+timeout_secs = 900
+
+[[check]]
+id = "zig-executive"
+tier = "owner"
+bead = "sf-7nv.4"
+claim = "On temporal-sdk-zig, a goal was opened by the project's executive from the owner's message in the channel, and started."
+command = ["proofs/tiers_zig_verify.sh", "--executive"]
+timeout_secs = 300
+
+[[check]]
 id = "zig-sub-goals"
 tier = "owner"
 bead = "sf-7nv.3"

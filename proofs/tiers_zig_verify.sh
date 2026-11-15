@@ -3,13 +3,14 @@
 # foreman started its beads and reported it ready, the director shipped it,
 # and it landed. Reads the goal's own record and event log.
 #
-#   proofs/tiers_zig_verify.sh [--side-by-side | --sub-goals] [GOAL_ID]
+#   proofs/tiers_zig_verify.sh [--side-by-side | --sub-goals | --executive] [GOAL_ID]
 #                                    default: the newest goal with one
 #
 # With --side-by-side it also requires that two of the sub-goal's beads ran
 # at the same time and were both absorbed. With --sub-goals it requires
 # instead that two sub-goals of one goal were in flight at once and landed
-# in turn.
+# in turn. With --executive it requires instead that the project's executive
+# opened a goal from the owner's message and that goal was started.
 #
 # Read-only.
 set -euo pipefail
@@ -18,6 +19,23 @@ state="${FACTORY_STATE_DIR:-$HOME/.local/state/software-factory}"
 fail() { echo "FAIL: $*" >&2; exit 1; }
 together=0
 if [ "${1:-}" = "--side-by-side" ]; then together=1; shift; fi
+if [ "${1:-}" = "--executive" ]; then
+  # A goal the project's executive opened from the owner's message, started.
+  shift
+  record="$state/projects/temporal-sdk-zig/executive.json"
+  [ -f "$record" ] || fail "temporal-sdk-zig has no executive record at $record"
+  for goal in $(jq -r '.threads[] | .goal // empty' "$record"); do
+    file="$state/goals/$goal/goal.json"
+    [ -f "$file" ] || continue
+    if jq -e '(.handoff // "" | length > 0) and (.phase != "intake")' "$file" >/dev/null; then
+      echo "goal: $goal"
+      echo "ok   opened by the executive after $(jq '.wakes' "$record") wake(s) of it, and started: now $(jq -r .phase "$file")"
+      echo "PASS"
+      exit 0
+    fi
+  done
+  fail "no goal opened by the executive of temporal-sdk-zig has been started"
+fi
 if [ "${1:-}" = "--sub-goals" ]; then
   # Two sub-goals of one goal were in flight at once and both landed, the
   # later one having taken in the default branch before it was verified.

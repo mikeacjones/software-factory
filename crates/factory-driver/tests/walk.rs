@@ -2954,6 +2954,264 @@ fn a_sub_goal_that_collides_with_one_that_landed_is_merged_before_it_ships() {
 }
 
 #[test]
+fn the_owner_talks_to_the_executive_which_opens_goals_and_says_which_run_together() {
+    use factory_driver::goal::{Phase, Supervisor};
+    use factory_slack::socket::Incoming;
+    use serde_json::json;
+
+    let world = World::new("executive", "true");
+    world.with_github("green");
+    let project = world.path("config/projects/toy.toml");
+    let text = std::fs::read_to_string(&project).unwrap()
+        + "\n[executive]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\nslots = 2\n";
+    std::fs::write(&project, text).unwrap();
+    std::fs::create_dir_all(world.path("config/goals/toy")).unwrap();
+    std::fs::write(
+        world.path("config/goals/toy/main.toml"),
+        "id = \"main\"\nflow = \"zig-sdk-bead\"\nship_flow = \"zig-sdk-ship\"\n[director]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(world.path("bin/state")).unwrap();
+    let say = |role: &str, n: u32, json: serde_json::Value| {
+        std::fs::write(
+            world.path(&format!("bin/state/{role}-{n}.json")),
+            json.to_string(),
+        )
+        .unwrap();
+    };
+    let front = |reply: &str, definition: &str, handoff: &str| json!({"reply": reply, "open_goal": {"definition": definition, "handoff": handoff}});
+    let charter = |paths: serde_json::Value| json!({"reply": "Here is the charter.", "ready": true, "objective": "Do it.", "stop_when": "It is done.", "plan": "One sub-goal.", "paths": paths, "edits": []});
+    let asks = json!({
+        "summary": "Decided.", "start": [], "file": [], "edit": [], "dropped_findings": [],
+        "open_subgoals": [], "ship": [], "tell_foreman": [], "ask_owner": "Which bead first?",
+        "complete": false, "evidence": "", "journal_entry": "", "project_memory": ""
+    });
+    let calls = |role: &str| world.calls().iter().filter(|call| call[0] == role).count();
+    // The brief of the nth call of a role.
+    let brief = |role: &str, n: usize| {
+        let all = world.calls();
+        let index = (0..all.len())
+            .filter(|&i| all[i][0] == role)
+            .nth(n - 1)
+            .unwrap();
+        std::fs::read_to_string(world.path(&format!("bin/state/brief-{}.md", index + 1))).unwrap()
+    };
+    let mut sup = Supervisor::new(world.config(), None, vec!["OWNER".to_string()], false).unwrap();
+    let phase = |sup: &Supervisor, id: &str| {
+        sup.goals()
+            .find(|goal| goal.id == id)
+            .map(|goal| goal.phase.clone())
+            .unwrap()
+    };
+    let press = |sup: &mut Supervisor, action: &str, goal: &str| {
+        sup.incoming(Incoming::Action {
+            channel: String::new(),
+            user: "OWNER".to_string(),
+            action_id: action.to_string(),
+            value: goal.to_string(),
+            message_ts: String::new(),
+        })
+        .unwrap();
+    };
+    let write = |sup: &mut Supervisor, thread: &str, text: &str| {
+        sup.incoming(Incoming::Message {
+            channel: String::new(),
+            user: "OWNER".to_string(),
+            text: text.to_string(),
+            ts: "9.9".to_string(),
+            thread_ts: Some(thread.to_string()),
+        })
+        .unwrap();
+    };
+
+    // A question is answered, and opens nothing.
+    say("executive", 1, front("Nothing is running.", "", ""));
+    let (thread, opened) = sup.tell_executive("toy", None, "What is running?").unwrap();
+    assert_eq!(opened, None);
+    assert_eq!(sup.goals().count(), 0);
+    let first = brief("executive", 1);
+    for expected in [
+        "# The owner wrote in the channel of project `toy`\n\n> What is running?",
+        "- `main`: no standing objective",
+        "## Goals of this project that have not ended\n\nNone.",
+    ] {
+        assert!(
+            first.contains(expected),
+            "missing {expected:?} in:\n{first}"
+        );
+    }
+
+    // The same conversation goes on in the same session. A goal of a kind
+    // the project does not have is refused and goes back to that session.
+    say("executive", 2, front("Opening one.", "nope", "x"));
+    say(
+        "executive",
+        3,
+        front(
+            "I have opened a goal. Its director takes this thread from here.",
+            "main",
+            "Nothing else is running on the project.",
+        ),
+    );
+    say(
+        "intake",
+        1,
+        json!({"reply": "Only under src/a?", "ready": false, "objective": "", "stop_when": "", "plan": "", "paths": [], "edits": []}),
+    );
+    let (_, opened) = sup
+        .tell_executive("toy", Some(&thread), "Then ship the feature.")
+        .unwrap();
+    let a = opened.expect("the executive opened a goal");
+    let sessions: Vec<String> = world
+        .calls()
+        .iter()
+        .filter(|call| call[0] == "executive")
+        .map(|call| call[1].clone())
+        .collect();
+    assert_eq!(sessions.len(), 3);
+    assert!(sessions.iter().all(|session| session == &sessions[0]));
+    assert_eq!(phase(&sup, &a), Phase::Intake);
+    // The director was told what the executive learned and what was said.
+    let handed = brief("intake", 1);
+    for expected in [
+        "The owner opened it with this message:\n\n> What is running?\n> \n> Then ship the feature.",
+        "## From the project's executive, who took the owner's message and opened this goal\n\nNothing else is running on the project.",
+        "executive:\n> Nothing is running.",
+    ] {
+        assert!(
+            handed.contains(expected),
+            "missing {expected:?} in:\n{handed}"
+        );
+    }
+    // From here the thread is the goal's: the owner's reply reaches the
+    // director, not the executive.
+    say("intake", 2, charter(json!(["src/a"])));
+    write(&mut sup, &thread, "Yes, only src/a.");
+    assert_eq!(calls("executive"), 3);
+    assert_eq!(calls("intake"), 2);
+    let goal_a = sup.goals().find(|goal| goal.id == a).unwrap().clone();
+    assert_eq!(goal_a.charter.unwrap().paths, ["src/a"]);
+
+    // With nothing else running, Start starts it. No one is asked.
+    say("director", 1, asks.clone());
+    press(&mut sup, "goal_start", &a);
+    assert_eq!(phase(&sup, &a), Phase::Running);
+    assert_eq!(calls("executive"), 3);
+
+    // A second goal, on other paths. Started while the first runs, it
+    // waits for the executive, which lets it run beside the first.
+    say(
+        "executive",
+        4,
+        front(
+            "Opened. It can keep to the docs.",
+            "main",
+            "A goal is running on src/a. This one could keep to docs.",
+        ),
+    );
+    say("intake", 3, charter(json!(["docs"])));
+    let (_, opened) = sup
+        .tell_executive("toy", None, "Also fix the docs.")
+        .unwrap();
+    let b = opened.unwrap();
+    assert!(brief("executive", 4).contains(&format!("- `{a}` (running): Do it.\n  Paths: src/a.")));
+    say(
+        "executive",
+        5,
+        json!({"summary": "The two touch different trees.", "start": [{"goal": b, "reason": "docs only"}]}),
+    );
+    say("director", 2, asks.clone());
+    press(&mut sup, "goal_start", &b);
+    assert_eq!(phase(&sup, &a), Phase::Running);
+    assert_eq!(phase(&sup, &b), Phase::Running);
+    let judged = brief("executive", 5);
+    for expected in [
+        "# Goals are waiting to run on project `toy`".to_string(),
+        "This project may have 2 goals running at once.".to_string(),
+        format!("## Running\n\n- `{a}` (running): Do it.\n  Paths: src/a."),
+        format!("## Waiting, longest first\n\n- `{b}` (waiting to run): Do it.\n  Paths: docs."),
+    ] {
+        assert!(
+            judged.contains(&expected),
+            "missing {expected:?} in:\n{judged}"
+        );
+    }
+    assert_ne!(
+        world
+            .calls()
+            .iter()
+            .rfind(|call| call[0] == "executive")
+            .unwrap()[1],
+        sessions[0],
+        "deciding what runs is a fresh session, not the conversation"
+    );
+
+    // A third, which could touch anything. The project is at its limit, so
+    // it queues with no one asked.
+    say(
+        "executive",
+        6,
+        front("Opened.", "main", "Two goals are running."),
+    );
+    say("intake", 4, charter(json!([])));
+    let (_, opened) = sup
+        .tell_executive("toy", None, "And tidy everything.")
+        .unwrap();
+    let c = opened.unwrap();
+    press(&mut sup, "goal_start", &c);
+    assert_eq!(phase(&sup, &c), Phase::Queued);
+    assert_eq!(calls("executive"), 6);
+
+    // One of the two ends. There is room, but the third has no paths: the
+    // executive's wish to start it is refused by code, and it stays in line.
+    say(
+        "executive",
+        7,
+        json!({"summary": "Start it.", "start": [{"goal": c, "reason": "there is room"}]}),
+    );
+    say(
+        "executive",
+        8,
+        json!({"summary": "It could touch anything, so it waits.", "start": []}),
+    );
+    let b_thread = sup
+        .goals()
+        .find(|goal| goal.id == b)
+        .unwrap()
+        .thread_ts
+        .clone();
+    write(&mut sup, &b_thread, "stop");
+    assert_eq!(phase(&sup, &b), Phase::Stopped);
+    assert_eq!(phase(&sup, &c), Phase::Queued);
+    assert_eq!(calls("executive"), 8);
+    let log =
+        std::fs::read_to_string(world.path("state/projects/toy/executive/events.jsonl")).unwrap();
+    assert!(
+        log.contains("would run beside another goal, and its charter names no paths"),
+        "{log}"
+    );
+
+    // When the last running goal ends, the one in line starts by itself.
+    say("director", 3, asks);
+    write(&mut sup, &thread, "stop");
+    assert_eq!(phase(&sup, &a), Phase::Stopped);
+    assert_eq!(phase(&sup, &c), Phase::Running);
+    assert_eq!(
+        calls("executive"),
+        8,
+        "nothing to judge when nothing else runs"
+    );
+
+    // The executive's record survives a restart.
+    drop(sup);
+    let sup = Supervisor::new(world.config(), None, vec!["OWNER".to_string()], false).unwrap();
+    let executive = sup.executives().next().unwrap();
+    assert_eq!(executive.threads.len(), 3);
+    assert_eq!(executive.threads[&thread].goal.as_deref(), Some(a.as_str()));
+    assert_eq!(executive.wakes, 6);
+}
+
+#[test]
 fn a_finding_is_proved_by_a_failing_test_and_a_fix_by_that_test_passing() {
     let world = World::new("proof", "true");
     // The tester's first reproduction passes when the factory runs it, and

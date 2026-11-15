@@ -25,7 +25,7 @@
 //! code checks.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
@@ -64,6 +64,11 @@ pub struct Charter {
     pub objective: String,
     pub stop_when: String,
     pub plan: String,
+    /// The files and directories the goal's work will change, when its
+    /// director could bound them. With them the goal may run beside another
+    /// whose paths do not overlap; without them it runs alone.
+    #[serde(default)]
+    pub paths: Vec<String>,
 }
 
 /// A change to a bead that already exists.
@@ -294,6 +299,42 @@ pub struct Goal {
     /// When the owner started it while its project was at its limit.
     #[serde(default)]
     pub queued_at: Option<u64>,
+    /// What the project's executive passed on when it opened the goal: its
+    /// note to the director, and what was said before.
+    #[serde(default)]
+    pub handoff: Option<String>,
+}
+
+/// The factory's record of a project's executive: the agent the owner
+/// talks to in the project's channel, above every goal's director.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Executive {
+    pub project: String,
+    /// Its conversations with the owner, by the message that opened each.
+    pub threads: BTreeMap<String, Front>,
+    pub wakes: u32,
+    pub usage: Usage,
+}
+
+/// One conversation between the owner and a project's executive.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Front {
+    pub channel: String,
+    pub opened_by: String,
+    /// The one session of the conversation.
+    pub session: Option<String>,
+    /// What was said, in order: who, then what.
+    pub said: Vec<(String, String)>,
+    /// The goal it became. From then the thread is that goal's.
+    pub goal: Option<String>,
+}
+
+/// Where an agent of the supervisor sits: the directory its runs, its
+/// checkout and its log are kept in, and the names its log carries.
+struct Seat {
+    project: String,
+    id: String,
+    dir: PathBuf,
 }
 
 impl Goal {
@@ -401,6 +442,7 @@ pub fn intake_schema() -> Value {
         "objective": text_schema("The goal, in a sentence or two the owner would recognise as theirs. Empty until ready."),
         "stop_when": text_schema("The condition that ends the goal, checkable against the tracker and the repository. Empty until ready."),
         "plan": text_schema("How you intend to go about it: the first beads in order and why, what you will file or ask about. Empty until ready."),
+        "paths": { "type": "array", "items": { "type": "string" }, "description": "The files and directories this goal's work will change, relative to the repository, when you can bound them with confidence. A goal with paths may run at the same time as another goal whose paths do not overlap; a goal without them runs alone. Empty until ready, and empty for a goal that may touch anything." },
         "edits": { "type": "array", "items": edit_schema(), "description": "Changes to existing beads the owner agreed to in this conversation, such as acceptance criteria. They are shown in the charter and applied when the owner starts the goal." },
     }))
 }
@@ -568,6 +610,21 @@ pub fn decision_problems(
         }
         if strings(sub, "title").trim().is_empty() || strings(sub, "objective").trim().is_empty() {
             problems.push("open_subgoal: it needs a title and an objective".to_string());
+        }
+        // A goal that may run beside another keeps to its charter's paths.
+        let own = goal
+            .charter
+            .as_ref()
+            .map(|charter| charter.paths.as_slice())
+            .unwrap_or_default();
+        for path in paths_of(sub)
+            .iter()
+            .filter(|path| !own.is_empty() && !under(path, own))
+        {
+            problems.push(format!(
+                "open_subgoal: `{path}`, declared for `{id}`, is outside this goal's own paths ({}): another goal may be running beside this one",
+                own.join(", ")
+            ));
         }
     }
     if !openings.is_empty() {
@@ -837,6 +894,16 @@ fn paths_of(work: &Value) -> Vec<String> {
         .collect()
 }
 
+/// Whether a declared path names a file or directory inside the repository,
+/// with no pattern in it.
+fn plain_path(path: &str) -> bool {
+    !path.is_empty()
+        && path != "."
+        && !path.starts_with('/')
+        && !path.split('/').any(|part| part == ".." || part.is_empty())
+        && !path.contains(['*', '?', '[', '\\'])
+}
+
 /// How the rules about paths are worded for one kind of work.
 struct Claims {
     /// The field of the result the problems are about.
@@ -863,6 +930,81 @@ const SUBGOAL_CLAIMS: Claims = Claims {
     overlap: "sub-goals whose paths overlap are worked on one after the other",
 };
 
+const GOAL_CLAIMS: Claims = Claims {
+    field: "start",
+    undeclared_new: "would run beside another goal, and its charter names no paths, so it runs alone: leave it waiting",
+    undeclared_old: "is running with no paths in its charter, so nothing may start beside it",
+    overlap: "goals whose paths overlap run one after the other",
+};
+
+/// What a project's executive returns in a conversation with the owner.
+pub fn front_schema() -> Value {
+    object_schema(json!({
+        "reply": text_schema("What you say to the owner in the thread, written to them directly."),
+        "open_goal": object_schema(json!({
+            "definition": text_schema("To open a goal: the ID of the goal definition it should run under. Empty while there is no goal to open: you are still finding out what the owner wants, or they asked something you can answer yourself."),
+            "handoff": text_schema("What the goal's director should know that the owner's own words do not say: what you found out, what else is running on the project and how this goal relates to it. Empty when opening none."),
+        })),
+    }))
+}
+
+/// What a project's executive returns when goals are waiting to run.
+pub fn schedule_schema() -> Value {
+    object_schema(json!({
+        "summary": text_schema("What you decided and why, for the owner, in a sentence or two."),
+        "start": { "type": "array", "description": "Waiting goals to start now, beside what is running. Empty to leave them waiting.", "items": object_schema(json!({
+            "goal": text_schema("The ID of a waiting goal."),
+            "reason": text_schema("Why it is safe to run beside what is running."),
+        }))},
+    }))
+}
+
+/// Why an executive's choice of goals to start may not be carried out.
+/// `running` and `waiting` are the project's goals in those states.
+pub fn schedule_problems(
+    slots: usize,
+    running: &[&Goal],
+    waiting: &[&Goal],
+    result: &Value,
+) -> Vec<String> {
+    let mut problems = Vec::new();
+    if strings(result, "summary").trim().is_empty() {
+        problems.push("`summary` is empty".to_string());
+    }
+    let paths = |goal: &Goal| {
+        goal.charter
+            .as_ref()
+            .map(|charter| charter.paths.clone())
+            .unwrap_or_default()
+    };
+    let mut claims: Vec<(String, Vec<String>, bool)> = running
+        .iter()
+        .map(|goal| (goal.id.clone(), paths(goal), true))
+        .collect();
+    let mut starting: Vec<&str> = Vec::new();
+    for start in items(result, "start") {
+        let id = strings(start, "goal").trim();
+        if starting.contains(&id) {
+            problems.push(format!("start: `{id}` is listed twice"));
+            continue;
+        }
+        starting.push(id);
+        match waiting.iter().find(|goal| goal.id == id) {
+            Some(goal) => claims.push((goal.id.clone(), paths(goal), false)),
+            None => problems.push(format!("start: `{id}` is not a goal that is waiting")),
+        }
+    }
+    if running.len() + starting.len() > slots {
+        problems.push(format!(
+            "start: that would make {} goals running at once, and this project may run {slots}",
+            running.len() + starting.len()
+        ));
+    } else if !starting.is_empty() {
+        problems.extend(claim_problems(&GOAL_CLAIMS, &claims));
+    }
+    problems
+}
+
 /// Why pieces of work may not go on at the same time. Work runs side by
 /// side only when each piece has declared the paths it will change and no
 /// two declarations overlap: that is what makes it safe before any of it
@@ -873,12 +1015,7 @@ fn claim_problems(words: &Claims, claims: &[(String, Vec<String>, bool)]) -> Vec
     let field = words.field;
     for (name, paths, old) in claims {
         for path in paths.iter().filter(|_| !old) {
-            let plain = !path.is_empty()
-                && path != "."
-                && !path.starts_with('/')
-                && !path.split('/').any(|part| part == ".." || part.is_empty())
-                && !path.contains(['*', '?', '[', '\\']);
-            if !plain {
+            if !plain_path(path) {
                 problems.push(format!(
                     "{field}: `{path}`, declared for `{name}`, is not a plain path inside the repository: name files and directories, with no patterns"
                 ));
@@ -1540,6 +1677,128 @@ pub fn foreman_brief(
     out
 }
 
+/// The most goals a project runs at once: its executive's slots, or its
+/// fixed limit when it has no executive.
+fn goal_limit(project: &Project) -> usize {
+    project
+        .executive
+        .as_ref()
+        .map_or(project.max_goals, |tier| tier.slots)
+        .max(1) as usize
+}
+
+/// One line on a goal, for an executive.
+fn goal_line(goal: &Goal) -> String {
+    let charter = goal.charter.clone().unwrap_or_default();
+    let subgoals: Vec<String> = goal
+        .subgoals
+        .iter()
+        .map(|sub| format!("{} ({})", sub.id, sub.state))
+        .collect();
+    format!(
+        "- `{}` ({}): {}\n  Paths: {}. Sub-goals: {}.\n",
+        goal.id,
+        match goal.phase {
+            Phase::Intake => "being agreed with the owner",
+            Phase::Queued => "waiting to run",
+            Phase::Running => "running",
+            Phase::ProposedComplete => "proposed as complete, waiting for the owner",
+            Phase::Complete => "complete",
+            Phase::Stopped => "stopped",
+        },
+        if charter.objective.trim().is_empty() {
+            "(no charter yet)".to_string()
+        } else {
+            truncate(&charter.objective.replace('\n', " "), 400)
+        },
+        if charter.paths.is_empty() {
+            "none declared, so it runs alone".to_string()
+        } else {
+            charter.paths.join(", ")
+        },
+        if subgoals.is_empty() {
+            "none".to_string()
+        } else {
+            subgoals.join(", ")
+        },
+    )
+}
+
+/// The briefing that opens an executive's conversation with the owner.
+pub fn front_brief(
+    project: &str,
+    text: &str,
+    definitions: &[GoalDefinition],
+    goals: &[&Goal],
+    tracker: &[Summary],
+    memory: &str,
+) -> String {
+    let mut out = format!(
+        "# The owner wrote in the channel of project `{project}`\n\n{}\n\n## The kinds of goal you can open\n\n",
+        quote_plain(text)
+    );
+    for definition in definitions {
+        out.push_str(&format!(
+            "- `{}`{}: {}\n",
+            definition.id,
+            if definition.default {
+                " (the usual one)"
+            } else {
+                ""
+            },
+            match (&definition.objective, &definition.stop_when) {
+                (Some(objective), Some(stop)) => format!("{objective} Stop when: {stop}"),
+                (Some(objective), None) => objective.clone(),
+                _ => "no standing objective; the owner says what it is for".to_string(),
+            }
+        ));
+    }
+    out.push_str("\n## Goals of this project that have not ended\n\n");
+    let live: Vec<&&Goal> = goals
+        .iter()
+        .filter(|goal| !matches!(goal.phase, Phase::Complete | Phase::Stopped))
+        .collect();
+    if live.is_empty() {
+        out.push_str("None.\n");
+    }
+    for goal in live {
+        out.push_str(&goal_line(goal));
+    }
+    out.push_str(&format!(
+        "\n## The tracker: open work, most urgent first\n\n{}\n## Project memory\n\n{}\n\nReturn the structured result. Your reply is posted in the thread as written.\n",
+        table(tracker, &[]),
+        if memory.trim().is_empty() {
+            "(empty)"
+        } else {
+            memory.trim()
+        },
+    ));
+    out
+}
+
+/// The briefing for an executive deciding which waiting goals may start.
+/// The same inputs give the same text.
+pub fn schedule_brief(project: &str, slots: usize, running: &[&Goal], waiting: &[&Goal]) -> String {
+    let mut out = format!(
+        "# Goals are waiting to run on project `{project}`\n\nThis project may have {slots} goals running at once. That is a limit, not a target. A waiting goal may start beside a running one only when both have paths in their charters and none overlap, which code checks, and only when you judge that they cannot collide.\n\n## Running\n\n"
+    );
+    for goal in running {
+        out.push_str(&goal_line(goal));
+    }
+    out.push_str("\n## Waiting, longest first\n\n");
+    for goal in waiting {
+        out.push_str(&goal_line(goal));
+        if let Some(charter) = &goal.charter {
+            out.push_str(&format!(
+                "  Its plan: {}\n",
+                truncate(&charter.plan.replace('\n', " "), 800)
+            ));
+        }
+    }
+    out.push_str("\nDecide which waiting goals, if any, start now. One you leave waiting starts by itself when a running goal ends. Return the structured result; code checks it and sends back what it refuses.\n");
+    out
+}
+
 fn quote_plain(text: &str) -> String {
     text.lines()
         .map(|line| format!("> {line}"))
@@ -1579,6 +1838,19 @@ pub fn check_definitions(config: &ConfigDir) -> Result<Vec<String>, DriverError>
     let mut lines = Vec::new();
     for id in config.projects()? {
         let project = config.project(&id)?;
+        if let Some(tier) = &project.executive {
+            if !factory.allowed_models.contains(&tier.model) {
+                return Err(DriverError::Preflight(format!(
+                    "project `{id}`: its executive's model `{}` is not allowed",
+                    tier.model
+                )));
+            }
+            config.role_prompt("executive")?;
+            lines.push(format!(
+                "{id}: executive {} ({}), {} goal(s) at a time",
+                tier.model, tier.effort, tier.slots
+            ));
+        }
         for definition in config.goal_definitions(&id)? {
             let refuse = |reason: String| {
                 DriverError::Preflight(format!(
@@ -1679,6 +1951,8 @@ pub struct Supervisor {
     /// Channel ID to project ID, for projects that have goal definitions.
     channels: BTreeMap<String, String>,
     goals: BTreeMap<String, Goal>,
+    /// Each project's executive, for the projects that have one.
+    executives: BTreeMap<String, Executive>,
     /// Whether pipelines post to Slack threads of their own.
     unit_slack: bool,
     sender: Sender<Internal>,
@@ -1723,6 +1997,19 @@ impl Supervisor {
                 goals.insert(goal.id.clone(), goal);
             }
         }
+        let mut executives = BTreeMap::new();
+        let dir = factory.state_dir.join("projects");
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path().join("executive.json");
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                let executive: Executive =
+                    serde_json::from_str(&text).map_err(|source| DriverError::Json {
+                        path: path.clone(),
+                        source,
+                    })?;
+                executives.insert(executive.project.clone(), executive);
+            }
+        }
         let (sender, receiver) = mpsc::channel();
         Ok(Supervisor {
             config,
@@ -1731,6 +2018,7 @@ impl Supervisor {
             owners,
             channels,
             goals,
+            executives,
             unit_slack,
             sender,
             receiver,
@@ -1778,13 +2066,64 @@ impl Supervisor {
         self.factory.state_dir.join("goals").join(goal)
     }
 
-    fn log(&self, goal: &Goal, kind: &str, data: Value) {
+    fn seat(&self, goal: &Goal) -> Seat {
+        Seat {
+            project: goal.project.clone(),
+            id: goal.id.clone(),
+            dir: self.dir(&goal.id),
+        }
+    }
+
+    /// Where a project's executive sits: beside the project's memory.
+    fn executive_seat(&self, project: &str) -> Seat {
+        Seat {
+            project: project.to_string(),
+            id: format!("{project}-executive"),
+            dir: self
+                .factory
+                .state_dir
+                .join("projects")
+                .join(project)
+                .join("executive"),
+        }
+    }
+
+    fn log_at(&self, seat: &Seat, kind: &str, data: Value) {
         let log = EventLog::new(
-            self.dir(&goal.id).join("events.jsonl"),
-            ProjectId::new(goal.project.clone()),
-            UnitId::new(goal.id.clone()),
+            seat.dir.join("events.jsonl"),
+            ProjectId::new(seat.project.clone()),
+            UnitId::new(seat.id.clone()),
         );
         let _ = log.append(kind, None, data);
+    }
+
+    fn log(&self, goal: &Goal, kind: &str, data: Value) {
+        self.log_at(&self.seat(goal), kind, data);
+    }
+
+    fn save_executive(&mut self, executive: Executive) -> Result<(), DriverError> {
+        let seat = self.executive_seat(&executive.project);
+        std::fs::create_dir_all(seat.dir.join("runs")).map_err(crate::io(&seat.dir))?;
+        let path = seat.dir.with_file_name("executive.json");
+        let text =
+            serde_json::to_string_pretty(&executive).map_err(|source| DriverError::Json {
+                path: path.clone(),
+                source,
+            })?;
+        let temp = seat.dir.with_file_name("executive.json.tmp");
+        std::fs::write(&temp, text).map_err(crate::io(&temp))?;
+        std::fs::rename(&temp, &path).map_err(crate::io(&path))?;
+        self.executives.insert(executive.project.clone(), executive);
+        Ok(())
+    }
+
+    /// Post in a thread that is not, or not yet, a goal's.
+    fn post(&self, channel: &str, thread: &str, text: &str) {
+        if let Some(slack) = &self.slack
+            && let Err(err) = slack.post(channel, Some(thread), text)
+        {
+            eprintln!("goals: slack: {err}");
+        }
     }
 
     fn save(&mut self, goal: Goal) -> Result<(), DriverError> {
@@ -1871,7 +2210,13 @@ impl Supervisor {
                 }
                 match thread_ts {
                     None => {
-                        if let Some(project) = self.channels.get(&channel).cloned() {
+                        let Some(project) = self.channels.get(&channel).cloned() else {
+                            return Ok(());
+                        };
+                        // A project with an executive is spoken to through it.
+                        if self.config.project(&project)?.executive.is_some() {
+                            self.front_turn(&project, &channel, &ts, &user, &text)?;
+                        } else {
                             self.open_goal(&project, &channel, &ts, &user, &text)?;
                         }
                         Ok(())
@@ -1882,10 +2227,24 @@ impl Supervisor {
                             .values()
                             .find(|goal| goal.channel == channel && goal.thread_ts == root)
                             .map(|goal| goal.id.clone());
-                        match goal {
-                            Some(id) => self.owner_said(&id, &text),
+                        // A conversation with an executive that has not
+                        // become a goal goes on with the executive.
+                        let front = self
+                            .executives
+                            .values()
+                            .find(|executive| {
+                                executive.threads.get(&root).is_some_and(|front| {
+                                    front.channel == channel && front.goal.is_none()
+                                })
+                            })
+                            .map(|executive| executive.project.clone());
+                        match (goal, front) {
+                            (Some(id), _) => self.owner_said(&id, &text),
+                            (None, Some(project)) => self
+                                .front_turn(&project, &channel, &root, &user, &text)
+                                .map(|_| ()),
                             // A pipeline's own thread: its driver reads it.
-                            None => Ok(()),
+                            (None, None) => Ok(()),
                         }
                     }
                 }
@@ -1935,6 +2294,24 @@ impl Supervisor {
         }) else {
             return Ok(None);
         };
+        let id = self.create_goal(project, channel, ts, user, &definition.id, text, None)?;
+        self.intake_turn(&id, text)?;
+        Ok(Some(id))
+    }
+
+    /// Record a new goal, still to be agreed, in the thread of the message
+    /// that opened it. Returns its ID.
+    #[allow(clippy::too_many_arguments)]
+    fn create_goal(
+        &mut self,
+        project: &str,
+        channel: &str,
+        ts: &str,
+        user: &str,
+        definition: &str,
+        text: &str,
+        handoff: Option<String>,
+    ) -> Result<String, DriverError> {
         // Two goals opened in the same second must not share a name.
         let mut name = format!("{project}-g{}", now_unix());
         let mut copy = 1;
@@ -1945,7 +2322,7 @@ impl Supervisor {
         let goal = Goal {
             id: name,
             project: project.to_string(),
-            definition: definition.id.clone(),
+            definition: definition.to_string(),
             phase: Phase::Intake,
             channel: channel.to_string(),
             thread_ts: ts.to_string(),
@@ -1965,16 +2342,303 @@ impl Supervisor {
             usage: Usage::default(),
             started_at: now_unix(),
             queued_at: None,
+            handoff,
         };
         let id = goal.id.clone();
         self.save(goal.clone())?;
         self.log(
             &goal,
             "goal.opened",
-            json!({ "text": text, "definition": goal.definition }),
+            json!({ "text": text, "definition": goal.definition, "by_executive": goal.handoff.is_some() }),
         );
-        self.intake_turn(&id, text)?;
-        Ok(Some(id))
+        Ok(id)
+    }
+
+    /// Say something to a project's executive as the owner would in its
+    /// channel, without Slack: `thread` continues a conversation, `None`
+    /// opens one. Returns the conversation's thread and the goal it became,
+    /// if it has.
+    pub fn tell_executive(
+        &mut self,
+        project: &str,
+        thread: Option<&str>,
+        text: &str,
+    ) -> Result<(String, Option<String>), DriverError> {
+        let owner = self.owners.first().cloned().unwrap_or_default();
+        let opened = format!(
+            "{}.{}",
+            now_unix(),
+            self.executives.len() + self.goals.len()
+        );
+        let thread = thread.map(str::to_string).unwrap_or(opened);
+        let goal = self.front_turn(project, "", &thread, &owner, text)?;
+        Ok((thread, goal))
+    }
+
+    pub fn executives(&self) -> impl Iterator<Item = &Executive> {
+        self.executives.values()
+    }
+
+    /// One turn of the owner's conversation with a project's executive. It
+    /// answers, and when it knows what goal the owner wants it opens one:
+    /// from then the thread belongs to that goal and its director. Returns
+    /// the goal, if this turn opened it.
+    fn front_turn(
+        &mut self,
+        project_id: &str,
+        channel: &str,
+        root: &str,
+        user: &str,
+        text: &str,
+    ) -> Result<Option<String>, DriverError> {
+        let project = self.config.project(project_id)?;
+        let Some(tier) = project.executive.clone() else {
+            return Ok(None);
+        };
+        let definitions = self.config.goal_definitions(project_id)?;
+        let mut executive = self
+            .executives
+            .get(project_id)
+            .cloned()
+            .unwrap_or_else(|| Executive {
+                project: project_id.to_string(),
+                ..Executive::default()
+            });
+        let mut front = executive
+            .threads
+            .get(root)
+            .cloned()
+            .unwrap_or_else(|| Front {
+                channel: channel.to_string(),
+                opened_by: user.to_string(),
+                ..Front::default()
+            });
+        front.said.push(("owner".to_string(), text.to_string()));
+        // Its seat has to exist before it runs.
+        executive.threads.insert(root.to_string(), front.clone());
+        self.save_executive(executive.clone())?;
+        let seat = self.executive_seat(project_id);
+        self.log_at(
+            &seat,
+            "owner.message",
+            json!({ "thread": root, "text": text }),
+        );
+
+        let (session, prompt) = match &front.session {
+            Some(session) => (
+                Session::Resume(session.clone()),
+                format!(
+                    "The owner replied in the thread:\n\n{}\n",
+                    quote_plain(text)
+                ),
+            ),
+            None => {
+                let tracker = bead_source(&project).list_open()?;
+                let memory =
+                    std::fs::read_to_string(self.memory_path(project_id)).unwrap_or_default();
+                let goals: Vec<&Goal> = self
+                    .goals
+                    .values()
+                    .filter(|goal| goal.project == project_id)
+                    .collect();
+                (
+                    Session::Fresh,
+                    front_brief(project_id, text, &definitions, &goals, &tracker, &memory),
+                )
+            }
+        };
+        let known: Vec<String> = definitions.iter().map(|d| d.id.clone()).collect();
+        let check = |result: &Value| {
+            let mut problems = Vec::new();
+            if strings(result, "reply").trim().is_empty() {
+                problems.push("`reply` is empty".to_string());
+            }
+            let wanted = result
+                .get("open_goal")
+                .map(|open| strings(open, "definition").trim())
+                .unwrap_or("");
+            if !wanted.is_empty() && !known.iter().any(|id| id == wanted) {
+                problems.push(format!(
+                    "open_goal: `{wanted}` is not a goal definition of this project: {}",
+                    known.join(", ")
+                ));
+            }
+            problems
+        };
+        let turn = Turn {
+            who: "executive",
+            role: "executive",
+            tier,
+            place: None,
+            schema: front_schema(),
+            session,
+            prompt,
+        };
+        let (result, session) = match self.run_agent(&seat, &mut executive.usage, turn, &check) {
+            Ok(done) => done,
+            Err(reason) => {
+                self.post(
+                    channel,
+                    root,
+                    &format!(
+                        ":warning: I could not answer ({}). Reply again to retry.",
+                        escape(&reason)
+                    ),
+                );
+                self.save_executive(executive)?;
+                return Ok(None);
+            }
+        };
+        executive.wakes += 1;
+        front.session = Some(session);
+        let reply = strings(&result, "reply").to_string();
+        front.said.push(("executive".to_string(), reply.clone()));
+        self.post(
+            channel,
+            root,
+            &format!(":office: *Executive*\n{}", escape(&reply)),
+        );
+        let open = result.get("open_goal").cloned().unwrap_or_default();
+        let definition = strings(&open, "definition").trim().to_string();
+        if definition.is_empty() {
+            executive.threads.insert(root.to_string(), front);
+            self.save_executive(executive)?;
+            return Ok(None);
+        }
+        // The goal takes over the thread. Its director is told what was
+        // said here, since it shares no session with the executive.
+        let conversation = front
+            .said
+            .iter()
+            .map(|(who, said)| format!("{who}:\n{}", quote_plain(said)))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let handoff = format!(
+            "{}\n\nWhat was said before the goal was opened:\n\n{conversation}",
+            strings(&open, "handoff").trim()
+        );
+        let asked = front
+            .said
+            .iter()
+            .filter(|(who, _)| who == "owner")
+            .map(|(_, said)| said.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let opened_by = front.opened_by.clone();
+        let goal = self.create_goal(
+            project_id,
+            channel,
+            root,
+            &opened_by,
+            &definition,
+            &asked,
+            Some(handoff.trim().to_string()),
+        )?;
+        front.goal = Some(goal.clone());
+        executive.threads.insert(root.to_string(), front);
+        self.save_executive(executive)?;
+        self.log_at(
+            &seat,
+            "goal.opened",
+            json!({ "thread": root, "goal": goal, "definition": definition }),
+        );
+        self.intake_turn(&goal, &asked)?;
+        Ok(Some(goal))
+    }
+
+    /// Ask a project's executive which waiting goals may start beside the
+    /// ones running. Called only when that is a judgement: something is
+    /// running, something waits, and there is room. If the executive cannot
+    /// be run, the goals stay in line and start when a running one ends.
+    fn schedule(&mut self, project_id: &str) -> Result<(), DriverError> {
+        let project = self.config.project(project_id)?;
+        let Some(tier) = project.executive.clone() else {
+            return Ok(());
+        };
+        let slots = tier.slots.max(1) as usize;
+        let running: Vec<Goal> = self.active(project_id).into_iter().cloned().collect();
+        let mut waiting: Vec<Goal> = self
+            .goals
+            .values()
+            .filter(|goal| goal.project == project_id && goal.phase == Phase::Queued)
+            .cloned()
+            .collect();
+        waiting.sort_by_key(|goal| (goal.queued_at.unwrap_or(u64::MAX), goal.id.clone()));
+        if waiting.is_empty() || running.is_empty() || running.len() >= slots {
+            return Ok(());
+        }
+        let mut executive = self
+            .executives
+            .get(project_id)
+            .cloned()
+            .unwrap_or_else(|| Executive {
+                project: project_id.to_string(),
+                ..Executive::default()
+            });
+        self.save_executive(executive.clone())?;
+        let seat = self.executive_seat(project_id);
+        let (now, later): (Vec<&Goal>, Vec<&Goal>) =
+            (running.iter().collect(), waiting.iter().collect());
+        let check = |result: &Value| schedule_problems(slots, &now, &later, result);
+        let turn = Turn {
+            who: "executive",
+            role: "executive",
+            tier,
+            place: None,
+            schema: schedule_schema(),
+            session: Session::Fresh,
+            prompt: schedule_brief(project_id, slots, &now, &later),
+        };
+        let result = match self.run_agent(&seat, &mut executive.usage, turn, &check) {
+            Ok((result, _)) => result,
+            Err(reason) => {
+                self.log_at(&seat, "executive.failed", json!({ "reason": reason }));
+                return self.save_executive(executive);
+            }
+        };
+        executive.wakes += 1;
+        self.save_executive(executive)?;
+        let starts: Vec<String> = items(&result, "start")
+            .iter()
+            .map(|start| strings(start, "goal").trim().to_string())
+            .collect();
+        self.log_at(
+            &seat,
+            "executive.decided",
+            json!({ "start": starts, "waiting": waiting.iter().map(|goal| &goal.id).collect::<Vec<_>>() }),
+        );
+        let summary = quote(&truncate(strings(&result, "summary"), 1500));
+        for goal in &waiting {
+            if starts.contains(&goal.id) {
+                self.start_goal(
+                    &goal.id,
+                    &format!(":office: *Executive*\n{summary}\n:rocket: *Goal started*, beside what is already running. It now moves on events: a pipeline ending, or a message from you here. `stop` ends it."),
+                )?;
+            } else {
+                self.say(
+                    goal,
+                    &format!(":office: *Executive*\n{summary}\nThis goal stays in line and starts when a running one ends."),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Start a goal that was waiting in line.
+    fn start_goal(&mut self, id: &str, announcement: &str) -> Result<(), DriverError> {
+        let Some(mut goal) = self.goals.get(id).cloned() else {
+            return Ok(());
+        };
+        goal.phase = Phase::Running;
+        goal.inbox.insert(0, Happening::Started);
+        self.log(
+            &goal,
+            "goal.unqueued",
+            json!({ "queued_at": goal.queued_at }),
+        );
+        self.say(&goal, announcement);
+        self.save(goal)?;
+        self.wake(id)
     }
 
     /// The goals of a project that hold one of its places: running, or
@@ -1992,31 +2656,28 @@ impl Supervisor {
     /// Start the goals that have waited longest, while their project has a
     /// place free. Called whenever a goal ends.
     fn start_queued(&mut self, project: &str) -> Result<(), DriverError> {
-        let limit = self.config.project(project)?.max_goals.max(1) as usize;
+        let config = self.config.project(project)?;
+        let limit = goal_limit(&config);
         loop {
-            if self.active(project).len() >= limit {
+            let active = self.active(project).len();
+            if active >= limit {
                 return Ok(());
+            }
+            // Beside a goal that is running, a waiting one starts only on
+            // the executive's word.
+            if active > 0 && config.executive.is_some() {
+                return self.schedule(project);
             }
             let next = self
                 .goals
                 .values()
                 .filter(|goal| goal.project == project && goal.phase == Phase::Queued)
                 .min_by_key(|goal| (goal.queued_at.unwrap_or(u64::MAX), goal.id.clone()))
-                .cloned();
-            let Some(mut goal) = next else {
+                .map(|goal| goal.id.clone());
+            let Some(id) = next else {
                 return Ok(());
             };
-            let id = goal.id.clone();
-            goal.phase = Phase::Running;
-            goal.inbox.insert(0, Happening::Started);
-            self.log(
-                &goal,
-                "goal.unqueued",
-                json!({ "queued_at": goal.queued_at }),
-            );
-            self.say(&goal, ":rocket: *Goal started.* The goal ahead of it has ended. It now moves on events: a pipeline ending, or a message from you here. `stop` ends it.");
-            self.save(goal)?;
-            self.wake(&id)?;
+            self.start_goal(&id, ":rocket: *Goal started.* The goal ahead of it has ended. It now moves on events: a pipeline ending, or a message from you here. `stop` ends it.")?;
         }
     }
 
@@ -2106,16 +2767,37 @@ impl Supervisor {
                     .iter()
                     .map(|other| format!("`{}`", other.id))
                     .collect();
-                if ahead.len() >= project.max_goals.max(1) as usize {
+                let limit = goal_limit(&project);
+                let full = ahead.len() >= limit;
+                // With room left and another goal running, whether this one
+                // may run beside it is the executive's to judge.
+                let judged = !full && !ahead.is_empty() && project.executive.is_some();
+                if full || judged {
                     goal.phase = Phase::Queued;
                     goal.queued_at = Some(now_unix());
-                    self.log(&goal, "goal.queued", json!({ "behind": ahead }));
-                    self.say(&goal, &format!(
-                        ":hourglass_flowing_sand: *Goal queued.* This project runs {} goal(s) at a time, and {} is running. This one starts by itself when that ends. What you write here meanwhile is kept for its director; `stop` takes it out of the queue.",
-                        project.max_goals.max(1),
-                        ahead.join(", ")
-                    ));
-                    return self.save(goal);
+                    self.log(
+                        &goal,
+                        "goal.queued",
+                        json!({ "behind": ahead, "judged": judged }),
+                    );
+                    self.say(&goal, &if judged {
+                        format!(
+                            ":hourglass_flowing_sand: *Goal waiting.* {} is running. The project's executive is deciding whether this one can safely run beside it; if not, it starts by itself when that ends. What you write here meanwhile is kept for its director; `stop` takes it out of the line.",
+                            ahead.join(", ")
+                        )
+                    } else {
+                        format!(
+                            ":hourglass_flowing_sand: *Goal queued.* This project runs {limit} goal(s) at a time, and {} is running. This one starts by itself when that ends. What you write here meanwhile is kept for its director; `stop` takes it out of the queue.",
+                            ahead.join(", ")
+                        )
+                    });
+                    let project = goal.project.clone();
+                    self.save(goal)?;
+                    return if judged {
+                        self.schedule(&project)
+                    } else {
+                        Ok(())
+                    };
                 }
                 goal.phase = Phase::Running;
                 goal.inbox.push(Happening::Started);
@@ -2202,16 +2884,16 @@ impl Supervisor {
     /// the director, a sub-goal's branch for its foreman.
     fn checkout(
         &self,
-        goal: &Goal,
+        home: &Path,
         project: &Project,
         place: &Option<(String, String)>,
     ) -> Result<PathBuf, DriverError> {
         let (dir, head) = match place {
-            Some((name, rev)) => (self.dir(&goal.id).join(name), rev.clone()),
+            Some((name, rev)) => (home.join(name), rev.clone()),
             None => {
                 factory_git::fetch(&project.repo, &project.remote)?;
                 (
-                    self.dir(&goal.id).join("checkout"),
+                    home.join("checkout"),
                     format!("{}/{}", project.remote, project.default_branch),
                 )
             }
@@ -2229,7 +2911,8 @@ impl Supervisor {
     /// session.
     fn run_agent(
         &mut self,
-        goal: &mut Goal,
+        seat: &Seat,
+        spent: &mut Usage,
         turn: Turn,
         check: &dyn Fn(&Value) -> Vec<String>,
     ) -> Result<(Value, String), String> {
@@ -2244,16 +2927,16 @@ impl Supervisor {
         } = turn;
         let project = self
             .config
-            .project(&goal.project)
+            .project(&seat.project)
             .map_err(|err| err.to_string())?;
         let cwd = self
-            .checkout(goal, &project, &place)
+            .checkout(&seat.dir, &project, &place)
             .map_err(|err| err.to_string())?;
         let system_prompt = self
             .config
             .role_prompt(role)
             .map_err(|err| err.to_string())?;
-        let dir = self.dir(&goal.id).join("runs");
+        let dir = seat.dir.join("runs");
         for attempt in 1..=3 {
             let run = std::fs::read_dir(&dir)
                 .map(|entries| entries.count())
@@ -2293,9 +2976,9 @@ impl Supervisor {
                 usage.rate_limit.as_ref(),
                 &spec.model,
             );
-            goal.usage.add(&usage);
-            self.log(
-                goal,
+            spent.add(&usage);
+            self.log_at(
+                seat,
                 &format!("{who}.ran"),
                 json!({ "role": role, "run": run, "account": account, "outcome": finished.outcome.name(), "session": finished.transcript.session_id, "usage": usage }),
             );
@@ -2306,8 +2989,8 @@ impl Supervisor {
                     if problems.is_empty() {
                         return Ok((result, id));
                     }
-                    self.log(
-                        goal,
+                    self.log_at(
+                        seat,
                         &format!("{who}.refused"),
                         json!({ "problems": problems }),
                     );
@@ -2407,6 +3090,15 @@ impl Supervisor {
             None => {
                 let memory =
                     std::fs::read_to_string(self.memory_path(&goal.project)).unwrap_or_default();
+                let handed = goal
+                    .handoff
+                    .as_deref()
+                    .map(|handoff| {
+                        format!(
+                            "\n## From the project's executive, who took the owner's message and opened this goal\n\n{handoff}\n"
+                        )
+                    })
+                    .unwrap_or_default();
                 let standing = match (&definition.objective, &definition.stop_when) {
                     (None, None) => String::new(),
                     (objective, stop) => format!(
@@ -2418,7 +3110,7 @@ impl Supervisor {
                 (
                     Session::Fresh,
                     format!(
-                        "# A new goal on project `{}`\n\nThe owner opened it with this message:\n\n{}\n{standing}\n## The tracker: open work, most urgent first\n\n{}\n## Project memory\n\n{}\n\n## What the director of this goal may decide once it runs\n\n{}\n",
+                        "# A new goal on project `{}`\n\nThe owner opened it with this message:\n\n{}\n{handed}{standing}\n## The tracker: open work, most urgent first\n\n{}\n## Project memory\n\n{}\n\n## What the director of this goal may decide once it runs\n\n{}\n",
                         goal.project,
                         quote_plain(owner_text),
                         table(&tracker, &[]),
@@ -2445,6 +3137,11 @@ impl Supervisor {
                         problems.push(format!("ready, but `{key}` is empty"));
                     }
                 }
+                for path in paths_of(result).iter().filter(|path| !plain_path(path)) {
+                    problems.push(format!(
+                        "paths: `{path}` is not a plain path inside the repository: name files and directories, with no patterns"
+                    ));
+                }
             }
             problems
         };
@@ -2457,7 +3154,8 @@ impl Supervisor {
             session,
             prompt,
         };
-        let result = self.run_agent(&mut goal, turn, &check);
+        let seat = self.seat(&goal);
+        let result = self.run_agent(&seat, &mut goal.usage, turn, &check);
         let (result, session) = match result {
             Ok(done) => done,
             Err(reason) => {
@@ -2479,6 +3177,7 @@ impl Supervisor {
                 objective: strings(&result, "objective").to_string(),
                 stop_when: strings(&result, "stop_when").to_string(),
                 plan: strings(&result, "plan").to_string(),
+                paths: paths_of(&result),
             });
             goal.charter_edits = edits_of(&result, "edits");
             let mut text = format!(
@@ -2488,6 +3187,13 @@ impl Supervisor {
                 quote(strings(&result, "stop_when")),
                 quote(&truncate(strings(&result, "plan"), 2500)),
             );
+            let paths = paths_of(&result);
+            if !paths.is_empty() {
+                text.push_str(&format!(
+                    "\n\n:file_folder: *Paths*\n{}\n_Its work keeps to these, so it may run beside another goal that touches none of them._",
+                    quote(&paths.join("\n"))
+                ));
+            }
             if !goal.charter_edits.is_empty() {
                 text.push_str(&format!(
                     "\n\n:pencil2: *Starting also makes these changes to beads, as we agreed*\n{}",
@@ -2662,7 +3368,8 @@ impl Supervisor {
             session: Session::Fresh,
             prompt: brief,
         };
-        let result = self.run_agent(&mut goal, turn, &check);
+        let seat = self.seat(&goal);
+        let result = self.run_agent(&seat, &mut goal.usage, turn, &check);
         let result = match result {
             Ok((result, _)) => result,
             Err(reason) => return self.director_failed(goal, &reason),
@@ -3039,7 +3746,8 @@ impl Supervisor {
             session: Session::Fresh,
             prompt: brief,
         };
-        let result = match self.run_agent(&mut goal, turn, &check) {
+        let seat = self.seat(&goal);
+        let result = match self.run_agent(&seat, &mut goal.usage, turn, &check) {
             Ok((result, _)) => result,
             Err(reason) => return self.foreman_failed(goal, index, &reason),
         };
@@ -3277,7 +3985,14 @@ impl Supervisor {
             pull_request: None,
             foreman: None,
             added: Vec::new(),
-            paths: paths_of(spec),
+            paths: match paths_of(spec) {
+                own if !own.is_empty() => own,
+                _ => goal
+                    .charter
+                    .as_ref()
+                    .map(|charter| charter.paths.clone())
+                    .unwrap_or_default(),
+            },
             queued_at: None,
         })
     }
@@ -4491,6 +5206,98 @@ mod tests {
             foreman_says(&tiered("allow"), &fenced, start(json!(["src/b"]))),
             [
                 "start: `src/b`, declared for `toy-1`, is outside this sub-goal's own paths (src/a): another sub-goal is being worked on beside this one"
+            ]
+        );
+    }
+
+    #[test]
+    fn goals_run_side_by_side_only_on_charters_whose_paths_do_not_overlap() {
+        let with_paths = |id: &str, phase: Phase, paths: &[&str]| {
+            let mut goal = goal();
+            goal.id = id.into();
+            goal.phase = phase;
+            goal.charter.as_mut().unwrap().paths =
+                paths.iter().map(|path| path.to_string()).collect();
+            goal
+        };
+        let running = with_paths("toy-g1", Phase::Running, &["src/worker"]);
+        let apart = with_paths("toy-g2", Phase::Queued, &["src/client"]);
+        let clashing = with_paths("toy-g3", Phase::Queued, &["src/worker/poll.zig"]);
+        let unbounded = with_paths("toy-g4", Phase::Queued, &[]);
+        let waiting = [&apart, &clashing, &unbounded];
+        let says = |slots: usize, running: &[&Goal], start: &[&str]| {
+            let start: Vec<Value> = start
+                .iter()
+                .map(|goal| json!({"goal": goal, "reason": ""}))
+                .collect();
+            schedule_problems(
+                slots,
+                running,
+                &waiting,
+                &json!({"summary": "Decided.", "start": start}),
+            )
+        };
+        // Apart from what is running: it may start. Leaving all waiting is
+        // always allowed, since they start when a running goal ends.
+        assert!(says(2, &[&running], &["toy-g2"]).is_empty());
+        assert!(says(2, &[&running], &[]).is_empty());
+        assert_eq!(
+            says(2, &[&running], &["toy-g3"]),
+            [
+                "start: `toy-g1` (`src/worker`) and `toy-g3` (`src/worker/poll.zig`) would change the same files: goals whose paths overlap run one after the other"
+            ]
+        );
+        // A goal that could touch anything runs alone, whichever side it is on.
+        assert_eq!(
+            says(2, &[&running], &["toy-g4"]),
+            [
+                "start: `toy-g4` would run beside another goal, and its charter names no paths, so it runs alone: leave it waiting"
+            ]
+        );
+        let loose = with_paths("toy-g1", Phase::Running, &[]);
+        assert_eq!(
+            says(2, &[&loose], &["toy-g2"]),
+            [
+                "start: `toy-g1` is running with no paths in its charter, so nothing may start beside it"
+            ]
+        );
+        // The limit, and goals that are not waiting.
+        assert_eq!(
+            says(2, &[&running], &["toy-g2", "toy-g4"]),
+            ["start: that would make 3 goals running at once, and this project may run 2"]
+        );
+        assert_eq!(
+            says(3, &[&running], &["toy-g9"]),
+            ["start: `toy-g9` is not a goal that is waiting"]
+        );
+        // The executive is shown each goal's paths, and the same text each time.
+        let brief = schedule_brief("toy", 2, &[&running], &[&apart, &unbounded]);
+        assert_eq!(
+            brief,
+            schedule_brief("toy", 2, &[&running], &[&apart, &unbounded])
+        );
+        for expected in [
+            "This project may have 2 goals running at once. That is a limit, not a target.",
+            "- `toy-g1` (running): Ship it\n  Paths: src/worker.",
+            "- `toy-g4` (waiting to run): Ship it\n  Paths: none declared, so it runs alone.",
+            "  Its plan: toy-1 first",
+        ] {
+            assert!(
+                brief.contains(expected),
+                "missing {expected:?} in:\n{brief}"
+            );
+        }
+
+        // A goal with paths keeps its sub-goals inside them.
+        let d = tiered("allow");
+        let fenced = with_paths("toy-g1", Phase::Running, &["src/worker"]);
+        let open = |paths: Value| json!({"open_subgoals": [{"id": "polling", "title": "Polling", "objective": "It polls.", "beads": ["toy-1"], "paths": paths}]});
+        assert!(problems(&d, &fenced, open(json!(["src/worker/poll.zig"]))).is_empty());
+        assert!(problems(&d, &fenced, open(json!([]))).is_empty());
+        assert_eq!(
+            problems(&d, &fenced, open(json!(["src/client"]))),
+            [
+                "open_subgoal: `src/client`, declared for `polling`, is outside this goal's own paths (src/worker): another goal may be running beside this one"
             ]
         );
     }

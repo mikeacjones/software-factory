@@ -127,6 +127,12 @@ pub struct Project {
     /// beyond that waits in a queue and starts when a running one ends.
     #[serde(default = "default_goals")]
     pub max_goals: u32,
+    /// The agent the owner talks to in the project's channel, above every
+    /// goal's director. It opens goals, and decides which may run at the
+    /// same time, up to its slots, which then stand in for `max_goals`.
+    /// Without it a top-level message opens a goal with its director at
+    /// once, and goals queue by `max_goals`.
+    pub executive: Option<Tier>,
     /// What the publication step should know about this project's commit
     /// messages and pull requests, such as the trailers it expects.
     pub publication_note: Option<String>,

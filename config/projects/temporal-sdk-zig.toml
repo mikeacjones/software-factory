@@ -23,6 +23,18 @@ test_patterns = ['^\s*test\s+"', '\btesting\.expect', '\bexpect(Equal|EqualStrin
 # deps/sdk-core and is not factory work yet.
 forbidden_paths = [".github/**", ".beads/**", ".claude/**", "deps/sdk-core", "deps/sdk-core/**", "worktrees/**"]
 
+# The executive is who the owner talks to in #temporal-sdk-zig. A new message
+# in the channel goes to it: it answers, or opens a goal under one of the
+# definitions in goals/temporal-sdk-zig/ and hands the thread to that goal's
+# director. It also decides which goals run at the same time: up to `slots`,
+# and only goals whose charters name paths that do not overlap. A goal that
+# could touch anything runs alone.
+[executive]
+model = "claude-fable-5-2"
+effort = "high"
+timeout_secs = 1800
+slots = 2
+
 [beads]
 kind = "dolt"
 host = "127.0.0.1"
