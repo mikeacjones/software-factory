@@ -95,6 +95,12 @@ pub fn install_release(
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
             .map_err(io(&binary))?;
     }
+    // The engine's command built beside the factory's goes with it, so
+    // that a release is one build of both.
+    let engine = factory.with_file_name("factory-engine");
+    if engine.is_file() {
+        put_program(&engine, &dir.join("factory-engine"))?;
+    }
     let link = current(state_dir);
     let staged = state_dir.join(format!("current.{}", std::process::id()));
     let _ = std::fs::remove_file(&staged);
@@ -116,6 +122,42 @@ pub fn install_release(
         }
     }
     Ok(dir)
+}
+
+/// Copy a program to where it is run from, whole or not at all: it is
+/// written beside its place and moved into it, so that a process already
+/// running the old one goes on undisturbed.
+fn put_program(from: &Path, to: &Path) -> Result<(), DriverError> {
+    use std::os::unix::fs::PermissionsExt;
+    if let Some(dir) = to.parent() {
+        std::fs::create_dir_all(dir).map_err(io(dir))?;
+    }
+    let staged = to.with_extension(format!("new.{}", std::process::id()));
+    std::fs::copy(from, &staged).map_err(io(from))?;
+    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))
+        .map_err(io(&staged))?;
+    std::fs::rename(&staged, to).map_err(io(to))
+}
+
+/// Put a release's build of the engine's command where the engine is run
+/// from, unless that is the build already there. The command does not run
+/// from the release itself: reaching the server from this machine is
+/// allowed to a program by its path, so the path stays the same from one
+/// release to the next. Returns whether anything was changed.
+pub fn install_engine(release: &Path, engine: &Path) -> Result<bool, DriverError> {
+    let built = release.join("factory-engine");
+    if !built.is_file() {
+        return Ok(false);
+    }
+    let same = std::fs::read(&built)
+        .ok()
+        .zip(std::fs::read(engine).ok())
+        .is_some_and(|(new, old)| new == old);
+    if same {
+        return Ok(false);
+    }
+    put_program(&built, engine)?;
+    Ok(true)
 }
 
 fn xml(text: &str) -> String {
@@ -340,15 +382,21 @@ pub fn children(pid: u32) -> Vec<u32> {
 /// would work beside the job on the same goals. `job` is the job's own
 /// process, if it has one.
 pub fn started_by_hand(job: Option<u32>) -> Vec<u32> {
-    run(&["/usr/bin/pgrep", "-f", "factory serve --config"])
-        .map(|out| {
-            out.stdout
-                .lines()
-                .filter_map(|line| line.trim().parse().ok())
-                .filter(|pid| Some(*pid) != job && *pid != std::process::id())
-                .collect()
-        })
-        .unwrap_or_default()
+    // The service as it is started, and the engine's worker it becomes
+    // when everything runs on the engine.
+    run(&[
+        "/usr/bin/pgrep",
+        "-f",
+        "factory serve --config|bin/factory-engine worker --config",
+    ])
+    .map(|out| {
+        out.stdout
+            .lines()
+            .filter_map(|line| line.trim().parse().ok())
+            .filter(|pid| Some(*pid) != job && *pid != std::process::id())
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 /// What `launchctl print` says about a job: whether it is running, under

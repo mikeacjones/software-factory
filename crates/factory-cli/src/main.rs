@@ -182,6 +182,44 @@ fn service_restart(
     }
 }
 
+/// Serve with everything on the engine: the tiers, the pipelines and the
+/// accounts are workflows on the Temporal server, and what is left to run
+/// here is the engine's worker. This process becomes it, so launchd keeps
+/// the worker itself alive, and restarting the service restarts the worker
+/// on the current release.
+fn serve_on_engine(
+    config: &ConfigDir,
+    factory: &factory_config::Factory,
+    temporal: &factory_config::Temporal,
+) -> Result<u8, String> {
+    use std::os::unix::process::CommandExt;
+    let engine = temporal
+        .engine_bin
+        .clone()
+        .unwrap_or_else(|| factory.state_dir.join("bin/factory-engine"));
+    // The engine this release was built with, if the release has one.
+    if let Some(release) = config.0.parent() {
+        match factory_driver::service::install_engine(release, &engine) {
+            Ok(true) => factory_core::note!(
+                "serve: installed this release's engine at {}",
+                engine.display()
+            ),
+            Ok(false) => {}
+            Err(err) => return Err(err.to_string()),
+        }
+    }
+    factory_core::note!(
+        "serve: started from {}; everything runs on the engine, and this process becomes its worker ({})",
+        config.0.display(),
+        engine.display()
+    );
+    let err = std::process::Command::new(&engine)
+        .args(["worker", "--config"])
+        .arg(&config.0)
+        .exec();
+    Err(format!("{} could not be started: {err}", engine.display()))
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match run(&args) {
@@ -253,6 +291,9 @@ fn run(args: &[String]) -> Result<u8, String> {
             // the current one is made to name while it runs.
             let config = ConfigDir(std::fs::canonicalize(&args.config.0).unwrap_or(args.config.0));
             let factory = config.factory().map_err(|err| fail(&err))?;
+            if let Some(temporal) = factory.temporal.as_ref().filter(|temporal| temporal.tiers) {
+                return serve_on_engine(&config, &factory, temporal);
+            }
             // What a service that died left running would work beside what
             // this one starts in its place.
             let live_runs = factory_driver::service::live_runs(&factory.state_dir);
