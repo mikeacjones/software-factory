@@ -21,6 +21,9 @@ path = ["~/.local/bin", "/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/b
 [temporal]
 address = "http://192.168.101.240:7233"
 namespace = "software-factory"
+# Every pipeline of a goal is a workflow on the engine: the service starts
+# and follows each through `bin/factory-engine` under the state directory.
+pipelines = true
 
 # The Claude accounts workers run under. Capacity left in a window when it
 # resets is lost, so each run uses the account whose week resets soonest, and
