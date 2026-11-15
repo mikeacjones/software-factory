@@ -38,6 +38,14 @@ command = ["cargo", "test", "--locked", "--offline", "--package", "factory-drive
 timeout_secs = 900
 
 [[check]]
+id = "continue"
+tier = "hermetic"
+bead = "sf-7nv.6"
+claim = "A pipeline that parked or failed is continued by whoever runs its beads, from a step of the bead pipeline and with a note, within the slots and at most three times before it goes up a level; a fresh start on it is refused; a director continues one only where no foreman runs the beads. A flow that sends a tester's break on to a step whose reports describe the code before it is refused. With scripted agents and a real pipeline: a pipeline parks under a director that cannot move it, the definition gains a foreman, and after a restart the open sub-goal's new foreman continues the same unit, which is told why and is absorbed."
+command = ["sh", "-c", "cargo test --locked --offline --package factory-driver --package factory-flow -- a_pipeline_that_stopped_is_continued a_needed_artifact_that_is_missing_or_stale a_parked_pipeline_is_continued"]
+timeout_secs = 900
+
+[[check]]
 id = "side-by-side-rules"
 tier = "hermetic"
 bead = "sf-7nv.2"

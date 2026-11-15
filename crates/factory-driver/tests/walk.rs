@@ -313,6 +313,7 @@ const OPTIONS: Options = Options {
     slack: false,
     flow: None,
     within: None,
+    continued: None,
 };
 
 #[test]
@@ -555,6 +556,7 @@ const SLACK: Options = Options {
     slack: true,
     flow: None,
     within: None,
+    continued: None,
 };
 
 #[test]
@@ -3237,6 +3239,211 @@ fn the_owner_talks_to_the_executive_which_opens_goals_and_says_which_run_togethe
     assert_eq!(executive.threads.len(), 3);
     assert_eq!(executive.threads[&thread].goal.as_deref(), Some(a.as_str()));
     assert_eq!(executive.wakes, 6);
+}
+
+#[test]
+fn a_parked_pipeline_is_continued_by_a_foreman_that_takes_over_the_sub_goal() {
+    use factory_driver::goal::Supervisor;
+    use factory_slack::socket::Incoming;
+    use serde_json::json;
+    use std::time::{Duration, Instant};
+
+    let world = World::new("continue", "true");
+    world.with_github("green");
+    // The builder asks the owner a question nobody is there to answer, so
+    // the bead's pipeline parks with its work kept.
+    world.scenario("ask-once");
+    std::fs::create_dir_all(world.path("bin/state")).unwrap();
+    std::fs::write(world.path("bin/state/broke"), "").unwrap();
+    std::fs::create_dir_all(world.path("config/goals/toy")).unwrap();
+    // The goal starts under a definition with no foreman: its director
+    // starts the beads itself.
+    let definition = "id = \"main\"\nflow = \"zig-sdk-bead\"\nship_flow = \"zig-sdk-ship\"\n[director]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\n";
+    std::fs::write(world.path("config/goals/toy/main.toml"), definition).unwrap();
+    let say = |role: &str, n: u32, json: serde_json::Value| {
+        std::fs::write(
+            world.path(&format!("bin/state/{role}-{n}.json")),
+            json.to_string(),
+        )
+        .unwrap();
+    };
+    let direct = |fields: serde_json::Value| {
+        let mut result = json!({
+            "summary": "Decided.", "start": [], "continue": [], "file": [], "edit": [],
+            "dropped_findings": [], "open_subgoals": [], "ship": [], "tell_foreman": [],
+            "ask_owner": "", "complete": false, "evidence": "", "journal_entry": "",
+            "project_memory": ""
+        });
+        for (key, value) in fields.as_object().unwrap() {
+            result[key] = value.clone();
+        }
+        result
+    };
+    let foreman = |fields: serde_json::Value| {
+        let mut result = json!({
+            "summary": "Decided.", "start": [], "continue": [], "file": [],
+            "dropped_findings": [], "report": "working", "message": "", "journal_entry": ""
+        });
+        for (key, value) in fields.as_object().unwrap() {
+            result[key] = value.clone();
+        }
+        result
+    };
+    say(
+        "intake",
+        1,
+        json!({"reply": "Here is the charter.", "ready": true, "objective": "Ship the feature.", "stop_when": "toy-1 has landed.", "plan": "One sub-goal.", "paths": [], "edits": []}),
+    );
+    say(
+        "director",
+        1,
+        direct(json!({
+            "open_subgoals": [{"id": "feature", "title": "The feature", "objective": "It works.", "beads": ["toy-1"], "paths": []}],
+            "start": [{"bead": "toy-1", "reason": "the only one"}],
+        })),
+    );
+    // The director cannot move a parked pipeline by starting it again, so
+    // it asks the owner.
+    say(
+        "director",
+        2,
+        direct(json!({"ask_owner": "The pipeline parked. Will you continue it?"})),
+    );
+
+    let supervisor =
+        || Supervisor::new(world.config(), None, vec!["OWNER".to_string()], false).unwrap();
+    let mut sup = supervisor();
+    let id = sup.open_directly("toy", "Ship the feature").unwrap();
+    sup.incoming(Incoming::Action {
+        channel: String::new(),
+        user: "OWNER".to_string(),
+        action_id: "goal_start".to_string(),
+        value: id.clone(),
+        message_ts: String::new(),
+    })
+    .unwrap();
+    let pump_until = |sup: &mut Supervisor, what: &str, done: &dyn Fn(&Supervisor) -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while !done(sup) {
+            assert!(Instant::now() < deadline, "{what}");
+            sup.pump(Duration::from_millis(200)).unwrap();
+        }
+    };
+    pump_until(&mut sup, "the pipeline never parked", &|sup| {
+        sup.goals().next().unwrap().wakes >= 2
+    });
+    let stuck = sup.goals().next().unwrap().clone();
+    assert_eq!(stuck.units.len(), 1);
+    assert_eq!(stuck.units[0].state, "parked");
+    assert!(stuck.units[0].detail.contains("Should the feature shout?"));
+    assert!(stuck.subgoals[0].foreman.is_none());
+    let unit = stuck.units[0].unit.clone().unwrap();
+    // Starting it again is not a way out: code refuses it before anything runs.
+    let refused = factory_driver::goal::decision_problems(
+        &world.config().goal_definitions("toy").unwrap()[0],
+        &stuck,
+        &[],
+        &|_| Vec::new(),
+        &[],
+        &direct(json!({"start": [{"bead": "toy-1", "reason": "again"}]})),
+    );
+    assert!(!refused.is_empty());
+
+    // The definition gains a foreman, and the factory is restarted. The open
+    // sub-goal gets one, which is told it takes over part-way and continues
+    // the parked pipeline from the step it names.
+    std::fs::write(
+        world.path("config/goals/toy/main.toml"),
+        format!("{definition}[foreman]\nmodel = \"claude-opus-5-5\"\neffort = \"medium\"\n"),
+    )
+    .unwrap();
+    say(
+        "foreman",
+        1,
+        foreman(
+            json!({"continue": [{"bead": "toy-1", "from": "build", "note": "Use the short name, and do not ask again."}]}),
+        ),
+    );
+    say(
+        "foreman",
+        2,
+        foreman(json!({"report": "ready", "message": "toy-1 is absorbed."})),
+    );
+    say("director", 3, direct(json!({"ask_owner": "Ship it now?"})));
+    drop(sup);
+    let mut sup = supervisor();
+    sup.resume().unwrap();
+    let adopted = sup.goals().next().unwrap().clone();
+    let record = adopted.subgoals[0].foreman.clone().unwrap();
+    assert_eq!((record.wakes, record.waiting.clone()), (1, None));
+    assert_eq!(adopted.units.len(), 1, "the same pipeline goes on");
+    assert_eq!(adopted.units[0].unit.as_deref(), Some(unit.as_str()));
+    assert_eq!(adopted.units[0].state, "running");
+    assert_eq!(adopted.units[0].continued, 1);
+    assert_eq!(adopted.units[0].subgoal.as_deref(), Some("feature"));
+    assert_eq!(adopted.wakes, 2, "the director was not woken for any of it");
+
+    pump_until(
+        &mut sup,
+        "the continued pipeline was never absorbed",
+        &|sup| sup.goals().next().unwrap().wakes >= 3,
+    );
+    let done = sup.goals().next().unwrap().clone();
+    assert_eq!(done.units[0].state, "absorbed");
+    assert_eq!(done.subgoals[0].absorbed.len(), 1);
+    assert_eq!(done.subgoals[0].absorbed[0].0, "toy-1");
+    assert_eq!(
+        done.subgoals[0].foreman.clone().unwrap().waiting.as_deref(),
+        Some("ready")
+    );
+
+    // What each was told.
+    let calls = world.calls();
+    let brief = |role: &str, n: usize| {
+        let index = (0..calls.len())
+            .filter(|&i| calls[i][0] == role)
+            .nth(n - 1)
+            .unwrap();
+        std::fs::read_to_string(world.path(&format!("bin/state/brief-{}.md", index + 1))).unwrap()
+    };
+    let taken_over = brief("foreman", 1);
+    for expected in [
+        "- You are taking over this sub-goal part-way.".to_string(),
+        "- `toy-1`: parked Parked:".to_string(),
+        format!("units/{unit}/events.jsonl"),
+        "The bead pipeline's steps, in order: build, fmt, index,".to_string(),
+    ] {
+        assert!(
+            taken_over.contains(&expected),
+            "missing {expected:?} in:\n{taken_over}"
+        );
+    }
+    // The step it continued from was told why, in the foreman's words.
+    let builders = calls.iter().filter(|call| call[0] == "builder").count();
+    let continued = brief("builder", 2);
+    for expected in [
+        "This pipeline stopped and has been continued by the agent that runs its sub-goal.",
+        "It had parked:",
+        "Use the short name, and do not ask again.",
+    ] {
+        assert!(
+            continued.contains(expected),
+            "missing {expected:?} in:\n{continued}"
+        );
+    }
+    assert!(builders >= 2);
+    // The unit's own record shows one pipeline, redirected, then absorbed.
+    let log =
+        std::fs::read_to_string(world.path(&format!("state/units/{unit}/events.jsonl"))).unwrap();
+    assert!(log.contains("\"kind\":\"unit.redirected\"") && log.contains("\"kind\":\"absorbed\""));
+    let goal_log =
+        std::fs::read_to_string(world.path(&format!("state/goals/{id}/events.jsonl"))).unwrap();
+    for kind in ["subgoal.adopted", "pipeline.continued"] {
+        assert!(
+            goal_log.contains(&format!("\"kind\":\"{kind}\"")),
+            "no {kind}"
+        );
+    }
 }
 
 #[test]

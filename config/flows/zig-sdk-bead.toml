@@ -93,7 +93,12 @@ session = "fresh"
 workspace = "scratch"
 needs = ["reports"]
 on.held = "review"
-on.broken = { to = "fix", max = 2, then = "review" }
+# Every break is proved by a failing test the factory commits to the branch,
+# and a change with a failing test is not a reviewer's to wave through. So a
+# break always goes back to the builder. After three fixes the pipeline parks
+# with the finding: whoever runs it (a sub-goal's foreman, the goal's
+# director, or the owner) reads it and continues it or gives it up.
+on.broken = { to = "fix", max = 3 }
 on.needs_owner = { to = "ask", max = 2 }
 
 [[step]]

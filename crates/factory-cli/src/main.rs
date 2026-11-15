@@ -91,6 +91,7 @@ fn run(args: &[String]) -> Result<u8, String> {
                 slack: args.slack,
                 flow: None,
                 within: None,
+                continued: None,
             };
             let mut driver = match (&args.unit, rest) {
                 (Some(unit), []) => {

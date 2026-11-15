@@ -249,6 +249,10 @@ pub struct Options {
     pub flow: Option<String>,
     /// The sub-goal this unit belongs to, if any.
     pub within: Option<Within>,
+    /// Set when the agent that runs a sub-goal continues a pipeline that
+    /// had parked or failed: what it wants the next step to know. The unit
+    /// then gets a fresh allowance on every bounded route.
+    pub continued: Option<String>,
 }
 
 /// One absorb at a time, across every pipeline of the process: a sub-goal's
@@ -711,7 +715,13 @@ impl Driver {
             // A unit runs on the flow it started with, not on what the file says now.
             None => Flow::parse(&std::fs::read_to_string(&pinned).map_err(io(&pinned))?)?,
             Some(step) => {
-                let (flow, text) = load_flow(&config, &factory, &project)?;
+                // The current flow is the goal's own pipeline, when a goal
+                // runs this unit, and otherwise the project's.
+                let mut with_flow = project.clone();
+                if let Some(flow) = &options.flow {
+                    with_flow.flow = flow.clone();
+                }
+                let (flow, text) = load_flow(&config, &factory, &with_flow)?;
                 if flow.step(step).is_none() {
                     return Err(factory_flow::FlowError::UnknownStep(step.to_string()).into());
                 }
@@ -737,6 +747,24 @@ impl Driver {
             project.id.clone(),
             unit.id.clone(),
         );
+        if let Some(note) = &options.continued {
+            // Whoever runs the sub-goal judged this pipeline worth going on
+            // with: the routes it had used up are open again, and the step
+            // it continues from is told why.
+            unit.position.used.clear();
+            let stopped = match &unit.status {
+                Status::Parked(reason) => format!("It had parked: {reason}\n\n"),
+                _ => String::new(),
+            };
+            let before = unit
+                .feedback
+                .take()
+                .map(|feedback| format!("{feedback}\n\n"))
+                .unwrap_or_default();
+            unit.feedback = Some(format!(
+                "{before}This pipeline stopped and has been continued by the agent that runs its sub-goal. {stopped}What it says to you:\n\n{note}"
+            ));
+        }
         unit.status = Status::Running;
         let saved_thread = unit.thread.clone();
         let mut driver = Driver {

@@ -496,6 +496,22 @@ impl Flow {
         )
     }
 
+    /// Whether a step that ends with `outcome` leaves the unit's code changed.
+    /// A step that writes code always may. A step that works in a scratch
+    /// copy changes nothing itself, but when it ends `broken` the factory
+    /// commits the regression tests it wrote to the unit's branch.
+    fn changes_code_on(step: &Step, outcome: &str) -> bool {
+        Self::changes_code(step)
+            || (outcome == "broken"
+                && matches!(
+                    &step.kind,
+                    StepKind::Agent {
+                        workspace: Workspace::Scratch,
+                        ..
+                    }
+                ))
+    }
+
     /// The artifacts sure to exist, and to describe the current code, when
     /// each step starts: on every path from the start, some step produced
     /// them after the last step that could change the code.
@@ -521,18 +537,21 @@ impl Flow {
         loop {
             let mut changed = false;
             for step in &self.steps {
-                let mut leaving = if Self::changes_code(step) {
-                    BTreeSet::new()
-                } else {
-                    entry.get(&step.id).cloned().unwrap_or_default()
-                };
-                leaving.extend(step.produces.clone());
-                for target in self.successors(step) {
-                    let Target::Step(next) = target else { continue };
-                    if let Some(known) = entry.get_mut(next) {
-                        let before = known.len();
-                        known.retain(|artifact| leaving.contains(artifact));
-                        changed |= known.len() != before;
+                let arriving = entry.get(&step.id).cloned().unwrap_or_default();
+                for (outcome, route) in &step.on {
+                    let mut leaving = if Self::changes_code_on(step, outcome) {
+                        BTreeSet::new()
+                    } else {
+                        arriving.clone()
+                    };
+                    leaving.extend(step.produces.clone());
+                    for target in [&route.to, &route.then] {
+                        let Target::Step(next) = target else { continue };
+                        if let Some(known) = entry.get_mut(next) {
+                            let before = known.len();
+                            known.retain(|artifact| leaving.contains(artifact));
+                            changed |= known.len() != before;
+                        }
                     }
                 }
             }
@@ -1118,6 +1137,20 @@ on.merged = "end"
         );
         assert_eq!(
             problems(&stale),
+            [
+                "step `review`: needs `reports`, but on some path that reaches it `reports` has not been produced since the code last changed"
+            ]
+        );
+        // A tester that breaks the change leaves its regression tests in the
+        // branch. Sending that on to a reviewer, once the fixes are used up,
+        // would hand the reviewer reports about code that has since changed.
+        let broken_on = with_reports("review").replace(
+            "on.broken = { to = \"fix\", max = 2 }",
+            "on.broken = { to = \"fix\", max = 2, then = \"review\" }",
+        );
+        assert_ne!(broken_on, with_reports("review"));
+        assert_eq!(
+            problems(&broken_on),
             [
                 "step `review`: needs `reports`, but on some path that reaches it `reports` has not been produced since the code last changed"
             ]
