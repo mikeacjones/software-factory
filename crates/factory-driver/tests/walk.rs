@@ -339,6 +339,80 @@ fn a_units_branch_is_on_the_remote_as_it_changes_and_while_its_agent_works() {
     );
 }
 
+/// Once a unit's branch has a pull request, only publishing moves it:
+/// every push to it runs the project's whole CI. Work in hand is still kept
+/// on the remote, on a branch of its own that is gone again once the work
+/// is published.
+#[test]
+fn work_in_hand_on_a_branch_with_a_pull_request_is_kept_beside_it_not_pushed_to_it() {
+    let world = World::new("sync-held", "true");
+    // CI fails once: the builder is handed the failure while the pull
+    // request is open, and commits as it goes.
+    world.with_github("pending red early pending green");
+    keep_branches_on_the_remote(&world);
+    world.scenario("commit-as-you-go");
+    let mut driver = Driver::start(world.config(), "toy", "toy-1", &OPTIONS).unwrap();
+    assert_eq!(driver.run().unwrap(), Status::Ended);
+    let unit = driver.unit().id.to_string();
+    let branch = driver.unit().branch.clone();
+    let holding = format!("wip/{branch}");
+    let events = events_of(&world, &unit);
+    let opened = events
+        .iter()
+        .position(|(kind, _, _)| kind == "published.pull_request")
+        .expect("no pull request was opened");
+
+    // Before the pull request the unit's own branch is what is kept.
+    assert!(
+        events[..opened]
+            .iter()
+            .filter(|(kind, _, _)| kind == "branch.synced")
+            .all(|(_, _, data)| data["branch"] == branch.as_str())
+    );
+    // After it, nothing but publishing touches that branch. The builder's
+    // commit in the middle of the fix went to the holding branch, while
+    // the builder was still at work.
+    let after: Vec<&(String, String, serde_json::Value)> = events[opened..]
+        .iter()
+        .filter(|(kind, _, _)| kind == "branch.synced")
+        .collect();
+    assert!(
+        after
+            .iter()
+            .any(|(_, step, data)| step == "fix" && data["when"] == "during the run"),
+        "{after:?}"
+    );
+    for (_, _, data) in &after {
+        assert_eq!(data["branch"], holding.as_str(), "{after:?}");
+    }
+    // The fix was published by the publish step, and the holding branch
+    // went with it: the remote is left with no branch of work in hand.
+    let unheld = events
+        .iter()
+        .position(|(kind, _, _)| kind == "branch.unheld")
+        .expect("the holding branch was never removed");
+    assert_eq!(events[unheld].2["error"], serde_json::Value::Null);
+    let republished = events[opened..]
+        .iter()
+        .position(|(kind, _, _)| kind == "published.pushed")
+        .map(|at| at + opened)
+        .expect("the fix was never published");
+    assert_eq!(unheld, republished + 1, "{events:?}");
+    assert_eq!(
+        run(
+            &world.path("remote.git"),
+            "git",
+            &["for-each-ref", "--format=%(refname)", "refs/heads/wip"]
+        ),
+        ""
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|(kind, _, _)| kind == "branch.sync_failed")
+    );
+}
+
 #[test]
 fn an_absorbed_beads_branch_leaves_the_remote_once_its_sub_goals_branch_is_there() {
     use factory_driver::goal::Supervisor;

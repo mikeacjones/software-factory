@@ -163,6 +163,10 @@ pub struct Unit {
     /// for a project that keeps its branches there as they change.
     #[serde(default)]
     pub synced: Option<String>,
+    /// The commit last pushed to the unit's holding branch: where work in
+    /// hand is kept while the unit's own branch has a pull request open.
+    #[serde(default)]
+    pub held: Option<String>,
     /// Whether this unit ships a sub-goal: its branch already holds one
     /// commit for each bead and is published as it stands.
     #[serde(default)]
@@ -337,6 +341,39 @@ fn push_if_moved(
         factory_git::push(worktree, &project.remote, branch).map_err(|err| err.to_string())
     };
     Some(push().map(|()| head))
+}
+
+/// Where a unit's work in hand is kept while its own branch has a pull
+/// request open. Every push to that branch runs the project's whole CI, and
+/// a commit made in the middle of a fix is not something to run it on.
+pub fn holding_branch(branch: &str) -> String {
+    format!("wip/{branch}")
+}
+
+/// Keep a worktree's work on the remote: on its own branch, or on its
+/// holding branch once that branch has a pull request, which only
+/// publishing may move. `synced` and `held` are the commits last pushed to
+/// each. Returns the commit pushed and whether it went to the holding
+/// branch, or `None` if there was nothing new.
+fn keep_on_remote(
+    factory: &Factory,
+    project: &Project,
+    worktree: &Path,
+    branch: &str,
+    (synced, held): (Option<&str>, Option<&str>),
+    pull_request: bool,
+) -> Option<Result<(String, bool), String>> {
+    if !pull_request {
+        return push_if_moved(factory, project, worktree, branch, synced)
+            .map(|pushed| pushed.map(|commit| (commit, false)));
+    }
+    // What the pull request already shows needs no second copy.
+    let head = factory_git::rev_parse(worktree, "HEAD").ok()?;
+    if synced == Some(head.as_str()) {
+        return None;
+    }
+    push_if_moved(factory, project, worktree, &holding_branch(branch), held)
+        .map(|pushed| pushed.map(|commit| (commit, true)))
 }
 
 /// One absorb at a time, across every pipeline of the process: a sub-goal's
@@ -691,6 +728,7 @@ impl Driver {
                 absorb_into: None,
                 absorbed: None,
                 synced: None,
+                held: None,
                 ship: false,
                 closes: Vec::new(),
                 issues: Vec::new(),
@@ -1258,21 +1296,28 @@ impl Driver {
         {
             return;
         }
-        let pushed = push_if_moved(
+        let pushed = keep_on_remote(
             &self.factory,
             &self.project,
             &self.unit.worktree,
             &self.unit.branch,
-            self.unit.synced.as_deref(),
+            (self.unit.synced.as_deref(), self.unit.held.as_deref()),
+            self.unit.pull_request.is_some(),
         );
         let _ = match pushed {
             None => Ok(()),
-            Some(Ok(commit)) => {
-                self.unit.synced = Some(commit.clone());
+            Some(Ok((commit, held))) => {
+                let branch = if held {
+                    self.unit.held = Some(commit.clone());
+                    holding_branch(&self.unit.branch)
+                } else {
+                    self.unit.synced = Some(commit.clone());
+                    self.unit.branch.clone()
+                };
                 self.event(
                     "branch.synced",
                     Some(step),
-                    json!({ "branch": self.unit.branch, "commit": commit, "when": "after the step" }),
+                    json!({ "branch": branch, "commit": commit, "when": "after the step" }),
                 )
             }
             Some(Err(error)) => self.event(
@@ -1281,6 +1326,22 @@ impl Driver {
                 json!({ "branch": self.unit.branch, "error": error }),
             ),
         };
+    }
+
+    /// Remove the unit's holding branch from the remote, if it has one. A
+    /// failure leaves a branch behind and holds nothing up.
+    fn drop_holding(&mut self, step: &str) {
+        if self.unit.held.take().is_none() {
+            return;
+        }
+        let branch = holding_branch(&self.unit.branch);
+        let gone =
+            factory_git::delete_remote_branch(&self.project.repo, &self.project.remote, &branch);
+        let _ = self.event(
+            "branch.unheld",
+            Some(step),
+            json!({ "branch": branch, "error": gone.err().map(|err| err.to_string()) }),
+        );
     }
 
     /// Add a step that ended to what a fresh agent is told has happened.
@@ -1797,6 +1858,8 @@ impl Driver {
                 )
             });
             let mut synced = self.unit.synced.clone();
+            let mut held = self.unit.held.clone();
+            let pull_request = self.unit.pull_request.is_some();
             let finished = {
                 let thread = &mut self.thread;
                 let step_id = step.id.clone();
@@ -1809,15 +1872,32 @@ impl Driver {
                     {
                         last_sync = Instant::now();
                         let step = StepId::new(step_id.clone());
-                        match push_if_moved(factory, project, worktree, branch, synced.as_deref()) {
+                        let kept = keep_on_remote(
+                            factory,
+                            project,
+                            worktree,
+                            branch,
+                            (synced.as_deref(), held.as_deref()),
+                            pull_request,
+                        );
+                        match kept {
                             None => {}
-                            Some(Ok(commit)) => {
+                            Some(Ok((commit, holding))) => {
+                                let pushed_to = if holding {
+                                    holding_branch(branch)
+                                } else {
+                                    branch.clone()
+                                };
                                 let _ = log.append(
                                     "branch.synced",
                                     Some(&step),
-                                    json!({ "branch": branch, "commit": commit, "when": "during the run" }),
+                                    json!({ "branch": pushed_to, "commit": commit, "when": "during the run" }),
                                 );
-                                synced = Some(commit);
+                                if holding {
+                                    held = Some(commit);
+                                } else {
+                                    synced = Some(commit);
+                                }
                             }
                             Some(Err(error)) => {
                                 let _ = log.append(
@@ -1852,6 +1932,7 @@ impl Driver {
                 })?
             };
             self.unit.synced = synced;
+            self.unit.held = held;
             // The run is over, however it ended: nothing is in flight.
             let _ = std::fs::remove_file(&in_flight);
             // Said while the step ran: for the next agent step.
@@ -2954,6 +3035,7 @@ impl Driver {
         {
             litter.push(err.to_string());
         }
+        self.drop_holding(&step.id);
         self.event("cleanup", Some(&step.id), json!({ "problems": litter }))?;
         self.save()?;
         Ok(StepEnd::Outcome("done".to_string()))
@@ -3636,11 +3718,14 @@ impl Driver {
                 .map_err(|err| DriverError::Preflight(format!("push to `{url}`: {err}")))?;
         }
         factory_git::push(&worktree, &self.project.remote, &self.unit.branch)?;
+        self.unit.synced = Some(commit.clone());
         self.event(
             "published.pushed",
             Some(&step.id),
             json!({ "remote": url, "branch": self.unit.branch }),
         )?;
+        // The work that was held aside is in what was just pushed.
+        self.drop_holding(&step.id);
 
         let mut said = format!(
             ":rocket: *{}* · one commit `{}` pushed to `{}`",
