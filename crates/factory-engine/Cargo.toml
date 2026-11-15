@@ -1,0 +1,29 @@
+[package]
+name = "factory-engine"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "The flow engine on Temporal: a workflow that runs a flow definition, with each step an activity"
+
+[lints]
+workspace = true
+
+[dependencies]
+factory-flow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# The SDK compiles its protocol definitions when it is built. With
+# `vendored-protox` that is done in Rust, so the build needs no `protoc`
+# installed on the machine.
+temporalio-client = { version = "=1.2.0", features = ["vendored-protox"] }
+temporalio-common = { version = "=1.2.0", features = ["vendored-protox"] }
+temporalio-macros = "=1.2.0"
+# The SDK's macros write code that names these two crates.
+temporalio-workflow = "=1.2.0"
+futures = "0.3"
+temporalio-sdk = { version = "=1.2.0", default-features = false, features = ["envconfig"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+
+[dev-dependencies]
+temporalio-sdk = { version = "=1.2.0", default-features = false, features = ["envconfig", "testing"] }
