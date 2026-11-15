@@ -314,6 +314,7 @@ const OPTIONS: Options = Options {
     flow: None,
     within: None,
     continued: None,
+    pausable: false,
 };
 
 #[test]
@@ -557,6 +558,7 @@ const SLACK: Options = Options {
     flow: None,
     within: None,
     continued: None,
+    pausable: false,
 };
 
 #[test]
@@ -3444,6 +3446,221 @@ fn a_parked_pipeline_is_continued_by_a_foreman_that_takes_over_the_sub_goal() {
             "no {kind}"
         );
     }
+}
+
+#[test]
+fn the_service_stops_at_a_safe_point_and_the_next_one_carries_on() {
+    use factory_driver::goal::Supervisor;
+    use factory_slack::socket::Incoming;
+    use serde_json::json;
+    use std::time::{Duration, Instant};
+
+    let world = World::new("drain", "true");
+    world.with_github("green");
+    std::fs::create_dir_all(world.path("bin/state")).unwrap();
+    std::fs::write(world.path("bin/state/broke"), "").unwrap();
+    std::fs::create_dir_all(world.path("config/goals/toy")).unwrap();
+    std::fs::write(
+        world.path("config/goals/toy/main.toml"),
+        "id = \"main\"\nflow = \"zig-sdk-bead\"\nship_flow = \"zig-sdk-ship\"\n[director]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\n[foreman]\nmodel = \"claude-opus-5-5\"\neffort = \"medium\"\n",
+    )
+    .unwrap();
+    let say = |role: &str, n: u32, json: serde_json::Value| {
+        std::fs::write(
+            world.path(&format!("bin/state/{role}-{n}.json")),
+            json.to_string(),
+        )
+        .unwrap();
+    };
+    let direct = |fields: serde_json::Value| {
+        let mut result = json!({
+            "summary": "Decided.", "start": [], "continue": [], "file": [], "edit": [],
+            "dropped_findings": [], "open_subgoals": [], "ship": [], "tell_foreman": [],
+            "ask_owner": "", "complete": false, "evidence": "", "journal_entry": "",
+            "project_memory": ""
+        });
+        for (key, value) in fields.as_object().unwrap() {
+            result[key] = value.clone();
+        }
+        result
+    };
+    let foreman = |fields: serde_json::Value| {
+        let mut result = json!({
+            "summary": "Decided.", "start": [], "continue": [], "file": [],
+            "dropped_findings": [], "report": "working", "message": "", "journal_entry": ""
+        });
+        for (key, value) in fields.as_object().unwrap() {
+            result[key] = value.clone();
+        }
+        result
+    };
+    say(
+        "intake",
+        1,
+        json!({"reply": "Here is the charter.", "ready": true, "objective": "Ship the feature.", "stop_when": "toy-1 has landed.", "plan": "One sub-goal.", "paths": [], "edits": []}),
+    );
+    say(
+        "director",
+        1,
+        direct(
+            json!({"open_subgoals": [{"id": "feature", "title": "The feature", "objective": "It works.", "beads": ["toy-1"], "paths": []}]}),
+        ),
+    );
+    say(
+        "foreman",
+        1,
+        foreman(json!({"start": [{"bead": "toy-1", "reason": "the only one", "paths": []}]})),
+    );
+    say(
+        "director",
+        2,
+        direct(json!({"ask_owner": "Noted. Anything else?"})),
+    );
+    say(
+        "foreman",
+        2,
+        foreman(json!({"report": "ready", "message": "toy-1 is absorbed."})),
+    );
+    say("director", 3, direct(json!({"ask_owner": "Ship it now?"})));
+
+    let flag = factory_driver::drain_flag(&world.path("state"));
+    let supervisor =
+        || Supervisor::new(world.config(), None, vec!["OWNER".to_string()], false).unwrap();
+    let calls = |role: &str| world.calls().iter().filter(|call| call[0] == role).count();
+    // Pump until the service has reached its safe point.
+    let drain = |sup: &mut Supervisor| {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while !sup.drained() {
+            assert!(Instant::now() < deadline, "the service never came to rest");
+            sup.pump(Duration::from_millis(100)).unwrap();
+        }
+        sup.pump(Duration::ZERO).unwrap();
+    };
+
+    // A restart is asked for just as a goal starts its first pipeline. The
+    // agents that were deciding finish; the pipeline stops before it has
+    // run anything, and is still the goal's running pipeline.
+    std::fs::create_dir_all(world.path("state")).unwrap();
+    std::fs::write(&flag, "").unwrap();
+    let mut sup = supervisor();
+    let id = sup.open_directly("toy", "Ship the feature").unwrap();
+    sup.incoming(Incoming::Action {
+        channel: String::new(),
+        user: "OWNER".to_string(),
+        action_id: "goal_start".to_string(),
+        value: id.clone(),
+        message_ts: String::new(),
+    })
+    .unwrap();
+    drain(&mut sup);
+    assert_eq!(sup.live(), 0);
+    let paused = sup.goals().next().unwrap().clone();
+    assert_eq!(paused.units.len(), 1);
+    assert_eq!(paused.units[0].state, "running", "nothing has ended");
+    let unit = paused.units[0].unit.clone().unwrap();
+    let log_path = world.path(&format!("state/units/{unit}/events.jsonl"));
+    let log = std::fs::read_to_string(&log_path).unwrap();
+    assert!(log.contains("\"kind\":\"unit.paused\""), "{log}");
+    assert!(
+        !log.contains("\"kind\":\"step.started\""),
+        "no step was started"
+    );
+    assert_eq!(calls("builder"), 0);
+    // What the owner writes while it is stopping is kept, not handled:
+    // handling it would wake an agent.
+    let thread = paused.thread_ts.clone();
+    sup.park_incoming(
+        vec![Incoming::Message {
+            channel: String::new(),
+            user: "OWNER".to_string(),
+            text: "One more thing: keep it short.".to_string(),
+            ts: "5.5".to_string(),
+            thread_ts: Some(thread),
+        }]
+        .into_iter(),
+    );
+    assert_eq!(calls("director"), 1);
+    drop(sup);
+
+    // The next service clears the request, continues the pipeline where it
+    // stopped, and handles what was kept.
+    std::fs::remove_file(&flag).unwrap();
+    let mut sup = supervisor();
+    sup.resume().unwrap();
+    assert_eq!(sup.live(), 1, "the pipeline is running again");
+    sup.take_parked_incoming();
+    assert_eq!(
+        calls("director"),
+        2,
+        "the owner's message reached the director"
+    );
+    assert!(!world.path("state/incoming.jsonl").exists());
+    let calls_now = world.calls();
+    let index = calls_now
+        .iter()
+        .rposition(|call| call[0] == "director")
+        .unwrap();
+    let heard =
+        std::fs::read_to_string(world.path(&format!("bin/state/brief-{}.md", index + 1))).unwrap();
+    assert!(
+        heard.contains("> One more thing: keep it short."),
+        "{heard}"
+    );
+
+    // A restart is asked for again, now with the pipeline somewhere in the
+    // middle. It finishes the step it is in. If that was its last, the
+    // foreman is owed the news but is not woken by a service that is leaving.
+    std::fs::write(&flag, "").unwrap();
+    let foremen = calls("foreman");
+    drain(&mut sup);
+    assert_eq!(sup.live(), 0);
+    assert_eq!(
+        calls("foreman"),
+        foremen,
+        "no agent was woken while stopping"
+    );
+    let resting = sup.goals().next().unwrap().clone();
+    let owed = resting.subgoals[0].foreman.clone().unwrap().inbox.len();
+    match resting.units[0].state.as_str() {
+        "running" => assert_eq!(owed, 0),
+        "absorbed" => assert_eq!(owed, 1, "its end is kept for the foreman"),
+        other => panic!("the pipeline is `{other}`"),
+    }
+    drop(sup);
+
+    // And the service after that finishes the job.
+    std::fs::remove_file(&flag).unwrap();
+    let mut sup = supervisor();
+    sup.resume().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while sup.goals().next().unwrap().wakes < 3 {
+        assert!(
+            Instant::now() < deadline,
+            "the sub-goal was never reported ready"
+        );
+        sup.pump(Duration::from_millis(200)).unwrap();
+    }
+    let done = sup.goals().next().unwrap().clone();
+    assert_eq!(done.units.len(), 1, "one pipeline all along");
+    assert_eq!(done.units[0].state, "absorbed");
+    assert_eq!(done.subgoals[0].absorbed.len(), 1);
+    assert_eq!(calls("foreman"), 2);
+    // Every step ran once: nothing was repeated and nothing skipped.
+    assert_eq!(calls("builder"), 1);
+    assert_eq!(calls("tester"), 1);
+    assert_eq!(calls("reviewer"), 1);
+    let log = std::fs::read_to_string(&log_path).unwrap();
+    assert!(log.matches("\"kind\":\"unit.resumed\"").count() >= 1);
+    let ran: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("\"kind\":\"step.ended\""))
+        .filter_map(|line| line.split("\"step\":\"").nth(1)?.split('"').next())
+        .collect();
+    let mut once = ran.clone();
+    once.dedup();
+    assert_eq!(ran, once);
+    assert_eq!(ran.first(), Some(&"build"));
+    assert_eq!(ran.last(), Some(&"absorb"));
 }
 
 #[test]

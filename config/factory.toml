@@ -4,6 +4,13 @@ claude_bin = "claude"
 cli_version = "2.1.325"
 allowed_models = ["claude-fable-5-2", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"]
 
+# launchd keeps the service running, as an agent of this user's desktop
+# session (`factory service install`). `path` is where the service and the
+# tools it starts are looked for, since launchd gives a job almost none.
+[service]
+label = "software-factory"
+path = ["~/.local/bin", "/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+
 # The Claude accounts workers run under. Capacity left in a window when it
 # resets is lost, so each run uses the account whose week resets soonest, and
 # between accounts whose weeks end together, the one whose five-hour session

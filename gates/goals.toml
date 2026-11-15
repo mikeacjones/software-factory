@@ -61,6 +61,22 @@ command = ["cargo", "test", "--locked", "--offline", "--package", "factory-drive
 timeout_secs = 900
 
 [[check]]
+id = "service"
+tier = "hermetic"
+bead = "sf-rzb.5"
+claim = "A release holds a build beside a copy of its config and becomes current in one step, with the one in use kept; the launchd job runs the current release, in the desktop session only, at login and whenever it exits; a run left behind by a process that died is found by its process ID and start time and killed with what it started, and a process that merely has that ID is not. Asked to stop at a safe point, with real pipelines: a pipeline about to start stops before its first step and stays the goal's running pipeline; no agent is woken while the service is stopping; what the owner writes meanwhile is kept and handled by the next service; and across two restarts every step of the pipeline runs exactly once."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-driver", "--package", "factory-supervise", "--", "a_release_holds_a_build", "the_launchd_job_runs", "a_jobs_state_is_read", "what_a_dead_process_left", "the_service_stops_at_a_safe_point"]
+timeout_secs = 900
+
+[[check]]
+id = "service-live"
+tier = "owner"
+bead = "sf-rzb.5"
+claim = "On this machine launchd is running the factory service from a release."
+command = ["cargo", "run", "--quiet", "--locked", "--package", "factory-cli", "--", "service", "status", "--config", "config"]
+timeout_secs = 300
+
+[[check]]
 id = "sub-goals"
 tier = "hermetic"
 bead = "sf-rzb.12"

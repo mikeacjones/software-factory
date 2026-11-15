@@ -26,6 +26,8 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
@@ -2102,6 +2104,11 @@ pub struct Supervisor {
     unit_slack: bool,
     sender: Sender<Internal>,
     receiver: Receiver<Internal>,
+    /// The pipelines running on threads of this process right now.
+    live: Arc<AtomicUsize>,
+    /// Whether the service has been asked to stop at a safe point. No agent
+    /// is woken and nothing new is started while it is.
+    draining: bool,
 }
 
 impl Supervisor {
@@ -2125,7 +2132,7 @@ impl Supervisor {
             if let (Some(slack), Some(name)) = (&slack, &project.slack_channel) {
                 match slack.ensure_channel(name, &owners) {
                     Ok(channel) => drop(channels.insert(channel, id)),
-                    Err(err) => eprintln!("goals: project {id}: channel #{name}: {err}"),
+                    Err(err) => factory_core::note!("goals: project {id}: channel #{name}: {err}"),
                 }
             }
         }
@@ -2167,6 +2174,8 @@ impl Supervisor {
             unit_slack,
             sender,
             receiver,
+            live: Arc::new(AtomicUsize::new(0)),
+            draining: false,
         })
     }
 
@@ -2267,7 +2276,7 @@ impl Supervisor {
         if let Some(slack) = &self.slack
             && let Err(err) = slack.post(channel, Some(thread), text)
         {
-            eprintln!("goals: slack: {err}");
+            factory_core::note!("goals: slack: {err}");
         }
     }
 
@@ -2696,6 +2705,9 @@ impl Supervisor {
     /// running, something waits, and there is room. If the executive cannot
     /// be run, the goals stay in line and start when a running one ends.
     fn schedule(&mut self, project_id: &str) -> Result<(), DriverError> {
+        if self.draining {
+            return Ok(());
+        }
         let project = self.config.project(project_id)?;
         let Some(tier) = project.executive.clone() else {
             return Ok(());
@@ -3507,7 +3519,9 @@ impl Supervisor {
     /// what it decides.
     fn wake(&mut self, id: &str) -> Result<(), DriverError> {
         let mut goal = self.goals[id].clone();
-        if goal.phase != Phase::Running || goal.inbox.is_empty() {
+        // While the service is stopping, what an agent is owed stays in its
+        // inbox: it is woken by the service that starts next.
+        if self.draining || goal.phase != Phase::Running || goal.inbox.is_empty() {
             return Ok(());
         }
         goal.retry_at = None;
@@ -3972,7 +3986,11 @@ impl Supervisor {
         let Some(mut foreman) = sub.foreman.clone() else {
             return Ok(());
         };
-        if goal.phase != Phase::Running || sub.state != "open" || foreman.inbox.is_empty() {
+        if self.draining
+            || goal.phase != Phase::Running
+            || sub.state != "open"
+            || foreman.inbox.is_empty()
+        {
             return Ok(());
         }
         let definition = self.definition(&goal)?;
@@ -4339,6 +4357,9 @@ impl Supervisor {
     /// Start the sub-goal that has waited longest to ship, if none of its
     /// project is shipping. Called whenever a ship pipeline ends.
     fn start_next_ship(&mut self, project: &str) -> Result<(), DriverError> {
+        if self.draining {
+            return Ok(());
+        }
         let of_project = || self.goals.values().filter(|goal| goal.project == project);
         if of_project()
             .flat_map(|goal| goal.units.iter())
@@ -4485,8 +4506,19 @@ impl Supervisor {
             flow,
             within,
             continued,
+            pausable: true,
         };
+        let live = self.live.clone();
+        live.fetch_add(1, Ordering::SeqCst);
         std::thread::spawn(move || {
+            // Counted down after its last report is sent, however it ends.
+            struct Counted(Arc<AtomicUsize>);
+            impl Drop for Counted {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, Ordering::SeqCst);
+                }
+            }
+            let _counted = Counted(live);
             let ended =
                 |outcome: &str, detail: String, driver: Option<&Driver>| Happening::PipelineEnded {
                     bead: name.clone(),
@@ -4551,6 +4583,9 @@ impl Supervisor {
                         Ok(Status::Parked(reason)) => {
                             ended("parked", format!("Parked: {reason}"), Some(&driver))
                         }
+                        // Stopped between steps for a restart of the
+                        // service, which continues it: nothing has ended.
+                        Ok(Status::Running) if driver.paused() => return,
                         Ok(Status::Running) => ended(
                             "failed",
                             "It stopped without ending.".to_string(),
@@ -4884,18 +4919,146 @@ impl Supervisor {
         Ok(())
     }
 
-    /// Serve for ever: Slack events as they arrive, pipelines as they end.
+    /// How many pipelines are running on threads of this process.
+    pub fn live(&self) -> usize {
+        self.live.load(Ordering::SeqCst)
+    }
+
+    /// Look at whether the service has been asked to stop at a safe point,
+    /// and say so in each running goal's thread the first time it has.
+    /// Returns whether that point has come: nothing is running any more.
+    pub fn drained(&mut self) -> bool {
+        let asked = crate::draining(&self.factory.state_dir);
+        if asked && !self.draining {
+            let running: Vec<Goal> = self
+                .goals
+                .values()
+                .filter(|goal| goal.phase == Phase::Running && goal.running() > 0)
+                .cloned()
+                .collect();
+            for goal in running {
+                self.say(&goal, ":arrows_counterclockwise: *The factory is restarting.* Each pipeline finishes the step it is in and starts no other; everything continues by itself in a moment. What you write here meanwhile is kept.");
+            }
+        }
+        self.draining = asked;
+        asked && self.live() == 0
+    }
+
+    fn parked_incoming(&self) -> PathBuf {
+        self.factory.state_dir.join("incoming.jsonl")
+    }
+
+    /// Keep what people did in Slack and the service has not handled, for
+    /// the service that starts next.
+    pub fn park_incoming(&self, unread: impl Iterator<Item = Incoming>) {
+        let lines: Vec<String> = unread
+            .map(|incoming| incoming_value(&incoming).to_string())
+            .collect();
+        if !lines.is_empty() {
+            let path = self.parked_incoming();
+            let mut text = std::fs::read_to_string(&path).unwrap_or_default();
+            text.push_str(&(lines.join("\n") + "\n"));
+            if let Err(err) = std::fs::write(&path, text) {
+                factory_core::note!("goals: {}: {err}", path.display());
+            }
+        }
+    }
+
+    /// Handle what the service before this one kept, as if it had just
+    /// arrived, in the order it did.
+    pub fn take_parked_incoming(&mut self) {
+        let path = self.parked_incoming();
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        let _ = std::fs::remove_file(&path);
+        for incoming in text
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter_map(|value| incoming_from(&value))
+        {
+            if let Err(err) = self.incoming(incoming) {
+                factory_core::note!("goals: {err}");
+            }
+        }
+    }
+
+    /// Serve: Slack events as they arrive, pipelines as they end. It
+    /// returns only when the service was asked to stop at a safe point and
+    /// that point has come: every pipeline has finished its step, their
+    /// reports are recorded, and what people wrote meanwhile is kept.
     pub fn serve(&mut self, listener: &Listener) {
         loop {
-            while let Ok(incoming) = listener.incoming.try_recv() {
+            if self.drained() {
+                // Reports sent just before the last pipeline stopped.
+                if let Err(err) = self.pump(Duration::ZERO) {
+                    factory_core::note!("goals: {err}");
+                }
+                self.park_incoming(listener.incoming.try_iter());
+                return;
+            }
+            // While stopping, messages wait: handling one wakes an agent.
+            while !self.draining
+                && let Ok(incoming) = listener.incoming.try_recv()
+            {
                 if let Err(err) = self.incoming(incoming) {
-                    eprintln!("goals: {err}");
+                    factory_core::note!("goals: {err}");
                 }
             }
             if let Err(err) = self.pump(Duration::from_millis(500)) {
-                eprintln!("goals: {err}");
+                factory_core::note!("goals: {err}");
             }
         }
+    }
+}
+
+/// Something a person did in Slack, as a line that can be kept in a file.
+fn incoming_value(incoming: &Incoming) -> Value {
+    match incoming {
+        Incoming::Message {
+            channel,
+            user,
+            text,
+            ts,
+            thread_ts,
+        } => json!({
+            "kind": "message", "channel": channel, "user": user, "text": text, "ts": ts,
+            "thread_ts": thread_ts,
+        }),
+        Incoming::Action {
+            channel,
+            user,
+            action_id,
+            value,
+            message_ts,
+        } => json!({
+            "kind": "action", "channel": channel, "user": user, "action_id": action_id,
+            "value": value, "message_ts": message_ts,
+        }),
+    }
+}
+
+fn incoming_from(value: &Value) -> Option<Incoming> {
+    let text = |key: &str| strings(value, key).to_string();
+    match strings(value, "kind") {
+        "message" => Some(Incoming::Message {
+            channel: text("channel"),
+            user: text("user"),
+            text: text("text"),
+            ts: text("ts"),
+            thread_ts: value
+                .get("thread_ts")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        }),
+        "action" => Some(Incoming::Action {
+            channel: text("channel"),
+            user: text("user"),
+            action_id: text("action_id"),
+            value: text("value"),
+            message_ts: text("message_ts"),
+        }),
+        _ => None,
     }
 }
 

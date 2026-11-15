@@ -20,6 +20,17 @@ usage:
   factory serve                               the always-on service: listen to Slack over a
                                               socket, open goals from the owner's messages,
                                               and run them on events
+  factory service install                     keep the service running under launchd, in this
+                                              user's desktop session: make a release of this
+                                              build and this config, and have launchd run it
+                                              at login and whenever it exits
+  factory service deploy [--now]              make a release of this build and this config
+                                              current, and restart the service onto it
+  factory service restart [--now]             restart the service at a safe point: running
+                                              steps finish and no other starts. `--now` stops
+                                              it where it stands, and the steps run again
+  factory service status                      whether launchd is running it, on which release
+  factory service uninstall                   stop it and take it out of launchd
   factory issues sync <project>               set the type and priority of every open bead's
                                               GitHub issue to the bead's, where they differ
   factory accounts                            each Claude account's usage windows, and which
@@ -42,6 +53,8 @@ exit codes: 0 the flow ended, 2 the unit is parked, 1 anything else";
 struct Args {
     config: ConfigDir,
     slack: bool,
+    /// Do it at once, without waiting for a safe point.
+    now: bool,
     unit: Option<String>,
     from: Option<String>,
     positional: Vec<String>,
@@ -51,6 +64,7 @@ fn parse(args: &[String]) -> Result<Args, String> {
     let mut parsed = Args {
         config: ConfigDir::default_location(),
         slack: true,
+        now: false,
         unit: None,
         from: None,
         positional: Vec::new(),
@@ -65,11 +79,107 @@ fn parse(args: &[String]) -> Result<Args, String> {
             "--unit" => parsed.unit = Some(args.next().ok_or("--unit needs a unit ID")?.clone()),
             "--from" => parsed.from = Some(args.next().ok_or("--from needs a step")?.clone()),
             "--no-slack" => parsed.slack = false,
+            "--now" => parsed.now = true,
             flag if flag.starts_with("--") => return Err(format!("unknown option `{flag}`")),
             value => parsed.positional.push(value.to_string()),
         }
     }
     Ok(parsed)
+}
+
+/// Say how launchd sees the service. Returns whether it is running.
+fn service_status(factory: &factory_config::Factory, job: &factory_driver::service::Job) -> bool {
+    use factory_driver::service::{children, current, started_by_hand};
+    let state = job.state();
+    let release = std::fs::canonicalize(current(&factory.state_dir))
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| "none".to_string());
+    match state.pid {
+        Some(pid) => println!(
+            "launchd job `{}`: {}, process {pid}, {} step(s) in flight",
+            job.label,
+            state.state,
+            children(pid).len()
+        ),
+        None if state.state.is_empty() => {
+            println!("launchd job `{}`: not loaded", job.label);
+        }
+        None => println!(
+            "launchd job `{}`: {}, last exit {}",
+            job.label,
+            state.state,
+            state.last_exit.as_deref().unwrap_or("unknown")
+        ),
+    }
+    println!("current release: {release}");
+    if factory_driver::draining(&factory.state_dir) {
+        println!("it has been asked to stop at a safe point, and is letting running steps finish");
+    }
+    for pid in started_by_hand(state.pid) {
+        println!(
+            "LOOK AT THIS: a factory service launchd did not start is running (process {pid})"
+        );
+    }
+    state.pid.is_some()
+}
+
+/// Restart the service onto the current release: at a safe point, or at
+/// once. Waits until launchd runs it under a new process.
+fn service_restart(
+    factory: &factory_config::Factory,
+    job: &factory_driver::service::Job,
+    now: bool,
+) -> Result<u8, String> {
+    use factory_driver::service::children;
+    let before = job.state();
+    let Some(old) = before.pid else {
+        if before.state.is_empty() {
+            return Err(format!(
+                "launchd has no job `{}`: run `factory service install` first",
+                job.label
+            ));
+        }
+        job.kickstart(false).map_err(|err| err.to_string())?;
+        println!("it was not running, and has been started");
+        return Ok(0);
+    };
+    if now {
+        job.kickstart(true).map_err(|err| err.to_string())?;
+    } else {
+        let flag = factory_driver::drain_flag(&factory.state_dir);
+        std::fs::write(&flag, "").map_err(|err| format!("{}: {err}", flag.display()))?;
+        println!(
+            "asked process {old} to stop at a safe point: {} step(s) are in flight and will finish first",
+            children(old).len()
+        );
+    }
+    let started = std::time::Instant::now();
+    let mut told = 0;
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        match job.state().pid {
+            Some(pid) if pid != old => {
+                println!("restarted: process {pid}");
+                service_status(factory, job);
+                return Ok(0);
+            }
+            _ => {}
+        }
+        let minutes = started.elapsed().as_secs() / 60;
+        if minutes > told {
+            told = minutes;
+            println!(
+                "still waiting after {minutes} min: {} step(s) in flight",
+                children(old).len()
+            );
+        }
+        if started.elapsed() >= std::time::Duration::from_secs(4 * 3600) {
+            return Err(
+                "it had not restarted after four hours. The request stands; `factory service restart --now` stops it where it is"
+                    .to_string(),
+            );
+        }
+    }
 }
 
 fn main() -> ExitCode {
@@ -94,6 +204,7 @@ fn run(args: &[String]) -> Result<u8, String> {
                 flow: None,
                 within: None,
                 continued: None,
+                pausable: false,
             };
             let mut driver = match (&args.unit, rest) {
                 (Some(unit), []) => {
@@ -135,14 +246,81 @@ fn run(args: &[String]) -> Result<u8, String> {
             }
         }
         ["serve"] => {
+            // The release this process started from, whatever the link to
+            // the current one is made to name while it runs.
+            let config = ConfigDir(std::fs::canonicalize(&args.config.0).unwrap_or(args.config.0));
+            let factory = config.factory().map_err(|err| fail(&err))?;
+            // What a service that died left running would work beside what
+            // this one starts in its place.
+            let live_runs = factory_driver::service::live_runs(&factory.state_dir);
+            for left in factory_supervise::reap_leftovers(&live_runs) {
+                factory_core::note!("serve: killed a run left by an earlier service: {left}");
+            }
+            factory_supervise::track_long_runs(&live_runs);
+            // A request to stop at a safe point was for the service before.
+            let _ = std::fs::remove_file(factory_driver::drain_flag(&factory.state_dir));
             let (mut supervisor, listener) =
-                Supervisor::from_config(args.config).map_err(|err| fail(&err))?;
-            println!(
-                "listening for goals on: {}",
+                Supervisor::from_config(config.clone()).map_err(|err| fail(&err))?;
+            factory_core::note!(
+                "serve: started from {}; listening for goals on: {}",
+                config.0.display(),
                 supervisor.projects_listening().join(", ")
             );
             supervisor.resume().map_err(|err| fail(&err))?;
+            supervisor.take_parked_incoming();
             supervisor.serve(&listener);
+            listener.stop();
+            factory_core::note!("serve: stopped at a safe point, as asked");
+            Ok(0)
+        }
+        ["service", "install"] => {
+            use factory_driver::service::{Job, plist, release_this_build, started_by_hand};
+            let factory = args.config.factory().map_err(|err| fail(&err))?;
+            check_definitions(&args.config).map_err(|err| fail(&err))?;
+            let job = Job::of(&factory).map_err(|err| fail(&err))?;
+            let by_hand = started_by_hand(job.state().pid);
+            if !by_hand.is_empty() {
+                return Err(format!(
+                    "a factory service that launchd did not start is running (process {by_hand:?}). Two would work on the same goals: stop that one first"
+                ));
+            }
+            let release = release_this_build(&factory, &args.config.0).map_err(|err| fail(&err))?;
+            println!("release: {}", release.display());
+            let text = plist(&job.label, &factory.state_dir, &factory.service.path);
+            job.load(&text).map_err(|err| fail(&err))?;
+            println!(
+                "launchd job `{}` loaded from {}",
+                job.label,
+                job.plist.display()
+            );
+            service_status(&factory, &job);
+            Ok(0)
+        }
+        ["service", "deploy"] => {
+            use factory_driver::service::{Job, release_this_build};
+            let factory = args.config.factory().map_err(|err| fail(&err))?;
+            // A config that cannot run must not become the current one.
+            check_definitions(&args.config).map_err(|err| fail(&err))?;
+            let job = Job::of(&factory).map_err(|err| fail(&err))?;
+            let release = release_this_build(&factory, &args.config.0).map_err(|err| fail(&err))?;
+            println!("release: {}", release.display());
+            service_restart(&factory, &job, args.now)
+        }
+        ["service", "restart"] => {
+            let factory = args.config.factory().map_err(|err| fail(&err))?;
+            let job = factory_driver::service::Job::of(&factory).map_err(|err| fail(&err))?;
+            service_restart(&factory, &job, args.now)
+        }
+        ["service", "status"] => {
+            let factory = args.config.factory().map_err(|err| fail(&err))?;
+            let job = factory_driver::service::Job::of(&factory).map_err(|err| fail(&err))?;
+            Ok(if service_status(&factory, &job) { 0 } else { 1 })
+        }
+        ["service", "uninstall"] => {
+            let factory = args.config.factory().map_err(|err| fail(&err))?;
+            let job = factory_driver::service::Job::of(&factory).map_err(|err| fail(&err))?;
+            job.unload().map_err(|err| fail(&err))?;
+            println!("launchd job `{}` stopped and removed", job.label);
             Ok(0)
         }
         ["accounts", "refresh"] => {

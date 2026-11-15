@@ -10,6 +10,7 @@
 //! This is the thin first cut of the driver: one unit, no ticks, no Redis.
 
 pub mod goal;
+pub mod service;
 pub mod thread;
 
 use std::collections::BTreeMap;
@@ -241,6 +242,23 @@ fn serious(result: &Value) -> Vec<&Value> {
 enum StepEnd {
     Outcome(String),
     Park(String),
+    /// It was waiting, and stopped waiting because the factory is about to
+    /// restart. The step runs again when the unit is continued.
+    Pause,
+}
+
+/// The file whose presence asks the service to stop at a safe point: every
+/// pipeline finishes the step it is in and starts no other, no agent is
+/// woken, and the service then ends, to be started again by whatever keeps
+/// it running. `factory service restart` makes it; the service removes it
+/// when it starts.
+pub fn drain_flag(state_dir: &Path) -> PathBuf {
+    state_dir.join("drain")
+}
+
+/// Whether the service has been asked to stop at a safe point.
+pub fn draining(state_dir: &Path) -> bool {
+    drain_flag(state_dir).exists()
 }
 
 pub struct Options {
@@ -254,6 +272,10 @@ pub struct Options {
     /// had parked or failed: what it wants the next step to know. The unit
     /// then gets a fresh allowance on every bounded route.
     pub continued: Option<String>,
+    /// Stop between steps, with the unit left as running, when the service
+    /// has been asked to stop at a safe point. For units the service runs:
+    /// it continues them when it starts again.
+    pub pausable: bool,
 }
 
 /// One absorb at a time, across every pipeline of the process: a sub-goal's
@@ -319,6 +341,8 @@ pub struct Driver {
     dir: PathBuf,
     log: EventLog,
     thread: Thread,
+    pausable: bool,
+    paused: bool,
 }
 
 /// The flow a project names, checked against everything it may refer to.
@@ -621,6 +645,8 @@ impl Driver {
             bead,
             dir,
             log,
+            pausable: options.pausable,
+            paused: false,
         };
         driver.event(
             "unit.created",
@@ -778,6 +804,8 @@ impl Driver {
             unit,
             dir,
             log,
+            pausable: options.pausable,
+            paused: false,
         };
         driver.thread = driver.open_thread(options, saved_thread);
         driver.event(
@@ -799,6 +827,28 @@ impl Driver {
 
     pub fn unit(&self) -> &Unit {
         &self.unit
+    }
+
+    /// Whether `run` returned because the service is stopping at a safe
+    /// point. The unit is still running as far as its record goes, and is
+    /// continued from the step it was about to start.
+    pub fn paused(&self) -> bool {
+        self.paused
+    }
+
+    fn pause_wanted(&self) -> bool {
+        self.pausable && draining(&self.factory.state_dir)
+    }
+
+    fn pause(&mut self) -> Result<Status, DriverError> {
+        let step = self.unit.position.step.clone();
+        self.event("unit.paused", Some(&step), json!({}))?;
+        self.thread.say(&format!(
+            ":double_vertical_bar: Paused before *{step}*: the factory is restarting. It continues by itself."
+        ));
+        self.paused = true;
+        self.save()?;
+        Ok(Status::Running)
     }
 
     pub fn flow(&self) -> &Flow {
@@ -1046,6 +1096,9 @@ impl Driver {
             if self.hear_owner() {
                 return self.park("the owner said stop");
             }
+            if self.pause_wanted() {
+                return self.pause();
+            }
             let step_id = self.unit.position.step.clone();
             let step = self
                 .flow
@@ -1072,6 +1125,7 @@ impl Driver {
             }
             let outcome = match end {
                 StepEnd::Park(reason) => return self.park(&reason),
+                StepEnd::Pause => return self.pause(),
                 StepEnd::Outcome(outcome) => outcome,
             };
             let mut line = format!("{step_id} (round {round}): {outcome}");
@@ -1239,8 +1293,13 @@ impl Driver {
     }
 
     /// Every account is at a limit: wait for the first to come back. The
-    /// step's session is kept. Returns why the unit should park, if it should.
-    fn wait_for_accounts(&mut self, step: &str, until: u64) -> Result<Option<String>, DriverError> {
+    /// step's session is kept. Returns how the step ends if the wait was cut
+    /// short: the owner said stop, or the factory is restarting.
+    fn wait_for_accounts(
+        &mut self,
+        step: &str,
+        until: u64,
+    ) -> Result<Option<StepEnd>, DriverError> {
         let wait = until.saturating_sub(now_unix());
         self.event(
             "accounts.limited",
@@ -1261,7 +1320,10 @@ impl Driver {
         ));
         while now_unix() < until {
             if self.hear_owner() {
-                return Ok(Some("the owner said stop".to_string()));
+                return Ok(Some(StepEnd::Park("the owner said stop".to_string())));
+            }
+            if self.pause_wanted() {
+                return Ok(Some(StepEnd::Pause));
             }
             std::thread::sleep(Duration::from_secs(
                 until.saturating_sub(now_unix()).clamp(1, 15),
@@ -1477,8 +1539,8 @@ impl Driver {
                 match pick_account(&self.factory, &model)? {
                     AccountPick::Use { id, token } => break (id, token),
                     AccountPick::Wait { until } => {
-                        if let Some(reason) = self.wait_for_accounts(&step.id, until)? {
-                            return Ok(StepEnd::Park(reason));
+                        if let Some(end) = self.wait_for_accounts(&step.id, until)? {
+                            return Ok(end);
                         }
                     }
                 }
@@ -2310,6 +2372,9 @@ impl Driver {
                             "GitHub could not be read for the pull request's checks: {err}"
                         )));
                     }
+                    if self.pause_wanted() {
+                        return Ok(StepEnd::Pause);
+                    }
                     std::thread::sleep(poll);
                     continue;
                 }
@@ -2430,6 +2495,10 @@ impl Driver {
                     duration_text(timeout.as_secs()),
                     waiting_on.join(", ")
                 )));
+            }
+            // Waiting for CI can take hours, and is safe to take up again.
+            if self.pause_wanted() {
+                return Ok(StepEnd::Pause);
             }
             std::thread::sleep(poll);
         }
@@ -3411,7 +3480,7 @@ pub fn pick_account(factory: &Factory, model: &str) -> Result<AccountPick, Drive
         if let Err(err) = &read {
             // Never fatal: runs report the same windows. But a login that
             // could not be refreshed is something the owner must hear about.
-            eprintln!("accounts: {err}");
+            factory_core::note!("accounts: {err}");
         }
         let _ = tracker.update(&account.id, |state| {
             match read {

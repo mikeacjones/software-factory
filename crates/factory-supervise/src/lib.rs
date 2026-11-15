@@ -129,6 +129,81 @@ fn spawn(spec: &Spec, stdout: Stdio, stderr: Stdio) -> Result<Child, Error> {
     Ok(child)
 }
 
+/// Where long runs are noted while they are alive, if anywhere: set once
+/// by a process that wants what it leaves behind when it dies to be found.
+static LEDGER: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// A run allowed at least this long is noted. The short ones (a git or a
+/// tracker command) end by themselves soon enough whoever is watching.
+const LONG_RUN: Duration = Duration::from_secs(5 * 60);
+
+/// From now on, note every long run of this process in `dir` for as long
+/// as it lives. If the process dies, what it left running can be found and
+/// removed by the one that takes its place: see [`reap_leftovers`].
+pub fn track_long_runs(dir: &Path) {
+    let _ = std::fs::create_dir_all(dir);
+    let _ = LEDGER.set(dir.to_path_buf());
+}
+
+/// When a process started, as `ps` prints it. Together with the process ID
+/// it names one process for good: an ID alone is used again after a while.
+fn started_at(pid: u32) -> Option<String> {
+    let out = Command::new("/bin/ps")
+        .args(["-o", "lstart=", "-p", &pid.to_string()])
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !text.is_empty()).then_some(text)
+}
+
+/// Note a run that has just started: a file named after its process group,
+/// holding when it started and what it is.
+fn note_in(dir: &Path, pgid: u32, command: &str) -> Option<PathBuf> {
+    let started = started_at(pgid)?;
+    let path = dir.join(format!("{pgid}.run"));
+    std::fs::write(&path, format!("{started}\n{command}\n")).ok()?;
+    Some(path)
+}
+
+fn note(spec: &Spec, pgid: u32) -> Option<PathBuf> {
+    let dir = LEDGER.get()?;
+    (spec.timeout >= LONG_RUN)
+        .then(|| note_in(dir, pgid, &spec.display()))
+        .flatten()
+}
+
+/// Kill every run noted in `dir` that is still alive, with everything it
+/// started, and clear the notes. For a process that has just taken the
+/// place of one that died: the runs the dead one was waiting for go on by
+/// themselves otherwise, and would be working beside the runs that replace
+/// them. Returns what was killed. A note whose process is gone, or whose
+/// process ID now belongs to something else, kills nothing.
+pub fn reap_leftovers(dir: &Path) -> Vec<String> {
+    let mut killed = Vec::new();
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(pgid) = name
+            .strip_suffix(".run")
+            .and_then(|id| id.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let mut lines = text.lines();
+        let (started, command) = (lines.next().unwrap_or(""), lines.next().unwrap_or(""));
+        if !started.is_empty() && started_at(pgid).as_deref() == Some(started) {
+            kill_group(pgid);
+            killed.push(format!(
+                "{command} (process group {pgid}, started {started})"
+            ));
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+    killed
+}
+
 /// SIGKILL a whole process group. Done through `kill` because this workspace
 /// forbids unsafe code, which a direct system call would need.
 fn kill_group(pgid: u32) {
@@ -155,6 +230,7 @@ pub fn capture(spec: &Spec) -> Result<Captured, Error> {
     let started = Instant::now();
     let mut child = spawn(spec, Stdio::piped(), Stdio::piped())?;
     let pgid = child.id();
+    let noted = note(spec, pgid);
     let stdout = child.stdout.take().map(read_all);
     let stderr = child.stderr.take().map(read_all);
 
@@ -177,6 +253,9 @@ pub fn capture(spec: &Spec) -> Result<Captured, Error> {
     };
     // Anything the command left running would keep the pipes open.
     kill_group(pgid);
+    if let Some(noted) = noted {
+        let _ = std::fs::remove_file(noted);
+    }
     let collect = |receiver: Option<mpsc::Receiver<String>>| {
         receiver
             .and_then(|receiver| receiver.recv_timeout(Duration::from_secs(5)).ok())
@@ -229,6 +308,7 @@ pub fn stream(
     let started = Instant::now();
     let mut child = spawn(spec, Stdio::piped(), Stdio::from(log_err))?;
     let pgid = child.id();
+    let noted = note(spec, pgid);
     let (sender, receiver) = mpsc::channel::<String>();
     if let Some(stdout) = child.stdout.take() {
         std::thread::spawn(move || {
@@ -284,6 +364,9 @@ pub fn stream(
     };
     // Leave nothing behind, then read what was already in the pipe.
     kill_group(pgid);
+    if let Some(noted) = noted {
+        let _ = std::fs::remove_file(noted);
+    }
     while let Ok(line) = receiver.recv_timeout(Duration::from_millis(200)) {
         lines += 1;
         handle(line, &mut log_file);
@@ -319,6 +402,50 @@ mod tests {
             std::env::temp_dir(),
             Duration::from_millis(timeout_ms),
         )
+    }
+
+    #[test]
+    fn what_a_dead_process_left_running_is_found_and_killed() {
+        let dir = std::env::temp_dir().join(format!("factory-ledger-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A run with a child of its own, as an agent with its tools has,
+        // whose watcher has gone: nobody waits for it any more.
+        let spec = sh("sleep 300 & sleep 300", 600_000);
+        let mut left = spawn(&spec, Stdio::null(), Stdio::null()).unwrap();
+        let pgid = left.id();
+        let note = note_in(&dir, pgid, &spec.display()).unwrap();
+        let alive = |pid: u32| started_at(pid).is_some();
+        assert!(alive(pgid));
+        // A note about a process that is gone, and one whose process ID now
+        // belongs to something that started at another time (this test).
+        std::fs::write(dir.join("999999.run"), "Mon Jan  1 00:00:00 2001\nold\n").unwrap();
+        let own = std::process::id();
+        std::fs::write(
+            dir.join(format!("{own}.run")),
+            "Mon Jan  1 00:00:00 2001\nreused\n",
+        )
+        .unwrap();
+
+        let killed = reap_leftovers(&dir);
+        let _ = left.wait();
+        assert_eq!(killed.len(), 1, "{killed:?}");
+        assert!(killed[0].contains("sleep 300") && killed[0].contains(&pgid.to_string()));
+        assert!(!alive(pgid), "the run is gone");
+        assert!(
+            alive(own),
+            "a process that merely has a noted ID is left alone"
+        );
+        assert!(!note.exists());
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            0,
+            "every note is cleared"
+        );
+        // Nothing noted, nothing done; a directory that is not there is fine.
+        assert!(reap_leftovers(&dir).is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(reap_leftovers(&dir).is_empty());
     }
 
     #[test]

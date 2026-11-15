@@ -313,6 +313,7 @@ dependencies = [
  "factory-config",
  "factory-core",
  "factory-driver",
+ "factory-supervise",
 ]
 
 [[package]]

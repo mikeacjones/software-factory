@@ -90,6 +90,10 @@ One level of the agents that run a goal, defined by a model, an effort, a time l
 
 The files and directories a foreman sets aside for a bead that runs beside others of its sub-goal. Beads may run at the same time only when each has paths and no two overlap, which code checks before anything starts.
 
+## release
+
+One build of the factory together with the config that build reads, kept in a directory of its own. launchd runs the service from the current release, which a link names; a deploy makes a new release and moves the link.
+
 ## tick
 
 One pass of the driver: preflight, observe, step every unit, execute actions with at most one landing, dispatch, write the heartbeat.

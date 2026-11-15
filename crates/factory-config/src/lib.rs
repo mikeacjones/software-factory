@@ -47,10 +47,64 @@ pub struct Factory {
     /// account again.
     #[serde(default = "default_limit_grace")]
     pub limit_grace_secs: u64,
+    /// How the factory is kept running under launchd.
+    #[serde(default)]
+    pub service: ServiceSettings,
 }
 
 fn default_limit_grace() -> u64 {
     60
+}
+
+/// How the factory is kept running: as a launchd agent of the desktop
+/// session of the user it runs as.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceSettings {
+    /// The launchd job's name.
+    #[serde(default = "default_service_label")]
+    pub label: String,
+    /// Where the service and everything it starts find their tools, in
+    /// order: launchd gives a job almost no `PATH` of its own.
+    #[serde(default = "default_service_path")]
+    pub path: Vec<String>,
+    /// How many releases to keep.
+    #[serde(default = "default_releases_kept")]
+    pub releases_kept: usize,
+}
+
+fn default_service_label() -> String {
+    "software-factory".to_string()
+}
+
+fn default_service_path() -> Vec<String> {
+    [
+        "~/.local/bin",
+        "/opt/homebrew/bin",
+        "/opt/homebrew/sbin",
+        "/usr/local/bin",
+        "/usr/bin",
+        "/bin",
+        "/usr/sbin",
+        "/sbin",
+    ]
+    .iter()
+    .map(|dir| dir.to_string())
+    .collect()
+}
+
+fn default_releases_kept() -> usize {
+    5
+}
+
+impl Default for ServiceSettings {
+    fn default() -> Self {
+        ServiceSettings {
+            label: default_service_label(),
+            path: default_service_path(),
+            releases_kept: default_releases_kept(),
+        }
+    }
 }
 
 /// A Claude subscription workers can run under.
@@ -541,6 +595,9 @@ impl ConfigDir {
         let (path, text) = self.read("factory.toml")?;
         let mut factory: Factory = parse(&path, &text)?;
         factory.state_dir = expand_home(&factory.state_dir);
+        for dir in &mut factory.service.path {
+            *dir = expand_home(Path::new(dir)).to_string_lossy().into_owned();
+        }
         if let Some(slack) = &mut factory.slack {
             slack.env_file = expand_home(&slack.env_file);
         }
