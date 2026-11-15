@@ -41,6 +41,14 @@ command = ["cargo", "test", "--locked", "--offline", "--package", "factory-engin
 timeout_secs = 900
 
 [[check]]
+id = "engine-goal-pipelines"
+tier = "host"
+bead = "sf-9a0.8"
+claim = "With `pipelines = true` in the factory's [temporal] table, a goal's pipelines are workflows: the service's own supervisor, with a scripted director, opens a sub-goal, and the bead it starts there runs on the engine inside the sub-goal and is absorbed, and the sub-goal is shipped on the engine as one pull request and merged, with nothing run on a thread of the service and each pipeline found on the server under the name the goal's record gives it. A pipeline run for a goal ends where it parks and says why; another takes the unit up from the factory's record, from a named step with a note that reaches that step and a ruling that reaches a later one, or exactly where it stands with nothing counted twice."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-engine", "--test", "pipeline", "--", "--test-threads=1", "a_goals_bead_and_its_sub_goals_shipping", "a_pipeline_run_for_a_goal_ends_where_it_parks", "a_unit_is_taken_up_where_it_stands"]
+timeout_secs = 900
+
+[[check]]
 id = "engine-described"
 tier = "host"
 bead = "sf-9a0.6"

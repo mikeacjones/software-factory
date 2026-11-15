@@ -455,6 +455,178 @@ const BEAD_TYPES: [&str; 6] = ["bug", "feature", "task", "chore", "spike", "deci
 /// pipeline was. A pipeline that ships a sub-goal must be settled as one
 /// even if the report does not say so, or the sub-goal would never be marked
 /// landed and nothing after it could start.
+/// How a pipeline that ran on the engine ended, as the tiers are told it:
+/// from the unit's own record, which the driver kept as it always does.
+fn engine_ended(
+    name: &str,
+    ship: bool,
+    outcome: &str,
+    detail: String,
+    unit: Option<&crate::Unit>,
+) -> Happening {
+    Happening::PipelineEnded {
+        bead: name.to_string(),
+        unit: unit.map(|unit| unit.id.to_string()),
+        outcome: outcome.to_string(),
+        detail,
+        pull_request: unit.and_then(|unit| unit.pull_request.clone()),
+        findings: unit
+            .map(|unit| {
+                unit.results
+                    .iter()
+                    .flat_map(|(step, result)| {
+                        items(result, "findings").iter().map(move |finding| {
+                            let mut finding = finding.clone();
+                            finding["step"] = json!(step);
+                            finding
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        commit: unit.and_then(|unit| unit.absorbed.clone()),
+        ship,
+        strayed: unit.map(|unit| unit.strayed.clone()).unwrap_or_default(),
+    }
+}
+
+/// What a goal's pipeline is called on the engine. It is made from what
+/// the goal's record says of the pipeline, so that the same name is asked
+/// for after a restart and the pipeline that is there is found: which
+/// time the bead was started in this goal, and how often that pipeline
+/// has been continued.
+fn pipeline_name(goal: &Goal, name: &str) -> String {
+    let started = goal.units.iter().filter(|unit| unit.bead == name).count();
+    let continued = goal
+        .units
+        .iter()
+        .rev()
+        .find(|unit| unit.bead == name)
+        .map_or(0, |unit| unit.continued);
+    format!("pipeline-{}-{name}-{started}-{continued}", goal.id)
+}
+
+/// Run one pipeline on the engine and follow it to its end. The engine's
+/// command starts it, or finds it if it was started before, and says on
+/// its standard output which unit it is for and how it ended. `began` is
+/// told the unit. `None` if the service is stopping: the pipeline goes on
+/// without it, and is found again by its name when the service is back.
+fn on_engine(
+    engine: &Path,
+    config: &ConfigDir,
+    file: &Path,
+    name: &str,
+    ship: bool,
+    began: impl Fn(&str),
+) -> Option<Happening> {
+    use std::io::BufRead;
+    let id = file
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let failed = |detail: String| Some(engine_ended(name, ship, "failed", detail, None));
+    let state_dir = config.factory().ok().map(|factory| factory.state_dir);
+    let stopping = || state_dir.as_deref().is_some_and(crate::draining);
+    let mut unit_id: Option<String> = None;
+    let mut tries = 0u32;
+    loop {
+        let child = std::process::Command::new(engine)
+            .arg("run")
+            .arg(file)
+            .arg("--config")
+            .arg(&config.0)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn();
+        let mut child = match child {
+            Ok(child) => child,
+            Err(err) => return failed(format!("`{}` could not be run: {err}", engine.display())),
+        };
+        let mut end = None;
+        if let Some(stdout) = child.stdout.take() {
+            for line in std::io::BufReader::new(stdout)
+                .lines()
+                .map_while(Result::ok)
+            {
+                match line.split_once(' ') {
+                    Some(("unit", id)) if unit_id.is_none() => {
+                        unit_id = Some(id.trim().to_string());
+                        began(id.trim());
+                    }
+                    Some((word @ ("end" | "refused" | "failed"), rest)) => {
+                        end = Some((word.to_string(), rest.to_string()));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let said = child
+            .wait_with_output()
+            .map(|out| String::from_utf8_lossy(&out.stderr).trim().to_string())
+            .unwrap_or_default();
+        let unit = unit_id
+            .as_deref()
+            .and_then(|id| crate::Driver::read_unit(config, id).ok());
+        match end {
+            Some((word, rest)) if word == "end" => {
+                let end: Value = serde_json::from_str(&rest).unwrap_or_default();
+                let unit = unit.as_ref();
+                return Some(if let Some(reason) = end["parked"].as_str() {
+                    engine_ended(name, ship, "parked", format!("Parked: {reason}"), unit)
+                } else if end["ended"] != json!(true) {
+                    engine_ended(name, ship, "failed", "It was given up.".to_string(), unit)
+                } else if unit.is_some_and(|unit| unit.merged.is_some()) {
+                    let detail = if ship {
+                        "Its pull request is merged and its beads are closed."
+                    } else {
+                        "Its change is merged and its bead is closed."
+                    };
+                    engine_ended(name, ship, "landed", detail.to_string(), unit)
+                } else if unit.is_some_and(|unit| unit.absorbed.is_some()) {
+                    engine_ended(
+                        name,
+                        ship,
+                        "absorbed",
+                        "Its change is one commit on the sub-goal's branch. The bead stays open until the sub-goal lands.".to_string(),
+                        unit,
+                    )
+                } else {
+                    engine_ended(
+                        name,
+                        ship,
+                        "published",
+                        "Its pull request is open.".to_string(),
+                        unit,
+                    )
+                });
+            }
+            Some((word, rest)) if word == "refused" => {
+                return Some(engine_ended(name, ship, "refused", rest, unit.as_ref()));
+            }
+            Some((_, rest)) => {
+                return Some(engine_ended(name, ship, "failed", rest, unit.as_ref()));
+            }
+            // The command ended without saying how the pipeline did: the
+            // server could not be reached, or the command was stopped.
+            // The pipeline itself is not touched by that. It is asked
+            // for again, by the same name, until it answers.
+            None => {
+                if stopping() {
+                    return None;
+                }
+                tries += 1;
+                if tries == 1 || tries.is_multiple_of(20) {
+                    factory_core::note!(
+                        "goals: pipeline `{id}` could not be followed (try {tries}): {said}"
+                    );
+                }
+                std::thread::sleep(Duration::from_secs(u64::from(tries.min(6)) * 5));
+            }
+        }
+    }
+}
+
 fn mark_shipping(goal: &Goal, happening: &mut Happening) {
     if let Happening::PipelineEnded { bead, ship, .. } = happening
         && goal
@@ -5018,6 +5190,48 @@ impl Supervisor {
         let (config, sender) = (self.config.clone(), self.sender.clone());
         let (goal_id, project) = (goal.id.clone(), goal.project.clone());
         let ship = recorded || matches!(within, Some(Within::Ship(_)));
+        if let Some(engine) = self.engine_command() {
+            // The pipeline is a workflow on the engine. Its name is made
+            // from what the goal's record says of it, so that after a
+            // restart the same name is asked for and the pipeline that is
+            // there is followed: which time the bead was started, and how
+            // often that pipeline has been continued.
+            let id = pipeline_name(goal, &name);
+            let spec = json!({
+                "id": id,
+                "project": project,
+                "bead": name,
+                "flow_name": flow,
+                "within": within,
+                "unit": resume,
+                "adopt": again.as_ref().map(|again| json!({
+                    "from": again.from, "note": again.note, "ruling": again.ruling,
+                })),
+            });
+            // What was asked for is on disk before anything is started:
+            // a restart in the next moment finds it there.
+            let file = self.pipeline_file(goal, &name);
+            let written = file
+                .parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|()| std::fs::write(&file, spec.to_string()));
+            match written {
+                Ok(()) => self.follow(&goal.id, &name, ship, engine, file),
+                Err(err) => {
+                    let _ = sender.send(Internal::Ended {
+                        goal: goal_id,
+                        happening: engine_ended(
+                            &name,
+                            ship,
+                            "failed",
+                            format!("{}: {err}", file.display()),
+                            None,
+                        ),
+                    });
+                }
+            }
+            return;
+        }
         // A pipeline continued by decision goes on from a named step, with
         // a note; one continued after a restart goes on where it was.
         let (from, continued, ruling) = match again {
@@ -5126,6 +5340,51 @@ impl Supervisor {
                 happening,
             });
         });
+    }
+
+    /// Where what was asked of the engine for a pipeline is kept.
+    fn pipeline_file(&self, goal: &Goal, name: &str) -> PathBuf {
+        self.dir(&goal.id)
+            .join("pipelines")
+            .join(format!("{}.json", pipeline_name(goal, name)))
+    }
+
+    /// Follow a pipeline on the engine to its end, on a thread of its
+    /// own, and report as a pipeline run here would.
+    fn follow(&self, goal: &str, name: &str, ship: bool, engine: PathBuf, file: PathBuf) {
+        let (config, sender) = (self.config.clone(), self.sender.clone());
+        let (goal_id, name) = (goal.to_string(), name.to_string());
+        std::thread::spawn(move || {
+            let happening = on_engine(&engine, &config, &file, &name, ship, |unit| {
+                let _ = sender.send(Internal::Began {
+                    goal: goal_id.clone(),
+                    bead: name.clone(),
+                    unit: unit.to_string(),
+                });
+            });
+            if let Some(happening) = happening {
+                let _ = sender.send(Internal::Ended {
+                    goal: goal_id.clone(),
+                    happening,
+                });
+            }
+        });
+    }
+
+    /// The engine's command and the config directory it is given, if
+    /// goals run their pipelines on the engine.
+    fn engine_command(&self) -> Option<PathBuf> {
+        let temporal = self
+            .factory
+            .temporal
+            .as_ref()
+            .filter(|temporal| temporal.pipelines)?;
+        Some(
+            temporal
+                .engine_bin
+                .clone()
+                .unwrap_or_else(|| self.factory.state_dir.join("bin/factory-engine")),
+        )
     }
 
     /// Handle what pipelines reported, waiting up to `wait` for the first
@@ -5400,6 +5659,22 @@ impl Supervisor {
                             Some(unit_id.clone()),
                             None,
                         );
+                    }
+                    // Asked of the engine before the restart: it may be
+                    // running there, and is found by its name.
+                    None if self
+                        .engine_command()
+                        .is_some_and(|_| self.pipeline_file(&goal, &unit.bead).is_file()) =>
+                    {
+                        if let Some(engine) = self.engine_command() {
+                            self.follow(
+                                &goal.id,
+                                &unit.bead,
+                                unit.ship,
+                                engine,
+                                self.pipeline_file(&goal, &unit.bead),
+                            );
+                        }
                     }
                     // It never got as far as having a unit. Whoever started
                     // it is told, and decides again with the tracker as it

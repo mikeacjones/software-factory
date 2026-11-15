@@ -79,6 +79,16 @@ pub struct Temporal {
     /// left, in seconds. Between those it acts on what runs report.
     #[serde(default = "default_accounts_check")]
     pub accounts_check_secs: u64,
+    /// Goals run their pipelines on the engine: every bead, sub-goal bead
+    /// and sub-goal being shipped is a workflow, started through the
+    /// engine's own command. Off, the service runs them itself.
+    #[serde(default)]
+    pub pipelines: bool,
+    /// The engine's command, when it is not `bin/factory-engine` under
+    /// the state directory. Reaching the server from this machine is
+    /// allowed to a program by its path, so it does not move.
+    #[serde(default)]
+    pub engine_bin: Option<PathBuf>,
 }
 
 fn default_accounts_check() -> u64 {

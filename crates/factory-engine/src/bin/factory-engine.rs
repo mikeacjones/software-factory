@@ -24,7 +24,10 @@ use factory_engine::accounts::{ACCOUNTS_ID, Accounts};
 use factory_engine::engine::{Adopt, GoOn, Pipeline, PipelineInput};
 use factory_engine::factory::FactoryRunner;
 use factory_engine::worker::{WorkerSettings, connect, ensure_accounts, pipeline_options, run};
-use temporalio_client::{WorkflowGetResultOptions, WorkflowQueryOptions, WorkflowSignalOptions};
+use temporalio_client::errors::WorkflowStartError;
+use temporalio_client::{
+    WorkflowGetResultOptions, WorkflowIdReusePolicy, WorkflowQueryOptions, WorkflowSignalOptions,
+};
 
 /// What this build of the engine is called: its release, when it runs
 /// from one, so that a pipeline's history says which build ran each step.
@@ -49,6 +52,11 @@ fn build_id() -> String {
 #[derive(serde::Deserialize)]
 struct RunSpec {
     project: String,
+    /// The pipeline's ID, when whoever starts it has to be able to find
+    /// it again by a name of its own. A pipeline of that name that exists
+    /// already, running or ended, is followed and nothing is started.
+    #[serde(default)]
+    id: Option<String>,
     /// The bead, or what a sub-goal being shipped is called.
     bead: String,
     #[serde(default)]
@@ -253,17 +261,22 @@ async fn command(args: &[String]) -> Result<(), String> {
                 stop_at_park: true,
                 ..PipelineInput::default()
             };
-            let id = format!(
-                "pipeline-{}-{}-{}",
-                spec.project,
-                spec.unit.as_deref().unwrap_or(&spec.bead),
-                factory_core_now()
-            );
-            let options = pipeline_options(&temporal.task_queue, &id, &input, &spec.title);
-            client
-                .start_workflow(Pipeline::run, input, options)
-                .await
-                .map_err(|err| format!("the pipeline could not be started: {err}"))?;
+            let id = spec.id.clone().unwrap_or_else(|| {
+                format!(
+                    "pipeline-{}-{}-{}",
+                    spec.project,
+                    spec.unit.as_deref().unwrap_or(&spec.bead),
+                    factory_core_now()
+                )
+            });
+            let mut options = pipeline_options(&temporal.task_queue, &id, &input, &spec.title);
+            // Asked twice for the same pipeline, as after a restart of
+            // whatever started it, this follows the one there is.
+            options.id_reuse_policy = WorkflowIdReusePolicy::RejectDuplicate;
+            match client.start_workflow(Pipeline::run, input, options).await {
+                Ok(_) | Err(WorkflowStartError::AlreadyStarted { .. }) => {}
+                Err(err) => return Err(format!("the pipeline could not be started: {err}")),
+            }
             println!("workflow {id}");
             follow(&client.get_workflow_handle::<Pipeline>(id)).await
         }

@@ -437,6 +437,207 @@ async fn a_pipeline_run_for_a_goal_ends_where_it_parks_and_another_takes_the_uni
     shop.close().await;
 }
 
+/// A unit something else was walking is taken up exactly where its
+/// record says it stands, with no step named: what the service's own
+/// pipelines need when they are handed to the engine as they are.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_unit_is_taken_up_where_it_stands_when_no_step_is_named() {
+    let Some(shop) = Shop::open("engine-stands", "true", "ask-once").await else {
+        return;
+    };
+    let (mut input, options) = shop.start("engine-stands");
+    input.stop_at_park = true;
+    let end = shop
+        .client()
+        .start_workflow(Pipeline::run, input, options)
+        .await
+        .unwrap()
+        .get_result(WorkflowGetResultOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(end.parked.as_deref(), Some("step `build` needs the owner"));
+    let before = unit_record(&shop.world, &end.unit);
+    let again = PipelineInput {
+        unit: end.unit.clone(),
+        beat_secs: 1,
+        stop_at_park: true,
+        adopt: Some(Adopt::default()),
+        ..PipelineInput::default()
+    };
+    let options = factory_engine::worker::pipeline_options(
+        "factory-engine-stands",
+        "pipeline-engine-stands-2",
+        &again,
+        "",
+    );
+    let second = shop
+        .client()
+        .start_workflow(Pipeline::run, again, options)
+        .await
+        .unwrap()
+        .get_result(WorkflowGetResultOptions::default())
+        .await
+        .unwrap();
+    assert!(second.ended, "{second:?}");
+    // The same step, in the same round: nothing was counted twice.
+    assert_eq!(second.done.first().unwrap().0, "build");
+    let after = unit_record(&shop.world, &end.unit);
+    assert_eq!(after["status"], "ended");
+    assert_eq!(
+        after["position"]["rounds"]["build"],
+        before["position"]["rounds"]["build"]
+    );
+    shop.close().await;
+}
+
+/// A whole goal with its pipelines on the engine: the service's own
+/// supervisor runs the director, and every pipeline it starts, the bead
+/// inside the sub-goal and the sub-goal being shipped, is a workflow.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_goals_bead_and_its_sub_goals_shipping_run_as_workflows_on_the_engine() {
+    use factory_driver::goal::{Phase, Supervisor};
+    use factory_slack::socket::Incoming;
+
+    let prepare = |world: &World| {
+        world.with_github("green");
+        let project = world.path("config/projects/toy.toml");
+        let text = std::fs::read_to_string(&project)
+            .unwrap()
+            .replace(
+                "merge_subject = \"Merge bead/{bead_short}: {title}\"",
+                "merge_method = \"squash\"\nmerge_subject = \"{title} (#{number})\"",
+            )
+            .replace(
+                "merge_body = \"{summary}\\n\\n{testing}\\n\\nBead: {bead}\"",
+                "merge_body = \"{commit_body}\\n\\n{testing}\\n\\n{commit_trailers}\"",
+            );
+        assert!(text.contains("merge_method = \"squash\""));
+        std::fs::write(&project, text).unwrap();
+        std::fs::create_dir_all(world.path("config/goals/toy")).unwrap();
+        std::fs::write(
+            world.path("config/goals/toy/main.toml"),
+            "id = \"main\"\nflow = \"zig-sdk-bead\"\nship_flow = \"zig-sdk-ship\"\n[director]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\n",
+        )
+        .unwrap();
+    };
+    let Some(shop) = Shop::open_after("engine-goal", "true", "", prepare).await else {
+        return;
+    };
+    let world = &shop.world;
+    // Goals run their pipelines on the engine, through its own command.
+    let factory = world.path("config/factory.toml");
+    let text = std::fs::read_to_string(&factory).unwrap();
+    std::fs::write(
+        &factory,
+        format!(
+            "{text}pipelines = true\nengine_bin = \"{}\"\n",
+            env!("CARGO_BIN_EXE_factory-engine")
+        ),
+    )
+    .unwrap();
+    let say = |role: &str, n: u32, json: String| {
+        std::fs::create_dir_all(world.path("bin/state")).unwrap();
+        std::fs::write(world.path(&format!("bin/state/{role}-{n}.json")), json).unwrap();
+    };
+    let decide = |fields: &str| {
+        let mut result = serde_json::json!({
+            "summary": "Decided.", "start": [], "file": [], "edit": [], "dropped_findings": [],
+            "open_subgoal": {"id": "", "title": "", "objective": "", "beads": []}, "ship": false,
+            "ask_owner": "", "complete": false, "evidence": "", "journal_entry": "", "project_memory": ""
+        });
+        let extra: serde_json::Value = serde_json::from_str(fields).unwrap();
+        for (key, value) in extra.as_object().unwrap() {
+            result[key] = value.clone();
+        }
+        result.to_string()
+    };
+    say("intake", 1, r#"{"reply":"Here is the charter.","ready":true,"objective":"Ship the feature.","stop_when":"The bead has landed.","plan":"One sub-goal: toy-1.","edits":[]}"#.to_string());
+    say(
+        "director",
+        1,
+        decide(
+            r#"{"open_subgoal":{"id":"feature","title":"The feature","objective":"It works.","beads":["toy-1"]},"start":[{"bead":"toy-1","reason":"first"}]}"#,
+        ),
+    );
+    say("director", 2, decide(r#"{"ship":true}"#));
+    say(
+        "director",
+        3,
+        decide(r#"{"complete":true,"evidence":"The bead landed in one pull request."}"#),
+    );
+
+    // The supervisor is not async: it runs on a thread of its own, as it
+    // does in the service.
+    let config = world.config();
+    let goal = tokio::task::spawn_blocking(move || {
+        let mut sup = Supervisor::new(config, None, vec!["OWNER".to_string()], false).unwrap();
+        let id = sup.open_directly("toy", "Ship the feature").unwrap();
+        sup.incoming(Incoming::Action {
+            channel: String::new(),
+            user: "OWNER".to_string(),
+            action_id: "goal_start".to_string(),
+            value: id.clone(),
+            message_ts: String::new(),
+        })
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(240);
+        while sup.goals().next().unwrap().wakes < 3 {
+            assert!(
+                Instant::now() < deadline,
+                "the goal never reached its third wake: {:?}",
+                sup.goals().next().unwrap().units
+            );
+            sup.pump(Duration::from_millis(200)).unwrap();
+        }
+        // Nothing ran on a thread of the service.
+        assert_eq!(sup.live(), 0);
+        sup.goals().next().unwrap().clone()
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(goal.phase, Phase::ProposedComplete);
+    assert_eq!(goal.subgoals[0].state, "landed");
+    assert!(goal.subgoals[0].pull_request.is_some());
+    let states: Vec<(&str, &str)> = goal
+        .units
+        .iter()
+        .map(|unit| (unit.bead.as_str(), unit.state.as_str()))
+        .collect();
+    assert_eq!(states, [("toy-1", "absorbed"), ("feature", "landed")]);
+    // The bead was absorbed into the sub-goal's branch and opened no pull
+    // request of its own; the sub-goal was shipped as one, and merged.
+    let gh = world.gh_calls();
+    assert_eq!(
+        gh.iter()
+            .filter(|call| call.starts_with("pr create"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        gh.iter()
+            .filter(|call| call.starts_with("pr merge"))
+            .count(),
+        1
+    );
+    // Each was a workflow, named from the goal's record of it, that ran
+    // to its end and says what everything in it was for.
+    for (name, unit) in [("toy-1", &goal.units[0]), ("feature", &goal.units[1])] {
+        let workflow = format!("pipeline-{}-{name}-1-0", goal.id);
+        let end = shop
+            .client()
+            .get_workflow_handle::<Pipeline>(workflow.clone())
+            .get_result(WorkflowGetResultOptions::default())
+            .await
+            .unwrap();
+        assert!(end.ended, "{workflow}: {end:?}");
+        assert_eq!(Some(&end.unit), unit.unit.as_ref());
+        let record = unit_record(world, &end.unit);
+        assert_eq!(record["status"], "ended");
+    }
+    shop.close().await;
+}
+
 /// The accounts workflow in front of the real driver: the step is handed
 /// an account by name, the driver reads that account's token itself, and a
 /// run the account refuses is carried on under the next one.
