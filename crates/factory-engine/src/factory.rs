@@ -12,10 +12,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use factory_config::ConfigDir;
-use factory_driver::{Driver, Options, Stepped};
+use factory_driver::{Driver, DriverError, Options, Stepped};
 
 use crate::accounts::{CheckCall, Picture};
-use crate::steps::{ParkCall, PrepareCall, Prepared, Started, StepCall, StepDone, StepRunner};
+use crate::steps::{
+    NotPrepared, ParkCall, PrepareCall, Prepared, Started, StepCall, StepDone, StepRunner,
+};
 
 /// Runs steps with the factory's driver, against one config directory.
 pub struct FactoryRunner {
@@ -101,14 +103,22 @@ impl FactoryRunner {
 }
 
 impl StepRunner for FactoryRunner {
-    fn prepare(&self, call: &PrepareCall) -> Result<Prepared, String> {
+    fn prepare(&self, call: &PrepareCall) -> Result<Prepared, NotPrepared> {
         let options = self.options(call.flow_name.clone(), None);
         let driver = Driver::start(self.config.clone(), &call.project, &call.bead, &options)
-            .map_err(|err| err.to_string())?;
+            .map_err(|err| match err {
+                // The bead itself is what is wrong, and stays wrong until
+                // someone changes it.
+                DriverError::NotLaunchable { .. } => NotPrepared::Refused(err.to_string()),
+                other => NotPrepared::Failed(other.to_string()),
+            })?;
         let unit = driver.unit().id.to_string();
-        let pinned = self.unit_dir(&unit)?.join("flow.toml");
+        let pinned = self
+            .unit_dir(&unit)
+            .map_err(NotPrepared::Failed)?
+            .join("flow.toml");
         let flow = std::fs::read_to_string(&pinned)
-            .map_err(|err| format!("{}: {err}", pinned.display()))?;
+            .map_err(|err| NotPrepared::Failed(format!("{}: {err}", pinned.display())))?;
         Ok(Prepared { unit, flow })
     }
 

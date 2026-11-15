@@ -2,7 +2,8 @@
 //! pipeline and talk to one.
 //!
 //!   factory-engine worker                     run a worker: the engine and the steps
-//!   factory-engine start <project> <bead>     start a pipeline for a bead
+//!   factory-engine start <project> <bead>     start a pipeline for a bead, and say
+//!                                             so if the bead is refused
 //!   factory-engine standing <pipeline>        where a pipeline stands
 //!   factory-engine go-on <pipeline> <step> <note>
 //!                                             continue a parked pipeline from a step
@@ -29,6 +30,10 @@ use temporalio_client::{
 
 /// What this build of the engine is called: its release, when it runs
 /// from one, so that a pipeline's history says which build ran each step.
+/// How long `start` watches a new pipeline for a unit or a refusal, in
+/// seconds.
+const START_LOOK_SECS: u64 = 90;
+
 fn build_id() -> String {
     std::env::current_exe()
         .ok()
@@ -107,6 +112,28 @@ async fn command(args: &[String]) -> Result<(), String> {
                 .await
                 .map_err(|err| format!("the pipeline could not be started: {err}"))?;
             println!("{id}");
+            if !wait {
+                // A bead that may not be worked on is refused in the
+                // pipeline's first moments. Whoever started it is told
+                // here, not left with a pipeline that ended unseen.
+                let began = std::time::Instant::now();
+                while began.elapsed() < std::time::Duration::from_secs(START_LOOK_SECS) {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    let Ok(standing) = handle
+                        .query(Pipeline::standing, (), WorkflowQueryOptions::default())
+                        .await
+                    else {
+                        continue;
+                    };
+                    if let Some(reason) = standing.refused {
+                        return Err(format!("the pipeline ended before its first step: {reason}"));
+                    }
+                    if !standing.unit.is_empty() {
+                        println!("unit: {}", standing.unit);
+                        break;
+                    }
+                }
+            }
             if wait {
                 let end = handle
                     .get_result(WorkflowGetResultOptions::default())
@@ -133,6 +160,9 @@ async fn command(args: &[String]) -> Result<(), String> {
                 .map_err(|err| format!("the pipeline could not be asked: {err}"))?;
             println!("unit: {}", standing.unit);
             println!("step: {}", standing.step);
+            if let Some(reason) = &standing.refused {
+                println!("ended before its first step: {reason}");
+            }
             if let Some(reason) = &standing.parked {
                 println!("parked: {reason}");
             }

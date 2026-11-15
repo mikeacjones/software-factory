@@ -128,6 +128,59 @@ fn unit_record(world: &World, unit: &str) -> serde_json::Value {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_bead_that_may_not_be_launched_ends_its_pipeline_at_once_and_says_why() {
+    let Some(shop) = Shop::open("engine-refused", "true", "").await else {
+        return;
+    };
+    // `toy-2` is someone else's: the driver will not start on it.
+    let (mut input, options) = shop.start("engine-refused");
+    input.bead = "toy-2".to_string();
+    let client = shop.client();
+    let handle = client
+        .start_workflow(Pipeline::run, input, options)
+        .await
+        .unwrap();
+    // It ends, where it once tried again for ever.
+    let ended = tokio::time::timeout(
+        Duration::from_secs(60),
+        handle.get_result(WorkflowGetResultOptions::default()),
+    )
+    .await
+    .expect("the pipeline went on trying to prepare a bead it had been refused");
+    assert!(ended.is_err(), "{ended:?}");
+    // Whoever asks is told why, and no unit was made.
+    let standing = handle
+        .query(Pipeline::standing, (), WorkflowQueryOptions::default())
+        .await
+        .unwrap();
+    let reason = standing.refused.unwrap_or_default();
+    assert!(reason.contains("may not be launched"), "{reason}");
+    assert!(reason.contains("it is claimed by `someone`"), "{reason}");
+    assert_eq!(standing.unit, "");
+    // The driver was asked once.
+    let json = handle
+        .fetch_history(WorkflowFetchHistoryOptions::default())
+        .to_json()
+        .await
+        .unwrap();
+    let history = String::from_utf8_lossy(&json).into_owned();
+    assert_eq!(
+        history.matches("ActivityTaskScheduled").count(),
+        1,
+        "{history}"
+    );
+    assert!(
+        !shop.world.path("state/units").exists() || {
+            std::fs::read_dir(shop.world.path("state/units"))
+                .unwrap()
+                .count()
+                == 0
+        }
+    );
+    shop.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_real_bead_is_built_broken_fixed_reviewed_and_published_under_the_engine() {
     let Some(shop) = Shop::open("engine-full", "test -f feature.txt", "").await else {
         return;

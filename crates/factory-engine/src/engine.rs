@@ -58,6 +58,10 @@ pub struct Standing {
     pub limited_secs: Option<u64>,
     /// The steps that have ended, in order, each with its outcome.
     pub done: Vec<(String, String)>,
+    /// Why the pipeline ended before its first step, if it did: the bead
+    /// may not be worked on as it stands.
+    #[serde(default)]
+    pub refused: Option<String>,
 }
 
 /// How a pipeline ended.
@@ -115,8 +119,23 @@ impl Pipeline {
             };
             let options =
                 ActivityOptions::with_start_to_close_timeout(Duration::from_secs(1800)).build();
-            let prepared = ctx.execute_activity(Steps::prepare, call, options).await?;
-            (prepared.unit, prepared.flow)
+            match ctx.execute_activity(Steps::prepare, call, options).await {
+                Ok(prepared) => (prepared.unit, prepared.flow),
+                // Only a refusal comes back: anything else is tried again.
+                // It is kept where someone who asks can read it, and the
+                // pipeline ends.
+                Err(err) => {
+                    // What the driver said is under the activity's own
+                    // failure, as its cause.
+                    let reason = err
+                        .failure()
+                        .and_then(|failure| failure.cause.as_ref())
+                        .map(|cause| cause.message.clone())
+                        .unwrap_or_else(|| err.to_string());
+                    ctx.state_mut(|state| state.standing.refused = Some(reason.clone()));
+                    return Err(refused(reason).into());
+                }
+            }
         } else {
             (input.unit.clone(), input.flow.clone())
         };

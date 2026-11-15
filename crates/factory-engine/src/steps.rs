@@ -13,6 +13,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use temporalio_client::WorkflowExecuteUpdateOptions;
 use temporalio_macros::activities;
+use temporalio_sdk::ApplicationFailure;
 use temporalio_sdk::activities::{ActivityContext, ActivityError};
 
 use crate::accounts::{AccountCall, Accounts, Ask, CheckCall, Lease, Picture};
@@ -82,17 +83,28 @@ pub struct ParkCall {
     pub reason: String,
 }
 
+/// Why a unit was not made ready.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NotPrepared {
+    /// The bead may not be worked on as it stands, as when it has no
+    /// acceptance criteria or someone else has it. Trying again would
+    /// change nothing: the pipeline ends, and says why.
+    Refused(String),
+    /// Something went wrong that may not go wrong the next time.
+    Failed(String),
+}
+
 /// What does the work of a step. The engine and the activities know only
 /// this much about it, which is what lets the same engine run a real
 /// pipeline, or in a test a script.
 pub trait StepRunner: Send + Sync + 'static {
     /// Make a unit ready for its first step. A runner with nothing to make
     /// ready has no use for this.
-    fn prepare(&self, call: &PrepareCall) -> Result<Prepared, String> {
-        Err(format!(
+    fn prepare(&self, call: &PrepareCall) -> Result<Prepared, NotPrepared> {
+        Err(NotPrepared::Refused(format!(
             "this runner cannot prepare a unit for `{}`",
             call.bead
-        ))
+        )))
     }
 
     /// Run an agent step. `session` is the session of a run of this step
@@ -242,7 +254,12 @@ impl Steps {
         let runner = self.runner.clone();
         match tokio::task::spawn_blocking(move || runner.prepare(&call)).await {
             Ok(Ok(prepared)) => Ok(prepared),
-            Ok(Err(reason)) => Err(failed(reason)),
+            // Temporal would otherwise try this again for ever, and the
+            // pipeline would stand still without saying why.
+            Ok(Err(NotPrepared::Refused(reason))) => Err(ActivityError::from(
+                ApplicationFailure::non_retryable(std::io::Error::other(reason)),
+            )),
+            Ok(Err(NotPrepared::Failed(reason))) => Err(failed(reason)),
             Err(join) => Err(failed(format!("preparing the unit was lost: {join}"))),
         }
     }
