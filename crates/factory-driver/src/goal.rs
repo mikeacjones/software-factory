@@ -249,6 +249,23 @@ enum Internal {
 
 const BEAD_TYPES: [&str; 6] = ["bug", "feature", "task", "chore", "spike", "decision"];
 
+/// Make a pipeline's report agree with the goal's record of what that
+/// pipeline was. A pipeline that ships a sub-goal must be settled as one
+/// even if the report does not say so, or the sub-goal would never be marked
+/// landed and nothing after it could start.
+fn mark_shipping(goal: &Goal, happening: &mut Happening) {
+    if let Happening::PipelineEnded { bead, ship, .. } = happening
+        && goal
+            .units
+            .iter()
+            .rev()
+            .find(|unit| &unit.bead == bead && unit.state == "running")
+            .is_some_and(|unit| unit.ship)
+    {
+        *ship = true;
+    }
+}
+
 fn text_schema(description: &str) -> Value {
     json!({ "type": "string", "description": description })
 }
@@ -2045,9 +2062,17 @@ impl Supervisor {
         within: Option<Within>,
         resume: Option<String>,
     ) {
+        // A pipeline continued after a restart carries no `within`: what it
+        // is comes from the goal's own record of it.
+        let recorded = goal
+            .units
+            .iter()
+            .rev()
+            .find(|unit| unit.bead == name && unit.state == "running")
+            .is_some_and(|unit| unit.ship);
         let (config, sender) = (self.config.clone(), self.sender.clone());
         let (goal_id, project) = (goal.id.clone(), goal.project.clone());
-        let ship = matches!(within, Some(Within::Ship(_)));
+        let ship = recorded || matches!(within, Some(Within::Ship(_)));
         let options = Options {
             slack: self.unit_slack,
             flow,
@@ -2183,6 +2208,8 @@ impl Supervisor {
                         continue;
                     };
                     let id = goal.id.clone();
+                    let mut happening = happening;
+                    mark_shipping(&goal, &mut happening);
                     if let Happening::PipelineEnded {
                         bead,
                         outcome,
@@ -2556,6 +2583,43 @@ mod tests {
             problems(&d, &with_subgoal("landed", &["toy-1"]), done),
             Vec::<String>::new()
         );
+    }
+
+    #[test]
+    fn a_shipping_pipeline_is_settled_as_one_whatever_its_report_says() {
+        // After a restart the continued pipeline reported as an ordinary one,
+        // and the sub-goal stayed "shipping" for ever.
+        let mut goal = with_subgoal("shipping", &["toy-1"]);
+        goal.units.push(GoalUnit {
+            bead: "signals".into(),
+            unit: Some("u9".into()),
+            state: "running".into(),
+            detail: String::new(),
+            ship: true,
+        });
+        let ended = |bead: &str| Happening::PipelineEnded {
+            bead: bead.into(),
+            unit: Some("u9".into()),
+            outcome: "landed".into(),
+            detail: String::new(),
+            pull_request: None,
+            findings: Vec::new(),
+            commit: None,
+            ship: false,
+        };
+        let mut report = ended("signals");
+        mark_shipping(&goal, &mut report);
+        assert!(matches!(
+            report,
+            Happening::PipelineEnded { ship: true, .. }
+        ));
+        // A bead's pipeline is left as it is.
+        let mut other = ended("toy-2");
+        mark_shipping(&goal, &mut other);
+        assert!(matches!(
+            other,
+            Happening::PipelineEnded { ship: false, .. }
+        ));
     }
 
     #[test]
