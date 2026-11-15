@@ -137,7 +137,8 @@ pub struct SubGoal {
     pub worktree: PathBuf,
     /// The commit of the default branch it started from.
     pub base: String,
-    /// `open`, `shipping`, `parked` or `landed`.
+    /// `open`, `queued` (waiting its turn to ship), `shipping`, `parked` or
+    /// `landed`.
     pub state: String,
     /// The beads whose work is on its branch, with the commit each became.
     pub absorbed: Vec<(String, String)>,
@@ -150,6 +151,14 @@ pub struct SubGoal {
     /// Beads its foreman filed to run in it, beyond what the director planned.
     #[serde(default)]
     pub added: Vec<String>,
+    /// The files and directories set aside for it while other sub-goals are
+    /// worked on beside it. Empty when nothing was declared.
+    #[serde(default)]
+    pub paths: Vec<String>,
+    /// When the director shipped it while another sub-goal of the project
+    /// was shipping: it waits its turn from then.
+    #[serde(default)]
+    pub queued_at: Option<u64>,
 }
 
 /// The factory's record of the agent that runs one sub-goal.
@@ -288,9 +297,18 @@ pub struct Goal {
 }
 
 impl Goal {
-    /// The sub-goal that has not landed yet, if there is one.
+    /// The first sub-goal that has not landed yet, if there is one. A goal
+    /// whose director has one slot never has a second.
     pub fn current(&self) -> Option<&SubGoal> {
         self.subgoals.iter().find(|sub| sub.state != "landed")
+    }
+
+    /// The sub-goals that have not landed: the ones the director's slots count.
+    fn in_flight(&self) -> Vec<&SubGoal> {
+        self.subgoals
+            .iter()
+            .filter(|sub| sub.state != "landed")
+            .collect()
     }
 
     /// The beads the current sub-goal has absorbed: open in the tracker, but
@@ -444,14 +462,18 @@ pub fn wake_schema() -> Value {
         "file": file_schema(false),
         "edit": { "type": "array", "description": "Changes to beads that exist.", "items": edit_schema() },
         "dropped_findings": dropped_schema(),
-        "open_subgoal": object_schema(json!({
-            "id": text_schema("A short slug for a new sub-goal, such as `signals`: lowercase letters, digits and dashes. It names the branch. Empty to open none."),
+        "open_subgoals": { "type": "array", "description": "Sub-goals to open now. Usually none or one.", "items": object_schema(json!({
+            "id": text_schema("A short slug for the sub-goal, such as `signals`: lowercase letters, digits and dashes. It names the branch."),
             "title": text_schema("What the sub-goal delivers, as the title its one pull request could carry."),
             "objective": text_schema("What will be true when it has landed."),
             "beads": { "type": "array", "items": { "type": "string" }, "description": "The beads you mean it to hold, in the order you would run them." },
-        })),
-        "ship": { "type": "boolean", "description": "True to ship the open sub-goal now: its branch gets the whole verification once, one pull request, and lands. Only when every bead you meant for it is absorbed and no pipeline is running." },
-        "tell_foreman": text_schema("A message to the foreman of the open sub-goal: an answer to what it escalated, or an instruction. Empty when there is nothing to say, and always empty on a goal whose sub-goals have no foreman."),
+            "paths": { "type": "array", "items": { "type": "string" }, "description": "The files and directories its beads will change, relative to the repository. Required for every sub-goal that is worked on while another has not landed, and no two may overlap. Leave empty for a sub-goal worked on alone." },
+        }))},
+        "ship": { "type": "array", "items": { "type": "string" }, "description": "The IDs of sub-goals to ship now, in the order they should land. Each gets the whole verification once on its branch, one pull request, and lands; they ship one at a time. Only a sub-goal whose beads you meant for it are absorbed and in which no pipeline is running." },
+        "tell_foreman": { "type": "array", "description": "Messages to foremen: an answer to what one escalated, or an instruction. Always empty on a goal whose sub-goals have no foreman.", "items": object_schema(json!({
+            "subgoal": text_schema("The ID of an open sub-goal."),
+            "text": text_schema("What you tell its foreman."),
+        }))},
         "ask_owner": text_schema("One question only the owner can answer, or empty."),
         "complete": { "type": "boolean", "description": "True to propose that the stop condition is met. The owner decides." },
         "evidence": text_schema("When complete: how the stop condition is met, point by point, with what you checked. Otherwise empty."),
@@ -511,37 +533,35 @@ pub fn decision_problems(
     let mut problems = Vec::new();
     let known = |id: &str| tracker.iter().any(|bead| bead.id == id);
     let complete = result.get("complete").and_then(Value::as_bool) == Some(true);
-    let ship = result.get("ship").and_then(Value::as_bool) == Some(true);
+    let ships = ships_of(goal, result);
+    let tells = tells_of(goal, result);
     let batched = definition.ship_flow.is_some();
     if strings(result, "summary").trim().is_empty() {
         problems.push("`summary` is empty".to_string());
     }
 
-    // Sub-goals: one at a time, each landing as one pull request.
-    let opening = result
-        .get("open_subgoal")
-        .filter(|sub| !strings(sub, "id").trim().is_empty());
+    // Sub-goals: each lands as one pull request, and the director may have
+    // so many of them not yet landed at once.
+    let openings = openings_of(result);
+    let opening = openings.first();
     let current = goal.current();
-    if let Some(sub) = opening {
+    let flight = goal.in_flight();
+    let slots = definition.director.slots.max(1) as usize;
+    for (index, sub) in openings.iter().enumerate() {
         let id = strings(sub, "id").trim();
         let slug = id.len() <= 40
             && id
                 .chars()
                 .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
-        if !batched {
-            problems.push("open_subgoal: this goal lands every bead as its own pull request and has no sub-goals".to_string());
-        } else if let Some(open) = current {
-            problems.push(format!(
-                "open_subgoal: sub-goal `{}` has not landed yet: ship it before opening another",
-                open.id
-            ));
-        }
         if !slug {
             problems.push(format!(
                 "open_subgoal: `{id}` is not a slug of lowercase letters, digits and dashes"
             ));
         }
-        if goal.subgoals.iter().any(|earlier| earlier.id == id) {
+        let twice = openings[..index]
+            .iter()
+            .any(|earlier| strings(earlier, "id").trim() == id);
+        if twice || goal.subgoals.iter().any(|earlier| earlier.id == id) {
             problems.push(format!(
                 "open_subgoal: this goal already had a sub-goal `{id}`"
             ));
@@ -550,11 +570,45 @@ pub fn decision_problems(
             problems.push("open_subgoal: it needs a title and an objective".to_string());
         }
     }
+    if !openings.is_empty() {
+        let waiting: Vec<String> = flight.iter().map(|sub| format!("`{}`", sub.id)).collect();
+        if !batched {
+            problems.push("open_subgoal: this goal lands every bead as its own pull request and has no sub-goals".to_string());
+        } else if flight.len() + openings.len() > slots {
+            problems.push(match current {
+                Some(open) if slots == 1 => format!(
+                    "open_subgoal: sub-goal `{}` has not landed yet: ship it before opening another",
+                    open.id
+                ),
+                _ => format!(
+                    "open_subgoal: that would make {} sub-goals that have not landed, and this goal's director may have {slots}{}",
+                    flight.len() + openings.len(),
+                    if waiting.is_empty() {
+                        String::new()
+                    } else {
+                        format!(": {} still to land", waiting.join(", "))
+                    }
+                ),
+            });
+        } else {
+            // Within the limit: may these be worked on beside each other?
+            let mut claims: Vec<(String, Vec<String>, bool)> = flight
+                .iter()
+                .map(|sub| (sub.id.clone(), sub.paths.clone(), true))
+                .collect();
+            claims.extend(
+                openings
+                    .iter()
+                    .map(|sub| (strings(sub, "id").trim().to_string(), paths_of(sub), false)),
+            );
+            problems.extend(claim_problems(&SUBGOAL_CLAIMS, &claims));
+        }
+    }
     let absorbed = goal.absorbed();
     // Whether the sub-goal in question is run by a foreman: the open one as
     // it was opened, or one opened now under this definition.
     let foreman = match current {
-        Some(open) => open.foreman.is_some(),
+        Some(_) => flight.iter().any(|sub| sub.foreman.is_some()),
         None => definition.foreman.is_some(),
     };
 
@@ -602,14 +656,19 @@ pub fn decision_problems(
             _ => {}
         }
     }
-    let tell = strings(result, "tell_foreman").trim();
-    if !tell.is_empty() {
-        match current {
-            _ if opening.is_some() => problems.push(
+    let opened_now = |id: &str| openings.iter().any(|sub| strings(sub, "id").trim() == id);
+    for (target, _) in &tells {
+        match flight.iter().find(|sub| &sub.id == target) {
+            None if opened_now(target) || (target.is_empty() && !openings.is_empty()) => problems.push(
                 "tell_foreman: a sub-goal you open now is briefed by its title, objective and beads: say it there"
                     .to_string(),
             ),
-            None => problems.push("tell_foreman: no sub-goal is open".to_string()),
+            None if target.is_empty() => {
+                problems.push("tell_foreman: no sub-goal is open".to_string());
+            }
+            None => problems.push(format!(
+                "tell_foreman: `{target}` is not a sub-goal that is open"
+            )),
             Some(open) if open.state != "open" => problems.push(format!(
                 "tell_foreman: sub-goal `{}` is being shipped, and its foreman has finished",
                 open.id
@@ -626,7 +685,7 @@ pub fn decision_problems(
                 Some(_) => {}
             },
         }
-        if ship {
+        if ships.contains(target) {
             problems.push(
                 "tell_foreman: ship the sub-goal or write to its foreman, not both".to_string(),
             );
@@ -634,18 +693,25 @@ pub fn decision_problems(
     }
     // A foreman that is not waiting for the director will move the goal by
     // itself: a pipeline of its sub-goal is running, or an event is on its
-    // way to it.
-    let foreman_working = !tell.is_empty()
-        || (opening.is_some() && definition.foreman.is_some())
-        || current.is_some_and(|open| {
-            open.state == "open"
-                && open
-                    .foreman
-                    .as_ref()
-                    .is_some_and(|foreman| foreman.waiting.is_none())
-        });
-    let shipping_now = usize::from(ship);
-    let in_flight = goal.running() + starting.len() + shipping_now + usize::from(foreman_working);
+    // way to it. So will a sub-goal that waits its turn to ship.
+    let moving = flight
+        .iter()
+        .filter(|sub| {
+            sub.state == "queued"
+                || (sub.state == "open"
+                    && sub
+                        .foreman
+                        .as_ref()
+                        .is_some_and(|foreman| foreman.waiting.is_none()))
+        })
+        .count()
+        + tells.len()
+        + if definition.foreman.is_some() {
+            openings.len()
+        } else {
+            0
+        };
+    let in_flight = goal.running() + starting.len() + ships.len() + moving;
     if goal.running() + starting.len() > definition.max_pipelines as usize {
         problems.push(format!(
             "start: that would make {} pipelines at once, and this goal may run {}",
@@ -653,21 +719,38 @@ pub fn decision_problems(
             definition.max_pipelines
         ));
     }
-    if ship {
-        match current {
-            _ if !batched => problems.push("ship: this goal has no sub-goals to ship".to_string()),
-            None => problems.push("ship: no sub-goal is open".to_string()),
-            Some(open) if open.absorbed.is_empty() => problems.push(format!(
+    for (index, id) in ships.iter().enumerate() {
+        if !batched {
+            problems.push("ship: this goal has no sub-goals to ship".to_string());
+            continue;
+        }
+        if ships[..index].contains(id) {
+            problems.push(format!("ship: `{id}` is listed twice"));
+            continue;
+        }
+        let Some(open) = flight.iter().find(|sub| &sub.id == id) else {
+            problems.push(if id.is_empty() {
+                "ship: no sub-goal is open".to_string()
+            } else {
+                format!("ship: `{id}` is not a sub-goal waiting to land")
+            });
+            continue;
+        };
+        if open.absorbed.is_empty() {
+            problems.push(format!(
                 "ship: sub-goal `{}` has absorbed no bead yet",
                 open.id
-            )),
-            Some(open) if open.state == "shipping" => problems.push(format!(
+            ));
+        } else if matches!(open.state.as_str(), "shipping" | "queued") {
+            problems.push(format!(
                 "ship: sub-goal `{}` is already being shipped",
                 open.id
-            )),
-            Some(_) => {}
+            ));
         }
-        if goal.running() > 0 || !starting.is_empty() || opening.is_some() {
+        // The first form of this rule spoke of one sub-goal; it still holds
+        // for each: nothing of its own may be running or starting.
+        let own_start = !starting.is_empty() && current.is_some_and(|first| &first.id == id);
+        if goal.running_in(id) > 0 || own_start || opened_now(id) {
             problems.push(
                 "ship: a sub-goal ships when nothing else is running or starting".to_string(),
             );
@@ -694,7 +777,7 @@ pub fn decision_problems(
                     .to_string(),
             );
         }
-        if let Some(open) = current.filter(|open| !open.absorbed.is_empty()) {
+        if let Some(open) = flight.iter().find(|open| !open.absorbed.is_empty()) {
             problems.push(format!(
                 "complete: sub-goal `{}` holds work that has not landed: ship it first",
                 open.id
@@ -745,35 +828,51 @@ fn file_problems(files: &[Value], launchable: &dyn Fn(&str) -> Vec<String>) -> V
     problems
 }
 
-/// The paths a foreman declared for a bead it starts.
-fn paths_of(start: &Value) -> Vec<String> {
-    items(start, "paths")
+/// The paths declared for a piece of work, tidied.
+fn paths_of(work: &Value) -> Vec<String> {
+    items(work, "paths")
         .iter()
         .filter_map(Value::as_str)
         .map(|path| path.trim().trim_end_matches('/').to_string())
         .collect()
 }
 
-/// Why the beads a foreman wants to start may not run beside each other and
-/// beside what is already running in the sub-goal. Beads run side by side
-/// only when each has declared the paths it will change and no two
-/// declarations overlap: that is what makes it safe before any of them runs.
-fn path_problems(goal: &Goal, sub: &SubGoal, starts: &[Value]) -> Vec<String> {
+/// How the rules about paths are worded for one kind of work.
+struct Claims {
+    /// The field of the result the problems are about.
+    field: &'static str,
+    /// What happens to work declared without paths that would run beside other work.
+    undeclared_new: &'static str,
+    /// What is said of work already going that has no paths.
+    undeclared_old: &'static str,
+    /// What becomes of work whose paths overlap.
+    overlap: &'static str,
+}
+
+const BEAD_CLAIMS: Claims = Claims {
+    field: "start",
+    undeclared_new: "would run beside another bead, so it needs `paths`: the files and directories it will change",
+    undeclared_old: "is running with no paths declared, so nothing may start beside it: wait for it to end",
+    overlap: "beads whose paths overlap run one after the other",
+};
+
+const SUBGOAL_CLAIMS: Claims = Claims {
+    field: "open_subgoal",
+    undeclared_new: "would be worked on beside another sub-goal, so it needs `paths`: the files and directories its beads will change",
+    undeclared_old: "has not landed and has no paths declared, so nothing may open beside it: wait for it to land",
+    overlap: "sub-goals whose paths overlap are worked on one after the other",
+};
+
+/// Why pieces of work may not go on at the same time. Work runs side by
+/// side only when each piece has declared the paths it will change and no
+/// two declarations overlap: that is what makes it safe before any of it
+/// runs. Each claim is a name, its paths, and whether it is already going;
+/// `starting` says whether anything new is among them.
+fn claim_problems(words: &Claims, claims: &[(String, Vec<String>, bool)]) -> Vec<String> {
     let mut problems = Vec::new();
-    let mut claims: Vec<(String, Vec<String>, bool)> = goal
-        .units
-        .iter()
-        .filter(|unit| {
-            unit.state == "running"
-                && !unit.ship
-                && unit.subgoal.as_deref().is_none_or(|own| own == sub.id)
-        })
-        .map(|unit| (unit.bead.clone(), unit.paths.clone(), true))
-        .collect();
-    for start in starts {
-        let bead = strings(start, "bead");
-        let paths = paths_of(start);
-        for path in &paths {
+    let field = words.field;
+    for (name, paths, old) in claims {
+        for path in paths.iter().filter(|_| !old) {
             let plain = !path.is_empty()
                 && path != "."
                 && !path.starts_with('/')
@@ -781,29 +880,27 @@ fn path_problems(goal: &Goal, sub: &SubGoal, starts: &[Value]) -> Vec<String> {
                 && !path.contains(['*', '?', '[', '\\']);
             if !plain {
                 problems.push(format!(
-                    "start: `{path}`, declared for `{bead}`, is not a plain path inside the repository: name files and directories, with no patterns"
+                    "{field}: `{path}`, declared for `{name}`, is not a plain path inside the repository: name files and directories, with no patterns"
                 ));
             }
         }
-        claims.push((bead.to_string(), paths, false));
     }
-    if claims.len() < 2 || starts.is_empty() {
+    if claims.len() < 2 || claims.iter().all(|(_, _, old)| *old) {
         return problems;
     }
-    for (bead, paths, running) in &claims {
+    for (name, paths, old) in claims {
         if paths.is_empty() {
-            problems.push(if *running {
-                format!(
-                    "start: `{bead}` is running with no paths declared, so nothing may start beside it: wait for it to end"
-                )
-            } else {
-                format!(
-                    "start: `{bead}` would run beside another bead, so it needs `paths`: the files and directories it will change"
-                )
-            });
+            problems.push(format!(
+                "{field}: `{name}` {}",
+                if *old {
+                    words.undeclared_old
+                } else {
+                    words.undeclared_new
+                }
+            ));
         }
     }
-    for (index, (bead, paths, _)) in claims.iter().enumerate() {
+    for (index, (name, paths, _)) in claims.iter().enumerate() {
         for (other, theirs, _) in &claims[index + 1..] {
             let clash = paths.iter().find_map(|path| {
                 theirs
@@ -816,12 +913,97 @@ fn path_problems(goal: &Goal, sub: &SubGoal, starts: &[Value]) -> Vec<String> {
             });
             if let Some((path, their)) = clash {
                 problems.push(format!(
-                    "start: `{bead}` (`{path}`) and `{other}` (`{their}`) would change the same files: beads whose paths overlap run one after the other"
+                    "{field}: `{name}` (`{path}`) and `{other}` (`{their}`) would change the same files: {}",
+                    words.overlap
                 ));
             }
         }
     }
     problems
+}
+
+/// Why the beads a foreman wants to start may not run beside each other and
+/// beside what is already running in the sub-goal.
+fn path_problems(goal: &Goal, sub: &SubGoal, starts: &[Value]) -> Vec<String> {
+    let mut claims: Vec<(String, Vec<String>, bool)> = goal
+        .units
+        .iter()
+        .filter(|unit| {
+            unit.state == "running"
+                && !unit.ship
+                && unit.subgoal.as_deref().is_none_or(|own| own == sub.id)
+        })
+        .map(|unit| (unit.bead.clone(), unit.paths.clone(), true))
+        .collect();
+    let mut problems = Vec::new();
+    for start in starts {
+        let bead = strings(start, "bead");
+        let paths = paths_of(start);
+        // A sub-goal worked on beside others keeps to its own paths.
+        for path in paths
+            .iter()
+            .filter(|path| !sub.paths.is_empty() && !under(path, &sub.paths))
+        {
+            problems.push(format!(
+                "start: `{path}`, declared for `{bead}`, is outside this sub-goal's own paths ({}): another sub-goal is being worked on beside this one",
+                sub.paths.join(", ")
+            ));
+        }
+        claims.push((bead.to_string(), paths, false));
+    }
+    if !starts.is_empty() {
+        problems.extend(claim_problems(&BEAD_CLAIMS, &claims));
+    }
+    problems
+}
+
+/// The sub-goals a director wants to open, from either form of its result.
+fn openings_of(result: &Value) -> Vec<&Value> {
+    result
+        .get("open_subgoal")
+        .into_iter()
+        .chain(items(result, "open_subgoals"))
+        .filter(|sub| !strings(sub, "id").trim().is_empty())
+        .collect()
+}
+
+/// The sub-goals a director wants shipped, in the order it gave: by ID, or
+/// `true` for the only one there is.
+fn ships_of(goal: &Goal, result: &Value) -> Vec<String> {
+    match result.get("ship") {
+        Some(Value::Bool(true)) => {
+            vec![goal.current().map(|sub| sub.id.clone()).unwrap_or_default()]
+        }
+        Some(Value::Array(ids)) => ids
+            .iter()
+            .filter_map(Value::as_str)
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// What a director tells foremen, as sub-goal and text. A bare text goes to
+/// the only sub-goal there is.
+fn tells_of(goal: &Goal, result: &Value) -> Vec<(String, String)> {
+    match result.get("tell_foreman") {
+        Some(Value::String(text)) if !text.trim().is_empty() => vec![(
+            goal.current().map(|sub| sub.id.clone()).unwrap_or_default(),
+            text.trim().to_string(),
+        )],
+        Some(Value::Array(tells)) => tells
+            .iter()
+            .map(|tell| {
+                (
+                    strings(tell, "subgoal").trim().to_string(),
+                    strings(tell, "text").trim().to_string(),
+                )
+            })
+            .filter(|(_, text)| !text.is_empty())
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 fn flag(value: &Value, key: &str) -> bool {
@@ -1013,8 +1195,16 @@ fn permission_text(definition: &GoalDefinition) -> String {
         Permission::Ask => "is put to the owner, who approves or rejects it",
     };
     if definition.foreman.is_some() {
+        let slots = definition.director.slots;
         return format!(
-            "- Sub-goals: each is a part of the goal that lands as one pull request, one open at a time. Opening one hands it to its foreman, a separate agent that starts its beads through the light pipeline, rules on their findings, and reports to you when the sub-goal is ready to ship or when it needs you. You do not start beads: `start` is refused.\n- Answering the foreman: `tell_foreman` reaches the foreman of the open sub-goal, and wakes it.\n- Shipping: yours to decide, once nothing is running in the sub-goal. It runs the whole verification once, opens one pull request for all of it and lands it, which closes its beads.\n- Filing a new bead {}.\n- Changing a bead that exists (criteria, priority, deferral) {}.\n- Ending the goal: you propose, the owner decides.",
+            "- Sub-goals: each is a part of the goal that lands as one pull request. {} Opening one (`open_subgoals`) hands it to its foreman, a separate agent that starts its beads through the light pipeline, rules on their findings, and reports to you when the sub-goal is ready to ship or when it needs you. You do not start beads: `start` is refused.\n- Answering a foreman: `tell_foreman` reaches the foreman of an open sub-goal, and wakes it.\n- Shipping: yours to decide, by naming the sub-goal in `ship` once nothing is running in it. It runs the whole verification once, opens one pull request for all of it and lands it, which closes its beads. Sub-goals ship one at a time, in the order you name them, and each takes in what landed before it first.\n- Filing a new bead {}.\n- Changing a bead that exists (criteria, priority, deferral) {}.\n- Ending the goal: you propose, the owner decides.",
+            if slots > 1 {
+                format!(
+                    "Up to {slots} may be waiting to land at once. That is a limit, not a target: sub-goals are worked on side by side only when each has `paths`, the files and directories its beads will change, and no two overlap, which code checks before anything opens. Open two together only when you have read the code and are certain neither needs the other's result or files; otherwise one after the other."
+                )
+            } else {
+                "One is open at a time.".to_string()
+            },
             say(definition.permissions.file_beads),
             say(definition.permissions.edit_beads),
         );
@@ -1168,6 +1358,11 @@ pub fn wake_brief(
                 },
                 _ => String::new(),
             };
+            let foreman = if sub.paths.is_empty() {
+                foreman
+            } else {
+                format!(" Its paths: {}.{foreman}", sub.paths.join(", "))
+            };
             out.push_str(&format!(
                 "- `{}` ({}): {}. Branch `{}`. Absorbed: {}. Planned and not yet absorbed: {}.{}{foreman}\n",
                 sub.id,
@@ -1240,7 +1435,7 @@ pub fn foreman_brief(
     let charter = goal.charter.clone().unwrap_or_default();
     let slots = definition.foreman.as_ref().map_or(1, |tier| tier.slots);
     let mut out = format!(
-        "# Sub-goal `{}` of goal `{}` on project `{}`, wake {}\n\n## What this sub-goal delivers\n\n{}\n\n{}\n\nIts branch is `{}`, and your working directory is a checkout of it as it is now.\n\n## The goal it is part of\n\n{}\n\n",
+        "# Sub-goal `{}` of goal `{}` on project `{}`, wake {}\n\n## What this sub-goal delivers\n\n{}\n\n{}\n\nIts branch is `{}`, and your working directory is a checkout of it as it is now.{}\n\n## The goal it is part of\n\n{}\n\n",
         sub.id,
         goal.id,
         goal.project,
@@ -1248,6 +1443,14 @@ pub fn foreman_brief(
         sub.title,
         sub.objective,
         sub.branch,
+        if sub.paths.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n\nAnother sub-goal is being worked on beside this one, so this one has paths of its own: {}. Its beads keep to them, and any paths you declare for a bead lie inside them. If a bead cannot be done within them, escalate.",
+                sub.paths.join(", ")
+            )
+        },
         charter.objective,
     );
     out.push_str("## What happened since you last ran\n\n");
@@ -1421,6 +1624,12 @@ pub fn check_definitions(config: &ConfigDir) -> Result<Vec<String>, DriverError>
                 with_ship.flow = ship.clone();
                 let (ship_flow, _) = crate::load_flow(config, &factory, &with_ship)
                     .map_err(|err| refuse(format!("its ship pipeline cannot be used: {err}")))?;
+                if definition.director.slots > 1 && !ends_with(&ship_flow, "sync") {
+                    return Err(refuse(format!(
+                        "its director may have sub-goals side by side, so its ship pipeline `{}` must take in the default branch before it verifies (action `sync`)",
+                        ship_flow.id
+                    )));
+                }
                 if !ends_with(&ship_flow, "land") {
                     return Err(refuse(format!(
                         "its ship pipeline `{}` never lands (action `land`)",
@@ -2595,21 +2804,35 @@ impl Supervisor {
                 }],
             );
         }
+        // What the decisions name, as they were checked: before any of
+        // them changes which sub-goals there are.
+        let tells = tells_of(&goal, &result);
+        let ships = ships_of(&goal, &result);
+        let open = goal
+            .current()
+            .filter(|_| definition.ship_flow.is_some())
+            .map(|sub| sub.id.clone());
         // A new sub-goal gets its branch before anything can start in it.
-        let opening = result
-            .get("open_subgoal")
-            .filter(|sub| !strings(sub, "id").trim().is_empty());
-        if let Some(sub) = opening {
+        let openings: Vec<Value> = openings_of(&result).into_iter().cloned().collect();
+        let first_opened = openings
+            .first()
+            .map(|sub| strings(sub, "id").trim().to_string());
+        for sub in &openings {
             match self.open_subgoal(&goal, &project, sub) {
                 Ok(sub) => {
                     self.say(&goal, &format!(
-                        ":seedling: *Sub-goal opened:* {} (`{}`)\n{}\nBranch `{}`. Its beads are absorbed there and it lands as one pull request.",
+                        ":seedling: *Sub-goal opened:* {} (`{}`)\n{}\nBranch `{}`. Its beads are absorbed there and it lands as one pull request.{}",
                         escape(&sub.title),
                         sub.id,
                         quote(&truncate(&sub.objective, 800)),
-                        escape(&sub.branch)
+                        escape(&sub.branch),
+                        if sub.paths.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" Its paths: `{}`.", escape(&sub.paths.join("`, `")))
+                        }
                     ));
-                    self.log(&goal, "subgoal.opened", json!({ "id": sub.id, "branch": sub.branch, "base": sub.base, "planned": sub.planned, "foreman": definition.foreman.is_some() }));
+                    self.log(&goal, "subgoal.opened", json!({ "id": sub.id, "branch": sub.branch, "base": sub.base, "planned": sub.planned, "paths": sub.paths, "foreman": definition.foreman.is_some() }));
                     let mut sub = sub;
                     if definition.foreman.is_some() {
                         // Its foreman takes it from here, woken below.
@@ -2625,58 +2848,60 @@ impl Supervisor {
                     self.say(
                         &goal,
                         &format!(
-                            ":x: Could not open the sub-goal: {}",
+                            ":x: Could not open the sub-goal `{}`: {}",
+                            escape(strings(sub, "id")),
                             escape(&err.to_string())
                         ),
                     );
                     goal.inbox.push(Happening::Note {
                         text: format!(
-                            "The factory could not open the sub-goal ({err}). Nothing was started."
+                            "The factory could not open the sub-goal `{}` ({err}). Nothing was started in it.",
+                            strings(sub, "id")
                         ),
                     });
                     goal.retry_at = Some(now_unix() + 60);
-                    return self.save(goal);
+                    self.save(goal)?;
+                    return self.wake_foremen(id);
                 }
             }
         }
-        let tell = strings(&result, "tell_foreman").trim();
-        let told = goal
-            .subgoals
-            .iter_mut()
-            .find(|sub| sub.state == "open")
-            .filter(|_| !tell.is_empty())
-            .and_then(|sub| {
-                let foreman = sub.foreman.as_mut()?;
-                foreman.inbox.push(Happening::DirectorSaid {
-                    text: tell.to_string(),
-                });
-                foreman.waiting = None;
-                foreman.exchanges += 1;
-                Some(sub.id.clone())
-            });
-        if let Some(sub) = told {
-            self.log(
-                &goal,
-                "foreman.told",
-                json!({ "subgoal": sub, "text": tell }),
-            );
+        for (target, text) in &tells {
+            let told = goal
+                .subgoals
+                .iter_mut()
+                .find(|sub| &sub.id == target && sub.state == "open")
+                .and_then(|sub| sub.foreman.as_mut())
+                .map(|foreman| {
+                    foreman
+                        .inbox
+                        .push(Happening::DirectorSaid { text: text.clone() });
+                    foreman.waiting = None;
+                    foreman.exchanges += 1;
+                })
+                .is_some();
+            if told {
+                self.log(
+                    &goal,
+                    "foreman.told",
+                    json!({ "subgoal": target, "text": text }),
+                );
+            }
         }
-        let open = goal
-            .current()
-            .filter(|_| definition.ship_flow.is_some())
-            .map(|sub| sub.id.clone());
+        // A bead the director starts itself goes into the one sub-goal
+        // there is: the one it just opened, or the one already open.
+        let into = open.or(first_opened);
         for start in items(&result, "start") {
             self.start_bead(
                 &mut goal,
                 &definition,
-                open.as_deref(),
+                into.as_deref(),
                 strings(start, "bead"),
                 strings(start, "reason"),
                 Vec::new(),
             )?;
         }
-        if result.get("ship").and_then(Value::as_bool) == Some(true) {
-            self.ship(&mut goal, &definition, &source)?;
+        for sub in &ships {
+            self.ship(&mut goal, &definition, &source, sub)?;
         }
         self.save(goal)?;
         self.wake_foremen(id)
@@ -2694,11 +2919,16 @@ impl Supervisor {
         paths: Vec<String>,
     ) -> Result<(), DriverError> {
         let mut within = None;
+        let mut paths = paths;
         if let Some(sub) = goal
             .subgoals
             .iter_mut()
             .find(|sub| Some(sub.id.as_str()) == subgoal)
         {
+            if paths.is_empty() {
+                // With none of its own, a bead keeps to its sub-goal's.
+                paths = sub.paths.clone();
+            }
             within = Some(Within::Bead {
                 tip: factory_git::rev_parse(&sub.worktree, "HEAD")?,
                 worktree: sub.worktree.clone(),
@@ -3047,20 +3277,108 @@ impl Supervisor {
             pull_request: None,
             foreman: None,
             added: Vec::new(),
+            paths: paths_of(spec),
+            queued_at: None,
         })
     }
 
-    /// Ship the open sub-goal: the heavy pipeline, once, on its branch. A
-    /// sub-goal whose shipping parked is continued where it stopped.
+    /// Ship a sub-goal, or put it in line. Sub-goals of a project ship one
+    /// at a time, so that each is verified on top of the one that landed
+    /// before it: its ship pipeline begins by taking in the default branch.
     fn ship(
         &mut self,
         goal: &mut Goal,
         definition: &GoalDefinition,
         source: &Source,
+        id: &str,
     ) -> Result<(), DriverError> {
-        let Some(index) = goal.subgoals.iter().position(|sub| sub.state != "landed") else {
+        let Some(index) = goal.subgoals.iter().position(|sub| sub.id == id) else {
             return Ok(());
         };
+        let others = self
+            .goals
+            .values()
+            .filter(|other| other.project == goal.project && other.id != goal.id);
+        let project: Vec<&Goal> = others.chain(std::iter::once(&*goal)).collect();
+        let ahead = project
+            .iter()
+            .flat_map(|goal| goal.units.iter())
+            .find(|unit| unit.ship && unit.state == "running")
+            .map(|unit| unit.bead.clone());
+        let Some(ahead) = ahead else {
+            return self.start_ship(goal, definition, source, index);
+        };
+        // After the last one already in line, in the order they were asked for.
+        let last = project
+            .iter()
+            .flat_map(|goal| goal.subgoals.iter())
+            .filter(|sub| sub.state == "queued")
+            .filter_map(|sub| sub.queued_at)
+            .max();
+        let ticket = last.map_or_else(now_unix, |last| last + 1);
+        let sub = &mut goal.subgoals[index];
+        sub.state = "queued".to_string();
+        sub.queued_at = Some(ticket);
+        let sub = sub.id.clone();
+        self.log(
+            goal,
+            "subgoal.queued",
+            json!({ "id": sub, "behind": ahead, "ticket": ticket }),
+        );
+        self.say(goal, &format!(
+            ":hourglass_flowing_sand: *Sub-goal* `{sub}` *is next to ship.* `{}` is shipping now; sub-goals land one at a time, each verified on top of the last.",
+            escape(&ahead)
+        ));
+        Ok(())
+    }
+
+    /// Start the sub-goal that has waited longest to ship, if none of its
+    /// project is shipping. Called whenever a ship pipeline ends.
+    fn start_next_ship(&mut self, project: &str) -> Result<(), DriverError> {
+        let of_project = || self.goals.values().filter(|goal| goal.project == project);
+        if of_project()
+            .flat_map(|goal| goal.units.iter())
+            .any(|unit| unit.ship && unit.state == "running")
+        {
+            return Ok(());
+        }
+        let next = of_project()
+            .filter(|goal| goal.phase == Phase::Running)
+            .flat_map(|goal| {
+                goal.subgoals
+                    .iter()
+                    .filter(|sub| sub.state == "queued")
+                    .map(|sub| {
+                        (
+                            sub.queued_at.unwrap_or(u64::MAX),
+                            goal.id.clone(),
+                            sub.id.clone(),
+                        )
+                    })
+            })
+            .min();
+        let Some((_, goal, sub)) = next else {
+            return Ok(());
+        };
+        let mut goal = self.goals[&goal].clone();
+        let definition = self.definition(&goal)?;
+        let source = bead_source(&self.config.project(&goal.project)?);
+        let Some(index) = goal.subgoals.iter().position(|own| own.id == sub) else {
+            return Ok(());
+        };
+        self.start_ship(&mut goal, &definition, &source, index)?;
+        self.save(goal)
+    }
+
+    /// Run the heavy pipeline, once, on a sub-goal's branch. A sub-goal
+    /// whose shipping parked is continued where it stopped.
+    fn start_ship(
+        &mut self,
+        goal: &mut Goal,
+        definition: &GoalDefinition,
+        source: &Source,
+        index: usize,
+    ) -> Result<(), DriverError> {
         let sub = goal.subgoals[index].clone();
         let closes: Vec<String> = sub.absorbed.iter().map(|(bead, _)| bead.clone()).collect();
         let mut criteria = String::new();
@@ -3109,6 +3427,7 @@ impl Supervisor {
             paths: Vec::new(),
         });
         goal.subgoals[index].state = "shipping".to_string();
+        goal.subgoals[index].queued_at = None;
         self.log(
             goal,
             "subgoal.shipping",
@@ -3313,6 +3632,8 @@ impl Supervisor {
                     let id = goal.id.clone();
                     let mut happening = happening;
                     mark_shipping(&goal, &mut happening);
+                    let shipped = matches!(&happening, Happening::PipelineEnded { ship: true, .. });
+                    let project = goal.project.clone();
                     // The sub-goal a bead's pipeline ran in.
                     let mut belongs: Option<String> = None;
                     if let Happening::PipelineEnded {
@@ -3411,6 +3732,10 @@ impl Supervisor {
                         _ => {
                             goal.inbox.push(happening);
                             self.save(goal)?;
+                            if shipped {
+                                // Landed or parked, its turn is over.
+                                self.start_next_ship(&project)?;
+                            }
                             self.wake(&id)?;
                         }
                     }
@@ -3492,6 +3817,7 @@ impl Supervisor {
             .collect();
         for project in projects {
             self.start_queued(&project)?;
+            self.start_next_ship(&project)?;
         }
         Ok(())
     }
@@ -3653,6 +3979,8 @@ mod tests {
             pull_request: None,
             foreman: None,
             added: Vec::new(),
+            paths: Vec::new(),
+            queued_at: None,
         });
         goal
     }
@@ -4010,6 +4338,159 @@ mod tests {
             start_one(&full, json!(["src/worker"])),
             [
                 "start: that would make 3 pipelines at once in this sub-goal, and its foreman may run 2"
+            ]
+        );
+    }
+
+    #[test]
+    fn sub_goals_are_worked_on_side_by_side_only_on_paths_that_do_not_overlap() {
+        // A director with two slots, each sub-goal run by a foreman.
+        let d: GoalDefinition = toml::from_str(
+            "id = \"d\"\nflow = \"bead\"\nship_flow = \"ship\"\nmax_pipelines = 2\n[director]\nmodel = \"m\"\neffort = \"high\"\nslots = 2\n[foreman]\nmodel = \"f\"\neffort = \"high\"\n",
+        )
+        .unwrap();
+        let sub = |id: &str, paths: Value| json!({"id": id, "title": "A part", "objective": "It works.", "beads": ["toy-1"], "paths": paths});
+        let open = |subs: Vec<Value>| json!({"open_subgoals": subs});
+
+        // Two at once, each on its own paths.
+        assert!(
+            problems(
+                &d,
+                &goal(),
+                open(vec![
+                    sub("left", json!(["src/a"])),
+                    sub("right", json!(["src/b"]))
+                ])
+            )
+            .is_empty()
+        );
+        // One alone needs none.
+        assert!(problems(&d, &goal(), open(vec![sub("left", json!([]))])).is_empty());
+        assert_eq!(
+            problems(
+                &d,
+                &goal(),
+                open(vec![sub("left", json!(["src/a"])), sub("right", json!([]))])
+            ),
+            [
+                "open_subgoal: `right` would be worked on beside another sub-goal, so it needs `paths`: the files and directories its beads will change"
+            ]
+        );
+        assert_eq!(
+            problems(
+                &d,
+                &goal(),
+                open(vec![
+                    sub("left", json!(["src"])),
+                    sub("right", json!(["src/b"]))
+                ])
+            ),
+            [
+                "open_subgoal: `left` (`src`) and `right` (`src/b`) would change the same files: sub-goals whose paths overlap are worked on one after the other"
+            ]
+        );
+        assert_eq!(
+            problems(
+                &d,
+                &goal(),
+                open(vec![sub("left", json!(["a"])), sub("left", json!(["b"]))])
+            ),
+            ["open_subgoal: this goal already had a sub-goal `left`"]
+        );
+        // The slots are a limit, counting every sub-goal that has not landed.
+        assert_eq!(
+            problems(
+                &d,
+                &goal(),
+                open(vec![
+                    sub("a", json!(["a"])),
+                    sub("b", json!(["b"])),
+                    sub("c", json!(["c"]))
+                ])
+            ),
+            [
+                "open_subgoal: that would make 3 sub-goals that have not landed, and this goal's director may have 2"
+            ]
+        );
+        // One already there counts, by its paths or by having none.
+        let mut one = with_foreman(&[], None);
+        assert_eq!(
+            problems(&d, &one, open(vec![sub("right", json!(["src/b"]))])),
+            [
+                "open_subgoal: `signals` has not landed and has no paths declared, so nothing may open beside it: wait for it to land"
+            ]
+        );
+        one.subgoals[0].paths = vec!["src/a".into()];
+        assert!(problems(&d, &one, open(vec![sub("right", json!(["src/b"]))])).is_empty());
+        assert!(
+            problems(&d, &one, open(vec![sub("right", json!(["src/a/x.zig"]))]))[0]
+                .contains("would change the same files")
+        );
+        let full = problems(
+            &d,
+            &one,
+            open(vec![sub("b", json!(["b"])), sub("c", json!(["c"]))]),
+        );
+        assert_eq!(
+            full,
+            [
+                "open_subgoal: that would make 3 sub-goals that have not landed, and this goal's director may have 2: `signals` still to land"
+            ]
+        );
+
+        // Two waiting on the director: each is shipped or answered by name.
+        let mut two = with_foreman(&["toy-1"], Some("ready"));
+        let mut second = two.subgoals[0].clone();
+        second.id = "timers".into();
+        two.subgoals.push(second);
+        assert!(problems(&d, &two, json!({"ship": ["signals", "timers"]})).is_empty());
+        assert!(
+            problems(
+                &d,
+                &two,
+                json!({"ship": ["timers"], "tell_foreman": [{"subgoal": "signals", "text": "Add toy-2."}]})
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            problems(&d, &two, json!({"ship": ["signals", "signals"]})),
+            ["ship: `signals` is listed twice"]
+        );
+        assert_eq!(
+            problems(&d, &two, json!({"ship": ["signals", "nowhere"]})),
+            ["ship: `nowhere` is not a sub-goal waiting to land"]
+        );
+        assert_eq!(
+            problems(
+                &d,
+                &two,
+                json!({"ship": ["signals"], "tell_foreman": [{"subgoal": "nowhere", "text": "Hello?"}]})
+            ),
+            ["tell_foreman: `nowhere` is not a sub-goal that is open"]
+        );
+        // One in line to ship will move the goal by itself; one being
+        // shipped cannot be shipped again.
+        two.subgoals[0].state = "queued".into();
+        two.subgoals[1].state = "landed".into();
+        assert!(problems(&d, &two, json!({})).is_empty());
+        assert_eq!(
+            problems(&d, &two, json!({"ship": ["signals"]})),
+            ["ship: sub-goal `signals` is already being shipped"]
+        );
+
+        // A bead of a sub-goal that has paths keeps inside them.
+        let mut fenced = with_foreman(&[], None);
+        fenced.subgoals[0].paths = vec!["src/a".into()];
+        let start =
+            |paths: Value| json!({"start": [{"bead": "toy-1", "reason": "", "paths": paths}]});
+        assert!(
+            foreman_says(&tiered("allow"), &fenced, start(json!(["src/a/poll.zig"]))).is_empty()
+        );
+        assert!(foreman_says(&tiered("allow"), &fenced, start(json!([]))).is_empty());
+        assert_eq!(
+            foreman_says(&tiered("allow"), &fenced, start(json!(["src/b"]))),
+            [
+                "start: `src/b`, declared for `toy-1`, is outside this sub-goal's own paths (src/a): another sub-goal is being worked on beside this one"
             ]
         );
     }

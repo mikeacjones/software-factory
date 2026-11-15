@@ -13,7 +13,20 @@
 # A failure here has no builder session to return to, so the fix step is a
 # fresh builder on the sub-goal's branch, briefed with the failure.
 id = "zig-sdk-ship"
-start = "fmt"
+start = "sync"
+
+# Other work may have landed since this branch was cut: another sub-goal of
+# the same goal, or anything else. The default branch is taken in first, so
+# that everything below verifies what will actually land. Sub-goals ship one
+# at a time, which makes this the point where one is folded onto the last.
+# A conflict goes to the fix step, and from there through all of it.
+[[step]]
+id = "sync"
+kind = "action"
+action = "sync"
+on.current = "fmt"
+on.moved = "fmt"
+on.conflict = "fix"
 
 [[step]]
 id = "fmt"
@@ -120,6 +133,8 @@ kind = "action"
 action = "publish"
 on.done = "ci"
 on.failed = { to = "describe", max = 2 }
+# Nothing is pushed while a file still holds a marker from the merge above.
+on.conflict = { to = "fix", max = 2 }
 
 [[step]]
 id = "ci"

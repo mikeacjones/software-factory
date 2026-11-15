@@ -3,11 +3,13 @@
 # foreman started its beads and reported it ready, the director shipped it,
 # and it landed. Reads the goal's own record and event log.
 #
-#   proofs/tiers_zig_verify.sh [--side-by-side] [GOAL_ID]
+#   proofs/tiers_zig_verify.sh [--side-by-side | --sub-goals] [GOAL_ID]
 #                                    default: the newest goal with one
 #
 # With --side-by-side it also requires that two of the sub-goal's beads ran
-# at the same time and were both absorbed.
+# at the same time and were both absorbed. With --sub-goals it requires
+# instead that two sub-goals of one goal were in flight at once and landed
+# in turn.
 #
 # Read-only.
 set -euo pipefail
@@ -16,6 +18,25 @@ state="${FACTORY_STATE_DIR:-$HOME/.local/state/software-factory}"
 fail() { echo "FAIL: $*" >&2; exit 1; }
 together=0
 if [ "${1:-}" = "--side-by-side" ]; then together=1; shift; fi
+if [ "${1:-}" = "--sub-goals" ]; then
+  # Two sub-goals of one goal were in flight at once and both landed, the
+  # later one having taken in the default branch before it was verified.
+  shift
+  for candidate in ${1:-$(ls -t "$state/goals" 2>/dev/null)}; do
+    file="$state/goals/$candidate/goal.json"
+    [ -f "$file" ] || continue
+    jq -e '.project == "temporal-sdk-zig" and ([.subgoals[]? | select(.state == "landed" and (.paths | length) > 0)] | length >= 2)' "$file" >/dev/null || continue
+    for unit in $(jq -r '.units[] | select(.ship == true and .state == "landed") | .unit' "$file"); do
+      if jq -e 'select(.kind == "tip.merged" and .data.sibling == false)' "$state/units/$unit/events.jsonl" >/dev/null 2>&1; then
+        echo "goal: $candidate"
+        echo "ok   two sub-goals with declared paths landed; ship unit $unit took in the default branch first"
+        echo "PASS"
+        exit 0
+      fi
+    done
+  done
+  fail "no goal for temporal-sdk-zig had two sub-goals on declared paths land, the later after merging the default branch"
+fi
 # A landed sub-goal that had a foreman which ran at least once.
 ran='[.subgoals[]? | select(.state == "landed" and (.foreman.wakes // 0) > 0)]'
 

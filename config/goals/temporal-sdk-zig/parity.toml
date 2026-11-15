@@ -22,15 +22,19 @@ stop_when = "All GA features and capabilities match."
 # the sub-goal is ready or when it needs an answer.
 #
 # `slots` is the most work a tier may have running below it at once. It is a
-# limit, never a target: the foreman runs two beads together only when it has
-# declared for each the paths it will change and code finds no overlap, and
-# otherwise one after the other. The bead absorbed second has the first
-# merged into it and its checks run again. A director's slots stay at 1 until
-# sub-goals can be landed side by side.
+# limit, never a target. The agent at that level runs work side by side only
+# when it has declared, for each piece, the paths it will change, and code
+# finds no overlap; otherwise one after the other.
+#
+# The foreman's are bead pipelines in its sub-goal. The bead absorbed second
+# has the first merged into it and its checks run again. The director's are
+# sub-goals that have not landed. They ship one at a time, each taking in
+# what landed before it and only then being verified.
 [director]
 model = "claude-fable-5-2"
 effort = "high"
 timeout_secs = 2400
+slots = 2
 
 [foreman]
 model = "claude-opus-5-5"

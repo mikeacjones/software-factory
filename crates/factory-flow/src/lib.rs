@@ -217,12 +217,21 @@ pub struct ActionSpec {
     pub required: &'static [&'static str],
 }
 
-pub const ACTIONS: [ActionSpec; 4] = [
-    // One final commit, a push, and the pull request.
+pub const ACTIONS: [ActionSpec; 5] = [
+    // One final commit, a push, and the pull request. `conflict` when a
+    // merge into the branch left conflicts that are still unresolved.
     ActionSpec {
         name: "publish",
-        outcomes: &["done", "failed"],
+        outcomes: &["done", "failed", "conflict"],
         required: &["done"],
+    },
+    // Bring the unit's branch up to date with the default branch: `current`
+    // if it already is, `moved` if the default branch merged in cleanly,
+    // and `conflict` if the merge left conflicts to resolve.
+    ActionSpec {
+        name: "sync",
+        outcomes: &["current", "moved", "conflict"],
+        required: &["current", "moved"],
     },
     // Wait for the pull request's checks: `red` as soon as one fails,
     // `green` once every one has passed.

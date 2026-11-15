@@ -626,12 +626,15 @@ impl ConfigDir {
             if definition.max_pipelines == 0 {
                 return Err(invalid("max_pipelines must be at least 1".to_string()));
             }
-            // Work that runs side by side has to be folded back together.
-            // A foreman can do that for the beads of its sub-goal; nothing
-            // does it yet for sub-goals.
-            if definition.director.slots != 1 {
+            // Work that runs side by side has to be folded back together:
+            // a sub-goal's beads by its foreman's pipelines, and sub-goals
+            // by shipping one at a time.
+            if definition.director.slots == 0 {
+                return Err(invalid("director.slots must be at least 1".to_string()));
+            }
+            if definition.director.slots > 1 && definition.foreman.is_none() {
                 return Err(invalid(
-                    "director.slots must be 1: running sub-goals side by side is not built yet"
+                    "director.slots above 1 needs a foreman: sub-goals worked on side by side are each run by one"
                         .to_string(),
                 ));
             }
@@ -933,7 +936,8 @@ timeout_secs = 60
                 .map(|tier| tier.slots),
             Some(2)
         );
-        // A director cannot yet: nothing reconciles sub-goals.
+        // A director may have sub-goals side by side only with foremen to
+        // run them.
         std::fs::write(
             goals.join("bugs.toml"),
             definition("bugs", "") + "slots = 2\n",
@@ -943,8 +947,14 @@ timeout_secs = 60
             dir.goal_definitions("toy")
                 .unwrap_err()
                 .to_string()
-                .contains("director.slots must be 1")
+                .contains("director.slots above 1 needs a foreman")
         );
+        std::fs::write(
+            goals.join("bugs.toml"),
+            definition("bugs", "ship_flow = \"ship\"") + "slots = 2\n" + foreman,
+        )
+        .unwrap();
+        assert_eq!(dir.goal_definitions("toy").unwrap()[0].director.slots, 2);
         std::fs::remove_dir_all(&dir.0).unwrap();
     }
 

@@ -1021,6 +1021,7 @@ impl Driver {
                 StepKind::Action { action } => match action.as_str() {
                     "await-ci" => self.await_ci_step(&step)?,
                     "land" => self.land_step(&step)?,
+                    "sync" => self.sync_step(&step)?,
                     _ => self.publish_step(&step)?,
                 },
             };
@@ -2917,6 +2918,21 @@ impl Driver {
         Ok(StepEnd::Outcome("done".to_string()))
     }
 
+    /// Conflicts handed to a builder must be gone before anything else
+    /// happens to the branch. Returns how the step ends while one is left.
+    fn unresolved(&mut self, step: &Step) -> Result<Option<StepEnd>, DriverError> {
+        let left = factory_git::with_conflict_markers(&self.unit.worktree, &self.unit.conflicts);
+        if left.is_empty() {
+            self.unit.conflicts.clear();
+            return Ok(None);
+        }
+        let reason = format!(
+            "These files still hold conflict markers from the merge into your branch: {}. Resolve each one so that both changes do what they were for, and remove the markers.",
+            left.join(", ")
+        );
+        self.send_back(step, "conflict", reason).map(Some)
+    }
+
     /// Before a unit is absorbed: if another bead of its sub-goal was
     /// absorbed since this one branched, merge the sub-goal's branch into
     /// the unit's. Returns how the step ends when the unit is not ready to
@@ -2925,61 +2941,114 @@ impl Driver {
         let Some(target) = self.unit.absorb_into.clone() else {
             return Ok(None);
         };
-        let worktree = self.unit.worktree.clone();
-        // Conflicts handed to the builder must be gone before anything else.
-        let unresolved = factory_git::with_conflict_markers(&worktree, &self.unit.conflicts);
-        if !unresolved.is_empty() {
-            let reason = format!(
-                "These files still hold conflict markers from merging the sub-goal's branch into yours: {}. Resolve each one so that both changes do what they were for, and remove the markers.",
-                unresolved.join(", ")
-            );
-            return self.send_back(step, "conflict", reason).map(Some);
+        if let Some(end) = self.unresolved(step)? {
+            return Ok(Some(end));
         }
-        self.unit.conflicts.clear();
         let tip = factory_git::rev_parse(&target, "HEAD")?;
         if tip == self.unit.base {
             return Ok(None);
         }
+        self.take_in(step, &tip, true).map(Some)
+    }
+
+    /// The `sync` action: bring the unit's branch up to date with the
+    /// project's default branch as the remote has it now. A sub-goal that
+    /// ships after other work landed takes that work in before anything is
+    /// verified, so that what is checked is what will land.
+    fn sync_step(&mut self, step: &Step) -> Result<StepEnd, DriverError> {
+        let synced = (|| {
+            if let Some(end) = self.unresolved(step)? {
+                return Ok(end);
+            }
+            factory_git::fetch(&self.project.repo, &self.project.remote)?;
+            let worktree = self.unit.worktree.clone();
+            let target = factory_git::rev_parse(
+                &worktree,
+                &format!("{}/{}", self.project.remote, self.project.default_branch),
+            )?;
+            if factory_git::is_ancestor(&worktree, &target, "HEAD")? {
+                return Ok(StepEnd::Outcome("current".to_string()));
+            }
+            self.take_in(step, &target, false)
+        })();
+        match synced {
+            Ok(end) => Ok(end),
+            Err(err) => {
+                let err: DriverError = err;
+                self.event(
+                    "sync.failed",
+                    Some(&step.id),
+                    json!({ "error": err.to_string() }),
+                )?;
+                Ok(StepEnd::Park(format!(
+                    "the branch could not be brought up to date with the default branch: {err}"
+                )))
+            }
+        }
+    }
+
+    /// Merge `tip` into the unit's branch and make it the unit's new base:
+    /// from here the unit's own change is what it adds to `tip`. `sibling`
+    /// says whose work `tip` holds: another bead of the same sub-goal, or
+    /// whatever landed on the default branch. A clean merge ends the step
+    /// as `moved` and one with conflicts as `conflict`.
+    fn take_in(&mut self, step: &Step, tip: &str, sibling: bool) -> Result<StepEnd, DriverError> {
+        let worktree = self.unit.worktree.clone();
+        let (theirs, into, headline) = if sibling {
+            (
+                "the sub-goal's branch",
+                "another bead of the sub-goal was absorbed first",
+                "Another bead of the sub-goal was absorbed first",
+            )
+        } else {
+            (
+                "the default branch",
+                "other work landed on the default branch first",
+                "Other work landed on the default branch first",
+            )
+        };
         let conflicted = factory_git::merge_keeping_conflicts(
             &worktree,
-            &tip,
-            &format!(
-                "checkpoint: merge the sub-goal's branch ({})",
-                self.unit.bead
-            ),
+            tip,
+            &format!("checkpoint: merge {theirs} ({})", self.unit.bead),
         )?;
         let head = factory_git::rev_parse(&worktree, "HEAD")?;
-        // From here the unit's own change is what it adds to the new tip.
-        let from = std::mem::replace(&mut self.unit.base, tip.clone());
+        let from = std::mem::replace(&mut self.unit.base, tip.to_string());
         self.unit.checkpoint = head.clone();
         self.event(
             "tip.merged",
             Some(&step.id),
-            json!({ "from": from, "onto": tip, "commit": head, "conflicts": conflicted }),
+            json!({ "from": from, "onto": tip, "commit": head, "conflicts": conflicted, "sibling": sibling }),
         )?;
+        let short = |commit: &str| commit[..commit.len().min(10)].to_string();
         if conflicted.is_empty() {
             self.unit.history.push(format!(
-                "{}: another bead of the sub-goal was absorbed first, so the sub-goal's branch ({}) was merged into this one. It merged cleanly, and the project's checks run again on the two together.",
+                "{}: {into}, so {theirs} ({}) was merged into this one. It merged cleanly, and the checks run on the two together.",
                 step.id,
-                &tip[..tip.len().min(10)]
+                short(tip)
             ));
             self.save()?;
-            return self
-                .send_back(
-                    step,
-                    "moved",
-                    "Another bead of the sub-goal was absorbed first. Its work merged cleanly into this branch, and the checks have to pass on the two together before this one is absorbed.".to_string(),
-                )
-                .map(Some);
+            return self.send_back(
+                step,
+                "moved",
+                format!(
+                    "{headline}. It merged cleanly into this branch, and the checks have to pass on the two together."
+                ),
+            );
         }
         self.unit.conflicts = conflicted.clone();
         let reason = format!(
-            "While this bead was in its pipeline, another bead of the same sub-goal was absorbed into the sub-goal's branch. That branch has been merged into yours, and these files conflicted: {}.\n\nEach holds git's conflict markers (`<<<<<<<`, `=======`, `>>>>>>>`), committed as a checkpoint: there is no merge in progress and nothing to abort or continue. Resolve every one so that both changes do what they were for: yours, and the other bead's (`git log -p {}..{}` shows what it did). Do not drop the other bead's work to make yours fit. Then make sure the result builds and its tests pass.",
+            "While this branch was being worked on, {into}. {} has been merged into yours, and these files conflicted: {}.\n\nEach holds git's conflict markers (`<<<<<<<`, `=======`, `>>>>>>>`), committed as a checkpoint: there is no merge in progress and nothing to abort or continue. Resolve every one so that both changes do what they were for: this branch's, and the other work's (`git log -p {}..{}` shows what it did). Do not drop the other work to make this branch's fit. Then make sure the result builds and its tests pass.",
+            if sibling {
+                "The sub-goal's branch"
+            } else {
+                "The default branch"
+            },
             conflicted.join(", "),
-            &from[..from.len().min(10)],
-            &tip[..tip.len().min(10)]
+            short(&from),
+            short(tip)
         );
-        self.send_back(step, "conflict", reason).map(Some)
+        self.send_back(step, "conflict", reason)
     }
 
     /// End an action with an outcome that leads back into the flow, with
@@ -3062,9 +3131,12 @@ impl Driver {
         };
         let (message, title, body) = (field("commit_message"), field("pr_title"), field("pr_body"));
         let worktree = self.unit.worktree.clone();
-        if matches!(&step.kind, StepKind::Action { action } if action == "absorb")
-            && let Some(end) = self.reconcile(step)?
-        {
+        let waits = if matches!(&step.kind, StepKind::Action { action } if action == "absorb") {
+            self.reconcile(step)?
+        } else {
+            self.unresolved(step)?
+        };
+        if let Some(end) = waits {
             return Ok(end);
         }
         self.thread.status(&format!(

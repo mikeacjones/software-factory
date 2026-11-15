@@ -24,7 +24,13 @@ arg_after() { # the argument that follows $1 in the rest of the list
 case "$1 $2" in
   "auth status") exit 0 ;;
   "pr list")
-    if [ -f "$state/pr" ]; then echo '[{"number":7,"url":"https://github.com/me/toy/pull/7"}]'; else echo '[]'; fi ;;
+    # Only the pull request of the branch asked for.
+    want=$(arg_after --head "$@")
+    if [ -f "$state/pr" ] && { [ -z "$want" ] || [ "$want" = "$(cat "$state/pr")" ]; }; then
+      echo '[{"number":7,"url":"https://github.com/me/toy/pull/7"}]'
+    else
+      echo '[]'
+    fi ;;
   "issue create")
     cat > /dev/null
     n=$(( $(cat "$state/issues" 2>/dev/null || echo 0) + 1 ))
@@ -32,6 +38,8 @@ case "$1 $2" in
     echo "https://github.com/me/toy/issues/$n" ;;
   "pr create")
     cat > "$state/pr-body"
+    # A new pull request: whatever was merged before was another one.
+    rm -f "$state/merged" "$state/merged-head"
     arg_after --head "$@" > "$state/pr"
     echo "https://github.com/me/toy/pull/7" ;;
   "pr edit") cat > "$state/pr-body" ;;

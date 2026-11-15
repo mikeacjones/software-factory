@@ -327,13 +327,19 @@ pub fn with_conflict_markers(dir: &Path, files: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// The commits after `from` up to `to`, oldest first, each as its short
-/// hash, its subject and its body.
+/// The commits after `from` up to `to`, oldest first and leaving out merges,
+/// each as its short hash, its subject and its body.
 pub fn log_messages(dir: &Path, from: &str, to: &str) -> Result<String, GitError> {
     let range = format!("{from}..{to}");
     git(
         dir,
-        &["log", "--reverse", "--format=### %h %s%n%n%b", &range],
+        &[
+            "log",
+            "--reverse",
+            "--no-merges",
+            "--format=### %h %s%n%n%b",
+            &range,
+        ],
         LOCAL,
     )
 }

@@ -2640,6 +2640,319 @@ fn two_beads_that_collide_are_merged_by_the_builder_of_the_second() {
     );
 }
 
+/// A goal whose director may have two sub-goals at once, run until both
+/// have shipped: `left` holds toy-1 and `right` holds toy-3, on the paths
+/// given. Returns the goal as it ended and the two ship pipelines' logs.
+fn two_sub_goals_side_by_side(
+    world: &World,
+    scenario: &str,
+    paths: [&str; 2],
+) -> (factory_driver::goal::Goal, [String; 2]) {
+    use factory_driver::goal::{Phase, Supervisor};
+    use factory_slack::socket::Incoming;
+
+    world.with_github("green");
+    world.scenario(scenario);
+    std::fs::create_dir_all(world.path("bin/state")).unwrap();
+    std::fs::write(world.path("bin/state/broke"), "").unwrap();
+    std::fs::write(
+        world.path("beads/toy-3.json"),
+        r#"{"id":"toy-3","title":"The other part","description":"Beside it.","acceptance_criteria":"- it is there","status":"open"}"#,
+    )
+    .unwrap();
+    let project = world.path("config/projects/toy.toml");
+    let text = std::fs::read_to_string(&project)
+        .unwrap()
+        .replace(
+            "merge_subject = \"Merge bead/{bead_short}: {title}\"",
+            "merge_method = \"squash\"\nmerge_subject = \"{title} (#{number})\"",
+        )
+        .replace(
+            "merge_body = \"{summary}\\n\\n{testing}\\n\\nBead: {bead}\"",
+            "merge_body = \"{commit_body}\\n\\n{testing}\\n\\n{commit_trailers}\"",
+        );
+    std::fs::write(&project, text).unwrap();
+    std::fs::create_dir_all(world.path("config/goals/toy")).unwrap();
+    std::fs::write(
+        world.path("config/goals/toy/main.toml"),
+        "id = \"main\"\nflow = \"zig-sdk-bead\"\nship_flow = \"zig-sdk-ship\"\nmax_pipelines = 2\n[director]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\nslots = 2\n[foreman]\nmodel = \"claude-opus-5-5\"\neffort = \"medium\"\n",
+    )
+    .unwrap();
+    let say = |role: &str, n: u32, json: serde_json::Value| {
+        std::fs::write(
+            world.path(&format!("bin/state/{role}-{n}.json")),
+            json.to_string(),
+        )
+        .unwrap();
+    };
+    let direct = |fields: serde_json::Value| {
+        let mut result = serde_json::json!({
+            "summary": "Decided.", "start": [], "file": [], "edit": [], "dropped_findings": [],
+            "open_subgoals": [], "ship": [], "tell_foreman": [], "ask_owner": "",
+            "complete": false, "evidence": "", "journal_entry": "", "project_memory": ""
+        });
+        for (key, value) in fields.as_object().unwrap() {
+            result[key] = value.clone();
+        }
+        result
+    };
+    let foreman = |fields: serde_json::Value| {
+        let mut result = serde_json::json!({
+            "summary": "Decided.", "start": [], "file": [], "dropped_findings": [],
+            "report": "working", "message": "", "journal_entry": ""
+        });
+        for (key, value) in fields.as_object().unwrap() {
+            result[key] = value.clone();
+        }
+        result
+    };
+    say(
+        "intake",
+        1,
+        serde_json::json!({"reply": "Here is the charter.", "ready": true, "objective": "Ship both parts.", "stop_when": "Both beads have landed.", "plan": "Two sub-goals, side by side.", "edits": []}),
+    );
+    say(
+        "director",
+        1,
+        direct(serde_json::json!({"open_subgoals": [
+            {"id": "left", "title": "The left part", "objective": "It works.", "beads": ["toy-1"], "paths": [paths[0]]},
+            {"id": "right", "title": "The right part", "objective": "It works.", "beads": ["toy-3"], "paths": [paths[1]]},
+        ]})),
+    );
+    // Each sub-goal's foreman starts its one bead, then reports it ready.
+    say(
+        "foreman",
+        1,
+        foreman(
+            serde_json::json!({"start": [{"bead": "toy-1", "reason": "the only one", "paths": []}]}),
+        ),
+    );
+    say(
+        "foreman",
+        2,
+        foreman(
+            serde_json::json!({"start": [{"bead": "toy-3", "reason": "the only one", "paths": []}]}),
+        ),
+    );
+    for n in [3, 4] {
+        say(
+            "foreman",
+            n,
+            foreman(serde_json::json!({"report": "ready", "message": "Its bead is absorbed."})),
+        );
+    }
+    // The director waits for both, then ships them in order.
+    say("director", 2, direct(serde_json::json!({})));
+    say(
+        "director",
+        3,
+        direct(serde_json::json!({"ship": ["left", "right"]})),
+    );
+    say("director", 4, direct(serde_json::json!({})));
+    say(
+        "director",
+        5,
+        direct(serde_json::json!({"complete": true, "evidence": "Both sub-goals landed."})),
+    );
+
+    let mut sup = Supervisor::new(world.config(), None, vec!["OWNER".to_string()], false).unwrap();
+    let id = sup.open_directly("toy", "Ship both parts").unwrap();
+    sup.incoming(Incoming::Action {
+        channel: String::new(),
+        user: "OWNER".to_string(),
+        action_id: "goal_start".to_string(),
+        value: id,
+        message_ts: String::new(),
+    })
+    .unwrap();
+    // Both sub-goals are open, each with a foreman and its bead running on
+    // the sub-goal's own paths.
+    let started = sup.goals().next().unwrap().clone();
+    assert_eq!(
+        started
+            .subgoals
+            .iter()
+            .map(|sub| (sub.id.as_str(), sub.state.as_str(), sub.paths.clone()))
+            .collect::<Vec<_>>(),
+        [
+            ("left", "open", vec![paths[0].to_string()]),
+            ("right", "open", vec![paths[1].to_string()])
+        ]
+    );
+    assert_eq!(started.units.len(), 2);
+    for (unit, (sub, path)) in started
+        .units
+        .iter()
+        .zip([("left", paths[0]), ("right", paths[1])])
+    {
+        assert_eq!(unit.state, "running");
+        assert_eq!(unit.subgoal.as_deref(), Some(sub));
+        assert_eq!(unit.paths, [path], "a bead keeps to its sub-goal's paths");
+    }
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    while sup.goals().next().unwrap().phase != Phase::ProposedComplete {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the two sub-goals never both landed: {:?}",
+            sup.goals()
+                .next()
+                .unwrap()
+                .subgoals
+                .iter()
+                .map(|sub| (&sub.id, &sub.state))
+                .collect::<Vec<_>>()
+        );
+        sup.pump(std::time::Duration::from_millis(200)).unwrap();
+    }
+    let goal = sup.goals().next().unwrap().clone();
+    let ship_log = |sub: &str| {
+        let unit = goal
+            .units
+            .iter()
+            .find(|unit| unit.ship && unit.bead == sub)
+            .and_then(|unit| unit.unit.clone())
+            .unwrap();
+        std::fs::read_to_string(world.path(&format!("state/units/{unit}/events.jsonl"))).unwrap()
+    };
+    let logs = [ship_log("left"), ship_log("right")];
+    (goal, logs)
+}
+
+#[test]
+fn two_sub_goals_worked_on_side_by_side_land_one_after_the_other() {
+    let world = World::new("sub-goals-side-by-side", "true");
+    let (goal, [left, right]) = two_sub_goals_side_by_side(&world, "own-file", ["toy-1", "toy-3"]);
+    assert_eq!(goal.wakes, 5);
+    for sub in &goal.subgoals {
+        assert_eq!(sub.state, "landed");
+        assert!(sub.foreman.clone().unwrap().wakes >= 2);
+    }
+    // Both were being built at once: the second foreman started its bead
+    // before the first bead ended.
+    let log = std::fs::read_to_string(world.path(&format!("state/goals/{}/events.jsonl", goal.id)))
+        .unwrap();
+    let position = |needle: &str| log.find(needle).unwrap_or_else(|| panic!("no {needle}"));
+    assert!(
+        position("\"bead\":\"toy-3\",\"paths\"") < position("\"kind\":\"subgoal.shipping\""),
+        "{log}"
+    );
+
+    // Shipping was one at a time, in the order the director gave: `right`
+    // waited in line while `left` shipped, and started when it had landed.
+    assert!(log.contains("\"kind\":\"subgoal.queued\""), "{log}");
+    assert!(log.contains("\"behind\":\"left\""), "{log}");
+    let shipping: Vec<usize> = log
+        .match_indices("\"kind\":\"subgoal.shipping\"")
+        .map(|(at, _)| at)
+        .collect();
+    assert_eq!(shipping.len(), 2);
+    assert!(left.contains("\"kind\":\"landed\""));
+
+    // `left` was cut from the default branch as it still was. `right` was
+    // not, by the time its turn came: the default branch, with `left` on it,
+    // was merged in before anything was verified, so what CI saw and what
+    // landed was the two together.
+    assert!(left.contains("\"outcome\":\"current\""), "{left}");
+    assert!(!left.contains("\"kind\":\"tip.merged\""));
+    assert!(right.contains("\"kind\":\"tip.merged\""), "{right}");
+    assert!(right.contains("\"conflicts\":[]") && right.contains("\"sibling\":false"));
+    let steps: Vec<&str> = right
+        .lines()
+        .filter(|line| line.contains("\"kind\":\"step.ended\""))
+        .filter_map(|line| line.split("\"step\":\"").nth(1)?.split('"').next())
+        .collect();
+    assert_eq!(&steps[..3], ["sync", "fmt", "index"], "{steps:?}");
+    for step in ["test", "test-safe", "samples", "ci", "land"] {
+        assert!(steps.contains(&step), "{step} did not run after the sync");
+    }
+
+    // Two pull requests, two squashed commits on main in order, both
+    // beads' work there, and both beads closed.
+    let gh = world.gh_calls();
+    for call in ["pr create", "pr merge"] {
+        assert_eq!(gh.iter().filter(|line| line.starts_with(call)).count(), 2);
+    }
+    let remote = world.path("remote.git");
+    assert_eq!(run(&remote, "git", &["rev-list", "--count", "main"]), "3");
+    assert_eq!(
+        run(&remote, "git", &["rev-list", "--count", "--merges", "main"]),
+        "0"
+    );
+    for bead in ["toy-1", "toy-3"] {
+        assert!(
+            !run(
+                &remote,
+                "git",
+                &["show", &format!("main:{bead}/feature.txt")]
+            )
+            .is_empty()
+        );
+        let text = std::fs::read_to_string(world.path(&format!("beads/{bead}.json"))).unwrap();
+        assert!(text.contains("\"closed\""), "{bead} is closed");
+    }
+    assert!(
+        run(&remote, "git", &["show", "--stat", "--format=", "main~1"])
+            .contains("toy-1/feature.txt"),
+        "`left` landed first"
+    );
+}
+
+#[test]
+fn a_sub_goal_that_collides_with_one_that_landed_is_merged_before_it_ships() {
+    let world = World::new("sub-goals-collide", "true");
+    // Both sub-goals' builders write the same file, whatever was declared,
+    // and the first try at the conflict leaves the markers in.
+    let (goal, [left, right]) = two_sub_goals_side_by_side(&world, "lazy-merge", ["a", "b"]);
+    for sub in &goal.subgoals {
+        assert_eq!(sub.state, "landed");
+    }
+    assert!(!left.contains("\"kind\":\"tip.merged\""));
+    assert!(right.contains("\"conflicts\":[\"feature.txt\"]"), "{right}");
+    // The conflict went to a builder on the sub-goal's branch. Its first
+    // answer left markers in, and nothing was pushed until they were gone.
+    assert_eq!(
+        right.matches("\"outcome\":\"conflict\"").count(),
+        2,
+        "{right}"
+    );
+    let before_push = &right[..right.find("\"kind\":\"published.pushed\"").unwrap()];
+    assert_eq!(before_push.matches("\"outcome\":\"conflict\"").count(), 2);
+    assert_eq!(
+        right.matches("\"kind\":\"published.pushed\"").count(),
+        1,
+        "pushed once, after the conflict was resolved"
+    );
+    let calls = world.calls();
+    let told: Vec<String> = (0..calls.len())
+        .filter(|&i| calls[i][0] == "builder")
+        .map(|i| {
+            std::fs::read_to_string(world.path(&format!("bin/state/brief-{}.md", i + 1))).unwrap()
+        })
+        .collect();
+    assert!(
+        told.iter().any(|brief| brief.contains(
+            "other work landed on the default branch first. The default branch has been merged into yours, and these files conflicted: feature.txt."
+        )),
+        "{}",
+        told.last().unwrap()
+    );
+    assert!(
+        told.iter()
+            .any(|brief| brief.contains("These files still hold conflict markers"))
+    );
+
+    // What landed holds both sub-goals' lines and no marker.
+    let remote = world.path("remote.git");
+    let merged = run(&remote, "git", &["show", "main:feature.txt"]);
+    assert!(
+        !merged.contains("<<<<<<<") && !merged.contains(">>>>>>>"),
+        "{merged}"
+    );
+    assert!(merged.lines().count() >= 2, "{merged}");
+    assert_eq!(run(&remote, "git", &["rev-list", "--count", "main"]), "3");
+}
+
 #[test]
 fn a_finding_is_proved_by_a_failing_test_and_a_fix_by_that_test_passing() {
     let world = World::new("proof", "true");
