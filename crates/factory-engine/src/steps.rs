@@ -7,9 +7,12 @@
 //! the ID back from the heartbeat and resumes the session. The work the run
 //! had done is not done again.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use factory_driver::Within;
+use factory_flow::Position;
 use serde::{Deserialize, Serialize};
 use temporalio_client::WorkflowExecuteUpdateOptions;
 use temporalio_macros::activities;
@@ -38,6 +41,10 @@ pub struct StepCall {
     /// workflow hands them out. `None` leaves the choice to the runner.
     #[serde(default)]
     pub account: Option<String>,
+    /// How often each bounded route of the flow has been taken so far,
+    /// keyed `step:outcome`, for the unit's own record.
+    #[serde(default)]
+    pub used: BTreeMap<String, u32>,
 }
 
 /// How a step ended.
@@ -65,6 +72,36 @@ pub struct PrepareCall {
     pub bead: String,
     /// The flow to run instead of the project's own, by name.
     pub flow_name: Option<String>,
+    /// The sub-goal the unit belongs to, if it is one bead of a sub-goal
+    /// or the sub-goal itself being shipped.
+    #[serde(default)]
+    pub within: Option<Within>,
+}
+
+/// A unit that exists already, to be taken up where its record says it
+/// stands: one that parked or failed and is continued, or one something
+/// else was walking.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdoptCall {
+    pub unit: String,
+    /// The step to go on from. `None` goes on where it stands.
+    pub from: Option<String>,
+    /// What whoever continues it wants that step to know.
+    pub note: Option<String>,
+    /// A decision about the bead that every later step is shown.
+    pub ruling: Option<String>,
+    /// The flow to run instead of the project's own, by name.
+    pub flow_name: Option<String>,
+}
+
+/// A unit taken up: its flow, and where it stands in it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Adopted {
+    pub flow: String,
+    pub position: Position,
+    pub project: String,
+    pub bead: String,
+    pub title: String,
 }
 
 /// A unit made ready: what it is called, and the flow it is pinned to.
@@ -122,6 +159,14 @@ pub trait StepRunner: Send + Sync + 'static {
 
     /// Run a command step or an action step.
     fn plain(&self, call: &StepCall) -> Result<StepDone, String>;
+
+    /// Take up a unit that exists already.
+    fn adopt(&self, call: &AdoptCall) -> Result<Adopted, NotPrepared> {
+        Err(NotPrepared::Refused(format!(
+            "this runner cannot take up the unit `{}`",
+            call.unit
+        )))
+    }
 
     /// The engine has parked the unit: record it where people will look.
     fn park(&self, _call: &ParkCall) -> Result<(), String> {
@@ -264,6 +309,24 @@ impl Steps {
             )),
             Ok(Err(NotPrepared::Failed(reason))) => Err(failed(reason)),
             Err(join) => Err(failed(format!("preparing the unit was lost: {join}"))),
+        }
+    }
+
+    /// Take up a unit that exists already.
+    #[activity]
+    pub async fn adopt(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        call: AdoptCall,
+    ) -> Result<Adopted, ActivityError> {
+        let runner = self.runner.clone();
+        match tokio::task::spawn_blocking(move || runner.adopt(&call)).await {
+            Ok(Ok(adopted)) => Ok(adopted),
+            Ok(Err(NotPrepared::Refused(reason))) => Err(ActivityError::from(
+                ApplicationFailure::non_retryable(std::io::Error::other(reason)),
+            )),
+            Ok(Err(NotPrepared::Failed(reason))) => Err(failed(reason)),
+            Err(join) => Err(failed(format!("taking up the unit was lost: {join}"))),
         }
     }
 

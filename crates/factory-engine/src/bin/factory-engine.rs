@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use factory_config::{ConfigDir, Temporal};
 use factory_engine::accounts::{ACCOUNTS_ID, Accounts};
-use factory_engine::engine::{GoOn, Pipeline, PipelineInput};
+use factory_engine::engine::{Adopt, GoOn, Pipeline, PipelineInput};
 use factory_engine::factory::FactoryRunner;
 use factory_engine::worker::{WorkerSettings, connect, ensure_accounts, pipeline_options, run};
 use temporalio_client::{WorkflowGetResultOptions, WorkflowQueryOptions, WorkflowSignalOptions};
@@ -42,6 +42,81 @@ fn build_id() -> String {
             (parts.next()?.as_os_str() == "releases").then_some(release)
         })
         .unwrap_or_else(|| "unreleased".to_string())
+}
+
+/// A pipeline for something that runs goals to start, as the file it
+/// hands over says it.
+#[derive(serde::Deserialize)]
+struct RunSpec {
+    project: String,
+    /// The bead, or what a sub-goal being shipped is called.
+    bead: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    flow_name: Option<String>,
+    #[serde(default)]
+    within: Option<factory_driver::Within>,
+    /// A unit to take up where it stands, instead of making one.
+    #[serde(default)]
+    unit: Option<String>,
+    #[serde(default)]
+    adopt: Option<Adopt>,
+}
+
+/// Follow a pipeline to its end for whoever started it, a line at a time
+/// on standard output: `unit <id>` as soon as it has one, then `end` with
+/// how it ended, `refused` with why it never began, or `failed` with what
+/// went wrong.
+async fn follow(
+    handle: &temporalio_client::WorkflowHandle<temporalio_client::Client, Pipeline>,
+) -> Result<(), String> {
+    use std::io::Write;
+    let say = |line: String| {
+        println!("{line}");
+        let _ = std::io::stdout().flush();
+    };
+    let mut result = Box::pin(handle.get_result(WorkflowGetResultOptions::default()));
+    let mut named = false;
+    let end = loop {
+        tokio::select! {
+            end = &mut result => break end,
+            _ = tokio::time::sleep(std::time::Duration::from_secs(2)), if !named => {
+                if let Ok(standing) = handle
+                    .query(Pipeline::standing, (), WorkflowQueryOptions::default())
+                    .await
+                    && !standing.unit.is_empty()
+                {
+                    say(format!("unit {}", standing.unit));
+                    named = true;
+                }
+            }
+        }
+    };
+    match end {
+        Ok(end) => {
+            if !named && !end.unit.is_empty() {
+                say(format!("unit {}", end.unit));
+            }
+            say(format!(
+                "end {}",
+                serde_json::to_string(&end).map_err(|err| err.to_string())?
+            ));
+        }
+        Err(err) => {
+            // A pipeline that never began says why to whoever asks.
+            let refused = handle
+                .query(Pipeline::standing, (), WorkflowQueryOptions::default())
+                .await
+                .ok()
+                .and_then(|standing| standing.refused);
+            match refused {
+                Some(reason) => say(format!("refused {}", reason.replace('\n', " "))),
+                None => say(format!("failed {}", err.to_string().replace('\n', " "))),
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn command(args: &[String]) -> Result<(), String> {
@@ -158,6 +233,46 @@ async fn command(args: &[String]) -> Result<(), String> {
             }
             Ok(())
         }
+        ["run", spec] => {
+            let text = std::fs::read_to_string(spec).map_err(|err| format!("{spec}: {err}"))?;
+            let spec: RunSpec =
+                serde_json::from_str(&text).map_err(|err| format!("{spec}: {err}"))?;
+            config.project(&spec.project).map_err(|err| err.to_string())?;
+            let client = connect(&temporal.address, &temporal.namespace).await?;
+            ensure_accounts(&client, &temporal.task_queue, temporal.accounts_check_secs).await?;
+            let taken_up = spec.unit.is_some();
+            let input = PipelineInput {
+                unit: spec.unit.clone().unwrap_or_default(),
+                project: spec.project.clone(),
+                bead: spec.bead.clone(),
+                flow_name: spec.flow_name.clone(),
+                beat_secs: temporal.beat_secs,
+                accounts: ACCOUNTS_ID.to_string(),
+                within: spec.within.clone(),
+                adopt: taken_up.then(|| spec.adopt.clone().unwrap_or_default()),
+                stop_at_park: true,
+                ..PipelineInput::default()
+            };
+            let id = format!(
+                "pipeline-{}-{}-{}",
+                spec.project,
+                spec.unit.as_deref().unwrap_or(&spec.bead),
+                factory_core_now()
+            );
+            let options = pipeline_options(&temporal.task_queue, &id, &input, &spec.title);
+            client
+                .start_workflow(Pipeline::run, input, options)
+                .await
+                .map_err(|err| format!("the pipeline could not be started: {err}"))?;
+            println!("workflow {id}");
+            follow(&client.get_workflow_handle::<Pipeline>(id)).await
+        }
+        ["watch", pipeline] => {
+            let client = connect(&temporal.address, &temporal.namespace).await?;
+            let handle = client.get_workflow_handle::<Pipeline>(pipeline.to_string());
+            println!("workflow {pipeline}");
+            follow(&handle).await
+        }
         ["standing", pipeline] => {
             let client = connect(&temporal.address, &temporal.namespace).await?;
             let standing = client
@@ -262,7 +377,7 @@ async fn command(args: &[String]) -> Result<(), String> {
             println!("told the accounts to look again");
             Ok(())
         }
-        _ => Err("usage: factory-engine worker | start <project> <bead> [--wait] | standing <pipeline> | go-on <pipeline> <step> <note> | give-up <pipeline> | accounts [recheck]   [--config <dir>]".to_string()),
+        _ => Err("usage: factory-engine worker | start <project> <bead> [--wait] | run <spec.json> | watch <pipeline> | standing <pipeline> | go-on <pipeline> <step> <note> | give-up <pipeline> | accounts [recheck]   [--config <dir>]".to_string()),
     }
 }
 

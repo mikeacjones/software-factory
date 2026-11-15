@@ -13,7 +13,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use factory_engine::accounts::{ACCOUNTS_ID, Accounts};
-use factory_engine::engine::{GoOn, Pipeline, PipelineInput};
+use factory_engine::engine::{Adopt, GoOn, Pipeline, PipelineInput};
 use temporalio_client::{
     Client, WorkflowFetchHistoryOptions, WorkflowGetResultOptions, WorkflowQueryOptions,
     WorkflowSignalOptions, WorkflowStartOptions,
@@ -344,6 +344,96 @@ async fn a_real_pipeline_that_needs_the_owner_parks_and_goes_on_with_the_answer(
         "{brief}"
     );
     assert_eq!(unit_record(&shop.world, &standing.unit)["status"], "ended");
+    shop.close().await;
+}
+
+/// A pipeline that a goal runs does not wait when it parks: it ends, and
+/// says why. Going on is a new pipeline that takes the unit up from the
+/// factory's own record of it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pipeline_run_for_a_goal_ends_where_it_parks_and_another_takes_the_unit_up() {
+    let Some(shop) = Shop::open("engine-adopt", "true", "ask-once").await else {
+        return;
+    };
+    let (mut input, options) = shop.start("engine-adopt");
+    input.stop_at_park = true;
+    let end = shop
+        .client()
+        .start_workflow(Pipeline::run, input, options)
+        .await
+        .unwrap()
+        .get_result(WorkflowGetResultOptions::default())
+        .await
+        .unwrap();
+    assert!(!end.ended);
+    assert_eq!(end.parked.as_deref(), Some("step `build` needs the owner"));
+    assert!(!end.unit.is_empty());
+    let unit = unit_record(&shop.world, &end.unit);
+    assert!(unit["status"]["parked"].is_string(), "{unit}");
+
+    // Whoever runs the sub-goal continues it: from a step, with a note
+    // for that step and a ruling for every step after it.
+    let again = PipelineInput {
+        unit: end.unit.clone(),
+        beat_secs: 1,
+        stop_at_park: true,
+        adopt: Some(Adopt {
+            from: Some("build".to_string()),
+            note: Some("No shouting: use the short name.".to_string()),
+            ruling: Some("Names are lower case in this project.".to_string()),
+        }),
+        ..PipelineInput::default()
+    };
+    let options = factory_engine::worker::pipeline_options(
+        "factory-engine-adopt",
+        "pipeline-engine-adopt-2",
+        &again,
+        "",
+    );
+    let handle = shop
+        .client()
+        .start_workflow(Pipeline::run, again, options)
+        .await
+        .unwrap();
+    let second = handle
+        .get_result(WorkflowGetResultOptions::default())
+        .await
+        .unwrap();
+    assert!(second.ended, "{second:?}");
+    assert_eq!(second.unit, end.unit);
+    assert_eq!(
+        second.done.first().unwrap(),
+        &("build".to_string(), "done".to_string())
+    );
+    assert_eq!(
+        second.done.last().unwrap(),
+        &("publish".to_string(), "done".to_string())
+    );
+    // It went on as the unit's second round of the step, and the record
+    // carries the engine's count of the routes it has taken.
+    let unit = unit_record(&shop.world, &end.unit);
+    assert_eq!(unit["status"], "ended");
+    assert_eq!(unit["position"]["rounds"]["build"], 2, "{unit}");
+    assert_eq!(unit["rulings"][0], "Names are lower case in this project.");
+    // The note reached the builder, and the ruling a later step too.
+    let calls = shop.world.calls();
+    let brief_of = |role: &str, nth: usize| {
+        let at = (0..calls.len())
+            .filter(|&i| calls[i][0] == role)
+            .nth(nth)
+            .unwrap();
+        std::fs::read_to_string(shop.world.path(&format!("bin/state/brief-{}.md", at + 1))).unwrap()
+    };
+    let builder = brief_of("builder", 1);
+    assert!(
+        builder.contains("No shouting: use the short name."),
+        "{builder}"
+    );
+    let reviewer = brief_of("reviewer", 0);
+    assert!(
+        reviewer.contains("Names are lower case in this project."),
+        "{reviewer}"
+    );
     shop.close().await;
 }
 

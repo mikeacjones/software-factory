@@ -156,6 +156,8 @@ pub struct Showing {
     pub doing: String,
     /// It was given up while it was parked, and has ended.
     pub given_up: bool,
+    /// It was told to end when it parked, and has.
+    pub left_parked: bool,
 }
 
 /// A pipeline's current details: what it is about, what it is doing, and
@@ -190,7 +192,12 @@ pub fn pipeline_details(showing: &Showing, standing: &Standing) -> String {
     if let Some(reason) = &standing.refused {
         text.push_str(&format!("**Ended before its first step.** {reason}\n\n"));
     } else if let Some(reason) = &standing.parked {
-        let state = if showing.given_up {
+        let state = if showing.left_parked {
+            format!(
+                "**Parked at step `{}`, and ended there.** Whoever runs its sub-goal decides what happens to it; going on is a new pipeline that takes the unit up.",
+                standing.step
+            )
+        } else if showing.given_up {
             format!(
                 "**Given up** while it was parked at step `{}`.",
                 standing.step
@@ -380,6 +387,7 @@ on.fail = "park"
             flow: "toy".to_string(),
             doing: "step `test`".to_string(),
             given_up: false,
+            left_parked: false,
         };
         let mut standing = Standing {
             unit: "toy-1-17".to_string(),

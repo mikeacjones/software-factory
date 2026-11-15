@@ -406,7 +406,7 @@ pub fn under(file: &str, paths: &[String]) -> bool {
 }
 
 /// How a unit relates to a goal's sub-goal.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Within {
     /// One bead of the sub-goal: it branches from the sub-goal's tip and its
     /// flow ends by absorbing into the sub-goal's worktree.
@@ -425,7 +425,7 @@ pub enum Within {
 }
 
 /// A sub-goal's branch, ready to ship.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ship {
     /// Names the unit, as a bead's ID would.
     pub id: String,
@@ -961,6 +961,21 @@ impl Driver {
         &self.unit
     }
 
+    /// A unit's record as it stands, whatever state the unit is in.
+    pub fn read_unit(config: &ConfigDir, unit_id: &str) -> Result<Unit, DriverError> {
+        let factory = config.factory()?;
+        let state = factory
+            .state_dir
+            .join("units")
+            .join(unit_id)
+            .join("unit.json");
+        let text = std::fs::read_to_string(&state).map_err(io(&state))?;
+        serde_json::from_str(&text).map_err(|source| DriverError::Json {
+            path: state,
+            source,
+        })
+    }
+
     /// Whether `run` returned because the service is stopping at a safe
     /// point. The unit is still running as far as its record goes, and is
     /// continued from the step it was about to start.
@@ -1448,6 +1463,22 @@ impl Driver {
     /// outcome leads is the caller's to decide, and nothing is advanced
     /// here. The unit's record says which step it was last given.
     pub fn run_step(&mut self, step_id: &str, round: u32) -> Result<Stepped, DriverError> {
+        self.run_step_at(step_id, round, None)
+    }
+
+    /// The same, and with how often each bounded route has been taken so
+    /// far, as whoever walks the flow counts it. The unit's record then
+    /// says where it stands in full, and something else can take the unit
+    /// up from the record alone.
+    pub fn run_step_at(
+        &mut self,
+        step_id: &str,
+        round: u32,
+        used: Option<&BTreeMap<String, u32>>,
+    ) -> Result<Stepped, DriverError> {
+        if let Some(used) = used {
+            self.unit.position.used = used.clone();
+        }
         self.unit.position.step = step_id.to_string();
         self.unit
             .position

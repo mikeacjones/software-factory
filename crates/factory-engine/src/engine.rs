@@ -13,7 +13,7 @@ use temporalio_sdk::{
 
 use crate::accounts::{AccountCall, Accounts, Lease, Limit};
 use crate::describe::{self, Showing};
-use crate::steps::{ParkCall, PrepareCall, StepCall, StepDone, Steps};
+use crate::steps::{AdoptCall, ParkCall, PrepareCall, StepCall, StepDone, Steps};
 
 /// How much longer than it was told to expect a pipeline waits for word
 /// that an account is back before it asks again by itself, in seconds.
@@ -44,6 +44,31 @@ pub struct PipelineInput {
     /// under, by its ID. Empty leaves the choice to whatever runs the step.
     #[serde(default)]
     pub accounts: String,
+    /// The sub-goal the bead belongs to, when a goal runs it: one bead of
+    /// the sub-goal, or the sub-goal itself being shipped.
+    #[serde(default)]
+    pub within: Option<factory_driver::Within>,
+    /// Take `unit` up where its record says it stands, and go on as this
+    /// says, instead of starting its flow from the top.
+    #[serde(default)]
+    pub adopt: Option<Adopt>,
+    /// End when the unit parks, with the reason, and do not wait to be
+    /// continued. For a pipeline a goal runs: what happens to a parked
+    /// one is decided there, and going on is a new pipeline that takes
+    /// the unit up.
+    #[serde(default)]
+    pub stop_at_park: bool,
+}
+
+/// How to go on with a unit that is taken up.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Adopt {
+    /// The step to go on from. `None` goes on where the unit stands.
+    pub from: Option<String>,
+    /// What whoever continues it wants that step to know.
+    pub note: Option<String>,
+    /// A decision about the bead that every later step is shown.
+    pub ruling: Option<String>,
 }
 
 /// Where a pipeline stands, for anyone who asks.
@@ -68,9 +93,16 @@ pub struct Standing {
 /// How a pipeline ended.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PipelineEnd {
-    /// True if the flow reached its end. False if it was given up while parked.
+    /// True if the flow reached its end. False if it was given up while
+    /// parked, or parked and was told to end there.
     pub ended: bool,
     pub done: Vec<(String, String)>,
+    /// The unit the pipeline was for.
+    #[serde(default)]
+    pub unit: String,
+    /// Why it parked, if it ended there.
+    #[serde(default)]
+    pub parked: Option<String>,
 }
 
 /// A decision to go on with a parked pipeline.
@@ -157,7 +189,59 @@ impl Pipeline {
         });
         // A bead with no unit yet gets one: its worktree and branch, and
         // its own copy of the flow, which is what this pipeline then runs.
-        let (unit, definition, title) = if input.unit.is_empty() {
+        let mut taken_up = None;
+        let (unit, definition, title) = if let Some(adopt) = &input.adopt {
+            show(
+                ctx,
+                "taking the unit up where its record says it stands".to_string(),
+            );
+            let call = AdoptCall {
+                unit: input.unit.clone(),
+                from: adopt.from.clone(),
+                note: adopt.note.clone(),
+                ruling: adopt.ruling.clone(),
+                flow_name: input.flow_name.clone(),
+            };
+            let how = match &adopt.from {
+                Some(step) => format!("go on from step `{step}`"),
+                None => "go on where it stands".to_string(),
+            };
+            let options = quick(
+                600,
+                format!(
+                    "Take up unit `{}` from its record and {how}{}",
+                    input.unit,
+                    adopt
+                        .note
+                        .as_ref()
+                        .map(|note| format!(": {note}"))
+                        .unwrap_or_default()
+                ),
+            );
+            match ctx.execute_activity(Steps::adopt, call, options).await {
+                Ok(adopted) => {
+                    ctx.state_mut(|state| {
+                        state.showing.project = adopted.project.clone();
+                        state.showing.bead = adopted.bead.clone();
+                    });
+                    taken_up = Some((adopted.position, adopted.bead));
+                    (input.unit.clone(), adopted.flow, adopted.title)
+                }
+                Err(err) => {
+                    let reason = err
+                        .failure()
+                        .and_then(|failure| failure.cause.as_ref())
+                        .map(|cause| cause.message.clone())
+                        .unwrap_or_else(|| err.to_string());
+                    ctx.state_mut(|state| {
+                        state.standing.unit = input.unit.clone();
+                        state.standing.refused = Some(reason.clone());
+                    });
+                    show(ctx, String::new());
+                    return Err(refused(reason).into());
+                }
+            }
+        } else if input.unit.is_empty() {
             show(
                 ctx,
                 "making the bead ready: claiming it, giving it a worktree and a branch".to_string(),
@@ -166,6 +250,7 @@ impl Pipeline {
                 project: input.project.clone(),
                 bead: input.bead.clone(),
                 flow_name: input.flow_name.clone(),
+                within: input.within.clone(),
             };
             let options = quick(
                 1800,
@@ -195,7 +280,11 @@ impl Pipeline {
         } else {
             (input.unit.clone(), input.flow.clone(), String::new())
         };
-        let about = describe::subject(&input.bead, &unit, &title);
+        let (start, bead) = match taken_up {
+            Some((position, bead)) => (Some(position), bead),
+            None => (None, input.bead.clone()),
+        };
+        let about = describe::subject(&bead, &unit, &title);
         ctx.state_mut(|state| {
             state.standing.unit = unit.clone();
             state.showing.title = title.clone();
@@ -204,7 +293,17 @@ impl Pipeline {
         // same on every replay.
         let flow = Flow::parse(&definition).map_err(|err| refused(err.to_string()))?;
         ctx.state_mut(|state| state.showing.flow = flow.id.clone());
-        let mut position = Position::start(&flow);
+        let mut position = match start {
+            Some(position) if flow.step(&position.step).is_some() => position,
+            Some(position) => {
+                return Err(refused(format!(
+                    "unit `{unit}` stands at step `{}`, which its flow does not have",
+                    position.step
+                ))
+                .into());
+            }
+            None => Position::start(&flow),
+        };
         let mut note: Option<String> = None;
         // The session of a run that stopped at a usage limit.
         let mut session: Option<String> = None;
@@ -293,6 +392,7 @@ impl Pipeline {
                 session: session.take(),
                 beat_secs: input.beat_secs.max(1),
                 account: account.clone(),
+                used: position.used.clone(),
             };
             // The step's own time limit is kept by whatever runs it. This
             // one is only the last resort. What notices a step that has
@@ -405,6 +505,8 @@ impl Pipeline {
                         return Ok(PipelineEnd {
                             ended: true,
                             done: ctx.state(|state| state.standing.done.clone()),
+                            unit: unit.clone(),
+                            parked: None,
                         });
                     }
                     Next::Ask => format!("step `{}` needs the owner", step.id),
@@ -425,8 +527,20 @@ impl Pipeline {
             };
             // Parked: it waits, for as long as it takes and with nothing
             // running, until someone continues it or gives it up.
-            ctx.state_mut(|state| state.standing.parked = Some(reason));
+            ctx.state_mut(|state| {
+                state.standing.parked = Some(reason.clone());
+                state.showing.left_parked = input.stop_at_park;
+            });
             show(ctx, String::new());
+            if input.stop_at_park {
+                // Whoever started it decides what happens to it now.
+                return Ok(PipelineEnd {
+                    ended: false,
+                    done: ctx.state(|state| state.standing.done.clone()),
+                    unit: unit.clone(),
+                    parked: Some(reason),
+                });
+            }
             ctx.wait_condition(|state| state.go_on.is_some() || state.given_up)
                 .await?;
             let Some(go_on) = ctx.state_mut(|state| state.go_on.take()) else {
@@ -435,6 +549,8 @@ impl Pipeline {
                 return Ok(PipelineEnd {
                     ended: false,
                     done: ctx.state(|state| state.standing.done.clone()),
+                    unit: unit.clone(),
+                    parked: None,
                 });
             };
             if flow.step(&go_on.from).is_none() {

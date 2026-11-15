@@ -16,7 +16,8 @@ use factory_driver::{Driver, DriverError, Options, Stepped};
 
 use crate::accounts::{CheckCall, Picture};
 use crate::steps::{
-    NotPrepared, ParkCall, PrepareCall, Prepared, Started, StepCall, StepDone, StepRunner,
+    AdoptCall, Adopted, NotPrepared, ParkCall, PrepareCall, Prepared, Started, StepCall, StepDone,
+    StepRunner,
 };
 
 /// Runs steps with the factory's driver, against one config directory.
@@ -81,7 +82,7 @@ impl FactoryRunner {
             &self.options_under(None, call.note.clone(), call.account.clone()),
             None,
         )
-        .and_then(|mut driver| driver.run_step(&call.step, call.round));
+        .and_then(|mut driver| driver.run_step_at(&call.step, call.round, Some(&call.used)));
         over.store(true, Ordering::Relaxed);
         Ok(match stepped.map_err(|err| err.to_string())? {
             Stepped::Outcome(outcome) => StepDone {
@@ -105,7 +106,8 @@ impl FactoryRunner {
 
 impl StepRunner for FactoryRunner {
     fn prepare(&self, call: &PrepareCall) -> Result<Prepared, NotPrepared> {
-        let options = self.options(call.flow_name.clone(), None);
+        let mut options = self.options(call.flow_name.clone(), None);
+        options.within = call.within.clone();
         let driver = Driver::start(self.config.clone(), &call.project, &call.bead, &options)
             .map_err(|err| match err {
                 // The bead itself is what is wrong, and stays wrong until
@@ -122,6 +124,50 @@ impl StepRunner for FactoryRunner {
         let flow = std::fs::read_to_string(&pinned)
             .map_err(|err| NotPrepared::Failed(format!("{}: {err}", pinned.display())))?;
         Ok(Prepared { unit, flow, title })
+    }
+
+    fn adopt(&self, call: &AdoptCall) -> Result<Adopted, NotPrepared> {
+        // Taking a unit up is the driver's own continuing of it: the step
+        // it goes on from, the note for that step and the ruling are put
+        // on the unit's record, and its thread is told. What comes back
+        // is where the record then says the unit stands.
+        let options = Options {
+            slack: self.slack,
+            flow: call.flow_name.clone(),
+            within: None,
+            continued: call.note.clone(),
+            ruling: call.ruling.clone(),
+            pausable: false,
+            engine: false,
+            account: None,
+        };
+        let driver = Driver::resume(
+            self.config.clone(),
+            &call.unit,
+            &options,
+            call.from.as_deref(),
+        )
+        .map_err(|err| match err {
+            // A unit that is not there, or has ended, stays so.
+            DriverError::AlreadyEnded(_) | DriverError::Flow(_) => {
+                NotPrepared::Refused(err.to_string())
+            }
+            other => NotPrepared::Failed(other.to_string()),
+        })?;
+        let unit = driver.unit();
+        let pinned = self
+            .unit_dir(&call.unit)
+            .map_err(NotPrepared::Failed)?
+            .join("flow.toml");
+        let flow = std::fs::read_to_string(&pinned)
+            .map_err(|err| NotPrepared::Failed(format!("{}: {err}", pinned.display())))?;
+        Ok(Adopted {
+            flow,
+            position: unit.position.clone(),
+            project: unit.project.to_string(),
+            bead: unit.bead.clone(),
+            title: unit.title.clone(),
+        })
     }
 
     fn agent(
