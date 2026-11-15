@@ -2,6 +2,8 @@
 
 #![allow(dead_code)]
 
+pub mod world;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex};

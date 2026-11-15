@@ -11,5 +11,6 @@
 //! business: see [`steps::StepRunner`].
 
 pub mod engine;
+pub mod factory;
 pub mod steps;
 pub mod worker;

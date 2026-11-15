@@ -205,6 +205,7 @@ fn run(args: &[String]) -> Result<u8, String> {
                 within: None,
                 continued: None,
                 pausable: false,
+                engine: false,
             };
             let mut driver = match (&args.unit, rest) {
                 (Some(unit), []) => {

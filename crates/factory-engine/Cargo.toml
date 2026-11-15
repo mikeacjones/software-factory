@@ -10,6 +10,8 @@ description = "The flow engine on Temporal: a workflow that runs a flow definiti
 workspace = true
 
 [dependencies]
+factory-config.workspace = true
+factory-driver.workspace = true
 factory-flow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -26,4 +28,5 @@ temporalio-sdk = { version = "=1.2.0", default-features = false, features = ["en
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 
 [dev-dependencies]
+factory-slack.workspace = true
 temporalio-sdk = { version = "=1.2.0", default-features = false, features = ["envconfig", "testing"] }

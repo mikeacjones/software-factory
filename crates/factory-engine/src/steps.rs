@@ -45,12 +45,49 @@ pub struct StepDone {
     /// The session an agent run had, so that the run after a usage limit
     /// resumes it.
     pub session: Option<String>,
+    /// Set instead of an outcome when the step parked the unit itself: for
+    /// something the flow has no route for, such as the owner saying stop.
+    pub parked: Option<String>,
+}
+
+/// A unit to make ready before its first step: a bead of a project.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrepareCall {
+    pub project: String,
+    pub bead: String,
+    /// The flow to run instead of the project's own, by name.
+    pub flow_name: Option<String>,
+}
+
+/// A unit made ready: what it is called, and the flow it is pinned to.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Prepared {
+    pub unit: String,
+    /// The text of the unit's flow definition, as it was when the unit was
+    /// made. This is what the engine runs.
+    pub flow: String,
+}
+
+/// A unit the engine has parked, and why.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParkCall {
+    pub unit: String,
+    pub reason: String,
 }
 
 /// What does the work of a step. The engine and the activities know only
 /// this much about it, which is what lets the same engine run a real
 /// pipeline, or in a test a script.
 pub trait StepRunner: Send + Sync + 'static {
+    /// Make a unit ready for its first step. A runner with nothing to make
+    /// ready has no use for this.
+    fn prepare(&self, call: &PrepareCall) -> Result<Prepared, String> {
+        Err(format!(
+            "this runner cannot prepare a unit for `{}`",
+            call.bead
+        ))
+    }
+
     /// Run an agent step. `session` is the session of a run of this step
     /// that was cut off, to be resumed, or `None` to start one. `started`
     /// must be called with the run's session ID as soon as it is known.
@@ -58,12 +95,26 @@ pub trait StepRunner: Send + Sync + 'static {
         &self,
         call: &StepCall,
         session: Option<String>,
-        started: &dyn Fn(&str),
+        started: Started,
     ) -> Result<StepDone, String>;
 
     /// Run a command step or an action step.
     fn plain(&self, call: &StepCall) -> Result<StepDone, String>;
+
+    /// The engine has parked the unit: record it where people will look.
+    fn park(&self, _call: &ParkCall) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// The unit's flow reached its end.
+    fn finish(&self, _unit: &str) -> Result<(), String> {
+        Ok(())
+    }
 }
+
+/// How a runner says which session an agent run is, from whatever thread
+/// learns it.
+pub type Started = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// The activities of a worker, over whatever does the work.
 pub struct Steps {
@@ -101,10 +152,10 @@ impl Steps {
         let runner = self.runner.clone();
         let (work_call, resume) = (call.clone(), cut_off.clone());
         let mut work = tokio::task::spawn_blocking(move || {
-            let started = |id: &str| {
+            let started: Started = Arc::new(move |id: &str| {
                 let _ = said.send(id.to_string());
-            };
-            runner.agent(&work_call, resume, &started)
+            });
+            runner.agent(&work_call, resume, started)
         });
         let mut session = cut_off.unwrap_or_default();
         // The first heartbeat an activity sends goes to the server at once,
@@ -140,18 +191,76 @@ impl Steps {
         }
     }
 
-    /// A command step or an action step.
+    /// A command step or an action step. It says it is alive while it
+    /// runs, so that one whose worker died is noticed and run again.
     #[activity]
     pub async fn plain(
         self: Arc<Self>,
-        _ctx: ActivityContext,
+        ctx: ActivityContext,
         call: StepCall,
     ) -> Result<StepDone, ActivityError> {
         let runner = self.runner.clone();
-        match tokio::task::spawn_blocking(move || runner.plain(&call)).await {
-            Ok(Ok(done)) => Ok(done),
+        let every = Duration::from_secs(call.beat_secs.max(1));
+        let mut work = tokio::task::spawn_blocking(move || runner.plain(&call));
+        let mut beat = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+        loop {
+            tokio::select! {
+                done = &mut work => {
+                    return match done {
+                        Ok(Ok(done)) => Ok(done),
+                        Ok(Err(reason)) => Err(failed(reason)),
+                        Err(join) => Err(failed(format!("the step's run was lost: {join}"))),
+                    };
+                }
+                _ = beat.tick() => {
+                    ctx.record_heartbeat(String::new()).await?;
+                }
+            }
+        }
+    }
+
+    /// Make a unit ready before its first step.
+    #[activity]
+    pub async fn prepare(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        call: PrepareCall,
+    ) -> Result<Prepared, ActivityError> {
+        let runner = self.runner.clone();
+        match tokio::task::spawn_blocking(move || runner.prepare(&call)).await {
+            Ok(Ok(prepared)) => Ok(prepared),
             Ok(Err(reason)) => Err(failed(reason)),
-            Err(join) => Err(failed(format!("the step's run was lost: {join}"))),
+            Err(join) => Err(failed(format!("preparing the unit was lost: {join}"))),
+        }
+    }
+
+    /// Record that the engine has parked a unit.
+    #[activity]
+    pub async fn park(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        call: ParkCall,
+    ) -> Result<bool, ActivityError> {
+        let runner = self.runner.clone();
+        match tokio::task::spawn_blocking(move || runner.park(&call)).await {
+            Ok(Ok(())) => Ok(true),
+            Ok(Err(reason)) => Err(failed(reason)),
+            Err(join) => Err(failed(format!("recording the park was lost: {join}"))),
+        }
+    }
+
+    /// Record that a unit's flow reached its end.
+    #[activity]
+    pub async fn finish(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        unit: String,
+    ) -> Result<bool, ActivityError> {
+        let runner = self.runner.clone();
+        match tokio::task::spawn_blocking(move || runner.finish(&unit)).await {
+            Ok(Ok(())) => Ok(true),
+            Ok(Err(reason)) => Err(failed(reason)),
+            Err(join) => Err(failed(format!("finishing the unit was lost: {join}"))),
         }
     }
 }
@@ -175,7 +284,7 @@ impl ExecRunner {
         kind: &str,
         call: &StepCall,
         session: Option<String>,
-        started: &dyn Fn(&str),
+        started: Option<Started>,
     ) -> Result<StepDone, String> {
         use std::io::BufRead;
         let (program, args) = self.argv.split_first().ok_or("the step command is empty")?;
@@ -201,7 +310,12 @@ impl ExecRunner {
                 .map_while(Result::ok)
             {
                 match line.split_once(' ') {
-                    Some(("session", id)) => started(id.trim()),
+                    Some(("session", id)) => {
+                        if let Some(started) = &started {
+                            started(id.trim());
+                        }
+                    }
+                    Some(("park", reason)) => done.parked = Some(reason.trim().to_string()),
                     Some(("outcome", word)) => done.outcome = word.trim().to_string(),
                     Some(("limited", secs)) => done.limited_secs = secs.trim().parse().ok(),
                     _ => {}
@@ -211,7 +325,7 @@ impl ExecRunner {
         let status = child
             .wait()
             .map_err(|err| format!("`{program}` could not be waited for: {err}"))?;
-        if done.outcome.is_empty() && done.limited_secs.is_none() {
+        if done.outcome.is_empty() && done.limited_secs.is_none() && done.parked.is_none() {
             return Err(format!(
                 "step `{}` ended ({status}) without saying how",
                 call.step
@@ -226,9 +340,9 @@ impl StepRunner for ExecRunner {
         &self,
         call: &StepCall,
         session: Option<String>,
-        started: &dyn Fn(&str),
+        started: Started,
     ) -> Result<StepDone, String> {
-        self.run("agent", call, session, started)
+        self.run("agent", call, session, Some(started))
     }
 
     fn plain(&self, call: &StepCall) -> Result<StepDone, String> {
@@ -237,6 +351,6 @@ impl StepRunner for ExecRunner {
         } else {
             "command"
         };
-        self.run(kind, call, None, &|_| {})
+        self.run(kind, call, None, None)
     }
 }

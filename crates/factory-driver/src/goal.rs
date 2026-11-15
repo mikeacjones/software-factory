@@ -4508,6 +4508,7 @@ impl Supervisor {
             within,
             continued,
             pausable: true,
+            engine: false,
         };
         let live = self.live.clone();
         live.fetch_add(1, Ordering::SeqCst);

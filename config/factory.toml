@@ -15,6 +15,13 @@ label = "software-factory"
 login_shell = true
 path = ["~/.local/bin", "/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
 
+# The Temporal server the flow engine runs on (`factory-engine worker`): the
+# owner's cluster, in a namespace of the factory's own. Nothing uses it yet
+# but the engine's own command.
+[temporal]
+address = "http://192.168.101.240:7233"
+namespace = "software-factory"
+
 # The Claude accounts workers run under. Capacity left in a window when it
 # resets is lost, so each run uses the account whose week resets soonest, and
 # between accounts whose weeks end together, the one whose five-hour session

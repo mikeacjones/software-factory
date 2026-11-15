@@ -50,10 +50,39 @@ pub struct Factory {
     /// How the factory is kept running under launchd.
     #[serde(default)]
     pub service: ServiceSettings,
+    /// The Temporal server the flow engine runs on, if any.
+    pub temporal: Option<Temporal>,
 }
 
 fn default_limit_grace() -> u64 {
     60
+}
+
+/// The Temporal server the flow engine runs on.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Temporal {
+    /// Where the server is, such as `http://192.168.101.240:7233`.
+    pub address: String,
+    pub namespace: String,
+    /// The queue the factory's workers take pipelines and steps from.
+    #[serde(default = "default_task_queue")]
+    pub task_queue: String,
+    /// The worker deployment the factory's workers are builds of.
+    #[serde(default = "default_service_label")]
+    pub deployment: String,
+    /// How often a running step says it is alive, in seconds. A step whose
+    /// worker died is given to another after three of these.
+    #[serde(default = "default_beat")]
+    pub beat_secs: u64,
+}
+
+fn default_task_queue() -> String {
+    "factory".to_string()
+}
+
+fn default_beat() -> u64 {
+    20
 }
 
 /// How the factory is kept running: as a launchd agent of the desktop

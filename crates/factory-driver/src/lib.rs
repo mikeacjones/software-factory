@@ -245,6 +245,23 @@ enum StepEnd {
     /// It was waiting, and stopped waiting because the factory is about to
     /// restart. The step runs again when the unit is continued.
     Pause,
+    /// It could not run because every account is at a usage limit until
+    /// this time. Only when something else does the waiting: see
+    /// [`Options::engine`].
+    Limited(u64),
+}
+
+/// How one step of a unit ended, for whoever is walking the unit's flow.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Stepped {
+    /// With an outcome for the flow to route.
+    Outcome(String),
+    /// The unit parked itself: something the flow has no route for.
+    Parked(String),
+    /// Every account is at a usage limit, for about this many seconds.
+    Limited { secs: u64 },
+    /// The factory is restarting. The step runs again.
+    Paused,
 }
 
 /// The file whose presence asks the service to stop at a safe point: every
@@ -276,6 +293,10 @@ pub struct Options {
     /// has been asked to stop at a safe point. For units the service runs:
     /// it continues them when it starts again.
     pub pausable: bool,
+    /// Something else walks the unit's flow and calls for one step at a
+    /// time: the engine. The unit then does no waiting of its own for a
+    /// usage limit, and does not announce each time it is picked up.
+    pub engine: bool,
 }
 
 /// One absorb at a time, across every pipeline of the process: a sub-goal's
@@ -343,6 +364,7 @@ pub struct Driver {
     thread: Thread,
     pausable: bool,
     paused: bool,
+    engine: bool,
 }
 
 /// The flow a project names, checked against everything it may refer to.
@@ -647,6 +669,7 @@ impl Driver {
             log,
             pausable: options.pausable,
             paused: false,
+            engine: options.engine,
         };
         driver.event(
             "unit.created",
@@ -806,21 +829,25 @@ impl Driver {
             log,
             pausable: options.pausable,
             paused: false,
+            engine: options.engine,
         };
         driver.thread = driver.open_thread(options, saved_thread);
-        driver.event(
-            if from.is_some() {
-                "unit.redirected"
-            } else {
-                "unit.resumed"
-            },
-            None,
-            json!({ "step": driver.unit.position.step, "flow": driver.unit.flow }),
-        )?;
-        driver.thread.say(&format!(
-            ":arrow_forward: Continuing from step *{}*.",
-            driver.unit.position.step
-        ));
+        // Picked up once per step by the engine: that is not news.
+        if !options.engine {
+            driver.event(
+                if from.is_some() {
+                    "unit.redirected"
+                } else {
+                    "unit.resumed"
+                },
+                None,
+                json!({ "step": driver.unit.position.step, "flow": driver.unit.flow }),
+            )?;
+            driver.thread.say(&format!(
+                ":arrow_forward: Continuing from step *{}*.",
+                driver.unit.position.step
+            ));
+        }
         driver.save()?;
         Ok(driver)
     }
@@ -1100,64 +1127,17 @@ impl Driver {
                 return self.pause();
             }
             let step_id = self.unit.position.step.clone();
-            let step = self
-                .flow
-                .step(&step_id)
-                .ok_or_else(|| factory_flow::FlowError::UnknownStep(step_id.clone()))?
-                .clone();
-            let round = self.unit.position.round();
-            self.event("step.started", Some(&step_id), json!({ "round": round }))?;
-            let started = Instant::now();
-            let end = match &step.kind {
-                StepKind::Agent { .. } => self.agent_step(&step)?,
-                StepKind::Command { .. } => self.command_step(&step)?,
-                StepKind::Action { action } => match action.as_str() {
-                    "await-ci" => self.await_ci_step(&step)?,
-                    "land" => self.land_step(&step)?,
-                    "sync" => self.sync_step(&step)?,
-                    _ => self.publish_step(&step)?,
-                },
-            };
-            let used = self.unit.usage.entry(step_id.clone()).or_default();
-            used.wall_secs += started.elapsed().as_secs();
-            if !matches!(step.kind, StepKind::Agent { .. }) {
-                used.runs += 1;
-            }
+            let (step, round, started, end) = self.perform(&step_id)?;
             let outcome = match end {
                 StepEnd::Park(reason) => return self.park(&reason),
                 StepEnd::Pause => return self.pause(),
+                // Only a unit walked by the engine leaves the waiting to it.
+                StepEnd::Limited(_) => {
+                    return self.park("every account is at a usage limit");
+                }
                 StepEnd::Outcome(outcome) => outcome,
             };
-            let mut line = format!("{step_id} (round {round}): {outcome}");
-            if matches!(step.kind, StepKind::Agent { .. })
-                && let Some(findings) = self
-                    .unit
-                    .results
-                    .get(&step_id)
-                    .and_then(|result| result.get("findings"))
-                    .and_then(Value::as_array)
-                    .filter(|findings| !findings.is_empty())
-            {
-                let titles: Vec<String> = findings
-                    .iter()
-                    .take(8)
-                    .map(|finding| {
-                        format!(
-                            "[{}] {}",
-                            finding
-                                .get("severity")
-                                .and_then(Value::as_str)
-                                .unwrap_or(""),
-                            truncate(
-                                finding.get("title").and_then(Value::as_str).unwrap_or(""),
-                                160
-                            )
-                        )
-                    })
-                    .collect();
-                line.push_str(&format!(". Findings: {}", titles.join("; ")));
-            }
-            self.unit.history.push(line);
+            self.remember(&step, round, &outcome);
             let next = self.unit.position.advance(&self.flow, &outcome)?;
             self.event(
                 "step.ended",
@@ -1186,47 +1166,166 @@ impl Driver {
                     let detail = self.unit.feedback.clone().unwrap_or_default();
                     return self.park(&format!("{reason}\n{}", truncate(&detail, 1200)));
                 }
-                Next::End => {
-                    self.unit.status = Status::Ended;
-                    self.event(
-                        "unit.ended",
-                        None,
-                        json!({ "pull_request": self.unit.pull_request }),
-                    )?;
-                    let report = usage_report(&self.unit, &self.flow);
-                    let (done, status) = match (&self.unit.merged, &self.unit.pull_request) {
-                        (Some(commit), Some(url)) => (
-                            format!(
-                                ":tada: *Landed.* {} is merged into `{}` as `{}`, and the bead is closed.",
-                                link(url, "The pull request"),
-                                escape(&self.project.default_branch),
-                                &commit[..commit.len().min(10)]
-                            ),
-                            format!(":white_check_mark: landed: {}", link(url, url)),
-                        ),
-                        (_, Some(url)) => (
-                            format!(
-                                ":tada: *Done.* Pull request: {}\nThe bead stays claimed by `{}` until it merges.",
-                                link(url, url),
-                                escape(&self.project.bead_actor)
-                            ),
-                            format!(":white_check_mark: pull request opened: {}", link(url, url)),
-                        ),
-                        _ => (
-                            format!(
-                                ":tada: *Done.* Branch `{}` is pushed.",
-                                escape(&self.unit.branch)
-                            ),
-                            ":white_check_mark: done".to_string(),
-                        ),
-                    };
-                    self.thread.say(&format!("{done}\n{}", code_block(&report)));
-                    self.thread.status(&status);
-                    self.save()?;
-                    return Ok(Status::Ended);
-                }
+                Next::End => return self.end_unit(),
             }
         }
+    }
+
+    /// Run one step of the flow, whichever the caller names, and account
+    /// for the time it took. Returns the step, which round of it this was,
+    /// when it started, and how it ended.
+    fn perform(&mut self, step_id: &str) -> Result<(Step, u32, Instant, StepEnd), DriverError> {
+        let step = self
+            .flow
+            .step(step_id)
+            .ok_or_else(|| factory_flow::FlowError::UnknownStep(step_id.to_string()))?
+            .clone();
+        let round = self.unit.position.round();
+        self.event("step.started", Some(step_id), json!({ "round": round }))?;
+        let started = Instant::now();
+        let end = match &step.kind {
+            StepKind::Agent { .. } => self.agent_step(&step)?,
+            StepKind::Command { .. } => self.command_step(&step)?,
+            StepKind::Action { action } => match action.as_str() {
+                "await-ci" => self.await_ci_step(&step)?,
+                "land" => self.land_step(&step)?,
+                "sync" => self.sync_step(&step)?,
+                _ => self.publish_step(&step)?,
+            },
+        };
+        let used = self.unit.usage.entry(step_id.to_string()).or_default();
+        used.wall_secs += started.elapsed().as_secs();
+        if !matches!(step.kind, StepKind::Agent { .. }) {
+            used.runs += 1;
+        }
+        Ok((step, round, started, end))
+    }
+
+    /// Add a step that ended to what a fresh agent is told has happened.
+    fn remember(&mut self, step: &Step, round: u32, outcome: &str) {
+        let step_id = &step.id;
+        let mut line = format!("{step_id} (round {round}): {outcome}");
+        if matches!(step.kind, StepKind::Agent { .. })
+            && let Some(findings) = self
+                .unit
+                .results
+                .get(step_id)
+                .and_then(|result| result.get("findings"))
+                .and_then(Value::as_array)
+                .filter(|findings| !findings.is_empty())
+        {
+            let titles: Vec<String> = findings
+                .iter()
+                .take(8)
+                .map(|finding| {
+                    format!(
+                        "[{}] {}",
+                        finding
+                            .get("severity")
+                            .and_then(Value::as_str)
+                            .unwrap_or(""),
+                        truncate(
+                            finding.get("title").and_then(Value::as_str).unwrap_or(""),
+                            160
+                        )
+                    )
+                })
+                .collect();
+            line.push_str(&format!(". Findings: {}", titles.join("; ")));
+        }
+        self.unit.history.push(line);
+    }
+
+    /// The flow reached its end: record it and say so.
+    fn end_unit(&mut self) -> Result<Status, DriverError> {
+        self.unit.status = Status::Ended;
+        self.event(
+            "unit.ended",
+            None,
+            json!({ "pull_request": self.unit.pull_request }),
+        )?;
+        let report = usage_report(&self.unit, &self.flow);
+        let (done, status) = match (&self.unit.merged, &self.unit.pull_request) {
+            (Some(commit), Some(url)) => (
+                format!(
+                    ":tada: *Landed.* {} is merged into `{}` as `{}`, and the bead is closed.",
+                    link(url, "The pull request"),
+                    escape(&self.project.default_branch),
+                    &commit[..commit.len().min(10)]
+                ),
+                format!(":white_check_mark: landed: {}", link(url, url)),
+            ),
+            (_, Some(url)) => (
+                format!(
+                    ":tada: *Done.* Pull request: {}\nThe bead stays claimed by `{}` until it merges.",
+                    link(url, url),
+                    escape(&self.project.bead_actor)
+                ),
+                format!(":white_check_mark: pull request opened: {}", link(url, url)),
+            ),
+            _ => (
+                format!(
+                    ":tada: *Done.* Branch `{}` is pushed.",
+                    escape(&self.unit.branch)
+                ),
+                ":white_check_mark: done".to_string(),
+            ),
+        };
+        self.thread.say(&format!("{done}\n{}", code_block(&report)));
+        self.thread.status(&status);
+        self.save()?;
+        Ok(Status::Ended)
+    }
+
+    /// Run exactly one step, the one named, as its `round`th time, and say
+    /// how it ended. For a unit whose flow something else walks: where the
+    /// outcome leads is the caller's to decide, and nothing is advanced
+    /// here. The unit's record says which step it was last given.
+    pub fn run_step(&mut self, step_id: &str, round: u32) -> Result<Stepped, DriverError> {
+        self.unit.position.step = step_id.to_string();
+        self.unit
+            .position
+            .rounds
+            .insert(step_id.to_string(), round.max(1));
+        self.unit.status = Status::Running;
+        let (step, round, started, end) = self.perform(step_id)?;
+        let stepped = match end {
+            StepEnd::Park(reason) => {
+                self.park(&reason)?;
+                Stepped::Parked(reason)
+            }
+            StepEnd::Pause => Stepped::Paused,
+            StepEnd::Limited(until) => Stepped::Limited {
+                secs: until.saturating_sub(now_unix()).max(1),
+            },
+            StepEnd::Outcome(outcome) => {
+                self.remember(&step, round, &outcome);
+                self.event(
+                    "step.ended",
+                    Some(step_id),
+                    json!({
+                        "round": round, "outcome": outcome, "next": "the engine decides",
+                        "secs": started.elapsed().as_secs(),
+                    }),
+                )?;
+                Stepped::Outcome(outcome)
+            }
+        };
+        self.save()?;
+        Ok(stepped)
+    }
+
+    /// Record that whoever walks the flow has parked the unit, with the
+    /// reason, and say so in its thread.
+    pub fn record_park(&mut self, reason: &str) -> Result<(), DriverError> {
+        let detail = self.unit.feedback.clone().unwrap_or_default();
+        self.park(&format!("{reason}\n{}", truncate(&detail, 1200)))
+            .map(|_| ())
+    }
+
+    /// Record that the flow reached its end.
+    pub fn finish(&mut self) -> Result<(), DriverError> {
+        self.end_unit().map(|_| ())
     }
 
     fn question(&self, step: &str) -> String {
@@ -1554,6 +1653,16 @@ impl Driver {
             let (account, oauth_token) = loop {
                 match pick_account(&self.factory, &model)? {
                     AccountPick::Use { id, token } => break (id, token),
+                    // Under the engine the wait is a timer of the server's,
+                    // and the step is called again when it fires.
+                    AccountPick::Wait { until } if self.engine => {
+                        self.event(
+                            "accounts.limited",
+                            Some(&step.id),
+                            json!({ "until": until, "waits": "the engine" }),
+                        )?;
+                        return Ok(StepEnd::Limited(until));
+                    }
                     AccountPick::Wait { until } => {
                         if let Some(end) = self.wait_for_accounts(&step.id, until)? {
                             return Ok(end);

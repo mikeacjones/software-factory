@@ -23,3 +23,20 @@ bead = "sf-9a0.2"
 claim = "Against a Temporal server started on this machine, with the Rust SDK 1.2.0: one engine workflow runs two different flow definitions given to it as data; a pipeline that parks waits with nothing running and is continued by a signal, from a step and with a note; a step whose worker is killed is given to the next worker, which resumes the session the first run reported; a usage limit is waited out on a server timer with no worker up, and the step then resumes its session; and with two versioned builds of the worker, a pipeline finishes on the build that started it while new pipelines start on the new one."
 command = ["cargo", "test", "--locked", "--offline", "--package", "factory-engine", "--test", "spike", "--", "--test-threads=1"]
 timeout_secs = 900
+
+[[check]]
+id = "engine-pipeline"
+tier = "host"
+bead = "sf-9a0.4"
+claim = "With the factory's own driver doing every step, on a real repository with a scripted Claude, and the engine on a Temporal server started on this machine walking the flow: a bead is prepared, built, broken once by the tester, fixed in the builder's session, reviewed and published, with the unit's record and log kept as the driver keeps them; and a pipeline whose builder needs the owner parks, in the workflow and in the unit's record, and goes on from a decision whose note reaches the builder."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-engine", "--test", "pipeline", "--", "--test-threads=1"]
+timeout_secs = 900
+
+[[check]]
+id = "engine-live"
+tier = "owner"
+bead = "sf-9a0.4"
+claim = "The owner's Temporal server answers this machine in the factory's namespace."
+command = ["temporal", "operator", "namespace", "describe", "--address", "192.168.101.240:7233", "--namespace", "software-factory"]
+timeout_secs = 60
+

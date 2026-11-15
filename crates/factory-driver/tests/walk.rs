@@ -7,307 +7,12 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
-use factory_config::ConfigDir;
+use common::world::{World, repo_config, run};
+
 use factory_driver::{Driver, DriverError, Options, Status};
-
-struct World {
-    root: PathBuf,
-}
-
-impl Drop for World {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
-    }
-}
-
-fn run(dir: &Path, program: &str, args: &[&str]) -> String {
-    let output = Command::new(program)
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{program} {args:?} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8_lossy(&output.stdout).trim().to_string()
-}
-
-fn repo_config() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config")
-}
-
-impl World {
-    /// A project with one commit, a bare remote, one bead and a config
-    /// directory that uses the repository's own flow and role prompts.
-    fn new(name: &str, test_command: &str) -> World {
-        let root = std::env::temp_dir().join(format!("factory-walk-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let world = World { root };
-        let path = |relative: &str| world.root.join(relative);
-        for dir in [
-            "toy",
-            "beads",
-            "bin",
-            "config/projects",
-            "config/flows",
-            "config/roles",
-        ] {
-            std::fs::create_dir_all(path(dir)).unwrap();
-        }
-
-        let toy = path("toy");
-        run(&toy, "git", &["init", "--quiet", "-b", "main"]);
-        run(&toy, "git", &["config", "user.name", "Test"]);
-        run(&toy, "git", &["config", "user.email", "test@localhost"]);
-        run(&toy, "git", &["config", "commit.gpgsign", "false"]);
-        std::fs::write(toy.join("README.md"), "# toy\n").unwrap();
-        run(&toy, "git", &["add", "--all"]);
-        run(&toy, "git", &["commit", "--quiet", "-m", "first"]);
-        run(
-            &world.root,
-            "git",
-            &["init", "--quiet", "--bare", "remote.git"],
-        );
-        let remote = path("remote.git");
-        run(
-            &toy,
-            "git",
-            &["remote", "add", "origin", remote.to_str().unwrap()],
-        );
-        run(&toy, "git", &["push", "--quiet", "origin", "main"]);
-
-        std::fs::write(
-            path("beads/toy-1.json"),
-            r#"{"id":"toy-1","title":"Add the feature","description":"Add it.","acceptance_criteria":"- the feature exists","status":"open"}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            path("beads/toy-2.json"),
-            r#"{"id":"toy-2","title":"Taken","acceptance_criteria":"- x","status":"in_progress","assignee":"someone"}"#,
-        )
-        .unwrap();
-
-        let fake = path("bin/claude");
-        std::fs::copy(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fake-claude.sh"),
-            &fake,
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        for kind in ["flows", "roles"] {
-            for entry in std::fs::read_dir(repo_config().join(kind)).unwrap() {
-                let entry = entry.unwrap().path();
-                std::fs::copy(
-                    &entry,
-                    path(&format!("config/{kind}")).join(entry.file_name().unwrap()),
-                )
-                .unwrap();
-            }
-        }
-        std::fs::write(
-            path("config/factory.toml"),
-            format!(
-                "state_dir = \"{}\"\nclaude_bin = \"{}\"\ncli_version = \"2.1.325\"\nallowed_models = [\"claude-opus-5-5\"]\n",
-                path("state").display(),
-                fake.display()
-            ),
-        )
-        .unwrap();
-        std::fs::write(
-            path("config/projects/toy.toml"),
-            format!(
-                r#"id = "toy"
-repo = "{}"
-default_branch = "main"
-flow = "build-break-review"
-forbidden_paths = [".github/**"]
-
-[beads]
-kind = "files"
-dir = "{}"
-
-[scopes]
-code = ["**"]
-runtime = ["runtime/**"]
-
-[commands.fmt]
-argv = ["true"]
-timeout_secs = 30
-
-[commands.readme]
-argv = ["true"]
-timeout_secs = 30
-
-[commands.changelog]
-argv = ["true"]
-timeout_secs = 30
-
-[commands.test]
-argv = ["sh", "-c", "{test_command}"]
-timeout_secs = 30
-"#,
-                toy.display(),
-                path("beads").display()
-            ),
-        )
-        .unwrap();
-        world
-    }
-
-    fn path(&self, relative: &str) -> PathBuf {
-        self.root.join(relative)
-    }
-
-    /// Give the project a Slack channel, served by a local stand-in.
-    fn with_slack(&self, fake: &common::FakeSlack) {
-        let env = self.path("slack.env");
-        std::fs::write(
-            &env,
-            format!(
-                "SLACK_BOT_TOKEN=xoxb-test\nSLACK_OWNER_USER_ID=OWNER\nSLACK_API_URL={}\n",
-                fake.url
-            ),
-        )
-        .unwrap();
-        let factory = self.path("config/factory.toml");
-        let text = std::fs::read_to_string(&factory).unwrap();
-        std::fs::write(
-            &factory,
-            format!(
-                "{text}\n[slack]\nenv_file = \"{}\"\npoll_secs = 1\nanswer_wait_secs = 20\n",
-                env.display()
-            ),
-        )
-        .unwrap();
-        let project = self.path("config/projects/toy.toml");
-        let text = std::fs::read_to_string(&project).unwrap();
-        std::fs::write(
-            &project,
-            text.replace("flow = ", "slack_channel = \"toy\"\nflow = "),
-        )
-        .unwrap();
-    }
-
-    /// Give the project a GitHub repository, played by a scripted `gh` and
-    /// the bare remote, and the Zig project's flow, which watches CI and lands.
-    /// `ci` is what each look at the checks sees, one word per look.
-    fn with_github(&self, ci: &str) {
-        use std::os::unix::fs::PermissionsExt;
-        let gh = self.path("bin/gh");
-        std::fs::copy(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fake-gh.sh"),
-            &gh,
-        )
-        .unwrap();
-        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let state = self.path("bin/state-gh");
-        std::fs::create_dir_all(&state).unwrap();
-        let remote = self.path("remote.git");
-        std::fs::write(state.join("remote"), remote.to_str().unwrap()).unwrap();
-        std::fs::write(state.join("ci"), ci.replace(' ', "\n") + "\n").unwrap();
-
-        // The project says it pushes to GitHub; git is told where that is.
-        let toy = self.path("toy");
-        run(
-            &toy,
-            "git",
-            &["remote", "set-url", "origin", "git@github.com:me/toy.git"],
-        );
-        let key = format!("url.{}.insteadOf", remote.display());
-        run(&toy, "git", &["config", &key, "git@github.com:me/toy.git"]);
-
-        let factory = self.path("config/factory.toml");
-        let text = std::fs::read_to_string(&factory).unwrap();
-        std::fs::write(&factory, format!("gh_bin = \"{}\"\n{text}", gh.display())).unwrap();
-        let project = self.path("config/projects/toy.toml");
-        let text = std::fs::read_to_string(&project)
-            .unwrap()
-            .replace("flow = \"build-break-review\"", "flow = \"zig-sdk\"");
-        std::fs::write(
-            &project,
-            format!(
-                "{text}
-[commands.samples-index]
-argv = [\"true\"]
-timeout_secs = 30
-
-[commands.samples-test]
-argv = [\"true\"]
-timeout_secs = 30
-
-[commands.test-releasesafe]
-argv = [\"true\"]
-timeout_secs = 30
-
-[commands.reports]
-argv = [\"sh\", \"-c\", \"echo scanned $1 > $0/INDEX.txt; echo No check failed. >> $0/INDEX.txt\", \"{{out}}\", \"{{base}}\"]
-timeout_secs = 30
-summary = \"INDEX.txt\"
-note = \"A scan hit is a line to look at.\"
-
-[github]
-repo = \"me/toy\"
-write = [\"me/toy\"]
-required_checks = [\"fmt\", \"unit\"]
-ci_poll_secs = 1
-ci_settle_secs = 1
-ci_timeout_secs = 30
-merge_subject = \"Merge bead/{{bead_short}}: {{title}}\"
-merge_body = \"{{summary}}\\n\\n{{testing}}\\n\\nBead: {{bead}}\"
-"
-            ),
-        )
-        .unwrap();
-    }
-
-    fn gh_calls(&self) -> Vec<String> {
-        std::fs::read_to_string(self.path("bin/state-gh/calls"))
-            .unwrap_or_default()
-            .lines()
-            .map(str::to_string)
-            .collect()
-    }
-
-    fn scenario(&self, words: &str) {
-        std::fs::create_dir_all(self.path("bin/state")).unwrap();
-        std::fs::write(self.path("bin/state/scenario"), words).unwrap();
-    }
-
-    fn config(&self) -> ConfigDir {
-        ConfigDir(self.path("config"))
-    }
-
-    fn calls(&self) -> Vec<Vec<String>> {
-        std::fs::read_to_string(self.path("bin/state/calls"))
-            .unwrap_or_default()
-            .lines()
-            .map(|line| line.split(' ').map(str::to_string).collect())
-            .collect()
-    }
-
-    fn event_kinds(&self, driver: &Driver) -> Vec<String> {
-        std::fs::read_to_string(driver.event_log())
-            .unwrap()
-            .lines()
-            .map(|line| {
-                let event: serde_json::Value = serde_json::from_str(line).unwrap();
-                match (event["kind"].as_str().unwrap(), event["step"].as_str()) {
-                    ("step.ended", Some(step)) => {
-                        format!("{step}:{}", event["data"]["outcome"].as_str().unwrap())
-                    }
-                    (kind, _) => kind.to_string(),
-                }
-            })
-            .collect()
-    }
-}
 
 const OPTIONS: Options = Options {
     slack: false,
@@ -315,6 +20,7 @@ const OPTIONS: Options = Options {
     within: None,
     continued: None,
     pausable: false,
+    engine: false,
 };
 
 #[test]
@@ -598,6 +304,7 @@ const SLACK: Options = Options {
     within: None,
     continued: None,
     pausable: false,
+    engine: false,
 };
 
 #[test]
@@ -606,7 +313,7 @@ fn the_owner_steers_and_answers_in_the_runs_thread() {
     world.scenario("ask-once");
     // The owner wrote two things before the first step, and a stranger one.
     let fake = common::FakeSlack::start_with(true, &common::REPLIES, Some("Yes, make it shout."));
-    world.with_slack(&fake);
+    world.with_slack(&fake.url);
 
     let mut driver = Driver::start(world.config(), "toy", "toy-1", &SLACK).unwrap();
     assert_eq!(driver.run().unwrap(), Status::Ended);
@@ -658,7 +365,7 @@ fn stop_from_the_owner_parks_the_unit() {
         &[("100.0", "BOT", "root"), ("101.0", "OWNER", "stop")],
         None,
     );
-    world.with_slack(&fake);
+    world.with_slack(&fake.url);
     let mut driver = Driver::start(world.config(), "toy", "toy-1", &SLACK).unwrap();
     assert_eq!(
         driver.run().unwrap(),
@@ -677,7 +384,7 @@ fn a_question_nobody_answers_parks_the_unit() {
     let world = World::new("silent", "true");
     world.scenario("ask-once");
     let fake = common::FakeSlack::start_with(true, &[("100.0", "BOT", "root")], None);
-    world.with_slack(&fake);
+    world.with_slack(&fake.url);
     let factory = world.path("config/factory.toml");
     let text = std::fs::read_to_string(&factory).unwrap();
     std::fs::write(
@@ -1142,7 +849,7 @@ fn a_goal_is_agreed_run_on_events_and_ended_by_the_owner() {
     let world = World::new("goal", "true");
     world.with_github("green");
     let fake = common::FakeSlack::start_with(true, &[("100.0", "BOT", "root")], None);
-    world.with_slack(&fake);
+    world.with_slack(&fake.url);
     world.scenario("minor-finding");
     std::fs::write(
         world.path("beads/toy-3.json"),

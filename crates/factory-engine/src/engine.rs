@@ -10,16 +10,26 @@ use temporalio_sdk::{
     WorkflowResult,
 };
 
-use crate::steps::{StepCall, StepDone, Steps};
+use crate::steps::{ParkCall, PrepareCall, StepCall, StepDone, Steps};
 
 /// What a pipeline is started with.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct PipelineInput {
-    /// The unit the pipeline is for.
+    /// The unit the pipeline is for, if it exists already. Empty for a
+    /// bead that has no unit yet: one is made first, from `project` and
+    /// `bead`, and the pipeline runs the flow that unit is pinned to.
     pub unit: String,
     /// The flow definition, as the text of its file. It is part of the
     /// workflow from here on: the file may change and this pipeline will not.
     pub flow: String,
+    /// The project and the bead a unit is made for, when `unit` is empty.
+    #[serde(default)]
+    pub project: String,
+    #[serde(default)]
+    pub bead: String,
+    /// The flow to run instead of the project's own, by name.
+    #[serde(default)]
+    pub flow_name: Option<String>,
     /// How often an agent step says it is alive, and so how soon a step
     /// whose worker died is given to another. Seconds.
     pub beat_secs: u64,
@@ -28,6 +38,8 @@ pub struct PipelineInput {
 /// Where a pipeline stands, for anyone who asks.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Standing {
+    /// The unit the pipeline is for, once it has one.
+    pub unit: String,
     /// The step it is in, or was in when it stopped.
     pub step: String,
     /// Why it is parked, if it is. A parked pipeline waits to be continued.
@@ -76,9 +88,30 @@ impl Pipeline {
         ctx: &mut WorkflowContext<Self>,
         input: PipelineInput,
     ) -> WorkflowResult<PipelineEnd> {
+        let brief = |limit: u64| {
+            ActivityOptions::with_start_to_close_timeout(Duration::from_secs(limit))
+                .heartbeat_timeout(Duration::from_secs(input.beat_secs.max(1) * 3))
+                .build()
+        };
+        // A bead with no unit yet gets one: its worktree and branch, and
+        // its own copy of the flow, which is what this pipeline then runs.
+        let (unit, definition) = if input.unit.is_empty() {
+            let call = PrepareCall {
+                project: input.project.clone(),
+                bead: input.bead.clone(),
+                flow_name: input.flow_name.clone(),
+            };
+            let options =
+                ActivityOptions::with_start_to_close_timeout(Duration::from_secs(1800)).build();
+            let prepared = ctx.execute_activity(Steps::prepare, call, options).await?;
+            (prepared.unit, prepared.flow)
+        } else {
+            (input.unit.clone(), input.flow.clone())
+        };
+        ctx.state_mut(|state| state.standing.unit = unit.clone());
         // Reading a definition is a pure function of its text, so it is the
         // same on every replay.
-        let flow = Flow::parse(&input.flow).map_err(|err| refused(err.to_string()))?;
+        let flow = Flow::parse(&definition).map_err(|err| refused(err.to_string()))?;
         let mut position = Position::start(&flow);
         let mut note: Option<String> = None;
         // The session of a run that stopped at a usage limit.
@@ -93,7 +126,7 @@ impl Pipeline {
                 state.standing.parked = None;
             });
             let call = StepCall {
-                unit: input.unit.clone(),
+                unit: unit.clone(),
                 step: step.id.clone(),
                 round: position.round(),
                 note: note.clone(),
@@ -104,19 +137,19 @@ impl Pipeline {
                 session: session.take(),
                 beat_secs: input.beat_secs.max(1),
             };
-            let limit = Duration::from_secs(step.timeout_secs.unwrap_or(3600));
+            // The step's own time limit is kept by whatever runs it. This
+            // one is only the last resort. What notices a step that has
+            // lost its worker is that it stops saying it is alive: it is
+            // then given to another.
+            let limit = step.timeout_secs.unwrap_or(0).max(6 * 3600) + 600;
             let done: StepDone = match &step.kind {
                 StepKind::Agent { .. } => {
-                    // A step that stops saying it is alive has lost its
-                    // worker, and is given to another.
-                    let options = ActivityOptions::with_start_to_close_timeout(limit)
-                        .heartbeat_timeout(Duration::from_secs(input.beat_secs.max(1) * 3))
-                        .build();
-                    ctx.execute_activity(Steps::agent, call, options).await?
+                    ctx.execute_activity(Steps::agent, call, brief(limit))
+                        .await?
                 }
                 _ => {
-                    let options = ActivityOptions::with_start_to_close_timeout(limit).build();
-                    ctx.execute_activity(Steps::plain, call, options).await?
+                    ctx.execute_activity(Steps::plain, call, brief(limit))
+                        .await?
                 }
             };
             if let Some(secs) = done.limited_secs {
@@ -130,26 +163,39 @@ impl Pipeline {
                 continue;
             }
             note = None;
-            ctx.state_mut(|state| {
-                state
-                    .standing
-                    .done
-                    .push((step.id.clone(), done.outcome.clone()));
-            });
-            let next = match position.advance(&flow, &done.outcome) {
-                Ok(next) => next,
-                Err(err) => Next::Park(err.to_string()),
-            };
-            let reason = match next {
-                Next::Step(_) => continue,
-                Next::End => {
-                    return Ok(PipelineEnd {
-                        ended: true,
-                        done: ctx.state(|state| state.standing.done.clone()),
-                    });
-                }
-                Next::Ask => format!("step `{}` needs the owner", step.id),
-                Next::Park(reason) => reason,
+            let reason = if let Some(reason) = done.parked {
+                // The step parked the unit itself, and has recorded it.
+                reason
+            } else {
+                ctx.state_mut(|state| {
+                    state
+                        .standing
+                        .done
+                        .push((step.id.clone(), done.outcome.clone()));
+                });
+                let next = match position.advance(&flow, &done.outcome) {
+                    Ok(next) => next,
+                    Err(err) => Next::Park(err.to_string()),
+                };
+                let reason = match next {
+                    Next::Step(_) => continue,
+                    Next::End => {
+                        ctx.execute_activity(Steps::finish, unit.clone(), brief(600))
+                            .await?;
+                        return Ok(PipelineEnd {
+                            ended: true,
+                            done: ctx.state(|state| state.standing.done.clone()),
+                        });
+                    }
+                    Next::Ask => format!("step `{}` needs the owner", step.id),
+                    Next::Park(reason) => reason,
+                };
+                let call = ParkCall {
+                    unit: unit.clone(),
+                    reason: reason.clone(),
+                };
+                ctx.execute_activity(Steps::park, call, brief(600)).await?;
+                reason
             };
             // Parked: it waits, for as long as it takes and with nothing
             // running, until someone continues it or gives it up.

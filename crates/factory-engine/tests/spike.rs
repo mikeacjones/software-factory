@@ -208,6 +208,7 @@ impl Rig {
             unit: unit.to_string(),
             flow: flow.to_string(),
             beat_secs: 1,
+            ..PipelineInput::default()
         }
     }
 

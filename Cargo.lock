@@ -658,7 +658,10 @@ dependencies = [
 name = "factory-engine"
 version = "0.0.0"
 dependencies = [
+ "factory-config",
+ "factory-driver",
  "factory-flow",
+ "factory-slack",
  "futures",
  "serde",
  "serde_json",
