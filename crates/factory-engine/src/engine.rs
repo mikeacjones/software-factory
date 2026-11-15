@@ -301,8 +301,9 @@ impl Pipeline {
             position.step = go_on.from.clone();
             *position.rounds.entry(go_on.from).or_insert(0) += 1;
             // Whoever continued it judged it worth going on with: the
-            // routes it had used up are open again.
-            position.used.clear();
+            // step it goes on from can be left once more. A route used up
+            // elsewhere stays used up.
+            position.reopen(&flow);
             note = Some(go_on.note);
         }
     }

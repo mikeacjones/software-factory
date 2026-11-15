@@ -193,6 +193,15 @@ pub struct Unit {
     /// Files it changed outside them.
     #[serde(default)]
     pub strayed: Vec<String>,
+    /// Paths no step may change that a step changed all the same, each
+    /// with the commit before that step: what the path has to be put back
+    /// to. Empty once they are.
+    #[serde(default)]
+    pub trespassed: BTreeMap<String, String>,
+    /// What whoever runs the bead's sub-goal has decided about it, in the
+    /// order decided. Every agent step is shown them.
+    #[serde(default)]
+    pub rulings: Vec<String>,
     /// Files left with conflict markers when the sub-goal's branch was
     /// merged into this unit's, for the builder to resolve.
     #[serde(default)]
@@ -294,9 +303,13 @@ pub struct Options {
     /// The sub-goal this unit belongs to, if any.
     pub within: Option<Within>,
     /// Set when the agent that runs a sub-goal continues a pipeline that
-    /// had parked or failed: what it wants the next step to know. The unit
-    /// then gets a fresh allowance on every bounded route.
+    /// had parked or failed: what it wants the next step to know. The step
+    /// it goes on from can then be left once more; routes used up elsewhere
+    /// stay used up.
     pub continued: Option<String>,
+    /// With `continued`: a decision about the bead that holds for every
+    /// step from here on, and that each of them is shown.
+    pub ruling: Option<String>,
     /// Stop between steps, with the unit left as running, when the service
     /// has been asked to stop at a safe point. For units the service runs:
     /// it continues them when it starts again.
@@ -736,6 +749,8 @@ impl Driver {
                 history: Vec::new(),
                 declared_paths: Vec::new(),
                 strayed: Vec::new(),
+                trespassed: BTreeMap::new(),
+                rulings: Vec::new(),
                 conflicts: Vec::new(),
                 runs: 0,
                 started_at,
@@ -880,9 +895,17 @@ impl Driver {
         );
         if let Some(note) = &options.continued {
             // Whoever runs the sub-goal judged this pipeline worth going on
-            // with: the routes it had used up are open again, and the step
-            // it continues from is told why.
-            unit.position.used.clear();
+            // with: the step it continues from can be left once more, and
+            // is told why. A route used up elsewhere stays used up, so the
+            // next time the tester breaks the change, say, it comes
+            // straight back to be looked at.
+            unit.position.reopen(&flow);
+            if let Some(ruling) = options.ruling.as_deref().map(str::trim)
+                && !ruling.is_empty()
+                && !unit.rulings.iter().any(|known| known == ruling)
+            {
+                unit.rulings.push(ruling.to_string());
+            }
             let stopped = match &unit.status {
                 Status::Parked(reason) => format!("It had parked: {reason}\n\n"),
                 _ => String::new(),
@@ -1781,6 +1804,7 @@ impl Driver {
                     feedback: feedback.as_deref(),
                     notes: &notes,
                     owner_messages: &owner_messages,
+                    rulings: &self.unit.rulings,
                     answer: answer.as_deref(),
                     rejected: &rejected,
                 })
@@ -2213,12 +2237,51 @@ impl Driver {
                     .iter()
                     .flat_map(|scope| self.project.scopes.get(scope).cloned().unwrap_or_default())
                     .collect();
-                let violations =
+                let mut violations =
                     scope_violations(&changed, &allowed, &self.project.forbidden_paths)?;
+                // A path no step may change is in the wrong until it is as
+                // it was before the step that changed it, and not after.
+                // Putting it back is a change to it too, and is the one
+                // change that is wanted: it must not park the unit again.
+                for trespass in
+                    scope_violations(&changed, &["**".to_string()], &self.project.forbidden_paths)?
+                {
+                    self.unit
+                        .trespassed
+                        .entry(trespass.path)
+                        .or_insert_with(|| before.clone());
+                }
+                let mut since: BTreeMap<String, Vec<String>> = BTreeMap::new();
+                let mut restored: Vec<String> = Vec::new();
+                for (path, clean) in &self.unit.trespassed {
+                    if !since.contains_key(clean) {
+                        let files = factory_git::changed_files(&cwd, clean, &head)?;
+                        since.insert(clean.clone(), files);
+                    }
+                    if !since.get(clean).is_some_and(|files| files.contains(path)) {
+                        restored.push(path.clone());
+                    }
+                }
+                for path in &restored {
+                    self.unit.trespassed.remove(path);
+                }
+                violations.retain(|violation| !restored.contains(&violation.path));
+                // One that an earlier step changed, and that is still not
+                // put back, is not let through because this step left it
+                // alone.
+                for path in self.unit.trespassed.keys() {
+                    if !violations.iter().any(|violation| &violation.path == path) {
+                        violations.push(factory_checks::Violation {
+                            path: path.clone(),
+                            reason: "no step may change this path, and an earlier step's change to it is still there".to_string(),
+                        });
+                    }
+                }
                 self.unit.checkpoint = head.clone();
                 self.event("checkpoint", Some(&step.id), json!({
                     "commit": head, "committed": committed, "files": changed,
                     "violations": violations.iter().map(|v| json!({"path": v.path, "reason": v.reason})).collect::<Vec<_>>(),
+                    "restored": restored,
                 }))?;
                 self.save()?;
                 if !violations.is_empty() {
@@ -2227,7 +2290,7 @@ impl Driver {
                         .map(|violation| format!("{} ({})", violation.path, violation.reason))
                         .collect();
                     return Ok(StepEnd::Park(format!(
-                        "step `{}` changed files it may not change:\n{}",
+                        "step `{}` changed files it may not change:\n{}\nA path no step may change has to be put back exactly as it was; a step that does that is not stopped for it.",
                         step.id,
                         list.join("\n")
                     )));

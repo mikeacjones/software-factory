@@ -185,6 +185,16 @@ pub struct Foreman {
     pub exchanges: u32,
 }
 
+/// How a stopped pipeline is continued by decision.
+struct Again {
+    /// The step to go on from.
+    from: String,
+    /// What that step is told.
+    note: String,
+    /// What every step from here on is told, if anything.
+    ruling: Option<String>,
+}
+
 /// How often a pipeline may be continued after parking before whoever
 /// continues it must take it to the level above.
 const MAX_CONTINUES: u32 = 3;
@@ -509,6 +519,7 @@ fn continue_schema() -> Value {
         "bead": text_schema("The bead whose pipeline stopped."),
         "from": text_schema("The step of the bead pipeline to continue from, such as `fix` to hand the builder a finding or `test` to run the checks again."),
         "note": text_schema("What that step should know: why the pipeline stopped and what you want done. An agent step reads it as its instructions."),
+        "ruling": text_schema("Empty, or a decision about the bead that every step from here on must take as given, the tester and the reviewer as well as the builder: what is out of scope, or how a question of design is settled. One or two sentences that stand without the note. Only the step you continue from reads the note; all of them read this."),
     }))})
 }
 
@@ -4399,6 +4410,7 @@ impl Supervisor {
     ) {
         let bead = strings(again, "bead").trim();
         let (from, note) = (strings(again, "from").trim(), strings(again, "note").trim());
+        let ruling = strings(again, "ruling").trim();
         let Some(unit) = stopped(goal, sub, bead).and_then(|unit| unit.unit.clone()) else {
             return;
         };
@@ -4425,15 +4437,23 @@ impl Supervisor {
         self.log(
             goal,
             "pipeline.continued",
-            json!({ "bead": bead, "unit": unit, "from": from, "note": note, "subgoal": subgoal }),
+            json!({ "bead": bead, "unit": unit, "from": from, "note": note, "ruling": ruling, "subgoal": subgoal }),
         );
         self.say(
             goal,
             &format!(
-                ":fast_forward: Pipeline for `{}` continued from step *{}*.\n{}",
+                ":fast_forward: Pipeline for `{}` continued from step *{}*.\n{}{}",
                 escape(bead),
                 escape(from),
-                quote(&truncate(note, 800))
+                quote(&truncate(note, 800)),
+                if ruling.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "\n*Ruling, for every step from here on:* {}",
+                        escape(&truncate(ruling, 600))
+                    )
+                }
             ),
         );
         self.launch(
@@ -4442,7 +4462,11 @@ impl Supervisor {
             bead.to_string(),
             None,
             Some(unit),
-            Some((from.to_string(), note.to_string())),
+            Some(Again {
+                from: from.to_string(),
+                note: note.to_string(),
+                ruling: Some(ruling.to_string()).filter(|ruling| !ruling.is_empty()),
+            }),
         );
     }
 
@@ -4981,7 +5005,7 @@ impl Supervisor {
         name: String,
         within: Option<Within>,
         resume: Option<String>,
-        again: Option<(String, String)>,
+        again: Option<Again>,
     ) {
         // A pipeline continued after a restart carries no `within`: what it
         // is comes from the goal's own record of it.
@@ -4996,12 +5020,16 @@ impl Supervisor {
         let ship = recorded || matches!(within, Some(Within::Ship(_)));
         // A pipeline continued by decision goes on from a named step, with
         // a note; one continued after a restart goes on where it was.
-        let (from, continued) = again.unzip();
+        let (from, continued, ruling) = match again {
+            Some(again) => (Some(again.from), Some(again.note), again.ruling),
+            None => (None, None, None),
+        };
         let options = Options {
             slack: self.unit_slack,
             flow,
             within,
             continued,
+            ruling,
             pausable: true,
             engine: false,
             account: None,

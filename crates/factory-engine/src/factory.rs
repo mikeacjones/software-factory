@@ -42,6 +42,7 @@ impl FactoryRunner {
             flow,
             within: None,
             continued: note,
+            ruling: None,
             pausable: false,
             engine: true,
             account,

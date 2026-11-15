@@ -204,6 +204,7 @@ fn run(args: &[String]) -> Result<u8, String> {
                 flow: None,
                 within: None,
                 continued: None,
+                ruling: None,
                 pausable: false,
                 engine: false,
                 account: None,

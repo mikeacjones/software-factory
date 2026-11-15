@@ -86,6 +86,10 @@ It is also where tracker work that is no goal's goes. A director that finds an o
 
 The agent that runs one sub-goal under the director: it starts the sub-goal's beads, rules on their findings, and reports to the director when the sub-goal is ready to ship or when it needs an answer. Like the director it starts fresh at every event and its decisions are checked by code.
 
+## ruling
+
+A decision about a bead by whoever runs its sub-goal, made when they continue its pipeline: what is out of scope, or how a question of design is settled. It is kept with the unit and shown to every agent step from then on, the tester and the reviewer included, which a continue's note is not.
+
 ## tier
 
 One level of the agents that run a goal, defined by a model, an effort, a time limit and its slots: the most pieces of work it may have running below it at once. The executive is the tier of a project, the director the tier of a goal and the foreman the tier of a sub-goal. Each is woken by events from the level below, and a slot count is a maximum, never a target.

@@ -444,6 +444,10 @@ pub struct Brief<'a> {
     pub answer: Option<&'a str>,
     /// Why this step's last result was rejected by code.
     pub rejected: &'a [String],
+    /// What whoever runs the bead's sub-goal has decided about the bead,
+    /// for every step that follows: what is in scope, how a question of
+    /// design is settled.
+    pub rulings: &'a [String],
 }
 
 fn section(out: &mut String, title: &str, body: &str) {
@@ -663,9 +667,25 @@ pub fn render(brief: &Brief<'_>) -> String {
         );
     }
 
+    section(&mut out, "Rulings on this bead", &rulings_text(brief));
     section(&mut out, "Messages from the owner", &owner_text(brief));
     section(&mut out, "Result", &outcome_text(brief, contract));
     out
+}
+
+fn rulings_text(brief: &Brief<'_>) -> String {
+    if brief.rulings.is_empty() {
+        return String::new();
+    }
+    format!(
+        "The agent that runs this bead's sub-goal stopped the pipeline, looked at it, and decided these. They hold for every step from here on, yours included. Take them as given: do not build, break or review against them. If you think one is wrong, say so in your summary and do the step as ruled.\n\n{}",
+        bullets(
+            brief
+                .rulings
+                .iter()
+                .map(|ruling| ruling.trim().replace('\n', "\n  "))
+        )
+    )
 }
 
 fn owner_text(brief: &Brief<'_>) -> String {
@@ -788,6 +808,7 @@ timeout_secs = 60
             owner_messages: &[],
             answer: None,
             rejected: &[],
+            rulings: &[],
         }
     }
 

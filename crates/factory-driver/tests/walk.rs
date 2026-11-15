@@ -19,6 +19,7 @@ const OPTIONS: Options = Options {
     flow: None,
     within: None,
     continued: None,
+    ruling: None,
     pausable: false,
     engine: false,
     account: None,
@@ -569,6 +570,75 @@ fn a_parked_unit_continues_from_the_step_it_stopped_at() {
 }
 
 #[test]
+fn a_forbidden_file_put_back_is_not_stopped_and_a_ruling_reaches_every_later_step() {
+    let world = World::new("trespass", "test -f feature.txt");
+    world.scenario("trespass");
+    let mut driver = Driver::start(world.config(), "toy", "toy-1", &OPTIONS).unwrap();
+    // The builder wrote under `.github`: the unit parks, as it should.
+    let Status::Parked(reason) = driver.run().unwrap() else {
+        panic!("expected the unit to park");
+    };
+    assert!(
+        reason.contains(".github/ci.yml (no step may change this path)"),
+        "{reason}"
+    );
+    assert!(driver.unit().trespassed.contains_key(".github/ci.yml"));
+    let unit_id = driver.unit().id.to_string();
+    drop(driver);
+
+    // Continued without being told to put it back, the builder leaves the
+    // file where it is. That it did not touch it this time excuses nothing.
+    let leave = Options {
+        continued: Some("Carry on.".to_string()),
+        ..OPTIONS
+    };
+    let mut driver = Driver::resume(world.config(), &unit_id, &leave, Some("build")).unwrap();
+    let Status::Parked(reason) = driver.run().unwrap() else {
+        panic!("expected the unit to park again");
+    };
+    assert!(
+        reason.contains("an earlier step's change to it is still there"),
+        "{reason}"
+    );
+    drop(driver);
+
+    // Told to put it back, it does. Taking the file away is a change to
+    // that path as well, and once parked the unit for a second time.
+    // A ruling comes with it, for every step from here on.
+    let before = world.calls().len();
+    let back = Options {
+        continued: Some("You may not change `.github`: put it back.".to_string()),
+        ruling: Some("Wiring the check into CI is the owner's to do, not this bead's.".to_string()),
+        ..OPTIONS
+    };
+    let mut driver = Driver::resume(world.config(), &unit_id, &back, Some("build")).unwrap();
+    assert_eq!(driver.run().unwrap(), Status::Ended);
+    assert!(driver.unit().trespassed.is_empty());
+    assert!(!driver.unit().worktree.join(".github").exists());
+
+    // The builder was told what to do in the note. The tester and the
+    // reviewer never see a note, and they were shown the ruling.
+    let calls = world.calls();
+    let mut shown = Vec::new();
+    for (index, call) in calls.iter().enumerate().skip(before) {
+        let brief =
+            std::fs::read_to_string(world.path(&format!("bin/state/brief-{}.md", index + 1)))
+                .unwrap();
+        assert!(
+            brief.contains("## Rulings on this bead")
+                && brief.contains("- Wiring the check into CI is the owner's to do"),
+            "call {} ({}) was not shown the ruling:\n{brief}",
+            index + 1,
+            call[0]
+        );
+        shown.push(call[0].clone());
+    }
+    for role in ["builder", "tester", "reviewer"] {
+        assert!(shown.iter().any(|seen| seen == role), "{shown:?}");
+    }
+}
+
+#[test]
 fn a_bead_someone_else_holds_is_refused_before_anything_is_created() {
     let world = World::new("refused", "true");
     let Err(DriverError::NotLaunchable { reasons, .. }) =
@@ -585,6 +655,7 @@ const SLACK: Options = Options {
     flow: None,
     within: None,
     continued: None,
+    ruling: None,
     pausable: false,
     engine: false,
     account: None,

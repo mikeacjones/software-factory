@@ -819,6 +819,27 @@ impl Position {
         self.rounds.get(&self.step).copied().unwrap_or(1)
     }
 
+    /// Go on from the current step, after whoever is above the unit judged
+    /// it worth going on with. A bounded route out of this step that was
+    /// used up gets one more use, so that going on is not futile. Every
+    /// other count stands: a route used up elsewhere parks the unit the
+    /// next time it is taken, and whoever continued it looks again. The
+    /// bound a flow sets is on the whole unit, not on each stretch between
+    /// two looks from above.
+    pub fn reopen(&mut self, flow: &Flow) {
+        let Some(step) = flow.step(&self.step) else {
+            return;
+        };
+        for (outcome, route) in &step.on {
+            let Some(max) = route.max else { continue };
+            if let Some(used) = self.used.get_mut(&format!("{}:{outcome}", self.step))
+                && *used >= max
+            {
+                *used = max.saturating_sub(1);
+            }
+        }
+    }
+
     /// Route the outcome the current step ended with, and move.
     pub fn advance(&mut self, flow: &Flow, outcome: &str) -> Result<Next, FlowError> {
         let step = flow
@@ -1262,6 +1283,49 @@ on.merged = "end"
         assert_eq!(
             position.advance(&flow, "fail").unwrap(),
             Next::Park("step `test` ended with `fail` more often than the flow allows".to_string())
+        );
+    }
+
+    #[test]
+    fn going_on_reopens_only_the_routes_out_of_the_step_gone_on_from() {
+        let flow = Flow::parse(FLOW).unwrap();
+        let mut position = Position::start(&flow);
+        position.advance(&flow, "done").unwrap();
+        // The tester breaks the change as often as the flow allows, and
+        // once more.
+        for _ in 0..2 {
+            position.advance(&flow, "pass").unwrap();
+            assert_eq!(
+                position.advance(&flow, "broken").unwrap(),
+                Next::Step("fix".to_string())
+            );
+            position.advance(&flow, "done").unwrap();
+        }
+        position.advance(&flow, "pass").unwrap();
+        assert!(matches!(
+            position.advance(&flow, "broken").unwrap(),
+            Next::Park(_)
+        ));
+        // Someone above goes on with it from the fix. The fix is made and
+        // checked, but the tester's allowance is not new: the next break
+        // comes straight back.
+        position.step = "fix".to_string();
+        position.reopen(&flow);
+        assert_eq!(position.used["break:broken"], 2);
+        position.advance(&flow, "done").unwrap();
+        position.advance(&flow, "pass").unwrap();
+        assert!(matches!(
+            position.advance(&flow, "broken").unwrap(),
+            Next::Park(_)
+        ));
+        // Going on from a step whose own route is used up opens that route
+        // once, or going on would end where it began.
+        position.step = "break".to_string();
+        position.reopen(&flow);
+        assert_eq!(position.used["break:broken"], 1);
+        assert_eq!(
+            position.advance(&flow, "broken").unwrap(),
+            Next::Step("fix".to_string())
         );
     }
 

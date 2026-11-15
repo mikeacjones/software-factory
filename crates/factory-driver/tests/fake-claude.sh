@@ -17,6 +17,9 @@
 #                      own-file      the builder writes under a directory named after its bead,
 #                                    not to the one file every bead shares
 #                      lazy-merge    the builder's first try at a merge conflict leaves the markers in
+#                      trespass      the builder first also writes a file under .github, which
+#                                    no step may change, and takes it away when it is
+#                                    told to put it back
 #                      limit-default-once
 #                                    the first run without an account token is refused
 #                                    at the five-hour limit
@@ -112,6 +115,13 @@ case "$role" in
         case "$scenario" in
           *own-file*) mkdir -p "$bead"; echo "line $count" >> "$bead/feature.txt" ;;
           *) echo "line $count" >> feature.txt ;;
+        esac ;;
+    esac
+    case "$scenario" in
+      *trespass*)
+        case "$brief" in
+          *"put it back"*) rm -rf .github ;;
+          *) [ -f "$state/trespassed" ] || { touch "$state/trespassed"; mkdir -p .github; echo "on: push" > .github/ci.yml; } ;;
         esac ;;
     esac
     # It commits what it has, as a builder is told to, and is not done yet.
