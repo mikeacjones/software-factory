@@ -3823,3 +3823,185 @@ fn a_goal_started_while_another_runs_is_queued_and_starts_when_that_ends() {
     sup.incoming(act("goal_start", &third)).unwrap();
     assert_eq!(phase(&sup, &third), Phase::Running);
 }
+
+/// Tracker work that is no goal's: a bead that should be closed without
+/// work. The owner can ask the executive for it, and a director passes it
+/// up to the executive, not to the owner. A closure that holds only once
+/// another bead has landed is carried out by code when it has.
+#[test]
+fn the_executive_closes_a_bead_for_the_owner_or_a_director_now_or_once_another_lands() {
+    use factory_driver::goal::{Phase, Supervisor};
+    use factory_slack::socket::Incoming;
+    use serde_json::json;
+    use std::time::Duration;
+
+    let world = World::new("exec-close", "true");
+    world.with_github("green");
+    let project = world.path("config/projects/toy.toml");
+    let text = std::fs::read_to_string(&project).unwrap()
+        + "issues = true\n\n[executive]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\nslots = 2\n";
+    std::fs::write(&project, text).unwrap();
+    std::fs::create_dir_all(world.path("config/goals/toy")).unwrap();
+    std::fs::write(
+        world.path("config/goals/toy/main.toml"),
+        "id = \"main\"\nflow = \"zig-sdk-bead\"\nship_flow = \"zig-sdk-ship\"\n[director]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        world.path("beads/toy-3.json"),
+        r#"{"id":"toy-3","title":"The feature, asked for again","acceptance_criteria":"- the feature exists","status":"open","external_ref":"https://github.com/me/toy/issues/5"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        world.path("beads/toy-4.json"),
+        r#"{"id":"toy-4","title":"The feature, a third time","acceptance_criteria":"- the feature exists","status":"open"}"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(world.path("bin/state")).unwrap();
+    let say = |role: &str, n: u32, json: serde_json::Value| {
+        std::fs::write(
+            world.path(&format!("bin/state/{role}-{n}.json")),
+            json.to_string(),
+        )
+        .unwrap();
+    };
+    let status = |bead: &str| {
+        let text = std::fs::read_to_string(world.path(&format!("beads/{bead}.json"))).unwrap();
+        serde_json::from_str::<serde_json::Value>(&text).unwrap()["status"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let brief = |role: &str, n: usize| {
+        let all = world.calls();
+        let index = (0..all.len())
+            .filter(|&i| all[i][0] == role)
+            .nth(n - 1)
+            .unwrap();
+        std::fs::read_to_string(world.path(&format!("bin/state/brief-{}.md", index + 1))).unwrap()
+    };
+    let closed_issues =
+        || std::fs::read_to_string(world.path("bin/state-gh/issues-closed")).unwrap_or_default();
+    let pending = |sup: &Supervisor| {
+        sup.executives()
+            .next()
+            .map(|executive| executive.pending.clone())
+            .unwrap_or_default()
+    };
+    let mut sup = Supervisor::new(world.config(), None, vec!["OWNER".to_string()], false).unwrap();
+
+    // The owner asks. A bead someone is working on is refused, and the
+    // refusal goes back to the same conversation. The second answer waits
+    // for toy-1 to land: nothing is closed yet.
+    let close = |bead: &str, kind: &str, once: &str| json!({"bead": bead, "reason": "toy-1 delivers the same feature.", "as": kind, "once_closed": once});
+    say(
+        "executive",
+        1,
+        json!({"reply": "Closing it.", "open_goal": {"definition": "", "handoff": ""}, "close": [close("toy-2", "duplicate", "")]}),
+    );
+    say(
+        "executive",
+        2,
+        json!({"reply": "I will close toy-3 when toy-1 has landed.", "open_goal": {"definition": "", "handoff": ""}, "close": [close("toy-3", "delivered", "toy-1")]}),
+    );
+    let (_, opened) = sup
+        .tell_executive(
+            "toy",
+            None,
+            "toy-3 is the same work as toy-1. Close it once toy-1 lands.",
+        )
+        .unwrap();
+    assert_eq!(opened, None);
+    assert!(
+        brief("executive", 2).contains("close: `toy-2` is being worked on"),
+        "{}",
+        brief("executive", 2)
+    );
+    assert_eq!(status("toy-2"), "in_progress");
+    assert_eq!(status("toy-3"), "open");
+    assert_eq!(pending(&sup).len(), 1);
+    assert_eq!(pending(&sup)[0].once_closed, "toy-1");
+    assert_eq!(closed_issues(), "");
+
+    // toy-1 lands. Code closes toy-3, and its issue with it, with no
+    // agent run for it.
+    let calls_before = world.calls().len();
+    factory_driver::bead_source(&world.config().project("toy").unwrap())
+        .close("toy-1", "Merged.", "factory")
+        .unwrap();
+    sup.pump(Duration::ZERO).unwrap();
+    assert_eq!(status("toy-3"), "closed");
+    assert!(pending(&sup).is_empty());
+    assert_eq!(world.calls().len(), calls_before);
+    let issues = closed_issues();
+    assert!(
+        issues.contains("5 --repo me/toy --reason completed --comment Closed as already delivered, by the project's executive: toy-1 delivers the same feature."),
+        "{issues}"
+    );
+
+    // A director finds the same about another bead. It cannot close a
+    // bead and does not ask the owner: it passes it up, and the executive
+    // is run for it, with what the director said.
+    say(
+        "executive",
+        3,
+        json!({"reply": "Opened.", "open_goal": {"definition": "main", "handoff": "Nothing else is running."}, "close": []}),
+    );
+    say(
+        "intake",
+        1,
+        json!({"reply": "Here is the charter.", "ready": true, "objective": "Do it.", "stop_when": "It is done.", "plan": "One sub-goal.", "paths": [], "edits": []}),
+    );
+    let (_, opened) = sup
+        .tell_executive("toy", None, "Ship the feature.")
+        .unwrap();
+    let goal = opened.unwrap();
+    say(
+        "director",
+        1,
+        json!({
+            "summary": "Waiting on the owner.", "start": [], "file": [], "edit": [], "dropped_findings": [],
+            "open_subgoals": [], "ship": [], "tell_foreman": [],
+            "tell_executive": "toy-4 asks for what toy-1 delivered, which has landed. It should be closed.",
+            "ask_owner": "Which bead first?",
+            "complete": false, "evidence": "", "journal_entry": "", "project_memory": ""
+        }),
+    );
+    say(
+        "executive",
+        4,
+        json!({"summary": "toy-4 repeats toy-1, which is closed.", "close": [close("toy-4", "duplicate", "")], "replies": []}),
+    );
+    sup.incoming(Incoming::Action {
+        channel: String::new(),
+        user: "OWNER".to_string(),
+        action_id: "goal_start".to_string(),
+        value: goal.clone(),
+        message_ts: String::new(),
+    })
+    .unwrap();
+    assert_eq!(
+        sup.goals().find(|other| other.id == goal).unwrap().phase,
+        Phase::Running
+    );
+    assert_eq!(status("toy-4"), "open");
+    sup.pump(Duration::ZERO).unwrap();
+    assert_eq!(status("toy-4"), "closed");
+    let desk = brief("executive", 4);
+    for expected in [
+        "# Directors have passed something up to you, on project `toy`".to_string(),
+        format!(
+            "## From the director of goal `{goal}`\n\n> toy-4 asks for what toy-1 delivered, which has landed. It should be closed."
+        ),
+    ] {
+        assert!(desk.contains(&expected), "missing {expected:?} in:\n{desk}");
+    }
+    let executive = sup.executives().next().unwrap();
+    assert!(executive.memos.is_empty());
+    // toy-4 had no issue: nothing more was closed on GitHub.
+    assert_eq!(closed_issues().lines().count(), 1);
+    // It is run once for what was passed up, not again on every turn.
+    let calls_before = world.calls().len();
+    sup.pump(Duration::ZERO).unwrap();
+    assert_eq!(world.calls().len(), calls_before);
+}

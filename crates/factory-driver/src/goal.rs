@@ -324,6 +324,42 @@ pub struct Executive {
     pub threads: BTreeMap<String, Front>,
     pub wakes: u32,
     pub usage: Usage,
+    /// What directors have passed up and it has not yet dealt with.
+    #[serde(default)]
+    pub memos: Vec<Memo>,
+    /// Beads it decided to close once another has landed.
+    #[serde(default)]
+    pub pending: Vec<Closure>,
+    /// When the pending closures were last looked at.
+    #[serde(default)]
+    pub pending_checked_at: u64,
+    /// After a turn at its desk failed: when to try again.
+    #[serde(default)]
+    pub desk_retry_at: u64,
+}
+
+/// Something a goal's director passed up to its project's executive.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Memo {
+    pub goal: String,
+    pub text: String,
+}
+
+/// A bead the executive closes without work being done on it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Closure {
+    pub bead: String,
+    pub reason: String,
+    /// `delivered`, `duplicate` or `not_planned`.
+    #[serde(rename = "as")]
+    pub kind: String,
+    /// The bead that must have landed first, or empty.
+    pub once_closed: String,
+    /// Where it was decided, which is where it is said when it happens.
+    #[serde(default)]
+    pub channel: String,
+    #[serde(default)]
+    pub thread: String,
 }
 
 /// One conversation between the owner and a project's executive.
@@ -536,6 +572,7 @@ pub fn wake_schema() -> Value {
             "subgoal": text_schema("The ID of an open sub-goal."),
             "text": text_schema("What you tell its foreman."),
         }))},
+        "tell_executive": text_schema("Something for the project's executive, the level above goals, or empty. For tracker work that is not this goal's: an open bead that should be closed because what landed already delivers it or because it duplicates another, said with the bead IDs and the reason. The executive can close a bead; you cannot, and it is not a question for the owner."),
         "ask_owner": text_schema("One question only the owner can answer, or empty."),
         "complete": { "type": "boolean", "description": "True to propose that the stop condition is met. The owner decides." },
         "evidence": text_schema("When complete: how the stop condition is met, point by point, with what you checked. Otherwise empty."),
@@ -973,10 +1010,82 @@ const GOAL_CLAIMS: Claims = Claims {
     overlap: "goals whose paths overlap run one after the other",
 };
 
+fn close_schema() -> Value {
+    json!({ "type": "array", "description": "Open beads to close without work: one whose work has already landed under another bead, one that duplicates another, one that will not be done. Never a bead a goal is working on. Usually empty.", "items": object_schema(json!({
+        "bead": text_schema("The ID of an open bead."),
+        "reason": text_schema("Why it is closed, for whoever reads the bead later: what delivered it or what it duplicates, by ID."),
+        "as": { "enum": ["delivered", "duplicate", "not_planned"], "description": "`delivered` when its work has landed under another bead, `duplicate` when another open bead covers it, `not_planned` when it will not be done." },
+        "once_closed": text_schema("When the reason holds only once another bead has landed: that bead's ID. Code then closes this one as soon as that one is closed. Empty to close it now."),
+    }))})
+}
+
+/// What a project's executive returns when a director has passed
+/// something up to it.
+pub fn desk_schema() -> Value {
+    object_schema(json!({
+        "summary": text_schema("What you decided and why, for the owner, in a sentence or two."),
+        "close": close_schema(),
+        "replies": { "type": "array", "description": "Answers to directors, when one needs to know something it cannot see in the tracker: that you will not do what it asked, and why. Each wakes that director. Usually empty.", "items": object_schema(json!({
+            "goal": text_schema("The ID of the goal whose director wrote."),
+            "text": text_schema("What you tell it."),
+        }))},
+    }))
+}
+
+/// Why beads may not be closed as an executive asked. `tracker` is the
+/// project's open beads, `held` the beads some goal is working on and
+/// where, and `known` says whether a bead exists at all, open or closed.
+pub fn close_problems(
+    closes: &[Value],
+    tracker: &[Summary],
+    held: &[(String, String)],
+    known: &dyn Fn(&str) -> bool,
+) -> Vec<String> {
+    let mut problems = Vec::new();
+    let mut seen: Vec<&str> = Vec::new();
+    for close in closes {
+        let id = strings(close, "bead").trim();
+        if seen.contains(&id) {
+            problems.push(format!("close: `{id}` is listed twice"));
+            continue;
+        }
+        seen.push(id);
+        let Some(bead) = tracker.iter().find(|bead| bead.id == id) else {
+            problems.push(format!("close: `{id}` is not an open bead of this project"));
+            continue;
+        };
+        if bead.issue_type == "epic" {
+            problems.push(format!(
+                "close: `{id}` is an epic: it is closed when the work under it is"
+            ));
+        }
+        if let Some((_, place)) = held.iter().find(|(held, _)| held == id) {
+            problems.push(format!(
+                "close: `{id}` is {place}: what becomes of it is that goal's director's to decide"
+            ));
+        } else if bead.status == "in_progress" {
+            problems.push(format!("close: `{id}` is being worked on"));
+        }
+        if strings(close, "reason").trim().is_empty() {
+            problems.push(format!("close: say in `reason` why `{id}` is closed"));
+        }
+        let once = strings(close, "once_closed").trim();
+        if once == id {
+            problems.push(format!("close: `{id}` cannot wait for itself to be closed"));
+        } else if !once.is_empty() && !known(once) {
+            problems.push(format!(
+                "close: `{once}`, which `{id}` is to wait for, is not a bead of this project"
+            ));
+        }
+    }
+    problems
+}
+
 /// What a project's executive returns in a conversation with the owner.
 pub fn front_schema() -> Value {
     object_schema(json!({
         "reply": text_schema("What you say to the owner in the thread, written to them directly."),
+        "close": close_schema(),
         "open_goal": object_schema(json!({
             "definition": text_schema("To open a goal: the ID of the goal definition it should run under. Empty while there is no goal to open: you are still finding out what the owner wants, or they asked something you can answer yourself."),
             "handoff": text_schema("What the goal's director should know that the owner's own words do not say: what you found out, what else is running on the project and how this goal relates to it. Empty when opening none."),
@@ -1923,6 +2032,48 @@ pub fn front_brief(
     out
 }
 
+/// The briefing for an executive given what directors passed up to it.
+/// The same inputs give the same text.
+pub fn desk_brief(
+    project: &str,
+    memos: &[Memo],
+    goals: &[&Goal],
+    tracker: &[Summary],
+    memory: &str,
+) -> String {
+    let mut out = format!(
+        "# Directors have passed something up to you, on project `{project}`\n\nEach is work on the tracker that is not their goal's to do. Decide what is done about each.\n\n"
+    );
+    for memo in memos {
+        out.push_str(&format!(
+            "## From the director of goal `{}`\n\n{}\n\n",
+            memo.goal,
+            quote_plain(memo.text.trim())
+        ));
+    }
+    out.push_str("## Goals of this project that have not ended\n\n");
+    let live: Vec<&&Goal> = goals
+        .iter()
+        .filter(|goal| !matches!(goal.phase, Phase::Complete | Phase::Stopped))
+        .collect();
+    if live.is_empty() {
+        out.push_str("None.\n");
+    }
+    for goal in live {
+        out.push_str(&goal_line(goal));
+    }
+    out.push_str(&format!(
+        "\n## The tracker: open work, most urgent first\n\n{}\n## Project memory\n\n{}\n\nCheck what you were told against the tracker and the repository before you act on it: `bd show <id>` for any bead, open or closed. Return the structured result; code checks it and sends back what it refuses.\n",
+        table(tracker, &[]),
+        if memory.trim().is_empty() {
+            "(empty)"
+        } else {
+            memory.trim()
+        },
+    ));
+    out
+}
+
 /// The briefing for an executive deciding which waiting goals may start.
 /// The same inputs give the same text.
 pub fn schedule_brief(project: &str, slots: usize, running: &[&Goal], waiting: &[&Goal]) -> String {
@@ -2602,6 +2753,8 @@ impl Supervisor {
             }
         };
         let known: Vec<String> = definitions.iter().map(|d| d.id.clone()).collect();
+        let source = bead_source(&project);
+        let held = self.held_beads(project_id);
         let check = |result: &Value| {
             let mut problems = Vec::new();
             if strings(result, "reply").trim().is_empty() {
@@ -2616,6 +2769,19 @@ impl Supervisor {
                     "open_goal: `{wanted}` is not a goal definition of this project: {}",
                     known.join(", ")
                 ));
+            }
+            let closes = items(result, "close");
+            if !closes.is_empty() {
+                match source.list_open() {
+                    Ok(tracker) => {
+                        problems.extend(close_problems(closes, &tracker, &held, &|bead| {
+                            source.read(bead).is_ok()
+                        }))
+                    }
+                    Err(err) => {
+                        problems.push(format!("close: the tracker could not be read: {err}"))
+                    }
+                }
             }
             problems
         };
@@ -2647,11 +2813,25 @@ impl Supervisor {
         front.session = Some(session);
         let reply = strings(&result, "reply").to_string();
         front.said.push(("executive".to_string(), reply.clone()));
-        self.post(
+        let did = self.carry_out_closes(
+            &project,
+            &mut executive,
+            items(&result, "close"),
             channel,
             root,
-            &format!(":office: *Executive*\n{}", escape(&reply)),
         );
+        let mut said = format!(":office: *Executive*\n{}", escape(&reply));
+        for line in &did {
+            said.push_str(&format!("\n• {}", escape(line)));
+        }
+        if !did.is_empty() {
+            self.log_at(
+                &seat,
+                "executive.decided",
+                json!({ "thread": root, "did": did }),
+            );
+        }
+        self.post(channel, root, &said);
         let open = result.get("open_goal").cloned().unwrap_or_default();
         let definition = strings(&open, "definition").trim().to_string();
         if definition.is_empty() {
@@ -2698,6 +2878,295 @@ impl Supervisor {
         );
         self.intake_turn(&goal, &asked)?;
         Ok(Some(goal))
+    }
+
+    /// The beads of a project that some goal is working on, and where.
+    fn held_beads(&self, project: &str) -> Vec<(String, String)> {
+        let mut held = Vec::new();
+        for goal in self.goals.values().filter(|goal| {
+            goal.project == project && !matches!(goal.phase, Phase::Complete | Phase::Stopped)
+        }) {
+            for sub in goal.subgoals.iter().filter(|sub| sub.state != "landed") {
+                let place = format!("in sub-goal `{}` of goal `{}`", sub.id, goal.id);
+                let beads = sub
+                    .planned
+                    .iter()
+                    .chain(&sub.added)
+                    .chain(sub.absorbed.iter().map(|(bead, _)| bead));
+                held.extend(beads.map(|bead| (bead.clone(), place.clone())));
+            }
+            for unit in goal
+                .units
+                .iter()
+                .filter(|unit| !unit.ship && matches!(unit.state.as_str(), "running" | "parked"))
+            {
+                held.push((
+                    unit.bead.clone(),
+                    format!("in a pipeline of goal `{}`", goal.id),
+                ));
+            }
+        }
+        held
+    }
+
+    /// Close a bead the executive decided to close, and its issue with it.
+    /// Returns what was done, in words for the thread.
+    fn close_bead(&self, seat: &Seat, project: &Project, closure: &Closure) -> String {
+        let source = bead_source(project);
+        let bead = match source.read(&closure.bead) {
+            Ok(bead) if bead.status == "closed" => {
+                return format!("`{}` was already closed", closure.bead);
+            }
+            Ok(bead) => bead,
+            Err(err) => return format!("could not close `{}`: {err}", closure.bead),
+        };
+        if let Some((_, place)) = self
+            .held_beads(project.id.as_str())
+            .iter()
+            .find(|(held, _)| *held == closure.bead)
+        {
+            return format!("did not close `{}`: by now it is {place}", closure.bead);
+        }
+        let why = match closure.kind.as_str() {
+            "delivered" => "Closed as already delivered",
+            "duplicate" => "Closed as a duplicate",
+            _ => "Closed as not planned",
+        };
+        let reason = format!(
+            "{why}, by the project's executive: {}",
+            closure.reason.trim()
+        );
+        if let Err(err) = source.close(&closure.bead, &reason, &project.bead_actor) {
+            self.log_at(
+                seat,
+                "bead.failed",
+                json!({ "close": closure, "error": err.to_string() }),
+            );
+            return format!("could not close `{}`: {err}", closure.bead);
+        }
+        self.log_at(seat, "bead.closed", json!({ "close": closure }));
+        let mut done = format!("closed `{}`", closure.bead);
+        // The bead's issue is closed with it, saying the same thing.
+        if let Some(settings) = project.github.as_ref().filter(|github| github.issues)
+            && let Some(number) = factory_github::issue_number(&bead.external_ref, &settings.repo)
+        {
+            let why = match closure.kind.as_str() {
+                "delivered" => factory_github::Closing::Completed,
+                "duplicate" => factory_github::Closing::Duplicate,
+                _ => factory_github::Closing::NotPlanned,
+            };
+            match crate::github_client(&self.factory, settings).close_issue(
+                &project.repo,
+                &settings.repo,
+                number,
+                why,
+                &reason,
+            ) {
+                Ok(()) => done.push_str(&format!(" and its issue #{number}")),
+                Err(err) => {
+                    self.log_at(
+                        seat,
+                        "issue.failed",
+                        json!({ "bead": closure.bead, "issue": number, "error": err.to_string() }),
+                    );
+                    done.push_str(&format!("; its issue #{number} could not be closed: {err}"));
+                }
+            }
+        }
+        done
+    }
+
+    /// Carry out the closures an executive decided on: now, or kept for
+    /// when the bead each waits for has landed. Returns what was done.
+    fn carry_out_closes(
+        &self,
+        project: &Project,
+        executive: &mut Executive,
+        closes: &[Value],
+        channel: &str,
+        thread: &str,
+    ) -> Vec<String> {
+        let seat = self.executive_seat(project.id.as_str());
+        let source = bead_source(project);
+        let mut did = Vec::new();
+        for close in closes {
+            let Ok(mut closure) = serde_json::from_value::<Closure>(close.clone()) else {
+                continue;
+            };
+            closure.channel = channel.to_string();
+            closure.thread = thread.to_string();
+            let once = closure.once_closed.trim().to_string();
+            let landed =
+                once.is_empty() || source.read(&once).is_ok_and(|bead| bead.status == "closed");
+            if landed {
+                did.push(self.close_bead(&seat, project, &closure));
+            } else {
+                did.push(format!(
+                    "will close `{}` as soon as `{once}` has landed",
+                    closure.bead
+                ));
+                executive.pending.retain(|other| other.bead != closure.bead);
+                executive.pending.push(closure);
+            }
+        }
+        did
+    }
+
+    /// Close the beads that were waiting for another to land, where it
+    /// has. Looked at once a minute while any wait.
+    fn settle_closures(&mut self, project_id: &str) -> Result<bool, DriverError> {
+        let Some(mut executive) = self.executives.get(project_id).cloned() else {
+            return Ok(false);
+        };
+        if executive.pending.is_empty() || now_unix() < executive.pending_checked_at + 60 {
+            return Ok(false);
+        }
+        executive.pending_checked_at = now_unix();
+        let project = self.config.project(project_id)?;
+        let source = bead_source(&project);
+        let seat = self.executive_seat(project_id);
+        let (due, waiting): (Vec<Closure>, Vec<Closure>) = std::mem::take(&mut executive.pending)
+            .into_iter()
+            .partition(|closure| {
+                source
+                    .read(closure.once_closed.trim())
+                    .is_ok_and(|bead| bead.status == "closed")
+            });
+        executive.pending = waiting;
+        let happened = !due.is_empty();
+        for closure in due {
+            let did = self.close_bead(&seat, &project, &closure);
+            self.post(
+                &closure.channel,
+                &closure.thread,
+                &format!(
+                    ":office: *Executive* `{}` has landed: {}. {}",
+                    closure.once_closed.trim(),
+                    escape(&did),
+                    escape(closure.reason.trim())
+                ),
+            );
+        }
+        self.save_executive(executive)?;
+        Ok(happened)
+    }
+
+    /// Give a project's executive what directors have passed up to it, and
+    /// carry out what it decides. Returns whether it was run.
+    fn desk(&mut self, project_id: &str) -> Result<bool, DriverError> {
+        let Some(mut executive) = self.executives.get(project_id).cloned() else {
+            return Ok(false);
+        };
+        if self.draining || executive.memos.is_empty() || now_unix() < executive.desk_retry_at {
+            return Ok(false);
+        }
+        let project = self.config.project(project_id)?;
+        let Some(tier) = project.executive.clone() else {
+            return Ok(false);
+        };
+        let source = bead_source(&project);
+        let tracker = source.list_open()?;
+        let memory = std::fs::read_to_string(self.memory_path(project_id)).unwrap_or_default();
+        let memos = executive.memos.clone();
+        let held = self.held_beads(project_id);
+        let seat = self.executive_seat(project_id);
+        let asking: Vec<String> = memos.iter().map(|memo| memo.goal.clone()).collect();
+        let prompt = {
+            let goals: Vec<&Goal> = self
+                .goals
+                .values()
+                .filter(|goal| goal.project == project_id)
+                .collect();
+            desk_brief(project_id, &memos, &goals, &tracker, &memory)
+        };
+        let check = |result: &Value| {
+            let mut problems = Vec::new();
+            if strings(result, "summary").trim().is_empty() {
+                problems.push("`summary` is empty".to_string());
+            }
+            problems.extend(close_problems(
+                items(result, "close"),
+                &tracker,
+                &held,
+                &|bead| source.read(bead).is_ok(),
+            ));
+            for reply in items(result, "replies") {
+                let goal = strings(reply, "goal").trim();
+                if !asking.iter().any(|id| id == goal) {
+                    problems.push(format!(
+                        "replies: `{goal}` is not a goal whose director wrote to you"
+                    ));
+                }
+            }
+            problems
+        };
+        let turn = Turn {
+            who: "executive",
+            role: "executive",
+            tier,
+            place: None,
+            schema: desk_schema(),
+            session: Session::Fresh,
+            prompt,
+        };
+        let result = match self.run_agent(&seat, &mut executive.usage, turn, &check) {
+            Ok((result, _)) => result,
+            Err(reason) => {
+                self.log_at(&seat, "executive.failed", json!({ "reason": reason }));
+                executive.desk_retry_at = now_unix() + 300;
+                self.save_executive(executive)?;
+                return Ok(true);
+            }
+        };
+        executive.wakes += 1;
+        // Whatever was passed up while it ran is kept for its next turn.
+        let later: Vec<Memo> = self
+            .executives
+            .get(project_id)
+            .map(|now| now.memos.iter().skip(memos.len()).cloned().collect())
+            .unwrap_or_default();
+        executive.memos = later;
+        // What it does is said in the thread of the first goal that asked.
+        let place = asking
+            .first()
+            .and_then(|id| self.goals.get(id))
+            .map(|goal| (goal.channel.clone(), goal.thread_ts.clone()))
+            .unwrap_or_default();
+        let did = self.carry_out_closes(
+            &project,
+            &mut executive,
+            items(&result, "close"),
+            &place.0,
+            &place.1,
+        );
+        self.log_at(
+            &seat,
+            "executive.decided",
+            json!({ "memos": memos, "did": did, "summary": strings(&result, "summary") }),
+        );
+        self.save_executive(executive)?;
+        let mut text = format!(
+            ":office: *Executive*\n{}",
+            quote(&truncate(strings(&result, "summary"), 1500))
+        );
+        for line in &did {
+            text.push_str(&format!("\n• {}", escape(line)));
+        }
+        self.post(&place.0, &place.1, &text);
+        for reply in items(&result, "replies") {
+            let id = strings(reply, "goal").trim().to_string();
+            if let Some(mut goal) = self.goals.get(&id).cloned() {
+                goal.inbox.push(Happening::Note {
+                    text: format!(
+                        "The project's executive answered what you passed up: {}",
+                        strings(reply, "text").trim()
+                    ),
+                });
+                self.save(goal)?;
+                self.wake(&id)?;
+            }
+        }
+        Ok(true)
     }
 
     /// Ask a project's executive which waiting goals may start beside the
@@ -3546,15 +4015,23 @@ impl Supervisor {
         };
         let snapshot = goal.clone();
         let steps = self.bead_steps(&definition, &project);
+        let has_executive = project.executive.is_some();
         let check = |result: &Value| {
-            decision_problems(
+            let mut problems = decision_problems(
                 &definition,
                 &snapshot,
                 &tracker,
                 &launchable,
                 &steps,
                 result,
-            )
+            );
+            if !has_executive && !strings(result, "tell_executive").trim().is_empty() {
+                problems.push(
+                    "tell_executive: this project has no executive: take it to the owner"
+                        .to_string(),
+                );
+            }
+            problems
         };
         let turn = Turn {
             who: "director",
@@ -3676,6 +4153,24 @@ impl Supervisor {
                     },
                 ],
             );
+        }
+        let passed_up = strings(&result, "tell_executive").trim();
+        if !passed_up.is_empty() {
+            let mut executive = self
+                .executives
+                .get(&goal.project)
+                .cloned()
+                .unwrap_or_else(|| Executive {
+                    project: goal.project.clone(),
+                    ..Executive::default()
+                });
+            executive.memos.push(Memo {
+                goal: goal.id.clone(),
+                text: passed_up.to_string(),
+            });
+            self.save_executive(executive)?;
+            self.log(&goal, "executive.told", json!({ "text": passed_up }));
+            did.push("passed a note up to the project's executive".to_string());
         }
         let question = strings(&result, "ask_owner").trim();
         if !question.is_empty() {
@@ -4610,6 +5105,18 @@ impl Supervisor {
     /// anything happened.
     pub fn pump(&mut self, wait: Duration) -> Result<bool, DriverError> {
         let mut happened = false;
+        // What directors passed up to an executive, and beads waiting to
+        // be closed until another has landed.
+        let desks: Vec<String> = self
+            .executives
+            .values()
+            .filter(|executive| !executive.memos.is_empty() || !executive.pending.is_empty())
+            .map(|executive| executive.project.clone())
+            .collect();
+        for project in desks {
+            happened |= self.desk(&project)?;
+            happened |= self.settle_closures(&project)?;
+        }
         let due: Vec<String> = self
             .goals
             .values()
@@ -5101,6 +5608,61 @@ mod tests {
             blockers: Vec::new(),
         };
         vec![bead("toy-1", true), bead("toy-2", false)]
+    }
+
+    #[test]
+    fn an_executive_closes_only_open_beads_nobody_is_working_on() {
+        let mut open = tracker();
+        open.push(Summary {
+            id: "toy-9".to_string(),
+            issue_type: "epic".to_string(),
+            ..open[0].clone()
+        });
+        open.push(Summary {
+            id: "toy-8".to_string(),
+            status: "in_progress".to_string(),
+            ..open[0].clone()
+        });
+        let held = vec![(
+            "toy-2".to_string(),
+            "in sub-goal `signals` of goal `g1`".to_string(),
+        )];
+        let known = |bead: &str| bead.starts_with("toy-");
+        let close = |bead: &str, reason: &str, once: &str| json!({"bead": bead, "reason": reason, "as": "delivered", "once_closed": once});
+        let problems = |closes: Vec<Value>| close_problems(&closes, &open, &held, &known);
+
+        assert!(problems(vec![close("toy-1", "toy-7 delivered it.", "")]).is_empty());
+        // Waiting for a bead that exists, open or closed, is allowed.
+        assert!(problems(vec![close("toy-1", "toy-7 delivers it.", "toy-7")]).is_empty());
+        assert_eq!(
+            problems(vec![
+                close("toy-1", "", ""),
+                close("toy-1", "again", ""),
+                close("toy-2", "dup", ""),
+                close("toy-5", "gone", ""),
+                close("toy-8", "dup", ""),
+                close("toy-9", "dup", ""),
+            ]),
+            [
+                "close: say in `reason` why `toy-1` is closed",
+                "close: `toy-1` is listed twice",
+                "close: `toy-2` is in sub-goal `signals` of goal `g1`: what becomes of it is that goal's director's to decide",
+                "close: `toy-5` is not an open bead of this project",
+                "close: `toy-8` is being worked on",
+                "close: `toy-9` is an epic: it is closed when the work under it is",
+            ]
+        );
+        assert_eq!(
+            problems(vec![
+                close("toy-1", "r", "toy-1"),
+                close("toy-2", "r", "elsewhere-3")
+            ]),
+            [
+                "close: `toy-1` cannot wait for itself to be closed",
+                "close: `toy-2` is in sub-goal `signals` of goal `g1`: what becomes of it is that goal's director's to decide",
+                "close: `elsewhere-3`, which `toy-2` is to wait for, is not a bead of this project",
+            ]
+        );
     }
 
     fn launchable(bead: &str) -> Vec<String> {

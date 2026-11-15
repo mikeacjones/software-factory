@@ -80,6 +80,8 @@ The agent that directs a goal: it decides which bead's pipeline runs next, what 
 
 The agent the owner talks to in a project's channel, above every goal's director. It answers, or opens a goal under one of the project's goal definitions and hands the thread to that goal's director, and it decides which waiting goals may start beside the ones running. It is the tier of a project.
 
+It is also where tracker work that is no goal's goes. A director that finds an open bead needing no work, because what landed delivers it or it duplicates another, passes it up to the executive, not to the owner. The executive can close such a bead, and its issue with it, at once or as soon as a bead it names has landed; code refuses one a goal is working on.
+
 ## foreman
 
 The agent that runs one sub-goal under the director: it starts the sub-goal's beads, rules on their findings, and reports to the director when the sub-goal is ready to ship or when it needs an answer. Like the director it starts fresh at every event and its decisions are checked by code.

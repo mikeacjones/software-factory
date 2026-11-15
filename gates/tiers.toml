@@ -102,6 +102,14 @@ command = ["cargo", "test", "--locked", "--offline", "--package", "factory-drive
 timeout_secs = 900
 
 [[check]]
+id = "executive-closes"
+tier = "hermetic"
+bead = "sf-7nv.7"
+claim = "An executive may close only an open bead that no goal is working on, that is not an epic and not in progress, with a reason, and may make it wait only for a bead that exists. With scripted agents: the owner asks for a closure, one of a bead in progress is refused and goes back to the same conversation, and one waiting on another bead closes nothing; when that bead is closed, code closes the waiting bead and its GitHub issue with no agent run; and a director that passes a bead up with `tell_executive` has the executive run once for it, briefed with what the director said, which closes the bead."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-driver", "--", "an_executive_closes_only", "the_executive_closes_a_bead"]
+timeout_secs = 900
+
+[[check]]
 id = "zig-executive"
 tier = "owner"
 bead = "sf-7nv.4"

@@ -40,6 +40,9 @@ case "$1 $2" in
       *)
         cat "$state/graphql" 2>/dev/null || echo '{"data":{"repository":{"issueTypes":{"nodes":[{"id":"IT_task","name":"Task","isEnabled":true},{"id":"IT_bug","name":"Bug","isEnabled":true}]},"issueFields":{"nodes":[{"id":"IFSS_priority","name":"Priority","options":[{"id":"O_critical","name":"Critical"},{"id":"O_high","name":"High"}]}]},"issue":{"id":"I_1","issueType":null,"issueFieldValues":{"nodes":[]}}}}}' ;;
     esac ;;
+  "issue close")
+    shift 2
+    echo "$*" >> "$state/issues-closed" ;;
   "issue create")
     cat > /dev/null
     n=$(( $(cat "$state/issues" 2>/dev/null || echo 0) + 1 ))

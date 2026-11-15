@@ -461,6 +461,41 @@ impl GitHub {
             })
     }
 
+    /// Close an issue that no pull request closes, with a comment that
+    /// says why.
+    pub fn close_issue(
+        &self,
+        cwd: &Path,
+        repo: &str,
+        number: u64,
+        why: Closing,
+        comment: &str,
+    ) -> Result<(), GitHubError> {
+        self.check_allowed(repo)?;
+        let number = number.to_string();
+        let reason = match why {
+            Closing::Completed => "completed",
+            Closing::NotPlanned => "not planned",
+            Closing::Duplicate => "duplicate",
+        };
+        self.gh(
+            cwd,
+            &[
+                "issue",
+                "close",
+                &number,
+                "--repo",
+                repo,
+                "--reason",
+                reason,
+                "--comment",
+                comment,
+            ],
+            None,
+        )
+        .map(|_| ())
+    }
+
     /// Set an issue's type and a single-select field, such as its priority,
     /// to what `want` names, leaving alone what already agrees. These are the
     /// repository's own type and fields, not labels. Returns what it changed.
@@ -568,6 +603,17 @@ impl GitHub {
     pub fn authenticated(&self, cwd: &Path) -> bool {
         self.gh(cwd, &["auth", "status"], None).is_ok()
     }
+}
+
+/// Why an issue is closed by the factory itself and not by a pull request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Closing {
+    /// Its work was delivered, under another issue.
+    Completed,
+    /// It will not be done.
+    NotPlanned,
+    /// Another open issue covers it.
+    Duplicate,
 }
 
 /// The number of an issue of `repo`, from its URL.
