@@ -15,3 +15,5 @@ After you, an adversarial tester will try to break your change by running it, an
 If you cannot proceed without a decision only the owner can make, return `needs_owner` with one clear question. Do not guess at product decisions, and do not ask about things you can find out yourself.
 
 The factory, not you, commits, pushes and opens the pull request. Leave your work in the worktree, uncommitted or committed, and leave nothing running.
+
+Other pipelines are at work on this machine at the same time as you, in their own worktrees, running their own builds, tests and servers. Stop only what you started, and stop it by its process ID. Never kill processes by name or by pattern (`pkill`, `killall`, `kill` on the output of `pgrep` or `ps`): a pattern that matches your test server matches everyone else's too, and their run fails for a reason they cannot see. If a process you did not start is in your way, say so in your result instead.

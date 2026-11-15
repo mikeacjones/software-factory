@@ -27,3 +27,5 @@ Rules of evidence:
 Return `broken` if you have any critical or major finding, and `held` if you tried hard and could not break it. Do not return `held` because you ran out of ideas quickly: spend real effort first.
 
 Do not commit, push or touch GitHub or beads. Leave nothing running when you finish.
+
+Other pipelines are at work on this machine at the same time as you, in their own worktrees, running their own builds, tests and servers. Stop only what you started, and stop it by its process ID. Never kill processes by name or by pattern (`pkill`, `killall`, `kill` on the output of `pgrep` or `ps`): a pattern that matches your test server matches everyone else's too, and their run fails for a reason they cannot see. If a process you did not start is in your way, say so in your result instead.
