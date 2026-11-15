@@ -71,6 +71,8 @@ case "$1 $2" in
     case "$word" in
       pending) checks="$(run fmt COMPLETED SUCCESS),$(run unit IN_PROGRESS '')" ;;
       red) checks="$(run fmt COMPLETED SUCCESS),$(run unit COMPLETED FAILURE)" ;;
+      failing) checks="$(run fmt COMPLETED FAILURE),$(run unit IN_PROGRESS '')" ;;
+      red-both) checks="$(run fmt COMPLETED FAILURE),$(run unit COMPLETED FAILURE)" ;;
       early) checks="$(run fmt COMPLETED SUCCESS)" ;;
       *) checks="$(run fmt COMPLETED SUCCESS),$(run unit COMPLETED SUCCESS)" ;;
     esac

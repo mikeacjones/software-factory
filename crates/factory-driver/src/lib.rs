@@ -2667,9 +2667,11 @@ impl Driver {
     }
 
     /// The `await-ci` action: watch the pull request's checks by polling, with
-    /// no model involved. One failed check ends the wait at once as `red`,
-    /// with its log as feedback for the step that fixes it. `green` needs every
-    /// check passed, and to still be so a little later.
+    /// no model involved. A failed check ends the wait as `red` once the
+    /// checks still running have finished, or have been waited for long
+    /// enough, with every failure and its log as feedback for the step that
+    /// fixes them. `green` needs every check passed, and to still be so a
+    /// little later.
     fn await_ci_step(&mut self, step: &Step) -> Result<StepEnd, DriverError> {
         let (Some(settings), Some(number)) =
             (self.project.github.clone(), self.pull_request_number())
@@ -2684,14 +2686,16 @@ impl Driver {
         let poll = Duration::from_secs(settings.ci_poll_secs.max(1));
         let settle = Duration::from_secs(settings.ci_settle_secs);
         let timeout = Duration::from_secs(settings.ci_timeout_secs);
+        let red_wait = Duration::from_secs(settings.ci_red_wait_secs);
         let started = Instant::now();
+        let mut red_since: Option<Instant> = None;
         let mut green_since: Option<Instant> = None;
         let mut last_status: Option<Instant> = None;
         let mut unreadable = 0;
         let mut waiting_on: Vec<String> = Vec::new();
         let short = self.unit.checkpoint[..self.unit.checkpoint.len().min(10)].to_string();
         self.thread.say(&format!(
-            ":eyes: *{}* · watching GitHub CI on `{short}`. No model runs while it waits: one failed check goes back to the builder, all green goes on.",
+            ":eyes: *{}* · watching GitHub CI on `{short}`. No model runs while it waits: a failure goes back to the builder once the checks still running have finished, all green goes on.",
             step.id
         ));
 
@@ -2743,6 +2747,54 @@ impl Driver {
             }
 
             match ci_verdict(&status.checks, &settings.required_checks) {
+                CiVerdict::Red { failed }
+                    if !factory_github::red_is_final(
+                        &status.checks,
+                        red_since.map_or(Duration::ZERO, |since| since.elapsed()),
+                        red_wait,
+                    ) && started.elapsed() < timeout =>
+                {
+                    // Red already, with checks still running. Another may
+                    // fail for another reason: the builder is handed all
+                    // of it at once.
+                    let running: Vec<String> = status
+                        .checks
+                        .iter()
+                        .filter(|check| check.state == factory_github::CheckState::Pending)
+                        .map(|check| check.name.clone())
+                        .collect();
+                    if red_since.is_none() {
+                        red_since = Some(Instant::now());
+                        self.event(
+                            "ci.failing",
+                            Some(&step.id),
+                            json!({
+                                "failed": failed.iter().map(|check| check.name.clone()).collect::<Vec<_>>(),
+                                "running": running, "secs": started.elapsed().as_secs(),
+                            }),
+                        )?;
+                        self.thread.say(&format!(
+                            ":x: *{}* · CI has failed after {} on `{}`. {} other check(s) are still running: waiting up to {} for them, so the builder is handed every failure at once.",
+                            step.id,
+                            duration_text(started.elapsed().as_secs()),
+                            escape(&failed[0].name),
+                            running.len(),
+                            duration_text(red_wait.as_secs())
+                        ));
+                    }
+                    green_since = None;
+                    waiting_on = running;
+                    if last_status.is_none_or(|at| at.elapsed() >= Duration::from_secs(60)) {
+                        last_status = Some(Instant::now());
+                        self.thread.status(&format!(
+                            ":x: *{}* · {} failed · {} · waiting on {} still running",
+                            step.id,
+                            failed.len(),
+                            duration_text(started.elapsed().as_secs()),
+                            waiting_on.len()
+                        ));
+                    }
+                }
                 CiVerdict::Red { failed } => {
                     let names: Vec<String> = failed
                         .iter()
@@ -2751,11 +2803,18 @@ impl Driver {
                             None => format!("- `{}`", check.name),
                         })
                         .collect();
-                    let log = failed.iter().find_map(|check| {
-                        github
-                            .failed_log(&repo_dir, &settings.repo, check)
-                            .map(|log| (check.name.clone(), log))
-                    });
+                    // The logs of the first few: the same defect often fails
+                    // every row of a matrix, and three are enough to tell.
+                    let logs: Vec<(String, String)> = failed
+                        .iter()
+                        .filter_map(|check| {
+                            github
+                                .failed_log(&repo_dir, &settings.repo, check)
+                                .map(|log| (check.name.clone(), log))
+                        })
+                        .take(3)
+                        .collect();
+                    let log = logs.first().cloned();
                     let mut feedback = format!(
                         "GitHub CI failed on the pull request, on commit `{short}`. The factory's own checks passed on this machine, so look for what differs there: the platform, the optimisation mode, timing.\n\nFailed checks:\n{}\n",
                         names.join("\n")
@@ -2770,6 +2829,18 @@ impl Driver {
                             path.display()
                         ));
                         log_path = Some(path);
+                    }
+                    for (index, (name, log)) in logs.iter().enumerate().skip(1) {
+                        let path =
+                            self.artifact(&format!("{}-failed-{}.log", step.id, index + 1), log)?;
+                        feedback.push_str(&format!(
+                            "\nThe end of the failing log of `{name}`:\n\n```\n{}\n```\n\nThe full failing log is in `{}`.\n",
+                            tail(log, 60),
+                            path.display()
+                        ));
+                    }
+                    if failed.len() > 1 {
+                        feedback.push_str("\nMore than one check failed. They may share one cause or have several: account for each before you return.\n");
                     }
                     feedback.push_str("\nReproduce the failure if you can, fix its cause, and run the project's commands before you return.");
                     self.unit.feedback = Some(feedback);

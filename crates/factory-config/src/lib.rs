@@ -367,6 +367,11 @@ pub struct GitHub {
     /// Green must still be green this long after it is first seen.
     #[serde(default = "default_ci_settle")]
     pub ci_settle_secs: u64,
+    /// Once a check has failed, how long to go on waiting for the checks
+    /// still running, so that every failure of the run is handed back
+    /// together and fixed in one round. Zero hands the first one back at once.
+    #[serde(default = "default_ci_red_wait")]
+    pub ci_red_wait_secs: u64,
     /// Keep GitHub issues in step with beads: a bead with no issue gets one
     /// when the factory files it or starts work on it, and a pull request
     /// must close the issue of every bead it lands.
@@ -458,6 +463,10 @@ fn default_ci_timeout() -> u64 {
 
 fn default_ci_settle() -> u64 {
     60
+}
+
+fn default_ci_red_wait() -> u64 {
+    20 * 60
 }
 
 fn default_true() -> bool {

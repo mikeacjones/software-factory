@@ -795,6 +795,17 @@ pub fn ci_verdict(checks: &[Check], required: &[String]) -> CiVerdict {
     }
 }
 
+/// Whether a red verdict is ready to be acted on: nothing is still running,
+/// or the others have been waited for long enough since the first failure
+/// was seen. Acting on the first failure while others are still running
+/// costs a whole round of CI for each failure that had not shown yet.
+pub fn red_is_final(checks: &[Check], waited: Duration, limit: Duration) -> bool {
+    let running = checks
+        .iter()
+        .any(|check| check.state == CheckState::Pending);
+    !running || waited >= limit
+}
+
 /// Text the factory would publish under the owner's name: a commit message, a
 /// pull-request title or body.
 ///
@@ -1068,6 +1079,25 @@ mod tests {
             state,
             url: None,
         }
+    }
+
+    #[test]
+    fn a_red_verdict_waits_for_what_is_still_running_but_not_for_ever() {
+        let running = [
+            check("unit", CheckState::Failed),
+            check("samples", CheckState::Pending),
+        ];
+        let limit = Duration::from_secs(600);
+        assert!(!red_is_final(&running, Duration::ZERO, limit));
+        assert!(!red_is_final(&running, Duration::from_secs(599), limit));
+        assert!(red_is_final(&running, limit, limit));
+        // A limit of zero is the old rule: the first failure is acted on.
+        assert!(red_is_final(&running, Duration::ZERO, Duration::ZERO));
+        let finished = [
+            check("unit", CheckState::Failed),
+            check("samples", CheckState::Passed),
+        ];
+        assert!(red_is_final(&finished, Duration::ZERO, limit));
     }
 
     #[test]

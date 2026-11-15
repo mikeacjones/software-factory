@@ -757,6 +757,67 @@ fn after_publish(kinds: &[String]) -> Vec<&str> {
         .collect()
 }
 
+/// A check fails while others are still running. The builder is not
+/// handed the first failure alone: the factory waits for the run to finish
+/// and hands back everything that failed, to be fixed in one round.
+#[test]
+fn a_failing_ci_run_is_waited_out_and_every_failure_goes_back_together() {
+    let world = World::new("ci-all", "true");
+    // One check fails with another still running, twice over; then that
+    // one fails too. After the fix everything passes.
+    world.with_github("pending failing failing red-both green");
+    let mut driver = Driver::start(world.config(), "toy", "toy-1", &OPTIONS).unwrap();
+    assert_eq!(driver.run().unwrap(), Status::Ended);
+    let unit = driver.unit().id.to_string();
+    let events = events_of(&world, &unit);
+
+    // The first failure was seen and said, and nothing was handed back yet.
+    let failing: Vec<&(String, String, serde_json::Value)> = events
+        .iter()
+        .filter(|(kind, _, _)| kind == "ci.failing")
+        .collect();
+    assert_eq!(failing.len(), 1, "it is said once, not at every look");
+    assert_eq!(failing[0].2["failed"], serde_json::json!(["fmt"]));
+    assert_eq!(failing[0].2["running"], serde_json::json!(["unit"]));
+    // One red, once nothing was running, with both failures in it.
+    let red: Vec<&(String, String, serde_json::Value)> = events
+        .iter()
+        .filter(|(kind, _, _)| kind == "ci.red")
+        .collect();
+    assert_eq!(red.len(), 1, "{red:?}");
+    assert_eq!(red[0].2["failed"], serde_json::json!(["fmt", "unit"]));
+    let at = |kind: &str| events.iter().position(|(k, _, _)| k == kind).unwrap();
+    assert!(at("ci.failing") < at("ci.red"));
+    assert_eq!(
+        events[at("ci.red")..]
+            .iter()
+            .filter(|(kind, step, _)| kind == "step.started" && step == "fix")
+            .count(),
+        1,
+        "one round of fixing for both failures"
+    );
+
+    // The builder was told about both, each with its log.
+    let calls = world.calls();
+    let fix = (0..calls.len())
+        .rfind(|&i| calls[i][0] == "builder")
+        .expect("the builder was not run for the fix");
+    let brief =
+        std::fs::read_to_string(world.path(&format!("bin/state/brief-{}.md", fix + 1))).unwrap();
+    for expected in [
+        "- `fmt`",
+        "- `unit`",
+        "The end of the failing log of `fmt`",
+        "The end of the failing log of `unit`",
+        "More than one check failed.",
+    ] {
+        assert!(
+            brief.contains(expected),
+            "missing {expected:?} in:\n{brief}"
+        );
+    }
+}
+
 #[test]
 fn a_red_check_goes_back_to_the_builder_and_green_is_merged_without_asking_anyone() {
     let world = World::new("land", "true");

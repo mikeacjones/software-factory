@@ -170,8 +170,9 @@ on.done = "ci"
 on.failed = { to = "describe", max = 2 }
 
 # No model from here on unless CI fails. The factory polls the pull request's
-# checks. The first failed check ends the wait: its log goes to the builder,
-# and the fix goes through every step above again before it is republished.
+# checks. A failed check ends the wait once the checks still running have
+# finished: every failure and its log goes to the builder together, and the
+# fix goes through every step above again before it is republished.
 [[step]]
 id = "ci"
 kind = "action"

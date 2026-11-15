@@ -84,8 +84,8 @@ timeout_secs = 900
 id = "ci-and-landing"
 tier = "hermetic"
 bead = "sf-c9e.11"
-claim = "Against a scripted GitHub: a failed check ends the wait at once and its log reaches the builder's session; green needs every required check present and passed; nothing merges unless the head is the commit the factory published; the bead is closed only after the merge commit is on the default branch; a conflicting pull request parks the unit; an ended unit can be moved onto the current flow by the owner; and a project that names squash lands as one single-parent commit whose message has the change's body, a Testing paragraph and its trailers."
-command = ["cargo", "test", "--locked", "--offline", "--package", "factory-driver", "--package", "factory-github", "--", "a_red_check", "a_pull_request_that_conflicts", "a_push_by_someone_else", "the_owner_can_put", "one_failed_check", "green_needs", "check_runs_and", "a_merge_outside", "a_project_can_land_by_squashing", "a_commit_message_splits"]
+claim = "Against a scripted GitHub: a failed check ends the wait and its log reaches the builder's session, at once when nothing else is running, and otherwise once the checks still running have finished or been waited for long enough, with every failure and its log handed back together for one round of fixing; green needs every required check present and passed; nothing merges unless the head is the commit the factory published; the bead is closed only after the merge commit is on the default branch; a conflicting pull request parks the unit; an ended unit can be moved onto the current flow by the owner; and a project that names squash lands as one single-parent commit whose message has the change's body, a Testing paragraph and its trailers."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-driver", "--package", "factory-github", "--", "a_red_check", "a_failing_ci_run", "a_red_verdict", "a_pull_request_that_conflicts", "a_push_by_someone_else", "the_owner_can_put", "one_failed_check", "green_needs", "check_runs_and", "a_merge_outside", "a_project_can_land_by_squashing", "a_commit_message_splits"]
 timeout_secs = 900
 
 [[check]]
