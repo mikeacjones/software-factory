@@ -4060,6 +4060,25 @@ pub fn account_token(factory: &Factory, id: &str) -> Result<Option<String>, Driv
             "the factory has no account `{id}`"
         )));
     };
+    if let Some(path) = &account.token_env_file {
+        // Read on every run, so a token the owner replaces is used by the
+        // next one. Nothing else is tried: an account that quietly became
+        // the CLI's login would run under whoever is logged in there.
+        let name = account.token_env.as_deref().unwrap_or_default();
+        let values = factory_config::read_env_file(path)?;
+        return match values
+            .get(name)
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+        {
+            Some(token) => Ok(Some(token.to_string())),
+            None => Err(AccountError::Token {
+                account: id.to_string(),
+                reason: format!("{} has no value for {name}", path.display()),
+            }
+            .into()),
+        };
+    }
     Ok(session_token(
         id,
         TokenSource {
@@ -4205,6 +4224,49 @@ fn preflight(factory: &Factory, project: &Project) -> Result<(), DriverError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_account_can_take_its_token_from_a_file_of_variables_and_from_nowhere_else() {
+        let dir = std::env::temp_dir().join(format!("factory-env-token-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let secrets = dir.join("secrets.env");
+        std::fs::write(
+            dir.join("factory.toml"),
+            format!(
+                "state_dir = \"/tmp/s\"\ncli_version = \"1\"\nallowed_models = [\"m\"]\n[[account]]\nid = \"a\"\ntoken_env_file = \"{0}\"\ntoken_env = \"A_TOKEN\"\n[[account]]\nid = \"b\"\ntoken_env_file = \"{0}\"\ntoken_env = \"B_TOKEN\"\n",
+                secrets.display()
+            ),
+        )
+        .unwrap();
+        let factory = ConfigDir(dir.clone()).factory().unwrap();
+        // As a shell would source it: comments, quotes, an empty value.
+        std::fs::write(&secrets, "# tokens\nA_TOKEN=\"tok-a\"\nB_TOKEN=\n").unwrap();
+        assert_eq!(
+            account_token(&factory, "a").unwrap().as_deref(),
+            Some("tok-a")
+        );
+        // An empty value is not the CLI's own login: it is an error.
+        let empty = account_token(&factory, "b").unwrap_err().to_string();
+        assert!(
+            empty.contains("account `b`") && empty.contains("no value for B_TOKEN"),
+            "{empty}"
+        );
+        // The file is read each time, so a replaced token is the next run's.
+        std::fs::write(&secrets, "A_TOKEN=tok-a2\nB_TOKEN=tok-b\n").unwrap();
+        assert_eq!(
+            account_token(&factory, "a").unwrap().as_deref(),
+            Some("tok-a2")
+        );
+        assert_eq!(
+            account_token(&factory, "b").unwrap().as_deref(),
+            Some("tok-b")
+        );
+        // Without the file there is no token, and no falling back.
+        std::fs::remove_file(&secrets).unwrap();
+        assert!(account_token(&factory, "a").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_commit_message_splits_into_body_and_trailers() {

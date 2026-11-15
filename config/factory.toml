@@ -27,26 +27,34 @@ namespace = "software-factory"
 # between accounts whose weeks end together, the one whose five-hour session
 # resets soonest. An account at a limit is left until its window resets; when
 # all are at a limit the factory waits for the earliest reset. The windows are
-# learned from every run. `usage_keychain` names a full login the factory may
-# ask about an account's windows with, without a model call, when it has not
-# heard from the account for half an hour. The first time such a login is
-# used the factory notes whose it is, and it refuses one that later belongs
-# to another account (`factory accounts pin <id>` accepts a deliberate change).
+# learned from every run.
+#
+# Each account runs under a long-lived token (`claude setup-token`) kept in
+# the owner's machine-config `.env`, under the names the owner's shell
+# functions `claude` and `claude2` read. So an account is the same
+# subscription for the factory as in the owner's shell, wherever the factory
+# is started from, whether or not the Keychain is unlocked, and whoever is
+# logged in to the CLI. A missing or empty token is an error, not the CLI's
+# own login.
+#
+# A setup token cannot read usage. `usage_keychain` names a full login the
+# factory may ask about an account's windows with, without a model call, when
+# it has not heard from the account for half an hour. It is an extra: without
+# it, or when it cannot be read, the windows come from runs alone. The first
+# time such a login is used the factory notes whose it is, and it refuses one
+# that later belongs to another account (`factory accounts pin <id>` accepts a
+# deliberate change).
 [[account]]
 id = "claude"
-# No token: the CLI's own login.
-usage_keychain = "Claude Code-credentials"
-# Claude Code keeps this login fresh only while it runs under it. When the
-# factory works under another account for hours, nothing does, and the usage
-# reads fail. So the factory refreshes it too, the way Claude Code does:
-# under the lock Claude Code keeps in its configuration directory, and only
-# if the login has not been refreshed meanwhile.
-usage_refresh = true
-usage_lock_dir = "~/.claude"
+token_env_file = "~/Source/machine-config/.env"
+token_env = "CLAUDE_OAUTH_TOKEN"
+# No usage login: the only full login of this account was the CLI's own,
+# which is whichever account the owner last logged in as.
 
 [[account]]
 id = "claude2"
-token_keychain = "claude2-oauth-token"
+token_env_file = "~/Source/machine-config/.env"
+token_env = "CLAUDE2_OAUTH_TOKEN"
 usage_keychain = "Claude Code-credentials-8351f113"
 # This login exists only for reading usage and nothing else keeps it fresh,
 # so the factory refreshes it when it is about to expire and writes it back

@@ -166,6 +166,13 @@ pub struct Account {
     pub token_file: Option<PathBuf>,
     pub token_env: Option<String>,
     pub token_keychain: Option<String>,
+    /// A file of `KEY=value` lines, only the owner's to read, in which
+    /// `token_env` names the token. It is then the account's one source:
+    /// the factory's own environment, the Keychain and the CLI's login are
+    /// not looked at, and a missing or empty value is an error, so that an
+    /// account is the same subscription wherever the factory is started
+    /// from and whoever is logged in to the CLI.
+    pub token_env_file: Option<PathBuf>,
     /// The Keychain item holding a full login for this account, used only to
     /// read its usage windows without a model call.
     pub usage_keychain: Option<String>,
@@ -696,7 +703,23 @@ impl ConfigDir {
         let mut seen = std::collections::BTreeSet::new();
         for account in &mut factory.accounts {
             account.token_file = account.token_file.as_deref().map(expand_home);
+            account.token_env_file = account.token_env_file.as_deref().map(expand_home);
             account.usage_lock_dir = account.usage_lock_dir.as_deref().map(expand_home);
+            if account.token_env_file.is_some() {
+                let wrong = if account.token_env.is_none() {
+                    Some("but no `token_env` to name the token in it")
+                } else if account.token_file.is_some() || account.token_keychain.is_some() {
+                    Some("and another source for its token as well: it may have one")
+                } else {
+                    None
+                };
+                if let Some(wrong) = wrong {
+                    return Err(ConfigError::Invalid {
+                        path,
+                        reason: format!("account `{}` has `token_env_file` {wrong}", account.id),
+                    });
+                }
+            }
             if account.usage_refresh && account.usage_keychain.is_none() {
                 return Err(ConfigError::Invalid {
                     path,
@@ -1183,6 +1206,27 @@ timeout_secs = 60
             lock_dir.ends_with(".claude") && !lock_dir.starts_with("~"),
             "{lock_dir:?}"
         );
+        // A token kept in a file of variables: the file and the variable
+        // are both needed, and it is then the only source.
+        let loaded = factory(
+            "[[account]]\nid = \"a\"\ntoken_env_file = \"~/secrets.env\"\ntoken_env = \"A_TOKEN\"\n",
+        )
+        .unwrap();
+        let file = loaded.accounts[0].token_env_file.clone().unwrap();
+        assert!(
+            file.ends_with("secrets.env") && !file.starts_with("~"),
+            "{file:?}"
+        );
+        for (wrong, why) in [
+            ("token_env_file = \"/x.env\"\n", "no `token_env`"),
+            (
+                "token_env_file = \"/x.env\"\ntoken_env = \"A\"\ntoken_keychain = \"k\"\n",
+                "another source",
+            ),
+        ] {
+            let refused = factory(&format!("[[account]]\nid = \"a\"\n{wrong}")).unwrap_err();
+            assert!(refused.to_string().contains(why), "{refused}");
+        }
         // Refreshing needs a login to refresh.
         let refused = factory("[[account]]\nid = \"claude\"\nusage_refresh = true\n").unwrap_err();
         assert!(
