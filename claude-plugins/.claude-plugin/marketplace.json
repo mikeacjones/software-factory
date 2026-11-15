@@ -1,0 +1,16 @@
+{
+  "name": "software-factory",
+  "description": "Claude Code plugins the factory's headless runs need and no public marketplace has",
+  "owner": {
+    "name": "software-factory"
+  },
+  "plugins": [
+    {
+      "name": "zls-lsp",
+      "description": "Zig language server (zls) for code intelligence in Zig projects",
+      "version": "1.0.0",
+      "source": "./plugins/zls-lsp",
+      "category": "development"
+    }
+  ]
+}

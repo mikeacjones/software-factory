@@ -1,0 +1,14 @@
+{
+  "name": "zls-lsp",
+  "description": "Zig language server (zls) for code intelligence in Zig projects",
+  "version": "1.0.0",
+  "lspServers": {
+    "zls": {
+      "command": "zls",
+      "extensionToLanguage": {
+        ".zig": "zig",
+        ".zon": "zig"
+      }
+    }
+  }
+}
