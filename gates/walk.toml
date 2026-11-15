@@ -97,6 +97,14 @@ command = ["cargo", "test", "--locked", "--offline", "--package", "factory-flow"
 timeout_secs = 900
 
 [[check]]
+id = "proofs"
+tier = "hermetic"
+bead = "sf-rzb.14"
+claim = "A finding whose reproduction passes when the factory runs it is sent back to the tester; an accepted finding's regression test joins the branch and is published; a fix that leaves it failing is sent back to the builder; a fresh tester is told what earlier rounds found; a report line named in fail_when sends the change to the fix step; a step limited to path scopes is skipped when the change touches none; removed test lines are pointed out; and a step's effort can rise by round."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-driver", "--package", "factory-checks", "--package", "factory-flow", "--", "a_finding_is_proved", "a_unit_is_built_broken_fixed", "a_report_line_that_must_not_pass", "a_sub_goal_absorbs", "removed_test_lines", "a_summary_line_that_must_never_pass", "a_command_can_depend_on_what_changed"]
+timeout_secs = 900
+
+[[check]]
 id = "scratch-walk-live"
 tier = "live"
 bead = "sf-c9e.7"

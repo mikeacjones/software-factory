@@ -193,10 +193,15 @@ pub fn schema(contract: Contract, outcomes: &[String]) -> Value {
                     "type": "string",
                     "description": "`path:line` of the code at fault."
                 },
+                "test_names": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "The names of the regression tests you left in the worktree for this finding, exactly as they are written in the code. Required for a critical or major finding."
+                },
                 "reproduction": object(json!({
                     "command": {
                         "type": "string",
-                        "description": "The exact command that shows the failure, runnable from the worktree root after applying your probe files."
+                        "description": "One shell command, run from the worktree root, that fails because of this finding and will pass once it is fixed: normally the project's test command narrowed to the regression test you left. The factory runs it before accepting the finding, and it must fail."
                     },
                     "expected": text(),
                     "observed": {
@@ -597,6 +602,9 @@ pub fn render(brief: &Brief<'_>) -> String {
                 .project
                 .commands
                 .iter()
+                // A command the factory fills in before running is not one
+                // an agent can run as written.
+                .filter(|(_, command)| !command.wants_out())
                 .map(|(name, command)| format!("`{name}`: `{}`", command.argv.join(" "))),
         );
         section(

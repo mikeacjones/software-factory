@@ -87,6 +87,7 @@ role = "builder"
 model = "claude-opus-5-5"
 effort = "medium"
 session = "continue:build"
+effort_by_round = ["medium", "high"]
 writes = ["code"]
 on.done = { to = "fmt", max = 8 }
 on.needs_owner = { to = "ask", max = 2 }

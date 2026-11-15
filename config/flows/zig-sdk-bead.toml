@@ -54,8 +54,20 @@ on.fail = { to = "fix", max = 2 }
 id = "test"
 kind = "command"
 command = "test"
-on.pass = "reports"
+on.pass = "test-safe"
 on.fail = { to = "fix", max = 3 }
+
+# The project requires the optimized test run for changes to the workflow
+# runtime, the fibers and the bridge, where code has failed only under
+# optimization. It runs here when the bead touches them, while the builder's
+# session is still at hand; every sub-goal gets it once more when it ships.
+[[step]]
+id = "test-safe"
+kind = "command"
+command = "test-releasesafe"
+when_changed = ["runtime"]
+on.pass = "reports"
+on.fail = { to = "fix", max = 2 }
 
 # The review reports, about this bead's change only: its base is the
 # sub-goal's tip when the bead started.
@@ -66,7 +78,10 @@ command = "reports"
 policy = "report-only"
 produces = "reports"
 on.pass = "break"
-on.fail = "park"
+# The reports are advisory as a whole, but the project names a few results
+# that must not pass (see `fail_when` on the command). Those go back to the
+# builder before any agent spends time on the change.
+on.fail = { to = "fix", max = 2 }
 
 [[step]]
 id = "break"
@@ -101,6 +116,9 @@ role = "builder"
 model = "claude-opus-5-5"
 effort = "medium"
 session = "continue:build"
+# From its second round on the fix gets more effort: by then the first
+# attempt has not held.
+effort_by_round = ["medium", "high"]
 writes = ["code"]
 on.done = { to = "fmt", max = 8 }
 on.needs_owner = { to = "ask", max = 2 }

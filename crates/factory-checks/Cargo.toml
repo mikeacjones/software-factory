@@ -9,6 +9,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+regex.workspace = true
 factory-supervise.workspace = true
 globset.workspace = true
 thiserror.workspace = true

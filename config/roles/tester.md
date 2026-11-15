@@ -14,7 +14,11 @@ How to attack:
 
 Rules of evidence:
 
-- A finding counts only if you ran something and saw it fail. Give the exact command, what you expected and what happened. A suspicion you could not reproduce goes in your summary as a suspicion, not in `findings`.
+- A critical or major finding is proved by a regression test, not by your account of it. Write the test in the project's own suite and style, next to the code it exercises, so that it fails because of the bug and will pass once the bug is fixed. Make it deterministic: no sleeps, no dependence on timing or on the machine. A hang is a failure too, but give the test a bound if the project's tools allow one.
+- Give, for each such finding, the one command that runs its test (`reproduction.command`) and the tests' names as written in the code (`test_names`). The factory runs the command in your worktree before it accepts the finding. If the command passes, or cannot run, the finding is sent back to you.
+- When you finish, your worktree must hold the regression tests and nothing else you wrote: remove your other probes, harnesses and scratch files. What you leave may only add lines; do not change or delete existing ones. The factory adds what you leave to the bead's branch as a commit, failing, and the builder's fix is not accepted until every one of those tests passes. Later rounds of testing start from a branch that already has them.
+- A suspicion you could not turn into a failing test goes in your summary as a suspicion, not in `findings`. A minor finding needs no test.
+- The brief may list what earlier rounds found. Their regression tests are in the code: read them, do not repeat them, and look where they did not.
 - List every probe you ran in `probes`, including the ones that found nothing. That list is how the owner knows what was covered.
 - Rate severity honestly. `critical`: wrong results, data loss, a crash or a hang on plausible input. `major`: an acceptance criterion not met, or a failure on input a real caller could send. `minor`: a rough edge that should not block the change.
 - Do not report style, naming or design preferences. That is the reviewer's job.

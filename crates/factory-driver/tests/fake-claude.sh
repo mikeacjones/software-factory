@@ -9,6 +9,8 @@
 #                      reject-once   the builder's first result has no evidence
 #                      ask-once      the builder first asks the owner a question
 #                      minor-finding the reviewer approves with one finding left open
+#                      bogus-finding the tester's first reproduction passes when run
+#                      lazy-fix      the builder's first fix leaves the regression test failing
 #                      limit-default-once
 #                                    the first run without an account token is refused
 #                                    at the five-hour limit
@@ -81,6 +83,15 @@ case "$role" in
       *"Your result was not accepted"*) ;;
       *) echo "line $count" >> feature.txt ;;
     esac
+    # A fix: make the tester's regression test, or the report's gate, pass.
+    case "$brief" in
+      *"regression test"*|*"must not pass"*)
+        case "$scenario" in
+          *lazy-fix*)
+            if [ -f "$state/lazy" ]; then touch fixed.txt; else touch "$state/lazy"; fi ;;
+          *) touch fixed.txt ;;
+        esac ;;
+    esac
     evidence='[{"criterion":"the feature exists","evidence":"cat feature.txt shows it"}]'
     case "$scenario" in
       *reject-once*)
@@ -99,12 +110,20 @@ case "$role" in
     esac
     ;;
   tester)
-    echo "probe" > probe.txt
-    probes='[{"what":"empty input","command":"sh probe.sh","observed":"exit 1"}]'
-    if [ ! -f "$state/broke" ]; then
+    retry=0
+    case "$brief" in *"Your result was not accepted"*) retry=1 ;; esac
+    probes='[{"what":"empty input","command":"sh regress.sh","observed":"exit 1"}]'
+    if [ ! -f "$state/broke" ] || [ "$retry" = 1 ]; then
       touch "$state/broke"
-      output='{"outcome":"broken","summary":"It fails on empty input.",'$common',"probes":'$probes',"findings":[{"title":"fails on empty input","severity":"major","location":"feature.txt:1","reproduction":{"command":"sh probe.sh","expected":"exit 0","observed":"exit 1"}}]}'
+      # The regression test: it fails until the builder's fix exists.
+      printf '%s\n' '# regression: empty-input' 'test -f fixed.txt' > regress.sh
+      proof='sh regress.sh'
+      case "$scenario" in
+        *bogus-finding*) [ "$retry" = 0 ] && proof='true' ;;
+      esac
+      output='{"outcome":"broken","summary":"It fails on empty input.",'$common',"probes":'$probes',"findings":[{"title":"fails on empty input","severity":"major","location":"feature.txt:1","test_names":["empty-input"],"reproduction":{"command":"'"$proof"'","expected":"exit 0","observed":"exit 1"}}]}'
     else
+      echo "probe" > probe.txt
       output='{"outcome":"held","summary":"Could not break it.",'$common',"probes":'$probes',"findings":[]}'
     fi
     ;;

@@ -67,6 +67,17 @@ The first flow, `build-break-review`, has four roles. The **builder** implements
 
 A flow can also carry reports. A command step may say it *produces* a named artifact, such as a directory of scanner output, and an agent step may say it *needs* one. The factory gives the command a directory outside the worktree, and briefs each step that needs the artifact with where it is and what its index says. The validator refuses a flow in which, on some path, a step would be given reports that are missing or were written before the code last changed.
 
+## How a finding and a fix are proved
+
+The adversarial tester does not get to assert a bug, and the builder does not get to assert a fix. Both are settled by a test that code runs.
+
+- **A finding is a failing test.** For each critical or major finding the tester leaves a regression test in the project's own suite and names the command that runs it. The factory runs that command in the tester's worktree before accepting the finding: if it passes, or cannot run, the finding goes back to the tester. What the tester leaves may only add lines.
+- **The tests join the branch.** The factory commits them to the unit's branch, failing. A later round of testing starts from code that already holds them, and a fresh tester or reviewer is told what earlier rounds found, since it shares no session with them.
+- **A fix is that test passing.** Before a builder's result is accepted, the factory runs every regression test the unit has gathered, and checks that none has disappeared from the code. While one fails the result goes back to the same session.
+- **From the second break on, the approach changes.** The fix is told to stop patching the reported case: write down the invariant, list the orderings and states, check each. A flow can also raise a step's effort by round.
+
+Two further checks need no model. A command step can be limited to changes that touch given path scopes, which is how the optimized test run joins a bead's pipeline only when the runtime changed. A report-producing command can name results that must never pass (`fail_when`); the rest of the report stays advisory. And when a later round of changes removes lines that look like tests or assertions, the reviewer is pointed at them.
+
 ## Goals
 
 A pipeline takes one bead to its landing. A *goal* sits above pipelines: an objective and a stop condition on a *project*, the *director* that runs it, the *flow* its beads go through and how many pipelines it may have at once. How goals of a kind run is a file, `goals/<project>/<id>.toml`; the objective itself comes from the owner.

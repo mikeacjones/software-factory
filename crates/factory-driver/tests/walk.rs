@@ -135,6 +135,7 @@ dir = "{}"
 
 [scopes]
 code = ["**"]
+runtime = ["runtime/**"]
 
 [commands.fmt]
 argv = ["true"]
@@ -401,8 +402,35 @@ fn a_unit_is_built_broken_fixed_reviewed_and_published() {
     let fix_brief = std::fs::read_to_string(world.path("bin/state/brief-3.md")).unwrap();
     assert!(fix_brief.contains("The adversarial tester broke the change"));
     assert!(fix_brief.contains("fails on empty input"));
-    assert!(fix_brief.contains("Reproduce: sh probe.sh"));
-    assert!(fix_brief.contains("probes.patch"));
+    assert!(fix_brief.contains("Reproduce: sh regress.sh"));
+    // The tester's regression test is in the builder's worktree, failing,
+    // and the fix is told the command that must pass.
+    assert!(
+        fix_brief.contains("The tester left regression tests"),
+        "{fix_brief}"
+    );
+    assert!(
+        fix_brief.contains("- `sh regress.sh` (fails on empty input)"),
+        "{fix_brief}"
+    );
+    let unit_now = driver.unit().clone();
+    assert_eq!(unit_now.regressions.len(), 1);
+    assert_eq!(unit_now.regressions[0].test_names, ["empty-input"]);
+    assert!(kinds.iter().any(|kind| kind == "regressions.added"));
+    // The second tester is a fresh session, told what the first one found.
+    let second_test = std::fs::read_to_string(world.path("bin/state/brief-4.md")).unwrap();
+    assert!(
+        second_test.contains("## What has happened on this bead so far"),
+        "{second_test}"
+    );
+    assert!(
+        second_test.contains("- break (round 1): broken. Findings: [major] fails on empty input"),
+        "{second_test}"
+    );
+    assert!(
+        second_test.contains("- fix (round 1): done"),
+        "{second_test}"
+    );
     assert!(
         !fix_brief.contains("## Acceptance criteria"),
         "a continued session gets only what is new"
@@ -439,7 +467,8 @@ fn a_unit_is_built_broken_fixed_reviewed_and_published() {
     );
     assert_eq!(
         run(&remote, "git", &["ls-tree", "-r", "--name-only", &branch]),
-        "README.md\nfeature.txt"
+        "README.md\nfeature.txt\nfixed.txt\nregress.sh",
+        "the regression test and the fix are published; the tester's other probes are not"
     );
     assert_eq!(
         run(&remote, "git", &["show", &format!("{branch}:feature.txt")]),
@@ -1609,13 +1638,12 @@ fn a_sub_goal_absorbs_its_beads_and_ships_as_one_pull_request() {
         sub.state, "shipping",
         "the director shipped it at the third wake"
     );
-    // Each bead ran the light pipeline: no ReleaseSafe tests, no samples, no CI.
+    // Each bead ran the light pipeline: no samples, no pull request, no CI.
     let first_unit = after_two.units[0].unit.clone().unwrap();
     let first_log =
         std::fs::read_to_string(world.path(&format!("state/units/{first_unit}/events.jsonl")))
             .unwrap();
     for absent in [
-        "\"step\":\"test-safe\"",
         "\"step\":\"samples\"",
         "\"step\":\"ci\"",
         "published.pushed",
@@ -1626,6 +1654,11 @@ fn a_sub_goal_absorbs_its_beads_and_ships_as_one_pull_request() {
         );
     }
     assert!(first_log.contains("\"kind\":\"absorbed\""));
+    assert!(
+        first_log.contains("\"kind\":\"command.skipped\"")
+            && first_log.contains("\"when_changed\":[\"runtime\"]"),
+        "the optimized tests are skipped when the bead does not touch the runtime"
+    );
 
     // Shipping: the heavy pipeline once, one pull request with both commits,
     // squashed onto main, and both beads closed.
@@ -1727,4 +1760,115 @@ fn a_sub_goal_absorbs_its_beads_and_ships_as_one_pull_request() {
     })
     .unwrap();
     assert_eq!(sup.goals().next().unwrap().phase, Phase::Complete);
+}
+
+#[test]
+fn a_finding_is_proved_by_a_failing_test_and_a_fix_by_that_test_passing() {
+    let world = World::new("proof", "true");
+    // The tester's first reproduction passes when the factory runs it, and
+    // the builder's first fix leaves the regression test failing.
+    world.scenario("bogus-finding lazy-fix");
+    let mut driver = Driver::start(world.config(), "toy", "toy-1", &OPTIONS).unwrap();
+    assert_eq!(driver.run().unwrap(), Status::Ended);
+
+    let calls = world.calls();
+    let roles: Vec<&str> = calls.iter().map(|call| call[0].as_str()).collect();
+    assert_eq!(
+        roles,
+        [
+            "builder",
+            "tester",
+            "tester",
+            "builder",
+            "builder",
+            "tester",
+            "reviewer",
+            "publisher"
+        ]
+    );
+    assert_eq!(
+        calls[1][1], calls[2][1],
+        "the refused finding goes back to the same tester"
+    );
+    assert_eq!(
+        calls[3][1], calls[4][1],
+        "the refused fix goes back to the same builder"
+    );
+    let refused_finding = std::fs::read_to_string(world.path("bin/state/brief-3.md")).unwrap();
+    assert!(
+        refused_finding.contains("the factory ran the reproduction of `fails on empty input` (`true`) in your worktree and it passed"),
+        "{refused_finding}"
+    );
+    let refused_fix = std::fs::read_to_string(world.path("bin/state/brief-5.md")).unwrap();
+    assert!(
+        refused_fix.contains("the regression test for `fails on empty input` still fails"),
+        "{refused_fix}"
+    );
+    assert!(refused_fix.contains("sh regress.sh"), "{refused_fix}");
+    // Only the finding that was proved joined the branch, once.
+    let kinds = world.event_kinds(&driver);
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|kind| *kind == "regressions.added")
+            .count(),
+        1
+    );
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|kind| *kind == "result.rejected")
+            .count(),
+        2
+    );
+    assert_eq!(driver.unit().regressions.len(), 1);
+    assert_eq!(driver.unit().regressions[0].command, "sh regress.sh");
+}
+
+#[test]
+fn a_report_line_that_must_not_pass_goes_back_to_the_builder() {
+    let world = World::new("gate", "true");
+    world.with_github("green");
+    // The tester holds at once, so that only the report sends work back.
+    std::fs::create_dir_all(world.path("bin/state")).unwrap();
+    std::fs::write(world.path("bin/state/broke"), "").unwrap();
+    let project = world.path("config/projects/toy.toml");
+    let text = std::fs::read_to_string(&project).unwrap();
+    let gated = text.replace(
+        "argv = [\"sh\", \"-c\", \"echo scanned $1 > $0/INDEX.txt; echo No check failed. >> $0/INDEX.txt\", \"{out}\", \"{base}\"]",
+        "argv = [\"sh\", \"-c\", \"if [ -f fixed.txt ]; then echo No check failed. > $0/INDEX.txt; else echo FAILED: changelog-check gitleaks > $0/INDEX.txt; fi\", \"{out}\"]\nfail_when = ['^FAILED:.*gitleaks']",
+    );
+    assert_ne!(gated, text, "the reports command was not rewritten");
+    std::fs::write(&project, gated).unwrap();
+
+    let mut driver = Driver::start(world.config(), "toy", "toy-1", &OPTIONS).unwrap();
+    assert_eq!(driver.run().unwrap(), Status::Ended);
+    let kinds = world.event_kinds(&driver);
+    let reports: Vec<&str> = kinds
+        .iter()
+        .filter(|kind| {
+            kind.starts_with("reports:") || kind.starts_with("fix:") || kind.starts_with("break:")
+        })
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        reports,
+        ["reports:fail", "fix:done", "reports:pass", "break:held"]
+    );
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|kind| *kind == "report.blocked")
+            .count(),
+        1
+    );
+    let fix_brief = std::fs::read_to_string(world.path("bin/state/brief-2.md")).unwrap();
+    assert!(
+        fix_brief.contains("show a result that must not pass"),
+        "{fix_brief}"
+    );
+    assert!(
+        fix_brief.contains("FAILED: changelog-check gitleaks"),
+        "{fix_brief}"
+    );
 }

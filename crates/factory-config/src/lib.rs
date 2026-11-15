@@ -133,6 +133,11 @@ pub struct Project {
     /// Named sets of path globs that a flow step's `writes` refers to.
     #[serde(default)]
     pub scopes: BTreeMap<String, Vec<String>>,
+    /// Regular expressions for lines that are tests or assertions in this
+    /// project. A fix that removes a matching line is pointed out to the
+    /// reviewer.
+    #[serde(default)]
+    pub test_patterns: Vec<String>,
     /// Paths no step may change, whatever its scopes say.
     #[serde(default)]
     pub forbidden_paths: Vec<String>,
@@ -295,6 +300,13 @@ pub struct CommandSpec {
     /// For a command that produces an artifact: what a reader should know
     /// before using it.
     pub note: Option<String>,
+    /// For a command that produces an artifact with a summary: patterns
+    /// (regular expressions, matched line by line) that make the step fail
+    /// when the summary matches one, whatever the command's exit code. It is
+    /// how a report that is otherwise advisory can still block on the few
+    /// results that must never pass.
+    #[serde(default)]
+    pub fail_when: Vec<String>,
 }
 
 impl CommandSpec {
@@ -312,6 +324,14 @@ pub struct Limits {
     pub step_timeout_secs: u64,
     /// Passed to the CLI as its spending cap for one run of one step.
     pub step_budget_usd: Option<f64>,
+    /// How long one reproduction or regression command may run. One that is
+    /// still running then counts as failing, which is how a hang is caught.
+    #[serde(default = "default_reproduction_timeout")]
+    pub reproduction_timeout_secs: u64,
+}
+
+fn default_reproduction_timeout() -> u64 {
+    10 * 60
 }
 
 fn default_step_timeout() -> u64 {
@@ -323,6 +343,7 @@ impl Default for Limits {
         Self {
             step_timeout_secs: default_step_timeout(),
             step_budget_usd: None,
+            reproduction_timeout_secs: default_reproduction_timeout(),
         }
     }
 }

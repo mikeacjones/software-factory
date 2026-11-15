@@ -15,6 +15,10 @@ setup = ["submodules"]
 # one only when it publishes.
 publish_checks = ["changelog-commits"]
 
+# What a test or an assertion looks like in this project. A fix that removes
+# such a line is pointed out to the reviewer.
+test_patterns = ['^\s*test\s+"', '\btesting\.expect', '\bexpect(Equal|EqualStrings|EqualSlices|Error|ApproxEqAbs)?\(', 'error\.SkipZigTest']
+
 # No bead of the first runs may touch these. A core bump changes
 # deps/sdk-core and is not factory work yet.
 forbidden_paths = [".github/**", ".beads/**", ".claude/**", "deps/sdk-core", "deps/sdk-core/**", "worktrees/**"]
@@ -63,6 +67,8 @@ required_checks = [
 
 [scopes]
 code = ["**"]
+# Where the project requires the optimized test run as well.
+runtime = ["src/workflow/**", "src/workflow.zig", "src/bridge/**", "src/bridge.zig", "deps/**"]
 
 [commands.submodules]
 argv = ["git", "submodule", "update", "--init"]
@@ -105,6 +111,10 @@ timeout_secs = 3600
 argv = [".review/reports.sh", "--base", "{base}", "--out", "{out}", "--quick"]
 timeout_secs = 1800
 summary = "INDEX.txt"
+# Results in the index that send the change back to the builder at once. The
+# rest of the reports stays advisory: the vulnerability scanners can fail for
+# reasons no bead caused, and the changelog check cannot pass on checkpoints.
+fail_when = ['^FAILED:.*\b(ast-check|gitleaks)\b', '^zlint\s+[1-9][0-9]* error']
 note = """
 Read INDEX.txt first, then the files it points to: diff.patch, added-lines.txt, public-api-diff.txt, dependencies.txt, the scan-*.txt files and each scanner's log. A scan hit is a line to look at, not a finding: look at each one and decide.
 

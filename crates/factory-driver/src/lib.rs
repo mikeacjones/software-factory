@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use factory_beads::{Bead, Source, readiness};
 use factory_brief::{Brief, Contract, Note, contract_of, findings_text, render, result_problems};
-use factory_checks::{Verdict, run_command, scope_violations};
+use factory_checks::{Verdict, first_match, run_command, scope_violations, weakened_tests};
 use factory_claude::accounts::{
     Choice, Refresh, TOKEN_URL, TokenSource, Tracker, USAGE_API, choose, read_usage, session_token,
 };
@@ -163,6 +163,14 @@ pub struct Unit {
     /// The beads closed when this unit lands. Empty means its own.
     #[serde(default)]
     pub closes: Vec<String>,
+    /// The adversarial tester's regression tests that are now part of the
+    /// unit's branch. Every one must pass before a fix is accepted.
+    #[serde(default)]
+    pub regressions: Vec<Regression>,
+    /// What has happened on the unit, one line for each step that ended:
+    /// what a fresh agent is told, since it shares no session with the rest.
+    #[serde(default)]
+    pub history: Vec<String>,
     pub runs: u32,
     pub started_at: u64,
 }
@@ -179,6 +187,37 @@ pub struct Artifact {
     pub command: String,
     /// How the command ended: `passed`, or what went wrong.
     pub ended: String,
+}
+
+/// A test the adversarial tester left to prove a finding. It failed when the
+/// factory ran it on the code the tester broke, and it stays in the branch.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Regression {
+    /// The tester round that found it.
+    pub round: u32,
+    pub finding: String,
+    /// Fails because of the finding, and must pass once it is fixed.
+    pub command: String,
+    /// The tests' names as written in the code, so that deleting a test
+    /// cannot make its command pass.
+    pub test_names: Vec<String>,
+}
+
+/// The findings of a tester's result that must come with a regression test.
+fn serious(result: &Value) -> Vec<&Value> {
+    result
+        .get("findings")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter(|finding| {
+            matches!(
+                finding.get("severity").and_then(Value::as_str),
+                Some("critical" | "major")
+            )
+        })
+        .collect()
 }
 
 /// How a step ended, as far as the flow is concerned.
@@ -524,6 +563,8 @@ impl Driver {
                 absorbed: None,
                 ship: false,
                 closes: Vec::new(),
+                regressions: Vec::new(),
+                history: Vec::new(),
                 runs: 0,
                 started_at,
             },
@@ -924,6 +965,36 @@ impl Driver {
                 StepEnd::Park(reason) => return self.park(&reason),
                 StepEnd::Outcome(outcome) => outcome,
             };
+            let mut line = format!("{step_id} (round {round}): {outcome}");
+            if matches!(step.kind, StepKind::Agent { .. })
+                && let Some(findings) = self
+                    .unit
+                    .results
+                    .get(&step_id)
+                    .and_then(|result| result.get("findings"))
+                    .and_then(Value::as_array)
+                    .filter(|findings| !findings.is_empty())
+            {
+                let titles: Vec<String> = findings
+                    .iter()
+                    .take(8)
+                    .map(|finding| {
+                        format!(
+                            "[{}] {}",
+                            finding
+                                .get("severity")
+                                .and_then(Value::as_str)
+                                .unwrap_or(""),
+                            truncate(
+                                finding.get("title").and_then(Value::as_str).unwrap_or(""),
+                                160
+                            )
+                        )
+                    })
+                    .collect();
+                line.push_str(&format!(". Findings: {}", titles.join("; ")));
+            }
+            self.unit.history.push(line);
             let next = self.unit.position.advance(&self.flow, &outcome)?;
             self.event(
                 "step.ended",
@@ -1109,6 +1180,13 @@ impl Driver {
         let schema = factory_brief::schema(contract, &outcomes);
         let model = self.model(model);
         let round = self.unit.position.round();
+        // A step can be given more effort in its later rounds.
+        let effort = match step.effort_by_round.len() {
+            0 => effort.clone(),
+            rounds => {
+                step.effort_by_round[(round as usize).saturating_sub(1).min(rounds - 1)].clone()
+            }
+        };
         let system_prompt = self.config.role_prompt(role)?;
         let repo = self.project.repo.clone();
 
@@ -1172,6 +1250,25 @@ impl Driver {
                 .collect()
         };
         let mut notes = notes;
+        if !continuing && !self.unit.history.is_empty() {
+            // A fresh session shares nothing with the steps before it.
+            notes.insert(
+                0,
+                Note {
+                    title: "What has happened on this bead so far".to_string(),
+                    body: format!(
+                        "{}\n\nEach round of changes is a commit on this branch (`git log {}..HEAD`). Regression tests left by earlier rounds of adversarial testing are part of the code.",
+                        self.unit
+                            .history
+                            .iter()
+                            .map(|line| format!("- {line}"))
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                        self.unit.base
+                    ),
+                },
+            );
+        }
         if self.unit.ship {
             // Nobody in this pipeline built the change: say what it holds.
             let commits =
@@ -1361,6 +1458,19 @@ impl Driver {
             match finished.outcome {
                 Outcome::Completed(result) => {
                     let mut problems = result_problems(contract, &outcomes, &result);
+                    let verdict = result.get("outcome").and_then(Value::as_str).unwrap_or("");
+                    if problems.is_empty() && contract == Contract::Probe && verdict == "broken" {
+                        // A finding is proved by a test that fails, not by a claim.
+                        problems.extend(self.verify_reproductions(&cwd, &result)?);
+                    }
+                    if problems.is_empty()
+                        && contract == Contract::Change
+                        && verdict == "done"
+                        && *workspace == Workspace::Unit
+                    {
+                        // A fix is not done while a regression test still fails.
+                        problems.extend(self.check_regressions(&cwd)?);
+                    }
                     if contract == Contract::Publication {
                         let own = self
                             .project
@@ -1513,6 +1623,23 @@ impl Driver {
                     &format!("checkpoint: {} round {round} ({})", step.id, self.unit.bead),
                 )?;
                 let changed = factory_git::changed_files(&cwd, &before, &head)?;
+                if before != self.unit.base && !self.project.test_patterns.is_empty() {
+                    // A later round of changes: did it make a test easier to pass?
+                    let diff = factory_git::diff_zero_context(&cwd, &before, &head)?;
+                    let removed = weakened_tests(&diff, &self.project.test_patterns)?;
+                    if !removed.is_empty() {
+                        self.event(
+                            "tests.removed",
+                            Some(&step.id),
+                            json!({ "lines": removed, "from": before, "to": head }),
+                        )?;
+                        self.unit.history.push(format!(
+                            "{} (round {round}) removed lines that look like tests or assertions; check that no test was weakened: {}",
+                            step.id,
+                            truncate(&removed.join(" | "), 1500)
+                        ));
+                    }
+                }
                 let allowed: Vec<String> = writes
                     .iter()
                     .flat_map(|scope| self.project.scopes.get(scope).cloned().unwrap_or_default())
@@ -1552,6 +1679,20 @@ impl Driver {
                     Some(&step.id),
                     json!({ "patch": patch_path }),
                 )?;
+                // What a tester that broke the change left behind is its
+                // regression tests: they join the unit's branch, failing.
+                let mut adopted = false;
+                if contract == Contract::Probe
+                    && outcome == "broken"
+                    && let Some(path) = &patch_path
+                {
+                    if let Err(err) = self.adopt_regressions(step, round, path, &result) {
+                        return Ok(StepEnd::Park(format!(
+                            "the tester's regression tests could not be added to the branch: {err}"
+                        )));
+                    }
+                    adopted = true;
+                }
                 if contract == Contract::Probe {
                     let summary = result.get("summary").and_then(Value::as_str).unwrap_or("");
                     let mut body = format!("Outcome: `{outcome}`.\n\n{summary}\n");
@@ -1561,7 +1702,9 @@ impl Driver {
                             "\nFindings, each reproduced by the tester:\n\n{findings}"
                         ));
                     }
-                    if let Some(path) = &patch_path {
+                    if adopted {
+                        body.push_str("\nThe tester's regression tests for these findings are now part of this branch.\n");
+                    } else if let Some(path) = &patch_path {
                         body.push_str(&format!(
                             "\nThe tester's probe files are a patch against the checkpoint it tested: `{}`. Apply it with `git apply` to run the reproductions; do not keep the probes unless they belong in the test suite.\n",
                             path.display()
@@ -1612,6 +1755,33 @@ impl Driver {
                     && let Some(line) = note.body.lines().find(|line| line.contains("probe files"))
                 {
                     text.push_str(&format!("\n{line}\n"));
+                }
+                let pending: Vec<&Regression> = self
+                    .unit
+                    .regressions
+                    .iter()
+                    .filter(|regression| contract == Contract::Probe && regression.round == round)
+                    .collect();
+                if !pending.is_empty() {
+                    text.push_str("\nThe tester left regression tests, and the factory has added them to your worktree as a commit. Each of these commands fails now. The factory runs every regression test of this bead, these and the earlier ones, before it accepts your result, and it does not accept it while one fails. Do not weaken or remove them: a test that is itself wrong is something to say in your summary.\n\n");
+                    for regression in pending {
+                        text.push_str(&format!(
+                            "- `{}` ({})\n",
+                            regression.command, regression.finding
+                        ));
+                    }
+                }
+                let breaks = self
+                    .unit
+                    .regressions
+                    .iter()
+                    .map(|regression| regression.round)
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len();
+                if contract == Contract::Probe && breaks >= 2 {
+                    text.push_str(&format!(
+                        "\nThis is the {breaks}th round in which the tester has broken this change. Fixing each report as it came has not fixed the design. Before you change any code: write down the invariant this mechanism must keep; list the orderings, interleavings and states it must hold in, starting with every one reported so far; and check the code against each. Then fix the cause. Say in your summary what the invariant is and which cases you checked.\n"
+                    ));
                 }
                 self.unit.feedback = Some(text);
             }
@@ -1693,6 +1863,28 @@ impl Driver {
             return Ok(StepEnd::Park("not a command step".to_string()));
         };
         let command = self.project.commands[name].clone();
+        if !step.when_changed.is_empty() {
+            let globs: Vec<String> = step
+                .when_changed
+                .iter()
+                .flat_map(|scope| self.project.scopes.get(scope).cloned().unwrap_or_default())
+                .collect();
+            let changed = factory_git::changed_files(&self.unit.worktree, &self.unit.base, "HEAD")?;
+            let outside = scope_violations(&changed, &globs, &[])?;
+            if outside.len() == changed.len() {
+                self.event(
+                    "command.skipped",
+                    Some(&step.id),
+                    json!({ "command": name, "when_changed": step.when_changed }),
+                )?;
+                self.thread.say(&format!(
+                    ":fast_forward: *{}* · not needed: the change touches nothing in {}",
+                    step.id,
+                    step.when_changed.join(", ")
+                ));
+                return Ok(StepEnd::Outcome("pass".to_string()));
+            }
+        }
         self.unit.runs += 1;
         // An artifact gets a directory of its own, outside the worktree.
         let out_dir = match &step.produces {
@@ -1809,6 +2001,27 @@ impl Driver {
                 .as_ref()
                 .and_then(|file| std::fs::read_to_string(dir.join(file)).ok())
                 .unwrap_or_default();
+            if let Some(line) = first_match(&summary, &command.fail_when)? {
+                // Advisory as a whole, but this line is one that must not pass.
+                self.unit.feedback = Some(format!(
+                    "The project's reports (`{shown}`), written by tools on commit `{short}`, show a result that must not pass:\n\n    {}\n\nThe summary:\n\n```\n{}\n```\n\nThe reports are in `{}`: read the file for that check, fix what it shows, and run the project's commands before you return.",
+                    line.trim(),
+                    truncate(summary.trim_end(), 4000),
+                    dir.display()
+                ));
+                self.event(
+                    "report.blocked",
+                    Some(&step.id),
+                    json!({ "artifact": artifact, "line": line }),
+                )?;
+                self.thread.say(&format!(
+                    ":x: *{}* · the reports show a result that must not pass: `{}`",
+                    step.id,
+                    escape(line.trim())
+                ));
+                self.save()?;
+                return Ok(StepEnd::Outcome("fail".to_string()));
+            }
             self.thread.say(&format!(
                 ":page_facing_up: *{}* · `{artifact}` written on `{short}` ({ended}) · {}\n{}",
                 step.id,
@@ -2375,6 +2588,174 @@ impl Driver {
             .filter(|other| matches!(&other.kind, StepKind::Agent { role, .. } if contract_of(role) == Some(Contract::Publication)))
             .find_map(|other| self.unit.results.get(&other.id))
             .cloned()
+    }
+
+    /// Run a reproduction or regression command the way the project would.
+    fn run_proof(&self, command: &str, cwd: &Path) -> Verdict {
+        run_command(
+            &["sh".to_string(), "-c".to_string(), command.to_string()],
+            cwd,
+            Duration::from_secs(self.project.limits.reproduction_timeout_secs),
+        )
+        .verdict
+    }
+
+    /// Check a tester's findings by running them. What it left in its
+    /// worktree must only add lines, and each critical or major finding's
+    /// command must fail there: a command that passes, or cannot run, proves
+    /// nothing. A hang counts as failing once the time allowed runs out.
+    fn verify_reproductions(
+        &self,
+        scratch: &Path,
+        result: &Value,
+    ) -> Result<Vec<String>, DriverError> {
+        let mut problems = Vec::new();
+        let findings = serious(result);
+        if findings.is_empty() {
+            return Ok(problems);
+        }
+        let left = factory_git::numstat_since(scratch, &self.unit.checkpoint)?;
+        if left.is_empty() {
+            problems.push("you left no regression test in the worktree: a critical or major finding needs a test in the project's own suite that fails because of it. Add it and leave it there; remove everything else you wrote".to_string());
+        }
+        let rewrote: Vec<&str> = left
+            .iter()
+            .filter(|(_, removed, _)| *removed > 0)
+            .map(|(_, _, path)| path.as_str())
+            .collect();
+        if !rewrote.is_empty() {
+            problems.push(format!(
+                "what you leave joins the branch as regression tests, so it may only add lines; you changed or removed existing lines in: {}. Restore them and add your tests beside the code",
+                rewrote.join(", ")
+            ));
+        }
+        for finding in findings {
+            let title = finding.get("title").and_then(Value::as_str).unwrap_or("");
+            let command = finding
+                .pointer("/reproduction/command")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            let names = finding
+                .get("test_names")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0);
+            if names == 0 {
+                problems.push(format!(
+                    "the finding `{title}` names no regression test in `test_names`"
+                ));
+            }
+            match self.run_proof(command, scratch) {
+                Verdict::Failed { .. } | Verdict::TimedOut => {}
+                Verdict::Passed => problems.push(format!(
+                    "the factory ran the reproduction of `{title}` (`{command}`) in your worktree and it passed: a finding needs a command that fails because of it. Fix the test or drop the finding"
+                )),
+                Verdict::CouldNotRun(reason) => problems.push(format!(
+                    "the reproduction of `{title}` (`{command}`) could not be run: {reason}"
+                )),
+            }
+        }
+        Ok(problems)
+    }
+
+    /// Add the tester's regression tests to the unit's branch as a commit of
+    /// their own, and remember the command that proves each finding.
+    fn adopt_regressions(
+        &mut self,
+        step: &Step,
+        round: u32,
+        patch: &Path,
+        result: &Value,
+    ) -> Result<(), DriverError> {
+        let worktree = self.unit.worktree.clone();
+        factory_git::apply_patch(&worktree, patch)?;
+        let before = self.unit.checkpoint.clone();
+        let (head, _) = factory_git::checkpoint(
+            &worktree,
+            &format!("tests: adversarial round {round} ({})", self.unit.bead),
+        )?;
+        let files = factory_git::changed_files(&worktree, &before, &head)?;
+        let forbidden =
+            scope_violations(&files, &["**".to_string()], &self.project.forbidden_paths)?;
+        if !forbidden.is_empty() {
+            return Err(DriverError::Preflight(format!(
+                "they touch paths no step may change: {}",
+                forbidden
+                    .iter()
+                    .map(|v| v.path.clone())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+        self.unit.checkpoint = head.clone();
+        for finding in serious(result) {
+            let text = |pointer: &str| {
+                finding
+                    .pointer(pointer)
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string()
+            };
+            self.unit.regressions.push(Regression {
+                round,
+                finding: text("/title"),
+                command: text("/reproduction/command"),
+                test_names: finding
+                    .get("test_names")
+                    .and_then(Value::as_array)
+                    .map(|names| {
+                        names
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            });
+        }
+        self.event(
+            "regressions.added",
+            Some(&step.id),
+            json!({ "commit": head, "files": files, "round": round,
+                    "commands": self.unit.regressions.iter().filter(|r| r.round == round).map(|r| r.command.clone()).collect::<Vec<_>>() }),
+        )?;
+        self.thread.say(&format!(
+            ":test_tube: *{}* · the tester's regression tests joined the branch as `{}` ({} file(s)). The fix is not accepted until they pass.",
+            step.id,
+            &head[..head.len().min(10)],
+            files.len()
+        ));
+        self.save()
+    }
+
+    /// Run every regression test of the unit. A fix is refused while one
+    /// fails, or while a test it should run has disappeared from the code.
+    fn check_regressions(&self, worktree: &Path) -> Result<Vec<String>, DriverError> {
+        let mut problems = Vec::new();
+        let mut ran = std::collections::BTreeSet::new();
+        for regression in &self.unit.regressions {
+            for name in &regression.test_names {
+                if !factory_git::tree_contains(worktree, name)? {
+                    problems.push(format!(
+                        "the regression test `{name}` (for `{}`) is no longer in the code: restore it",
+                        regression.finding
+                    ));
+                }
+            }
+            if regression.command.is_empty() || !ran.insert(regression.command.clone()) {
+                continue;
+            }
+            match self.run_proof(&regression.command, worktree) {
+                Verdict::Passed => {}
+                verdict => problems.push(format!(
+                    "the regression test for `{}` still fails ({verdict:?}) when the factory runs `{}` in your worktree",
+                    regression.finding, regression.command
+                )),
+            }
+        }
+        Ok(problems)
     }
 
     /// The `absorb` action: the unit's one commit joins the branch of the

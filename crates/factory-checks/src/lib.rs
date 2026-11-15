@@ -115,6 +115,48 @@ pub fn scope_violations(
     Ok(violations)
 }
 
+fn regexes(patterns: &[String]) -> Result<Vec<regex::Regex>, CheckError> {
+    patterns
+        .iter()
+        .map(|pattern| {
+            regex::Regex::new(pattern)
+                .map_err(|err| CheckError::BadGlob(pattern.clone(), err.to_string()))
+        })
+        .collect()
+}
+
+/// The first line of `text` that matches one of the patterns, if any does.
+pub fn first_match(text: &str, patterns: &[String]) -> Result<Option<String>, CheckError> {
+    let patterns = regexes(patterns)?;
+    Ok(text
+        .lines()
+        .find(|line| patterns.iter().any(|pattern| pattern.is_match(line)))
+        .map(str::to_string))
+}
+
+/// Lines a change removed that look like tests or assertions: the sign of a
+/// test made easier to pass. `diff` is a unified diff with no context;
+/// `patterns` say what a test line looks like in this project. Each entry is
+/// `path: the removed line`. A line that was only moved or reworded shows up
+/// too, which is why this is a pointer for a reviewer and not a verdict.
+pub fn weakened_tests(diff: &str, patterns: &[String]) -> Result<Vec<String>, CheckError> {
+    let patterns = regexes(patterns)?;
+    let mut file = String::new();
+    let mut removed = Vec::new();
+    for line in diff.lines() {
+        if let Some(path) = line.strip_prefix("--- a/") {
+            file = path.to_string();
+        } else if line.starts_with("--- ") || line.starts_with("+++ ") {
+            continue;
+        } else if let Some(text) = line.strip_prefix('-')
+            && patterns.iter().any(|pattern| pattern.is_match(text))
+        {
+            removed.push(format!("{file}: {}", text.trim()));
+        }
+    }
+    Ok(removed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,6 +228,40 @@ mod tests {
     fn a_step_with_no_scopes_may_change_nothing() {
         let found = scope_violations(&strings(&["src/a.zig"]), &[], &[]).unwrap();
         assert_eq!(found[0].reason, "this step may not change any file");
+    }
+
+    #[test]
+    fn removed_test_lines_are_pointed_out() {
+        let diff = "diff --git a/src/a.zig b/src/a.zig\n--- a/src/a.zig\n+++ b/src/a.zig\n@@ -10,2 +10,1 @@\n-test \"signals are not lost\" {\n-    try std.testing.expectEqual(2, seen);\n+    const seen = 2;\n@@ -40 +39 @@\n-    return x + 1;\n+    return x + 2;\n";
+        let patterns = strings(&[r#"^\s*test\s+""#, r"std\.testing\.expect"]);
+        assert_eq!(
+            weakened_tests(diff, &patterns).unwrap(),
+            [
+                "src/a.zig: test \"signals are not lost\" {",
+                "src/a.zig: try std.testing.expectEqual(2, seen);"
+            ]
+        );
+        // Added test lines and changed code are not removals of tests.
+        let added =
+            "--- a/src/a.zig\n+++ b/src/a.zig\n@@ -1 +1,2 @@\n+test \"new\" {}\n-    return 1;\n";
+        assert!(weakened_tests(added, &patterns).unwrap().is_empty());
+        assert!(weakened_tests(diff, &[]).unwrap().is_empty());
+        assert!(weakened_tests(diff, &strings(&["("])).is_err());
+    }
+
+    #[test]
+    fn a_summary_line_that_must_never_pass_is_found() {
+        let index = "fmt                exit 0\nzlint              2 error(s), 3 warning(s)\n\nFAILED: changelog-check gitleaks\n";
+        let gate = strings(&[
+            r"^FAILED:.*\b(ast-check|gitleaks)\b",
+            r"^zlint\s+[1-9]\d* error",
+        ]);
+        assert_eq!(
+            first_match(index, &gate).unwrap().as_deref(),
+            Some("zlint              2 error(s), 3 warning(s)")
+        );
+        let clean = "zlint              0 error(s), 3 warning(s)\n\nFAILED: changelog-check\n";
+        assert_eq!(first_match(clean, &gate).unwrap(), None);
     }
 
     #[test]

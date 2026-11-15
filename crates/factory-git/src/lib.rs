@@ -181,6 +181,50 @@ pub fn patch_since(dir: &Path, commit: &str) -> Result<String, GitError> {
     git(dir, &["diff", "--cached", "--binary", commit], LOCAL)
 }
 
+/// What a worktree adds to and removes from `commit`, new files included,
+/// as lines added, lines removed and path for each file. Binary files count
+/// as zero lines.
+pub fn numstat_since(dir: &Path, commit: &str) -> Result<Vec<(u64, u64, String)>, GitError> {
+    git(dir, &["add", "--all"], LOCAL)?;
+    let out = git(dir, &["diff", "--cached", "--numstat", commit], LOCAL)?;
+    Ok(out
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(3, '\t');
+            let added = parts.next()?.parse().unwrap_or(0);
+            let removed = parts.next()?.parse().unwrap_or(0);
+            Some((added, removed, parts.next()?.to_string()))
+        })
+        .collect())
+}
+
+/// Apply a patch file to a worktree and its index.
+pub fn apply_patch(dir: &Path, patch: &Path) -> Result<(), GitError> {
+    let patch = patch.to_string_lossy();
+    git(
+        dir,
+        &["apply", "--index", "--whitespace=nowarn", &patch],
+        LOCAL,
+    )
+    .map(|_| ())
+}
+
+/// The difference between two commits with no context lines: only what was
+/// removed and added.
+pub fn diff_zero_context(dir: &Path, from: &str, to: &str) -> Result<String, GitError> {
+    git(dir, &["diff", "--no-color", "--unified=0", from, to], LOCAL)
+}
+
+/// Whether a literal text occurs in any tracked file.
+pub fn tree_contains(dir: &Path, text: &str) -> Result<bool, GitError> {
+    Ok(git_raw(
+        dir,
+        &["grep", "--quiet", "--fixed-strings", "-e", text],
+        LOCAL,
+    )?
+    .success())
+}
+
 /// The tree a commit holds: equal trees mean equal content.
 pub fn tree_of(dir: &Path, rev: &str) -> Result<String, GitError> {
     rev_parse(dir, &format!("{rev}^{{tree}}"))

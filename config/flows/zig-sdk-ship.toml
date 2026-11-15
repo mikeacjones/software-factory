@@ -71,7 +71,10 @@ command = "reports"
 policy = "report-only"
 produces = "reports"
 on.pass = "review"
-on.fail = "park"
+# The reports are advisory as a whole, but the project names a few results
+# that must not pass (see `fail_when` on the command). Those go back to the
+# builder before any agent spends time on the change.
+on.fail = { to = "fix", max = 2 }
 
 # The beads read together: do they fit, does the whole meet the sub-goal?
 [[step]]
@@ -94,6 +97,9 @@ role = "builder"
 model = "claude-opus-5-5"
 effort = "medium"
 session = "fresh"
+# From its second round on the fix gets more effort: by then the first
+# attempt has not held.
+effort_by_round = ["medium", "high"]
 writes = ["code"]
 on.done = { to = "fmt", max = 6 }
 on.needs_owner = { to = "ask", max = 2 }
