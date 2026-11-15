@@ -3,14 +3,20 @@
 use std::time::Duration;
 
 use factory_flow::{Flow, Next, Position, StepKind};
+use futures::FutureExt;
 use serde::{Deserialize, Serialize};
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{
-    ActivityOptions, ApplicationFailure, SyncWorkflowContext, WorkflowContext, WorkflowContextView,
-    WorkflowResult,
+    ActivityOptions, ApplicationFailure, SignalWorkflowOptions, SyncWorkflowContext,
+    WorkflowContext, WorkflowContextView, WorkflowResult,
 };
 
+use crate::accounts::{AccountCall, Accounts, Lease, Limit};
 use crate::steps::{ParkCall, PrepareCall, StepCall, StepDone, Steps};
+
+/// How much longer than it was told to expect a pipeline waits for word
+/// that an account is back before it asks again by itself, in seconds.
+const ASK_AGAIN_SECS: u64 = 60;
 
 /// What a pipeline is started with.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -33,6 +39,10 @@ pub struct PipelineInput {
     /// How often an agent step says it is alive, and so how soon a step
     /// whose worker died is given to another. Seconds.
     pub beat_secs: u64,
+    /// The accounts workflow that says which account each agent step runs
+    /// under, by its ID. Empty leaves the choice to whatever runs the step.
+    #[serde(default)]
+    pub accounts: String,
 }
 
 /// Where a pipeline stands, for anyone who asks.
@@ -74,6 +84,8 @@ pub struct Pipeline {
     standing: Standing,
     go_on: Option<GoOn>,
     given_up: bool,
+    /// The accounts workflow has said an account is back.
+    account_ready: bool,
 }
 
 /// A definition the engine cannot run. Trying again would not help.
@@ -125,6 +137,43 @@ impl Pipeline {
                 state.standing.step = step.id.clone();
                 state.standing.parked = None;
             });
+            // An agent step runs under an account, and which one is not
+            // its to choose: it asks, and waits here if there is none.
+            let account = match &step.kind {
+                StepKind::Agent { model, .. } if !input.accounts.is_empty() => {
+                    let who = ctx.info().workflow_id().to_string();
+                    loop {
+                        ctx.state_mut(|state| state.account_ready = false);
+                        let ask = AccountCall {
+                            accounts: input.accounts.clone(),
+                            who: who.clone(),
+                            model: model.clone(),
+                        };
+                        let options =
+                            ActivityOptions::with_start_to_close_timeout(Duration::from_secs(60))
+                                .build();
+                        match ctx.execute_activity(Steps::account, ask, options).await? {
+                            Lease::Use { account } => break Some(account),
+                            Lease::Wait { secs } => {
+                                // Nothing runs while it waits. The accounts
+                                // workflow says when to ask again; the timer
+                                // is only in case that word never comes.
+                                ctx.state_mut(|state| state.standing.limited_secs = Some(secs));
+                                let mut timer =
+                                    ctx.timer(Duration::from_secs(secs + ASK_AGAIN_SECS)).fuse();
+                                let mut told =
+                                    ctx.wait_condition(|state| state.account_ready).fuse();
+                                futures::select_biased! {
+                                    heard = told => heard?,
+                                    _ = timer => {}
+                                }
+                                ctx.state_mut(|state| state.standing.limited_secs = None);
+                            }
+                        }
+                    }
+                }
+                _ => None,
+            };
             let call = StepCall {
                 unit: unit.clone(),
                 step: step.id.clone(),
@@ -136,6 +185,7 @@ impl Pipeline {
                 },
                 session: session.take(),
                 beat_secs: input.beat_secs.max(1),
+                account: account.clone(),
             };
             // The step's own time limit is kept by whatever runs it. This
             // one is only the last resort. What notices a step that has
@@ -152,6 +202,24 @@ impl Pipeline {
                         .await?
                 }
             };
+            if let (Some(secs), Some(account), StepKind::Agent { model, .. }) =
+                (done.limited_secs, &account, &step.kind)
+            {
+                // The account it was handed is at a limit. The accounts
+                // workflow is told, and the step asks it again: for
+                // another account, or to wait. Its session is kept.
+                let limit = Limit {
+                    account: account.clone(),
+                    model: model.clone(),
+                    secs,
+                };
+                ctx.external_workflow(input.accounts.clone(), None)
+                    .signal(Accounts::limited, limit, SignalWorkflowOptions::default())
+                    .await
+                    .map_err(|err| refused(format!("the accounts could not be told: {err}")))?;
+                session = done.session;
+                continue;
+            }
             if let Some(secs) = done.limited_secs {
                 // Every account is at a limit. Nothing needs to run while
                 // the factory waits: the timer is the server's.
@@ -224,6 +292,12 @@ impl Pipeline {
     #[signal]
     pub fn go_on(&mut self, _ctx: &mut SyncWorkflowContext<Self>, decision: GoOn) {
         self.go_on = Some(decision);
+    }
+
+    /// An account is back: a pipeline waiting for one asks again.
+    #[signal]
+    pub fn account_ready(&mut self, _ctx: &mut SyncWorkflowContext<Self>, _nothing: ()) {
+        self.account_ready = true;
     }
 
     /// Give a parked pipeline up.

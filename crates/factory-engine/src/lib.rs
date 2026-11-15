@@ -10,6 +10,7 @@
 //! Every step is an activity, and what an activity does is not the engine's
 //! business: see [`steps::StepRunner`].
 
+pub mod accounts;
 pub mod engine;
 pub mod factory;
 pub mod steps;

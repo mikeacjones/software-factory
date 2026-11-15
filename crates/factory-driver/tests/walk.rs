@@ -21,6 +21,7 @@ const OPTIONS: Options = Options {
     continued: None,
     pausable: false,
     engine: false,
+    account: None,
 };
 
 #[test]
@@ -512,6 +513,7 @@ const SLACK: Options = Options {
     continued: None,
     pausable: false,
     engine: false,
+    account: None,
 };
 
 #[test]

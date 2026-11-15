@@ -75,6 +75,14 @@ pub struct Temporal {
     /// worker died is given to another after three of these.
     #[serde(default = "default_beat")]
     pub beat_secs: u64,
+    /// How often the accounts workflow asks again what each account has
+    /// left, in seconds. Between those it acts on what runs report.
+    #[serde(default = "default_accounts_check")]
+    pub accounts_check_secs: u64,
+}
+
+fn default_accounts_check() -> u64 {
+    15 * 60
 }
 
 fn default_task_queue() -> String {

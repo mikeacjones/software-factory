@@ -45,6 +45,7 @@ Owner's decision, 2026-11-14. Every agent runs in bypass mode as the owner's acc
 | Tasks | Scheduled and manual tasks that run beside the flow | `factory-tasks` |
 | Briefings | The brief for each agent step, and the role prompts | `factory-brief` |
 | Driver | The reconciler: observe, step every unit, act, land at most one, dispatch | `factory-driver` |
+| Engine | The flow engine on Temporal: one workflow that runs any flow definition, each step an activity done by the driver; and the accounts workflow, which hands every agent step its *account* and owns the waiting when all are at a limit | `factory-engine` |
 | Watchdog | A separate process that checks the driver, Redis, slots and overdue tasks, and alerts on its own | `factory-watchdog` |
 | CLI | The `factory` binary | `factory-cli` |
 | Dev tooling | `cargo xtask`: the quality command and the gate runner | `xtask` |

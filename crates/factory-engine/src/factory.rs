@@ -14,6 +14,7 @@ use std::time::Duration;
 use factory_config::ConfigDir;
 use factory_driver::{Driver, Options, Stepped};
 
+use crate::accounts::{CheckCall, Picture};
 use crate::steps::{ParkCall, PrepareCall, Prepared, Started, StepCall, StepDone, StepRunner};
 
 /// Runs steps with the factory's driver, against one config directory.
@@ -25,6 +26,15 @@ pub struct FactoryRunner {
 
 impl FactoryRunner {
     fn options(&self, flow: Option<String>, note: Option<String>) -> Options {
+        self.options_under(flow, note, None)
+    }
+
+    fn options_under(
+        &self,
+        flow: Option<String>,
+        note: Option<String>,
+        account: Option<String>,
+    ) -> Options {
         Options {
             slack: self.slack,
             flow,
@@ -32,6 +42,7 @@ impl FactoryRunner {
             continued: note,
             pausable: false,
             engine: true,
+            account,
         }
     }
 
@@ -64,7 +75,7 @@ impl FactoryRunner {
         let stepped = Driver::resume(
             self.config.clone(),
             &call.unit,
-            &self.options(None, call.note.clone()),
+            &self.options_under(None, call.note.clone(), call.account.clone()),
             None,
         )
         .and_then(|mut driver| driver.run_step(&call.step, call.round));
@@ -131,5 +142,22 @@ impl StepRunner for FactoryRunner {
         Driver::resume(self.config.clone(), unit, &self.options(None, None), None)
             .and_then(|mut driver| driver.finish())
             .map_err(|err| err.to_string())
+    }
+
+    fn accounts(&self, call: &CheckCall) -> Result<Picture, String> {
+        let factory = self.config.factory().map_err(|err| err.to_string())?;
+        // Each account's login is used where it is kept, here, and only
+        // what it has left goes back.
+        let states =
+            factory_driver::refresh_accounts(&factory, call.max_age_secs, call.forget_limits);
+        Ok(Picture {
+            order: factory
+                .accounts
+                .iter()
+                .map(|account| account.id.clone())
+                .collect(),
+            states,
+            grace_secs: factory.limit_grace_secs,
+        })
     }
 }

@@ -12,10 +12,11 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use factory_engine::accounts::{ACCOUNTS_ID, Accounts};
 use factory_engine::engine::{GoOn, Pipeline, PipelineInput};
 use temporalio_client::{
-    Client, WorkflowGetResultOptions, WorkflowQueryOptions, WorkflowSignalOptions,
-    WorkflowStartOptions,
+    Client, WorkflowFetchHistoryOptions, WorkflowGetResultOptions, WorkflowQueryOptions,
+    WorkflowSignalOptions, WorkflowStartOptions,
 };
 use temporalio_sdk::testing::{
     EphemeralExe, LocalServer, LocalWorkflowEnvironmentOptions, WorkflowEnvironment,
@@ -39,11 +40,23 @@ struct Shop {
 
 impl Shop {
     async fn open(name: &str, test_command: &str, scenario: &str) -> Option<Shop> {
+        Shop::open_after(name, test_command, scenario, |_| {}).await
+    }
+
+    /// Open a shop whose world `prepare` has changed first, before the
+    /// worker reads its config.
+    async fn open_after(
+        name: &str,
+        test_command: &str,
+        scenario: &str,
+        prepare: impl FnOnce(&World),
+    ) -> Option<Shop> {
         let Some(cli) = temporal_cli() else {
             eprintln!("no `temporal` CLI on the PATH: skipped");
             return None;
         };
         let world = World::new(name, test_command);
+        prepare(&world);
         if !scenario.is_empty() {
             world.scenario(scenario);
         }
@@ -278,5 +291,100 @@ async fn a_real_pipeline_that_needs_the_owner_parks_and_goes_on_with_the_answer(
         "{brief}"
     );
     assert_eq!(unit_record(&shop.world, &standing.unit)["status"], "ended");
+    shop.close().await;
+}
+
+/// The accounts workflow in front of the real driver: the step is handed
+/// an account by name, the driver reads that account's token itself, and a
+/// run the account refuses is carried on under the next one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_real_run_refused_at_a_limit_is_handed_the_next_account_by_the_accounts_workflow() {
+    let opened = Shop::open_after("engine-accounts", "true", "limit-default-once", |world| {
+        let token = world.path("token-b");
+        std::fs::write(&token, "tok-b\n").unwrap();
+        let factory = world.path("config/factory.toml");
+        let text = std::fs::read_to_string(&factory).unwrap();
+        std::fs::write(
+            &factory,
+            format!(
+                "limit_grace_secs = 0\n{text}\n[[account]]\nid = \"a\"\n\n[[account]]\nid = \"b\"\ntoken_file = \"{}\"\n",
+                token.display()
+            ),
+        )
+        .unwrap();
+    })
+    .await;
+    let Some(shop) = opened else {
+        return;
+    };
+    let (mut input, options) = shop.start("engine-accounts");
+    input.accounts = ACCOUNTS_ID.to_string();
+    let handle = shop
+        .client()
+        .start_workflow(Pipeline::run, input, options)
+        .await
+        .unwrap();
+    let end = handle
+        .get_result(WorkflowGetResultOptions::default())
+        .await
+        .unwrap();
+    assert!(end.ended, "{end:?}");
+
+    // The builder started under the first account, was refused, and
+    // carried on in the same session under the second. Nothing after it
+    // went back to the first.
+    let calls = shop.world.calls();
+    assert_eq!(
+        (calls[0][0].as_str(), calls[0][3].as_str()),
+        ("builder", "default")
+    );
+    assert_eq!(
+        (calls[1][0].as_str(), calls[1][3].as_str()),
+        ("builder", "tok-b")
+    );
+    assert_eq!(
+        calls[0][1], calls[1][1],
+        "the session continues across accounts"
+    );
+    assert!(
+        calls[1..].iter().all(|call| call[3] == "tok-b"),
+        "{calls:?}"
+    );
+
+    // The accounts workflow was told, and holds the first account back for
+    // the model that was refused.
+    let board = shop
+        .client()
+        .get_workflow_handle::<Accounts>(ACCOUNTS_ID.to_string())
+        .query(Accounts::board, (), WorkflowQueryOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(board.picture.order, ["a", "b"]);
+    assert!(
+        !board.picture.states["a"].blocked.is_empty(),
+        "the limit is not on the board: {board:?}"
+    );
+    assert!(board.waiting.is_empty());
+
+    // The token was used where the run happened and is in no history.
+    for workflow in [ACCOUNTS_ID, "pipeline-engine-accounts"] {
+        let json = shop
+            .client()
+            .get_workflow_handle::<Pipeline>(workflow.to_string())
+            .fetch_history(WorkflowFetchHistoryOptions::default())
+            .to_json()
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&json).into_owned();
+        // Payloads are base64 in a history's JSON: look for the token as
+        // it would be written there, at each of the three alignments.
+        for encoded in ["dG9rLW", "Rvay1i", "0b2stY"] {
+            assert!(
+                !text.contains(encoded),
+                "a token is in the history of `{workflow}`"
+            );
+        }
+        assert!(!text.contains("tok-b"));
+    }
     shop.close().await;
 }

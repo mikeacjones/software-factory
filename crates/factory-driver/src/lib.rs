@@ -301,6 +301,10 @@ pub struct Options {
     /// time: the engine. The unit then does no waiting of its own for a
     /// usage limit, and does not announce each time it is picked up.
     pub engine: bool,
+    /// The account every run of this step is to use, when whoever walks
+    /// the flow hands accounts out. The step then ends as limited if that
+    /// account turns out to be at a limit, and picks no other itself.
+    pub account: Option<String>,
 }
 
 /// Push a branch to the project's remote if its worktree is not at the
@@ -401,6 +405,7 @@ pub struct Driver {
     pausable: bool,
     paused: bool,
     engine: bool,
+    account: Option<String>,
 }
 
 /// The flow a project names, checked against everything it may refer to.
@@ -707,6 +712,7 @@ impl Driver {
             pausable: options.pausable,
             paused: false,
             engine: options.engine,
+            account: options.account.clone(),
         };
         driver.event(
             "unit.created",
@@ -867,6 +873,7 @@ impl Driver {
             pausable: options.pausable,
             paused: false,
             engine: options.engine,
+            account: options.account.clone(),
         };
         driver.thread = driver.open_thread(options, saved_thread);
         // Picked up once per step by the engine: that is not news.
@@ -1726,6 +1733,12 @@ impl Driver {
             // The account is chosen afresh for every run: the one whose
             // session resets soonest, or a wait when all are at a limit.
             let (account, oauth_token) = loop {
+                if let Some(id) = self.account.clone() {
+                    // Chosen by what walks the flow, which knows every
+                    // account's limits and who else is waiting for one.
+                    let token = account_token(&self.factory, &id)?;
+                    break (id, token);
+                }
                 match pick_account(&self.factory, &model)? {
                     AccountPick::Use { id, token } => break (id, token),
                     // Under the engine the wait is a timer of the server's,
@@ -1982,6 +1995,14 @@ impl Driver {
                             "account": account, "window": window, "resets_at": resets_at,
                         }),
                     )?;
+                    if self.account.is_some() {
+                        // The account was handed to this step. Whoever
+                        // handed it out is told, and names another or
+                        // waits; the session is kept for the next run.
+                        return Ok(StepEnd::Limited(
+                            resets_at.unwrap_or_else(|| now_unix() + 15 * 60),
+                        ));
+                    }
                     if limit_waits > 8 {
                         return Ok(StepEnd::Park(
                             "the step was refused at a usage limit nine times".to_string(),
@@ -3725,10 +3746,18 @@ pub enum AccountPick {
 /// endpoint before a choice is made, if the account has a login to ask with.
 const STALE_SECS: u64 = 30 * 60;
 
-/// Choose the account for a run on `model`. The accounts' windows are
-/// learned from every run; one the factory has not heard from lately is
-/// asked about once, without a model call.
-pub fn pick_account(factory: &Factory, model: &str) -> Result<AccountPick, DriverError> {
+/// What the factory knows about its accounts, after asking the usage
+/// endpoint about each one it has not heard from for `max_age_secs` and has
+/// a login to ask with. No model call is made.
+///
+/// A limit a run hit stands until it ends, whatever the endpoint says,
+/// unless `forget_limits`: that is for when the owner says the picture is
+/// wrong, such as after a usage reset, and the endpoint is then believed.
+pub fn refresh_accounts(
+    factory: &Factory,
+    max_age_secs: u64,
+    forget_limits: bool,
+) -> BTreeMap<String, factory_claude::accounts::AccountState> {
     let tracker = Tracker::new(&factory.state_dir);
     let now = now_unix();
     let states = tracker.load();
@@ -3737,7 +3766,8 @@ pub fn pick_account(factory: &Factory, model: &str) -> Result<AccountPick, Drive
             continue;
         };
         let known = states.get(&account.id).cloned().unwrap_or_default();
-        if now.saturating_sub(known.updated_at.max(known.usage_checked_at)) <= STALE_SECS {
+        let age = now.saturating_sub(known.updated_at.max(known.usage_checked_at));
+        if max_age_secs > 0 && age <= max_age_secs {
             continue;
         }
         let refresh = account.usage_refresh.then_some(Refresh {
@@ -3762,7 +3792,7 @@ pub fn pick_account(factory: &Factory, model: &str) -> Result<AccountPick, Drive
                 Ok(mut fresh) => {
                     // Limits a run hit and that have not ended still stand.
                     for (scope, until) in &state.blocked {
-                        if *until > now {
+                        if *until > now && !forget_limits {
                             fresh.blocked.entry(scope.clone()).or_insert(*until);
                         }
                     }
@@ -3790,24 +3820,39 @@ pub fn pick_account(factory: &Factory, model: &str) -> Result<AccountPick, Drive
             state.usage_checked_at = now;
         });
     }
+    tracker.load()
+}
+
+/// The token a run under an account is given: `None` for the CLI's own
+/// login. It is read where the run happens and goes nowhere else.
+pub fn account_token(factory: &Factory, id: &str) -> Result<Option<String>, DriverError> {
+    let Some(account) = factory.accounts.iter().find(|account| account.id == id) else {
+        return Err(DriverError::Preflight(format!(
+            "the factory has no account `{id}`"
+        )));
+    };
+    Ok(session_token(
+        id,
+        TokenSource {
+            file: account.token_file.as_deref(),
+            env: account.token_env.as_deref(),
+            keychain: account.token_keychain.as_deref(),
+        },
+    )?)
+}
+
+/// Choose the account for a run on `model`. The accounts' windows are
+/// learned from every run; one the factory has not heard from lately is
+/// asked about once, without a model call.
+pub fn pick_account(factory: &Factory, model: &str) -> Result<AccountPick, DriverError> {
+    let states = refresh_accounts(factory, STALE_SECS, false);
     let ids: Vec<String> = factory.accounts.iter().map(|a| a.id.clone()).collect();
-    Ok(match choose(&ids, &tracker.load(), model, now) {
+    Ok(match choose(&ids, &states, model, now_unix()) {
         Choice::Wait { until } => AccountPick::Wait {
             until: until + factory.limit_grace_secs,
         },
         Choice::Use(id) => {
-            let account = factory.accounts.iter().find(|a| a.id == id);
-            let token = match account {
-                Some(account) => session_token(
-                    &id,
-                    TokenSource {
-                        file: account.token_file.as_deref(),
-                        env: account.token_env.as_deref(),
-                        keychain: account.token_keychain.as_deref(),
-                    },
-                )?,
-                None => None,
-            };
+            let token = account_token(factory, &id)?;
             AccountPick::Use { id, token }
         }
     })

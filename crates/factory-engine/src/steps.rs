@@ -11,8 +11,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use temporalio_client::WorkflowExecuteUpdateOptions;
 use temporalio_macros::activities;
 use temporalio_sdk::activities::{ActivityContext, ActivityError};
+
+use crate::accounts::{AccountCall, Accounts, Ask, CheckCall, Lease, Picture};
 
 /// One step of one unit's flow, to be run.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -30,6 +33,10 @@ pub struct StepCall {
     pub session: Option<String>,
     /// How often an agent step is to say it is alive, in seconds.
     pub beat_secs: u64,
+    /// The account an agent step is to run under, when the accounts
+    /// workflow hands them out. `None` leaves the choice to the runner.
+    #[serde(default)]
+    pub account: Option<String>,
 }
 
 /// How a step ended.
@@ -109,6 +116,12 @@ pub trait StepRunner: Send + Sync + 'static {
     /// The unit's flow reached its end.
     fn finish(&self, _unit: &str) -> Result<(), String> {
         Ok(())
+    }
+
+    /// What every account has left, asked afresh as `call` says. Only
+    /// names and numbers: a token stays where it is kept.
+    fn accounts(&self, _call: &CheckCall) -> Result<Picture, String> {
+        Err("this runner knows no accounts".to_string())
     }
 }
 
@@ -249,6 +262,44 @@ impl Steps {
         }
     }
 
+    /// Ask what every account has left.
+    #[activity]
+    pub async fn accounts(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        call: CheckCall,
+    ) -> Result<Picture, ActivityError> {
+        let runner = self.runner.clone();
+        match tokio::task::spawn_blocking(move || runner.accounts(&call)).await {
+            Ok(Ok(picture)) => Ok(picture),
+            Ok(Err(reason)) => Err(failed(reason)),
+            Err(join) => Err(failed(format!("checking the accounts was lost: {join}"))),
+        }
+    }
+
+    /// Ask the accounts workflow which account a step is to run under. A
+    /// workflow cannot ask another this way itself, so it is done here.
+    #[activity]
+    pub async fn account(
+        self: Arc<Self>,
+        ctx: ActivityContext,
+        call: AccountCall,
+    ) -> Result<Lease, ActivityError> {
+        let ask = Ask {
+            who: call.who,
+            model: call.model,
+        };
+        ctx.client()
+            .get_workflow_handle::<Accounts>(call.accounts)
+            .execute_update(
+                Accounts::acquire,
+                ask,
+                WorkflowExecuteUpdateOptions::default(),
+            )
+            .await
+            .map_err(|err| failed(format!("the accounts could not be asked: {err}")))
+    }
+
     /// Record that a unit's flow reached its end.
     #[activity]
     pub async fn finish(
@@ -270,10 +321,12 @@ impl Steps {
 ///
 /// The command is told what to do in its environment (`FACTORY_KIND`,
 /// `FACTORY_UNIT`, `FACTORY_STEP`, `FACTORY_ROUND`, `FACTORY_NOTE`,
-/// `FACTORY_ACTION`, and `FACTORY_SESSION` when a cut-off run is to be
-/// resumed), and answers on its standard output, a line at a time:
-/// `session <id>` as soon as an agent run knows its session, then
-/// `outcome <word>`, or `limited <seconds>` if every account is at a limit.
+/// `FACTORY_ACTION`, `FACTORY_SESSION` when a cut-off run is to be resumed,
+/// and `FACTORY_ACCOUNT` when the step was handed an account), and answers
+/// on its standard output, a line at a time: `session <id>` as soon as an
+/// agent run knows its session, then `outcome <word>`, or `limited
+/// <seconds>` if the run stopped at a usage limit. Asked for the accounts
+/// (`FACTORY_KIND=accounts`), it answers `accounts <picture as JSON>`.
 pub struct ExecRunner {
     pub argv: Vec<String>,
 }
@@ -298,6 +351,7 @@ impl ExecRunner {
             .env("FACTORY_NOTE", call.note.as_deref().unwrap_or(""))
             .env("FACTORY_ACTION", call.action.as_deref().unwrap_or(""))
             .env("FACTORY_SESSION", session.as_deref().unwrap_or(""))
+            .env("FACTORY_ACCOUNT", call.account.as_deref().unwrap_or(""))
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped());
         let mut child = command
@@ -352,5 +406,22 @@ impl StepRunner for ExecRunner {
             "command"
         };
         self.run(kind, call, None, None)
+    }
+
+    fn accounts(&self, call: &CheckCall) -> Result<Picture, String> {
+        let (program, args) = self.argv.split_first().ok_or("the step command is empty")?;
+        let out = std::process::Command::new(program)
+            .args(args)
+            .env("FACTORY_KIND", "accounts")
+            .env("FACTORY_FORGET", if call.forget_limits { "1" } else { "" })
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|err| format!("`{program}` could not be run: {err}"))?;
+        let said = String::from_utf8_lossy(&out.stdout);
+        let picture = said
+            .lines()
+            .find_map(|line| line.strip_prefix("accounts "))
+            .ok_or("the command did not say what the accounts have left")?;
+        serde_json::from_str(picture).map_err(|err| format!("the accounts' picture: {err}"))
     }
 }

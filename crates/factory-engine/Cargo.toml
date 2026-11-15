@@ -10,6 +10,7 @@ description = "The flow engine on Temporal: a workflow that runs a flow definiti
 workspace = true
 
 [dependencies]
+factory-claude.workspace = true
 factory-config.workspace = true
 factory-driver.workspace = true
 factory-flow.workspace = true

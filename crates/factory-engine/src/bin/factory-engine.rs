@@ -7,6 +7,9 @@
 //!   factory-engine go-on <pipeline> <step> <note>
 //!                                             continue a parked pipeline from a step
 //!   factory-engine give-up <pipeline>         end a parked pipeline
+//!   factory-engine accounts                   what every account has left, and who waits
+//!   factory-engine accounts recheck           look at every account again now, as after
+//!                                             a usage reset; those waiting are released
 //!
 //!   --config <dir>   the factory's config directory, whose `[temporal]`
 //!                    table says where the server is
@@ -16,9 +19,10 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use factory_config::{ConfigDir, Temporal};
+use factory_engine::accounts::{ACCOUNTS_ID, Accounts};
 use factory_engine::engine::{GoOn, Pipeline, PipelineInput};
 use factory_engine::factory::FactoryRunner;
-use factory_engine::worker::{WorkerSettings, connect, run};
+use factory_engine::worker::{WorkerSettings, connect, ensure_accounts, run};
 use temporalio_client::{
     WorkflowGetResultOptions, WorkflowQueryOptions, WorkflowSignalOptions, WorkflowStartOptions,
 };
@@ -79,6 +83,8 @@ async fn command(args: &[String]) -> Result<(), String> {
                 config,
                 slack: factory.slack.is_some(),
             });
+            let client = connect(&temporal.address, &temporal.namespace).await?;
+            ensure_accounts(&client, &temporal.task_queue, temporal.accounts_check_secs).await?;
             run(settings, runner).await
         }
         ["start", project, bead] => {
@@ -86,11 +92,13 @@ async fn command(args: &[String]) -> Result<(), String> {
             // is started for it.
             config.project(project).map_err(|err| err.to_string())?;
             let client = connect(&temporal.address, &temporal.namespace).await?;
+            ensure_accounts(&client, &temporal.task_queue, temporal.accounts_check_secs).await?;
             let id = format!("pipeline-{project}-{bead}-{}", factory_core_now());
             let input = PipelineInput {
                 project: project.to_string(),
                 bead: bead.to_string(),
                 beat_secs: temporal.beat_secs,
+                accounts: ACCOUNTS_ID.to_string(),
                 ..PipelineInput::default()
             };
             let options = WorkflowStartOptions::new(temporal.task_queue.clone(), id.clone()).build();
@@ -160,7 +168,64 @@ async fn command(args: &[String]) -> Result<(), String> {
             println!("told {pipeline} to give up");
             Ok(())
         }
-        _ => Err("usage: factory-engine worker | start <project> <bead> [--wait] | standing <pipeline> | go-on <pipeline> <step> <note> | give-up <pipeline>   [--config <dir>]".to_string()),
+        ["accounts"] => {
+            let client = connect(&temporal.address, &temporal.namespace).await?;
+            let board = client
+                .get_workflow_handle::<Accounts>(ACCOUNTS_ID.to_string())
+                .query(Accounts::board, (), WorkflowQueryOptions::default())
+                .await
+                .map_err(|err| format!("the accounts could not be asked: {err}"))?;
+            let now = factory_core_now();
+            if board.checked_at == 0 {
+                println!("not checked yet");
+            } else {
+                println!("checked {}s ago", now.saturating_sub(board.checked_at));
+            }
+            if let Some(trouble) = &board.trouble {
+                println!("the last check failed: {trouble}");
+            }
+            let left = |name: &str, window: &Option<factory_claude::Window>| match window {
+                Some(window) if window.resets_at > now => format!(
+                    "{name} {:.0}% used, resets in {}m",
+                    window.utilization * 100.0,
+                    (window.resets_at - now) / 60
+                ),
+                _ => format!("{name} not open"),
+            };
+            let nothing = Default::default();
+            for id in &board.picture.order {
+                let state = board.picture.states.get(id).unwrap_or(&nothing);
+                println!(
+                    "{id}: {}; {}",
+                    left("five-hour", &state.five_hour),
+                    left("week", &state.seven_day)
+                );
+                for (scope, until) in &state.blocked {
+                    if *until > now {
+                        let what = if scope == "*" { "everything" } else { scope };
+                        println!("  at a limit for {what}, for {}m more", (until - now) / 60 + 1);
+                    }
+                }
+                if let Some(concern) = &state.concern {
+                    println!("  LOOK AT THIS: {concern}");
+                }
+            }
+            for waiting in &board.waiting {
+                println!("waiting: {} (for `{}`)", waiting.who, waiting.model);
+            }
+            Ok(())
+        }
+        ["accounts", "recheck"] => {
+            let client = connect(&temporal.address, &temporal.namespace).await?;
+            client
+                .get_workflow_handle::<Accounts>(ACCOUNTS_ID.to_string())
+                .signal(Accounts::recheck, (), WorkflowSignalOptions::default())
+                .await
+                .map_err(|err| format!("the accounts could not be told: {err}"))?;
+            println!("told the accounts to look again");
+            Ok(())
+        }
+        _ => Err("usage: factory-engine worker | start <project> <bead> [--wait] | standing <pipeline> | go-on <pipeline> <step> <note> | give-up <pipeline> | accounts [recheck]   [--config <dir>]".to_string()),
     }
 }
 

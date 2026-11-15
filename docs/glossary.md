@@ -54,6 +54,8 @@ A lane that executes one run at a time, with its own runner and work directory. 
 
 A Claude subscription the factory may run workers under. It is supplied to a run as a token in the environment, and its limits are tracked from the rate-limit event of every run.
 
+Under the flow engine the accounts are handed out by one workflow, the *accounts workflow*. A step asks it which account to run under and is given a name, or told to wait; it releases everything waiting as soon as an account is back, whether its limit ended or the owner said to look again (`factory-engine accounts recheck`). The token for a name is read by the worker that runs the step and is in no workflow's history.
+
 ## session
 
 One Claude Code conversation, named by its session ID. An agent step starts a fresh session or continues the session of a named earlier step.

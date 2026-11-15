@@ -28,8 +28,16 @@ timeout_secs = 900
 id = "engine-pipeline"
 tier = "host"
 bead = "sf-9a0.4"
-claim = "With the factory's own driver doing every step, on a real repository with a scripted Claude, and the engine on a Temporal server started on this machine walking the flow: a bead is prepared, built, broken once by the tester, fixed in the builder's session, reviewed and published, with the unit's record and log kept as the driver keeps them; and a pipeline whose builder needs the owner parks, in the workflow and in the unit's record, and goes on from a decision whose note reaches the builder."
+claim = "With the factory's own driver doing every step, on a real repository with a scripted Claude, and the engine on a Temporal server started on this machine walking the flow: a bead is prepared, built, broken once by the tester, fixed in the builder's session, reviewed and published, with the unit's record and log kept as the driver keeps them; and a pipeline whose builder needs the owner parks, in the workflow and in the unit's record, and goes on from a decision whose note reaches the builder; and with two accounts and the accounts workflow handing them out, a run the first account refuses at a limit carries on in its session under the second, whose token the driver reads itself and no history holds."
 command = ["cargo", "test", "--locked", "--offline", "--package", "factory-engine", "--test", "pipeline", "--", "--test-threads=1"]
+timeout_secs = 900
+
+[[check]]
+id = "accounts-workflow"
+tier = "host"
+bead = "sf-9a0.3"
+claim = "With stand-in accounts, on a Temporal server started on this machine: of three accounts the one whose week ends soonest is handed out and one at a limit is passed over; a run stopped by a limit reports it and is handed the next account, in the same session, with no new check of the accounts; a pipeline asking when every account is at a limit waits with no worker up, and is released by the limit ending, by a re-check signal that finds an account back, and after the accounts workflow has continued as new; and no account's token is in the history of the accounts workflow or of any pipeline, searched inside the payloads."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-engine", "--test", "accounts", "--", "--test-threads=1"]
 timeout_secs = 900
 
 [[check]]

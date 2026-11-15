@@ -658,6 +658,7 @@ dependencies = [
 name = "factory-engine"
 version = "0.0.0"
 dependencies = [
+ "factory-claude",
  "factory-config",
  "factory-driver",
  "factory-flow",

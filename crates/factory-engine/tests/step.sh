@@ -11,19 +11,37 @@
 #     hang-build     the first build reports its session and never ends
 #     limited        the first tester run stops at a usage limit for 3 seconds
 #     hold-<unit>    that unit's build waits until state/release-<unit> exists
+#     limits-<account>  an agent run under that account stops at a usage limit
+#
+# Asked for the accounts (FACTORY_KIND=accounts) it answers with
+# state/picture.json and notes the check in state/checks. A step handed an
+# account reads that account's token from state/token-<account>, as a real
+# run reads it from the keychain, and notes it in state/tokens-used.
 here=$(cd "$(dirname "$0")" && pwd)
 state="$here/state"
 mkdir -p "$state"
+if [ "$FACTORY_KIND" = accounts ]; then
+  echo "$(date +%s) forget=${FACTORY_FORGET:--}" >> "$state/checks"
+  echo "accounts $(tr -d '\n' < "$state/picture.json")"
+  exit 0
+fi
 key="$FACTORY_UNIT-$FACTORY_STEP"
 n=$(( $(cat "$state/n-$key" 2>/dev/null || echo 0) + 1 ))
 echo "$n" > "$state/n-$key"
 scenario=$(cat "$state/scenario" 2>/dev/null)
-echo "$(date +%s) $FACTORY_UNIT $FACTORY_KIND $FACTORY_STEP round=$FACTORY_ROUND session=${FACTORY_SESSION:--} note=${FACTORY_NOTE:--} build=${FACTORY_BUILD:--}" >> "$state/calls"
+echo "$(date +%s) $FACTORY_UNIT $FACTORY_KIND $FACTORY_STEP round=$FACTORY_ROUND session=${FACTORY_SESSION:--} note=${FACTORY_NOTE:--} build=${FACTORY_BUILD:--}${FACTORY_ACCOUNT:+ account=$FACTORY_ACCOUNT}" >> "$state/calls"
+if [ -n "$FACTORY_ACCOUNT" ] && [ -f "$state/token-$FACTORY_ACCOUNT" ]; then
+  cat "$state/token-$FACTORY_ACCOUNT" >> "$state/tokens-used"
+fi
 
 if [ "$FACTORY_KIND" = agent ]; then
   echo "session ${FACTORY_SESSION:-sess-$key-$n}"
 fi
 
+case "$scenario" in
+  *"limits-${FACTORY_ACCOUNT:-none}"*)
+    if [ "$FACTORY_KIND" = agent ]; then echo "limited 600"; exit 0; fi ;;
+esac
 case "$scenario" in
   *hang-build*)
     if [ "$FACTORY_STEP" = build ] && [ -z "$FACTORY_SESSION" ]; then
