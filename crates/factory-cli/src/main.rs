@@ -266,7 +266,7 @@ fn run(args: &[String]) -> Result<u8, String> {
                 Supervisor::new(args.config, None, Vec::new(), false).map_err(|err| fail(&err))?;
             for goal in supervisor.goals() {
                 println!(
-                    "{}  {:?}  {} wakes, {} pipelines, est. ${:.2} for the director\n    {}",
+                    "{}  {:?}  {} wakes, {} pipelines, est. ${:.2} for its director and foremen\n    {}",
                     goal.id,
                     goal.phase,
                     goal.wakes,

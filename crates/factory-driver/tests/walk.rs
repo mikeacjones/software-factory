@@ -1795,6 +1795,526 @@ fn a_sub_goal_absorbs_its_beads_and_ships_as_one_pull_request() {
 }
 
 #[test]
+fn a_foreman_runs_a_sub_goals_beads_and_the_director_only_plans_and_ships() {
+    use factory_driver::goal::{Phase, Supervisor};
+    use factory_slack::socket::Incoming;
+    use std::time::{Duration, Instant};
+
+    let world = World::new("foreman", "true");
+    world.with_github("green");
+    // Every reviewer leaves one minor finding for someone to rule on.
+    world.scenario("minor-finding");
+    std::fs::write(
+        world.path("beads/toy-3.json"),
+        r#"{"id":"toy-3","title":"The follow-up","description":"Later.","acceptance_criteria":"- it follows","status":"open","open_blockers":["toy-1"]}"#,
+    )
+    .unwrap();
+    let project = world.path("config/projects/toy.toml");
+    let text = std::fs::read_to_string(&project)
+        .unwrap()
+        .replace(
+            "merge_subject = \"Merge bead/{bead_short}: {title}\"",
+            "merge_method = \"squash\"\nmerge_subject = \"{title} (#{number})\"",
+        )
+        .replace(
+            "merge_body = \"{summary}\\n\\n{testing}\\n\\nBead: {bead}\"",
+            "merge_body = \"{commit_body}\\n\\n{testing}\\n\\n{commit_trailers}\"",
+        );
+    std::fs::write(&project, text).unwrap();
+    std::fs::create_dir_all(world.path("config/goals/toy")).unwrap();
+    std::fs::write(
+        world.path("config/goals/toy/main.toml"),
+        "id = \"main\"\nflow = \"zig-sdk-bead\"\nship_flow = \"zig-sdk-ship\"\n[director]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\n[foreman]\nmodel = \"claude-opus-5-5\"\neffort = \"medium\"\n",
+    )
+    .unwrap();
+    let say = |role: &str, n: u32, json: String| {
+        std::fs::create_dir_all(world.path("bin/state")).unwrap();
+        std::fs::write(world.path(&format!("bin/state/{role}-{n}.json")), json).unwrap();
+    };
+    let with = |mut result: serde_json::Value, fields: &str| {
+        let extra: serde_json::Value = serde_json::from_str(fields).unwrap();
+        for (key, value) in extra.as_object().unwrap() {
+            result[key] = value.clone();
+        }
+        result.to_string()
+    };
+    let direct = |fields: &str| {
+        with(
+            serde_json::json!({
+                "summary": "Decided.", "start": [], "file": [], "edit": [], "dropped_findings": [],
+                "open_subgoal": {"id": "", "title": "", "objective": "", "beads": []}, "ship": false,
+                "tell_foreman": "", "ask_owner": "", "complete": false, "evidence": "",
+                "journal_entry": "", "project_memory": ""
+            }),
+            fields,
+        )
+    };
+    let foreman = |fields: &str| {
+        with(
+            serde_json::json!({
+                "summary": "Decided.", "start": [], "file": [], "dropped_findings": [],
+                "report": "working", "message": "", "journal_entry": ""
+            }),
+            fields,
+        )
+    };
+    say("intake", 1, r#"{"reply":"Here is the charter.","ready":true,"objective":"Ship the feature.","stop_when":"Both beads have landed.","plan":"One sub-goal: toy-1, then toy-3.","edits":[]}"#.to_string());
+    // The director plans and opens; it starts nothing.
+    say(
+        "director",
+        1,
+        direct(
+            r#"{"open_subgoal":{"id":"feature","title":"The feature and its follow-up","objective":"Both parts work.","beads":["toy-1","toy-3"]}}"#,
+        ),
+    );
+    // The foreman asks before it starts, and the director answers.
+    say(
+        "foreman",
+        1,
+        foreman(r#"{"report":"escalate","message":"Is toy-3 meant to build on toy-1?"}"#),
+    );
+    say(
+        "director",
+        2,
+        direct(r#"{"tell_foreman":"Yes: toy-1, then toy-3."}"#),
+    );
+    say(
+        "foreman",
+        2,
+        foreman(
+            r#"{"start":[{"bead":"toy-1","reason":"first"}],"journal_entry":"The director confirmed the order."}"#,
+        ),
+    );
+    // toy-1 is absorbed with a finding: the foreman files it to run here,
+    // and is woken again at once to go on.
+    say(
+        "foreman",
+        3,
+        foreman(
+            r#"{"file":[{"title":"Document the timeout","type":"task","priority":2,"description":"The reviewer found the doc silent on it.","acceptance_criteria":"- the doc says it","parent":"","discovered_from":"toy-1","deferred":false,"run_here":true}]}"#,
+        ),
+    );
+    say(
+        "foreman",
+        4,
+        foreman(r#"{"start":[{"bead":"toy-3","reason":"its blocker is absorbed"}]}"#),
+    );
+    say(
+        "foreman",
+        5,
+        foreman(
+            r#"{"start":[{"bead":"filed-4","reason":"the fix this sub-goal should not ship without"}],"dropped_findings":[{"finding":"F1","reason":"the same finding, already filed"}]}"#,
+        ),
+    );
+    say(
+        "foreman",
+        6,
+        foreman(
+            r#"{"report":"ready","message":"toy-1, toy-3 and the doc fix are absorbed.","dropped_findings":[{"finding":"F1","reason":"fixed by the bead that just landed"}]}"#,
+        ),
+    );
+    // The director hears from the sub-goal again only now.
+    say("director", 3, direct(r#"{"ship":true}"#));
+    say(
+        "director",
+        4,
+        direct(r#"{"complete":true,"evidence":"The sub-goal landed as one pull request."}"#),
+    );
+
+    let mut sup = Supervisor::new(world.config(), None, vec!["OWNER".to_string()], false).unwrap();
+    let id = sup.open_directly("toy", "Ship the feature").unwrap();
+    sup.incoming(Incoming::Action {
+        channel: String::new(),
+        user: "OWNER".to_string(),
+        action_id: "goal_start".to_string(),
+        value: id.clone(),
+        message_ts: String::new(),
+    })
+    .unwrap();
+    let goal = |sup: &Supervisor| sup.goals().next().unwrap().clone();
+    let roles =
+        |world: &World, role: &str| world.calls().iter().filter(|call| call[0] == role).count();
+    // The brief of the nth call of a role.
+    let brief = |world: &World, role: &str, n: usize| {
+        let calls = world.calls();
+        let index = (0..calls.len())
+            .filter(|&i| calls[i][0] == role)
+            .nth(n - 1)
+            .unwrap();
+        std::fs::read_to_string(world.path(&format!("bin/state/brief-{}.md", index + 1))).unwrap()
+    };
+
+    // Start ran the whole exchange: the director opened the sub-goal, its
+    // foreman escalated, the director answered, and the foreman started the
+    // first bead. Nothing waited for a pipeline.
+    let started = goal(&sup);
+    assert_eq!(started.wakes, 2);
+    let sub = &started.subgoals[0];
+    let record = sub.foreman.clone().unwrap();
+    assert_eq!(
+        (record.wakes, record.waiting, record.exchanges),
+        (2, None, 0)
+    );
+    assert_eq!(started.units.len(), 1);
+    assert_eq!(started.units[0].bead, "toy-1");
+    assert_eq!(started.units[0].subgoal.as_deref(), Some("feature"));
+    let asked = brief(&world, "director", 2);
+    assert!(
+        asked.contains("- The foreman of sub-goal `feature` has **escalated** and waits for you:\n\n> Is toy-3 meant to build on toy-1?"),
+        "{asked}"
+    );
+    let answered = brief(&world, "foreman", 2);
+    assert!(
+        answered.contains("- The director wrote to you:\n\n> Yes: toy-1, then toy-3."),
+        "{answered}"
+    );
+    // The foreman reads the sub-goal's branch, not the default branch's
+    // checkout the director uses, and not the branch's own worktree.
+    let calls = world.calls();
+    let place = |role: &str| {
+        calls
+            .iter()
+            .find(|call| call[0] == role)
+            .map(|call| call[2].clone())
+            .unwrap()
+    };
+    assert!(
+        place("foreman").ends_with("/foreman-feature"),
+        "{}",
+        place("foreman")
+    );
+    assert!(place("director").ends_with("/checkout"));
+
+    // The beads run one after another, and no bead's end wakes the director.
+    let deadline = Instant::now() + Duration::from_secs(180);
+    while goal(&sup).wakes < 3 {
+        assert!(
+            Instant::now() < deadline,
+            "the sub-goal was never reported ready"
+        );
+        sup.pump(Duration::from_millis(200)).unwrap();
+        if goal(&sup).wakes < 3 {
+            assert_eq!(
+                roles(&world, "director"),
+                2,
+                "the director ran while its foreman was working"
+            );
+        }
+    }
+    let ready = goal(&sup);
+    let sub = &ready.subgoals[0];
+    assert_eq!(
+        sub.absorbed
+            .iter()
+            .map(|(bead, _)| bead.as_str())
+            .collect::<Vec<_>>(),
+        ["toy-1", "toy-3", "filed-4"]
+    );
+    assert_eq!(sub.added, ["filed-4"]);
+    assert_eq!(sub.foreman.clone().unwrap().wakes, 6);
+    assert_eq!(
+        sub.state, "shipping",
+        "the director shipped it at its third wake"
+    );
+    assert_eq!(roles(&world, "foreman"), 6);
+
+    // What the foreman was told at each step.
+    let third = brief(&world, "foreman", 3);
+    for expected in [
+        "- The pipeline for `toy-1` ended: **absorbed**.",
+        "  - F1 (review, minor): The doc omits the timeout at `feature.txt:1`",
+        "## Wake 2\n\nThe director confirmed the order.",
+        "- Not yet absorbed: toy-3.",
+    ] {
+        assert!(
+            third.contains(expected),
+            "missing {expected:?} in:\n{third}"
+        );
+    }
+    let fourth = brief(&world, "foreman", 4);
+    assert!(
+        fourth.contains(
+            "- The beads you filed to run here now exist and are part of this sub-goal: filed-4."
+        ),
+        "{fourth}"
+    );
+    assert!(
+        fourth.contains("- Filed by you to run here: filed-4."),
+        "{fourth}"
+    );
+    // The bead it filed is linked to the one it came from.
+    let filed = std::fs::read_to_string(world.path("beads/filed-4.json")).unwrap();
+    assert!(filed.contains("Discovered from toy-1"), "{filed}");
+    // What the director was told when the sub-goal came back to it: the
+    // report, and none of the beads' own events.
+    let handed = brief(&world, "director", 3);
+    assert!(
+        handed.contains("- The foreman of sub-goal `feature` reports it **ready** to ship and waits for you:\n\n> toy-1, toy-3 and the doc fix are absorbed."),
+        "{handed}"
+    );
+    assert!(!handed.contains("- The pipeline for"), "{handed}");
+
+    // Shipping and ending are the director's and the owner's, as before.
+    let deadline = Instant::now() + Duration::from_secs(180);
+    while goal(&sup).wakes < 4 {
+        assert!(Instant::now() < deadline, "the sub-goal never landed");
+        sup.pump(Duration::from_millis(200)).unwrap();
+    }
+    let shipped = goal(&sup);
+    assert_eq!(shipped.phase, Phase::ProposedComplete);
+    assert_eq!(shipped.subgoals[0].state, "landed");
+    assert_eq!(roles(&world, "director"), 4);
+    assert_eq!(
+        roles(&world, "foreman"),
+        6,
+        "shipping does not wake the foreman"
+    );
+    assert!(
+        !world
+            .path(&format!("state/goals/{id}/foreman-feature"))
+            .exists(),
+        "a landed sub-goal's foreman keeps no checkout"
+    );
+    let gh = world.gh_calls();
+    assert_eq!(
+        gh.iter()
+            .filter(|call| call.starts_with("pr create"))
+            .count(),
+        1
+    );
+    let remote = world.path("remote.git");
+    assert_eq!(
+        run(&remote, "git", &["rev-list", "--count", "main"]),
+        "2",
+        "one squashed commit on main"
+    );
+    for bead in ["toy-1", "toy-3", "filed-4"] {
+        let text = std::fs::read_to_string(world.path(&format!("beads/{bead}.json"))).unwrap();
+        assert!(
+            text.contains("\"closed\""),
+            "{bead} is closed when the sub-goal lands"
+        );
+    }
+    let log =
+        std::fs::read_to_string(world.path(&format!("state/goals/{id}/events.jsonl"))).unwrap();
+    for kind in [
+        "foreman.ran",
+        "foreman.decided",
+        "foreman.told",
+        "director.ran",
+    ] {
+        assert!(
+            log.contains(&format!("\"kind\":\"{kind}\"")),
+            "no {kind} in the goal's log"
+        );
+    }
+
+    sup.incoming(Incoming::Action {
+        channel: String::new(),
+        user: "OWNER".to_string(),
+        action_id: "goal_accept".to_string(),
+        value: id,
+        message_ts: String::new(),
+    })
+    .unwrap();
+    assert_eq!(sup.goals().next().unwrap().phase, Phase::Complete);
+}
+
+#[test]
+fn a_foreman_that_cannot_run_is_retried_and_then_handed_to_the_director() {
+    use factory_driver::goal::Supervisor;
+    use factory_slack::socket::Incoming;
+    use std::time::{Duration, Instant};
+
+    let world = World::new("foreman-fails", "true");
+    // The project's commands and its scripted GitHub; nothing here ships.
+    world.with_github("green");
+    std::fs::create_dir_all(world.path("config/goals/toy")).unwrap();
+    std::fs::write(
+        world.path("config/goals/toy/main.toml"),
+        "id = \"main\"\nflow = \"zig-sdk-bead\"\nship_flow = \"zig-sdk-ship\"\n[director]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\n[foreman]\nmodel = \"claude-opus-5-5\"\neffort = \"medium\"\n",
+    )
+    .unwrap();
+    let say = |role: &str, n: u32, json: serde_json::Value| {
+        std::fs::create_dir_all(world.path("bin/state")).unwrap();
+        std::fs::write(
+            world.path(&format!("bin/state/{role}-{n}.json")),
+            json.to_string(),
+        )
+        .unwrap();
+    };
+    let direct = |fields: serde_json::Value| {
+        let mut result = serde_json::json!({
+            "summary": "Decided.", "start": [], "file": [], "edit": [], "dropped_findings": [],
+            "open_subgoal": {"id": "", "title": "", "objective": "", "beads": []}, "ship": false,
+            "tell_foreman": "", "ask_owner": "", "complete": false, "evidence": "",
+            "journal_entry": "", "project_memory": ""
+        });
+        for (key, value) in fields.as_object().unwrap() {
+            result[key] = value.clone();
+        }
+        result
+    };
+    say(
+        "intake",
+        1,
+        serde_json::json!({"reply": "Here is the charter.", "ready": true, "objective": "Ship the feature.", "stop_when": "toy-1 has landed.", "plan": "One sub-goal.", "edits": []}),
+    );
+    say(
+        "director",
+        1,
+        direct(
+            serde_json::json!({"open_subgoal": {"id": "feature", "title": "The feature", "objective": "It works.", "beads": ["toy-1"]}}),
+        ),
+    );
+    // The foreman has no script yet: every run returns nothing code accepts.
+
+    let supervisor =
+        || Supervisor::new(world.config(), None, vec!["OWNER".to_string()], false).unwrap();
+    let mut sup = supervisor();
+    let id = sup.open_directly("toy", "Ship the feature").unwrap();
+    sup.incoming(Incoming::Action {
+        channel: String::new(),
+        user: "OWNER".to_string(),
+        action_id: "goal_start".to_string(),
+        value: id.clone(),
+        message_ts: String::new(),
+    })
+    .unwrap();
+    let foreman = |sup: &Supervisor| {
+        sup.goals().next().unwrap().subgoals[0]
+            .foreman
+            .clone()
+            .unwrap()
+    };
+    let calls = |role: &str| world.calls().iter().filter(|call| call[0] == role).count();
+
+    // One failed wake: the refused result went back to the same session
+    // twice, the event it was owed is kept, and a retry is set.
+    let first = foreman(&sup);
+    assert_eq!((first.failures, first.wakes, first.inbox.len()), (1, 0, 1));
+    assert!(first.retry_at.is_some() && first.waiting.is_none());
+    assert_eq!(calls("foreman"), 3);
+    let sessions: Vec<String> = world
+        .calls()
+        .iter()
+        .filter(|call| call[0] == "foreman")
+        .map(|call| call[1].clone())
+        .collect();
+    assert!(sessions.iter().all(|session| session == &sessions[0]));
+    assert_eq!(
+        calls("director"),
+        1,
+        "one failure is not the director's business"
+    );
+
+    // A restart finds the foreman owed its event and wakes it again. After
+    // five failures in a row the sub-goal goes to the director instead.
+    say(
+        "director",
+        2,
+        direct(serde_json::json!({"ask_owner": "The foreman cannot run. Try again?"})),
+    );
+    for failures in 2..=4 {
+        drop(sup);
+        sup = supervisor();
+        sup.resume().unwrap();
+        assert_eq!(foreman(&sup).failures, failures);
+        assert_eq!(calls("director"), 1);
+    }
+    drop(sup);
+    sup = supervisor();
+    sup.resume().unwrap();
+    let gave_up = foreman(&sup);
+    assert_eq!(gave_up.waiting.as_deref(), Some("escalated"));
+    assert_eq!((gave_up.failures, gave_up.retry_at), (0, None));
+    assert_eq!(calls("foreman"), 15);
+    assert_eq!(calls("director"), 2);
+    let calls_now = world.calls();
+    let index = calls_now
+        .iter()
+        .rposition(|call| call[0] == "director")
+        .unwrap();
+    let told =
+        std::fs::read_to_string(world.path(&format!("bin/state/brief-{}.md", index + 1))).unwrap();
+    assert!(
+        told.contains("has **escalated** and waits for you:\n\n> The foreman could not be run five times in a row"),
+        "{told}"
+    );
+    // A foreman that waits is left alone, restart or not.
+    drop(sup);
+    sup = supervisor();
+    sup.resume().unwrap();
+    assert_eq!(calls("foreman"), 15);
+
+    // The owner says to try again, the director passes it on, and this time
+    // the foreman runs: it still has the event it was first owed.
+    say(
+        "director",
+        3,
+        direct(serde_json::json!({"tell_foreman": "Try once more."})),
+    );
+    say(
+        "foreman",
+        16,
+        serde_json::json!({"summary": "Starting.", "start": [{"bead": "toy-1", "reason": "the only one"}], "file": [], "dropped_findings": [], "report": "working", "message": "", "journal_entry": ""}),
+    );
+    say(
+        "foreman",
+        17,
+        serde_json::json!({"summary": "Done.", "start": [], "file": [], "dropped_findings": [], "report": "ready", "message": "toy-1 is absorbed.", "journal_entry": ""}),
+    );
+    say(
+        "director",
+        4,
+        direct(serde_json::json!({"ask_owner": "Ship it now?"})),
+    );
+    let thread = sup.goals().next().unwrap().thread_ts.clone();
+    sup.incoming(Incoming::Message {
+        channel: String::new(),
+        user: "OWNER".to_string(),
+        text: "Yes, try again.".to_string(),
+        ts: "2.0".to_string(),
+        thread_ts: Some(thread),
+    })
+    .unwrap();
+    let running = foreman(&sup);
+    assert_eq!(
+        (running.wakes, running.waiting, running.exchanges),
+        (1, None, 0)
+    );
+    let calls_now = world.calls();
+    let index = calls_now
+        .iter()
+        .rposition(|call| call[0] == "foreman")
+        .unwrap();
+    let woken =
+        std::fs::read_to_string(world.path(&format!("bin/state/brief-{}.md", index + 1))).unwrap();
+    for expected in [
+        "- The director opened this sub-goal and handed it to you.",
+        "- The director wrote to you:\n\n> Try once more.",
+    ] {
+        assert!(
+            woken.contains(expected),
+            "missing {expected:?} in:\n{woken}"
+        );
+    }
+
+    // The bead runs, and the foreman hands the sub-goal back.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while sup.goals().next().unwrap().wakes < 4 {
+        assert!(
+            Instant::now() < deadline,
+            "the sub-goal was never reported ready"
+        );
+        sup.pump(Duration::from_millis(200)).unwrap();
+    }
+    let done = sup.goals().next().unwrap().clone();
+    assert_eq!(done.subgoals[0].absorbed.len(), 1);
+    assert_eq!(foreman(&sup).waiting.as_deref(), Some("ready"));
+}
+
+#[test]
 fn a_finding_is_proved_by_a_failing_test_and_a_fix_by_that_test_passing() {
     let world = World::new("proof", "true");
     // The tester's first reproduction passes when the factory runs it, and

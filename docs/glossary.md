@@ -72,7 +72,15 @@ What one bead goes through from being started to being landed: a unit walking it
 
 ## director
 
-The agent that directs a goal: it decides which bead's pipeline runs next, what to file, when the owner is needed and when to propose that the goal is complete. It starts fresh at every event and its decisions are checked by code.
+The agent that directs a goal: it decides which bead's pipeline runs next, what to file, when the owner is needed and when to propose that the goal is complete. It starts fresh at every event and its decisions are checked by code. On a goal whose sub-goals have foremen it opens and ships sub-goals, and leaves their beads to them.
+
+## foreman
+
+The agent that runs one sub-goal under the director: it starts the sub-goal's beads, rules on their findings, and reports to the director when the sub-goal is ready to ship or when it needs an answer. Like the director it starts fresh at every event and its decisions are checked by code.
+
+## tier
+
+One level of the agents that run a goal, defined by a model, an effort, a time limit and its slots: the most pieces of work it may have running below it at once. The director is the tier of a goal and the foreman the tier of a sub-goal. Each is woken by events from the level below, and a slot count is a maximum, never a target.
 
 ## tick
 

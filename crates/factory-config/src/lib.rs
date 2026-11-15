@@ -392,7 +392,11 @@ pub struct GoalDefinition {
     /// without saying more.
     pub objective: Option<String>,
     pub stop_when: Option<String>,
-    pub director: Director,
+    pub director: Tier,
+    /// The agent that runs each sub-goal: it starts the sub-goal's beads,
+    /// rules on their findings and reports to the director. Without it the
+    /// director does that itself.
+    pub foreman: Option<Tier>,
     #[serde(default)]
     pub permissions: GoalPermissions,
 }
@@ -401,15 +405,26 @@ fn default_pipelines() -> u32 {
     1
 }
 
-/// The agent that directs a goal.
+/// One level of the agents that run a goal: the director of the goal, or
+/// the foreman of a sub-goal. Each is woken by events from the level below
+/// it, decides, and has its decisions checked by code.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Director {
+pub struct Tier {
     pub model: String,
     pub effort: String,
     /// The wall-clock cap of one wake.
     #[serde(default = "default_wake_timeout")]
     pub timeout_secs: u64,
+    /// The most pieces of work it may have running below it at once: bead
+    /// pipelines for a foreman, sub-goals for a director. A maximum, never
+    /// a target: the agent runs work together only when it is safe to.
+    #[serde(default = "default_slots")]
+    pub slots: u32,
+}
+
+fn default_slots() -> u32 {
+    1
 }
 
 fn default_wake_timeout() -> u64 {
@@ -610,6 +625,23 @@ impl ConfigDir {
             }
             if definition.max_pipelines == 0 {
                 return Err(invalid("max_pipelines must be at least 1".to_string()));
+            }
+            // Work that runs side by side has to be folded back together,
+            // and nothing does that yet.
+            for (name, tier) in [
+                ("director", Some(&definition.director)),
+                ("foreman", definition.foreman.as_ref()),
+            ] {
+                if tier.is_some_and(|tier| tier.slots != 1) {
+                    return Err(invalid(format!(
+                        "{name}.slots must be 1: running work side by side is not built yet"
+                    )));
+                }
+            }
+            if definition.foreman.is_some() && definition.ship_flow.is_none() {
+                return Err(invalid(
+                    "a foreman runs a sub-goal, so the definition needs a ship_flow".to_string(),
+                ));
             }
             definitions.push(definition);
         }
@@ -844,6 +876,39 @@ timeout_secs = 60
                 .unwrap_err()
                 .to_string()
                 .contains("pipelines")
+        );
+
+        // A foreman is a second tier with the same shape as the director.
+        // It needs sub-goals to run, and no tier runs work side by side yet.
+        let foreman = "\n[foreman]\nmodel = \"f\"\neffort = \"medium\"\n";
+        let with_foreman = |extra: &str, tail: &str| definition("bugs", extra) + foreman + tail;
+        std::fs::write(
+            goals.join("bugs.toml"),
+            with_foreman("ship_flow = \"ship\"", ""),
+        )
+        .unwrap();
+        let loaded = dir.goal_definitions("toy").unwrap();
+        let tier = loaded[0].foreman.clone().unwrap();
+        assert_eq!((tier.model.as_str(), tier.slots), ("f", 1));
+        assert_eq!(tier.timeout_secs, loaded[0].director.timeout_secs);
+        assert!(loaded[1].foreman.is_none());
+        std::fs::write(goals.join("bugs.toml"), with_foreman("", "")).unwrap();
+        assert!(
+            dir.goal_definitions("toy")
+                .unwrap_err()
+                .to_string()
+                .contains("needs a ship_flow")
+        );
+        std::fs::write(
+            goals.join("bugs.toml"),
+            with_foreman("ship_flow = \"ship\"", "slots = 2\n"),
+        )
+        .unwrap();
+        assert!(
+            dir.goal_definitions("toy")
+                .unwrap_err()
+                .to_string()
+                .contains("foreman.slots must be 1")
         );
         std::fs::remove_dir_all(&dir.0).unwrap();
     }

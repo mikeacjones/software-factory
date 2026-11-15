@@ -1,0 +1,46 @@
+# Tiers: an Executive, Directors and Foremen run work in parallel where it is
+# safe. Each check is an acceptance line of a bead in epic E18 (sf-7nv). The
+# stages land bottom-up, and each adds its checks here.
+id = "tiers"
+title = "A goal runs under every tier, with work side by side"
+bead = "sf-7nv.5"
+
+[[tool]]
+name = "claude"
+command = ["claude", "--version"]
+
+[[tool]]
+name = "jq"
+command = ["jq", "--version"]
+
+[[check]]
+id = "tier-definitions"
+tier = "hermetic"
+bead = "sf-7nv.1"
+claim = "A goal definition may give its sub-goals a foreman, a tier of the same shape as the director; a foreman without sub-goals to run, or a tier asked to run work side by side before that is built, is refused; and every goal definition in config/ names allowed models and prompts that exist for each tier."
+command = ["sh", "-c", "cargo test --locked --offline --package factory-config goal_definitions_load && cargo run --quiet --locked --offline --package factory-cli -- goal check --config config"]
+timeout_secs = 900
+
+[[check]]
+id = "foreman-decisions"
+tier = "hermetic"
+bead = "sf-7nv.1"
+claim = "A foreman may start only launchable beads of its own sub-goal, within its slots; it is never left idle, since a result with nothing running and nothing reported is refused; ready needs absorbed work, nothing running and a word to the director. A director whose sub-goals have foremen cannot start beads, must move the goal itself once a foreman waits, and is cut off from an exchange with a foreman that starts nothing. Each is briefed on the other with the same text for the same inputs."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-driver", "--lib", "--", "a_director_with_foremen", "a_foreman_starts_its_own_beads", "each_tier_is_briefed"]
+timeout_secs = 900
+
+[[check]]
+id = "foreman-run"
+tier = "hermetic"
+bead = "sf-7nv.1"
+claim = "With scripted agents and real pipelines against scripted stand-ins: opening a sub-goal wakes its foreman; the foreman's escalation wakes the director and the answer wakes the foreman; the foreman starts each bead in turn, files a finding as a bead that joins the sub-goal and runs there, and reports ready; no bead's end wakes the director, which runs only to plan, to answer and to ship; and the sub-goal lands as one pull request that closes every bead. A foreman that cannot run is retried, survives restarts with the event it was owed, and after five failures hands its sub-goal to the director."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-driver", "--test", "walk", "a_foreman_"]
+timeout_secs = 900
+
+[[check]]
+id = "zig-foreman"
+tier = "owner"
+bead = "sf-7nv.1"
+claim = "On temporal-sdk-zig, a sub-goal of a real goal was run by a foreman from its first bead to ready, shipped by the director, and landed."
+command = ["proofs/tiers_zig_verify.sh"]
+timeout_secs = 300

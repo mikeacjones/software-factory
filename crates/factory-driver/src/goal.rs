@@ -15,6 +15,14 @@
 //! The director can propose that the goal is complete. Ending it is the
 //! owner's act and involves no agent: they press Accept, or reply with what
 //! is still missing.
+//!
+//! A goal definition may put a foreman under the director. The director
+//! then opens sub-goals and ships them, and each sub-goal's foreman, woken
+//! the same way by its own events, starts that sub-goal's beads, rules on
+//! their findings and reports to the director when the sub-goal is ready or
+//! when it needs an answer. Both are the same mechanism at two levels: an
+//! inbox of events from below, a fresh session per wake, and decisions that
+//! code checks.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -23,7 +31,9 @@ use std::time::Duration;
 
 use factory_beads::{Change, NewBead, Source, Summary, readiness};
 use factory_claude::{Outcome, RunSpec, Session, Usage};
-use factory_config::{ConfigDir, Factory, GoalDefinition, Permission, Project, read_env_file};
+use factory_config::{
+    ConfigDir, Factory, GoalDefinition, Permission, Project, Tier, read_env_file,
+};
 use factory_core::{EventLog, ProjectId, UnitId, now_unix};
 use factory_slack::socket::{Incoming, Listener};
 use factory_slack::{Button, Slack, escape, quote, truncate};
@@ -133,7 +143,35 @@ pub struct SubGoal {
     pub absorbed: Vec<(String, String)>,
     pub ship_unit: Option<String>,
     pub pull_request: Option<String>,
+    /// Its foreman, when the goal's definition had one as it was opened.
+    /// Without one the director starts its beads itself.
+    #[serde(default)]
+    pub foreman: Option<Foreman>,
+    /// Beads its foreman filed to run in it, beyond what the director planned.
+    #[serde(default)]
+    pub added: Vec<String>,
 }
+
+/// The factory's record of the agent that runs one sub-goal.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Foreman {
+    /// What it has not been told yet.
+    pub inbox: Vec<Happening>,
+    pub wakes: u32,
+    pub failures: u32,
+    pub retry_at: Option<u64>,
+    /// `ready` or `escalated` while it waits for the director. Otherwise it
+    /// is working: a pipeline is running, or an event is on its way to it.
+    pub waiting: Option<String>,
+    /// What it last said to the director.
+    pub message: String,
+    /// Messages between it and the director since a pipeline last started.
+    pub exchanges: u32,
+}
+
+/// How many messages a director and a foreman may pass each other without
+/// a pipeline starting, before the director must ship or ask the owner.
+const MAX_EXCHANGES: u32 = 6;
 
 /// One pipeline the goal started.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -146,13 +184,37 @@ pub struct GoalUnit {
     /// Whether this pipeline ships a sub-goal; `bead` is then the sub-goal's ID.
     #[serde(default)]
     pub ship: bool,
+    /// The sub-goal a bead's pipeline runs in.
+    #[serde(default)]
+    pub subgoal: Option<String>,
 }
 
-/// Something the director has not been told yet.
+/// Something a director or a foreman has not been told yet.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Happening {
     Started,
+    /// A fact from the factory itself, such as a pipeline lost in a restart.
+    Note {
+        text: String,
+    },
+    /// To a foreman: the director opened its sub-goal.
+    Opened,
+    /// To a foreman: the director wrote to it.
+    DirectorSaid {
+        text: String,
+    },
+    /// To a foreman: the beads it filed to run in its sub-goal now exist.
+    Filed {
+        beads: Vec<String>,
+    },
+    /// To the director: a sub-goal's foreman has stopped and waits. `report`
+    /// is `ready` or `escalated`.
+    ForemanReported {
+        subgoal: String,
+        report: String,
+        message: String,
+    },
     OwnerSaid {
         text: String,
     },
@@ -238,6 +300,18 @@ impl Goal {
             .filter(|unit| unit.state == "running")
             .count()
     }
+
+    /// The bead pipelines running in one sub-goal.
+    fn running_in(&self, sub: &str) -> usize {
+        self.units
+            .iter()
+            .filter(|unit| {
+                unit.state == "running"
+                    && !unit.ship
+                    && unit.subgoal.as_deref().is_none_or(|own| own == sub)
+            })
+            .count()
+    }
 }
 
 /// What a pipeline thread tells the supervisor.
@@ -306,29 +380,59 @@ pub fn intake_schema() -> Value {
     }))
 }
 
+fn start_schema() -> Value {
+    json!({ "type": "array", "description": "Pipelines to start now.", "items": object_schema(json!({
+        "bead": text_schema("The ID of a launchable bead."),
+        "reason": text_schema("Why this one next."),
+    }))})
+}
+
+/// A new bead to file. A foreman's may also join its sub-goal.
+fn file_schema(foreman: bool) -> Value {
+    let mut properties = json!({
+        "title": text_schema("What the bead is, as a short title."),
+        "type": { "enum": BEAD_TYPES },
+        "priority": { "type": "integer", "minimum": 0, "maximum": 4 },
+        "description": text_schema("Why it exists and what needs doing, for someone who has not seen this goal."),
+        "acceptance_criteria": text_schema("How anyone will know it is done."),
+        "parent": text_schema("The epic it belongs under, or empty."),
+        "discovered_from": text_schema("The bead whose work turned this up, or empty."),
+        "deferred": { "type": "boolean", "description": "True to file it into the icebox: kept, but not ready work." },
+    });
+    if foreman {
+        properties["run_here"] = json!({ "type": "boolean", "description": "True when this sub-goal should not ship without it: it joins the sub-goal, and you are woken again at once to start it. False for work that can land later by itself." });
+    }
+    json!({ "type": "array", "description": "New beads to file.", "items": object_schema(properties) })
+}
+
+fn dropped_schema() -> Value {
+    json!({ "type": "array", "description": "Findings from an ended pipeline that you decided not to file.", "items": object_schema(json!({
+        "finding": text_schema("Which finding, by its label."),
+        "reason": text_schema("Why it is not worth a bead."),
+    }))})
+}
+
+/// What a sub-goal's foreman returns each time an event wakes it.
+pub fn foreman_schema() -> Value {
+    object_schema(json!({
+        "summary": text_schema("What you concluded and decided, for the owner and the director, in a few plain sentences."),
+        "start": start_schema(),
+        "file": file_schema(true),
+        "dropped_findings": dropped_schema(),
+        "report": { "enum": ["working", "ready", "escalate"], "description": "`working` while a pipeline of this sub-goal is running or being started. `ready` when everything meant for it is absorbed and the director should ship it. `escalate` when you need the director: a bead that cannot run, a question, work that does not belong." },
+        "message": text_schema("To the director, when `report` is `ready` or `escalate`: what the sub-goal holds and what they should know, or what you need from them. Otherwise empty."),
+        "journal_entry": text_schema("What you want to remember at the next wake of this sub-goal. You start fresh each time; this is all that carries over."),
+    }))
+}
+
 /// What the director returns each time an event wakes it.
 pub fn wake_schema() -> Value {
     object_schema(json!({
         "summary": text_schema("What you concluded and decided, for the owner, in a few plain sentences."),
-        "start": { "type": "array", "description": "Pipelines to start now.", "items": object_schema(json!({
-            "bead": text_schema("The ID of a launchable bead."),
-            "reason": text_schema("Why this one next."),
-        }))},
-        "file": { "type": "array", "description": "New beads to file.", "items": object_schema(json!({
-            "title": text_schema("What the bead is, as a short title."),
-            "type": { "enum": BEAD_TYPES },
-            "priority": { "type": "integer", "minimum": 0, "maximum": 4 },
-            "description": text_schema("Why it exists and what needs doing, for someone who has not seen this goal."),
-            "acceptance_criteria": text_schema("How anyone will know it is done."),
-            "parent": text_schema("The epic it belongs under, or empty."),
-            "discovered_from": text_schema("The bead whose work turned this up, or empty."),
-            "deferred": { "type": "boolean", "description": "True to file it into the icebox: kept, but not ready work." },
-        }))},
+        "start": start_schema(),
+        "file": file_schema(false),
         "edit": { "type": "array", "description": "Changes to beads that exist.", "items": edit_schema() },
-        "dropped_findings": { "type": "array", "description": "Findings from an ended pipeline that you decided not to file.", "items": object_schema(json!({
-            "finding": text_schema("Which finding, by its label."),
-            "reason": text_schema("Why it is not worth a bead."),
-        }))},
+        "dropped_findings": dropped_schema(),
         "open_subgoal": object_schema(json!({
             "id": text_schema("A short slug for a new sub-goal, such as `signals`: lowercase letters, digits and dashes. It names the branch. Empty to open none."),
             "title": text_schema("What the sub-goal delivers, as the title its one pull request could carry."),
@@ -336,6 +440,7 @@ pub fn wake_schema() -> Value {
             "beads": { "type": "array", "items": { "type": "string" }, "description": "The beads you mean it to hold, in the order you would run them." },
         })),
         "ship": { "type": "boolean", "description": "True to ship the open sub-goal now: its branch gets the whole verification once, one pull request, and lands. Only when every bead you meant for it is absorbed and no pipeline is running." },
+        "tell_foreman": text_schema("A message to the foreman of the open sub-goal: an answer to what it escalated, or an instruction. Empty when there is nothing to say, and always empty on a goal whose sub-goals have no foreman."),
         "ask_owner": text_schema("One question only the owner can answer, or empty."),
         "complete": { "type": "boolean", "description": "True to propose that the stop condition is met. The owner decides." },
         "evidence": text_schema("When complete: how the stop condition is met, point by point, with what you checked. Otherwise empty."),
@@ -435,8 +540,20 @@ pub fn decision_problems(
         }
     }
     let absorbed = goal.absorbed();
+    // Whether the sub-goal in question is run by a foreman: the open one as
+    // it was opened, or one opened now under this definition.
+    let foreman = match current {
+        Some(open) => open.foreman.is_some(),
+        None => definition.foreman.is_some(),
+    };
 
     let mut starting: Vec<&str> = Vec::new();
+    if foreman && !items(result, "start").is_empty() {
+        problems.push(
+            "start: each sub-goal of this goal is run by its foreman, which starts its beads: name them in `open_subgoal.beads`, or say what you want in `tell_foreman`"
+                .to_string(),
+        );
+    }
     for start in items(result, "start") {
         let bead = strings(start, "bead");
         if starting.contains(&bead) {
@@ -474,8 +591,50 @@ pub fn decision_problems(
             _ => {}
         }
     }
+    let tell = strings(result, "tell_foreman").trim();
+    if !tell.is_empty() {
+        match current {
+            _ if opening.is_some() => problems.push(
+                "tell_foreman: a sub-goal you open now is briefed by its title, objective and beads: say it there"
+                    .to_string(),
+            ),
+            None => problems.push("tell_foreman: no sub-goal is open".to_string()),
+            Some(open) if open.state != "open" => problems.push(format!(
+                "tell_foreman: sub-goal `{}` is being shipped, and its foreman has finished",
+                open.id
+            )),
+            Some(open) => match &open.foreman {
+                None => problems.push(format!(
+                    "tell_foreman: sub-goal `{}` has no foreman: you start its beads yourself",
+                    open.id
+                )),
+                Some(foreman) if foreman.exchanges >= MAX_EXCHANGES => problems.push(format!(
+                    "tell_foreman: you and the foreman of `{}` have passed {} messages without a pipeline starting: ship what is absorbed, or ask the owner",
+                    open.id, foreman.exchanges
+                )),
+                Some(_) => {}
+            },
+        }
+        if ship {
+            problems.push(
+                "tell_foreman: ship the sub-goal or write to its foreman, not both".to_string(),
+            );
+        }
+    }
+    // A foreman that is not waiting for the director will move the goal by
+    // itself: a pipeline of its sub-goal is running, or an event is on its
+    // way to it.
+    let foreman_working = !tell.is_empty()
+        || (opening.is_some() && definition.foreman.is_some())
+        || current.is_some_and(|open| {
+            open.state == "open"
+                && open
+                    .foreman
+                    .as_ref()
+                    .is_some_and(|foreman| foreman.waiting.is_none())
+        });
     let shipping_now = usize::from(ship);
-    let in_flight = goal.running() + starting.len() + shipping_now;
+    let in_flight = goal.running() + starting.len() + shipping_now + usize::from(foreman_working);
     if goal.running() + starting.len() > definition.max_pipelines as usize {
         problems.push(format!(
             "start: that would make {} pipelines at once, and this goal may run {}",
@@ -504,25 +663,7 @@ pub fn decision_problems(
         }
     }
 
-    for file in items(result, "file") {
-        let title = strings(file, "title");
-        if title.trim().is_empty() || strings(file, "description").trim().is_empty() {
-            problems.push("file: a bead needs a title and a description".to_string());
-        }
-        if !BEAD_TYPES.contains(&strings(file, "type")) {
-            problems.push(format!("file: `{title}` has no valid type"));
-        }
-        let priority = file.get("priority").and_then(Value::as_i64).unwrap_or(-1);
-        if !(0..=4).contains(&priority) {
-            problems.push(format!("file: `{title}` needs a priority from 0 to 4"));
-        }
-        let from = strings(file, "discovered_from");
-        if !from.is_empty() && launchable(from) == ["unknown"] {
-            problems.push(format!(
-                "file: `{title}` was discovered from `{from}`, which does not exist"
-            ));
-        }
-    }
+    problems.extend(file_problems(items(result, "file"), launchable));
     let edits = edits_of(result, "edit");
     if edits.len() != items(result, "edit").len() {
         problems.push("edit: an entry could not be read".to_string());
@@ -538,7 +679,7 @@ pub fn decision_problems(
         }
         if in_flight > 0 {
             problems.push(
-                "complete: a goal cannot be complete while a pipeline is running or being started"
+                "complete: a goal cannot be complete while work is running or being started"
                     .to_string(),
             );
         }
@@ -557,9 +698,191 @@ pub fn decision_problems(
             && !items(result, "file").is_empty());
     if in_flight == 0 && !asks_owner && !complete && !needs_approval {
         problems.push(
-            "nothing would be running and nobody would be asked: start a pipeline, ship the sub-goal, ask the owner, or propose that the goal is complete"
+            if foreman {
+                "nothing would be running and nobody would be asked: open a sub-goal, answer the foreman with `tell_foreman`, ship the sub-goal, ask the owner, or propose that the goal is complete"
+            } else {
+                "nothing would be running and nobody would be asked: start a pipeline, ship the sub-goal, ask the owner, or propose that the goal is complete"
+            }
+            .to_string(),
+        );
+    }
+    problems
+}
+
+/// Why beads may not be filed as asked.
+fn file_problems(files: &[Value], launchable: &dyn Fn(&str) -> Vec<String>) -> Vec<String> {
+    let mut problems = Vec::new();
+    for file in files {
+        let title = strings(file, "title");
+        if title.trim().is_empty() || strings(file, "description").trim().is_empty() {
+            problems.push("file: a bead needs a title and a description".to_string());
+        }
+        if !BEAD_TYPES.contains(&strings(file, "type")) {
+            problems.push(format!("file: `{title}` has no valid type"));
+        }
+        let priority = file.get("priority").and_then(Value::as_i64).unwrap_or(-1);
+        if !(0..=4).contains(&priority) {
+            problems.push(format!("file: `{title}` needs a priority from 0 to 4"));
+        }
+        let from = strings(file, "discovered_from");
+        if !from.is_empty() && launchable(from) == ["unknown"] {
+            problems.push(format!(
+                "file: `{title}` was discovered from `{from}`, which does not exist"
+            ));
+        }
+    }
+    problems
+}
+
+fn flag(value: &Value, key: &str) -> bool {
+    value.get(key).and_then(Value::as_bool) == Some(true)
+}
+
+/// Why a foreman's decisions may not be carried out. Empty means they may.
+///
+/// The rule that matters most: a sub-goal is never left with nothing that
+/// can move it. After every decision a pipeline is running in it, or the
+/// director has been told.
+pub fn foreman_problems(
+    definition: &GoalDefinition,
+    goal: &Goal,
+    sub: &SubGoal,
+    tracker: &[Summary],
+    launchable: &dyn Fn(&str) -> Vec<String>,
+    result: &Value,
+) -> Vec<String> {
+    let mut problems = Vec::new();
+    if strings(result, "summary").trim().is_empty() {
+        problems.push("`summary` is empty".to_string());
+    }
+    let report = strings(result, "report");
+    let slots = definition.foreman.as_ref().map_or(1, |tier| tier.slots) as usize;
+    let running = goal.running_in(&sub.id);
+
+    let mut starting: Vec<&str> = Vec::new();
+    for start in items(result, "start") {
+        let bead = strings(start, "bead");
+        if starting.contains(&bead) {
+            problems.push(format!("start: `{bead}` is listed twice"));
+            continue;
+        }
+        starting.push(bead);
+        let is_running = |unit: &GoalUnit| unit.bead == bead && unit.state == "running";
+        if sub.absorbed.iter().any(|(done, _)| done == bead) {
+            problems.push(format!(
+                "start: `{bead}` is already absorbed in this sub-goal"
+            ));
+        } else if goal.units.iter().any(is_running) {
+            problems.push(format!("start: a pipeline for `{bead}` is already running"));
+        } else if !sub.planned.iter().chain(&sub.added).any(|own| own == bead) {
+            problems.push(format!(
+                "start: `{bead}` is not one of this sub-goal's beads. The director planned {}; a bead you file with `run_here` joins them. If another bead belongs here, escalate",
+                if sub.planned.is_empty() {
+                    "none".to_string()
+                } else {
+                    sub.planned.join(", ")
+                }
+            ));
+        } else if !tracker.iter().any(|open| open.id == bead) {
+            problems.push(format!(
+                "start: `{bead}` is not an open bead of this project"
+            ));
+        } else {
+            let reasons = launchable(bead);
+            if !reasons.is_empty() {
+                problems.push(format!(
+                    "start: `{bead}` may not be launched: {}",
+                    reasons.join("; ")
+                ));
+            }
+        }
+    }
+    if running + starting.len() > slots {
+        problems.push(format!(
+            "start: that would make {} pipelines at once in this sub-goal, and its foreman may run {slots}",
+            running + starting.len()
+        ));
+    } else if goal.running() + starting.len() > definition.max_pipelines as usize {
+        problems.push(format!(
+            "start: that would make {} pipelines at once, and the goal may run {}",
+            goal.running() + starting.len(),
+            definition.max_pipelines
+        ));
+    }
+
+    let files = items(result, "file");
+    if !files.is_empty() && definition.permissions.file_beads == Permission::Ask {
+        problems.push(
+            "file: on this goal a new bead is put to the owner, which is the director's to do: describe it in `message` and escalate"
                 .to_string(),
         );
+    }
+    problems.extend(file_problems(files, launchable));
+    let here = files.iter().filter(|file| flag(file, "run_here")).count();
+    if files
+        .iter()
+        .any(|file| flag(file, "run_here") && flag(file, "deferred"))
+    {
+        problems.push("file: a bead that is to run here cannot be filed deferred".to_string());
+    }
+    // A bead filed to run here wakes the foreman again to start it. Filing
+    // another before that one has started would go round for ever.
+    let unstarted: Vec<&str> = sub
+        .added
+        .iter()
+        .map(String::as_str)
+        .filter(|bead| {
+            !sub.absorbed.iter().any(|(done, _)| done == bead)
+                && !starting.contains(bead)
+                && !goal.units.iter().any(|unit| &unit.bead == bead)
+        })
+        .collect();
+    if here > 0 && !unstarted.is_empty() {
+        problems.push(format!(
+            "file: you already filed {} to run here and have not started it: start it, or escalate, before filing another to run here",
+            unstarted.join(", ")
+        ));
+    }
+
+    let message = strings(result, "message").trim();
+    match report {
+        "ready" => {
+            if running > 0 || !starting.is_empty() || here > 0 {
+                problems.push(
+                    "ready: a sub-goal is ready when nothing in it is running, starting or waiting to run"
+                        .to_string(),
+                );
+            }
+            if sub.absorbed.is_empty() {
+                problems.push(
+                    "ready: this sub-goal has absorbed nothing, so there is nothing to ship: escalate instead"
+                        .to_string(),
+                );
+            }
+            if message.is_empty() {
+                problems.push(
+                    "ready: say in `message` what the sub-goal now holds and what the director should know before shipping it"
+                        .to_string(),
+                );
+            }
+        }
+        "escalate" => {
+            if message.is_empty() {
+                problems
+                    .push("escalate: say in `message` what you need from the director".to_string());
+            }
+        }
+        "working" => {
+            if running + starting.len() + here == 0 {
+                problems.push(
+                    "working: nothing would be running in this sub-goal and the director would not be told: start a bead, report `ready`, or `escalate`"
+                        .to_string(),
+                );
+            }
+        }
+        other => problems.push(format!(
+            "`report` is `{other}`, not `working`, `ready` or `escalate`"
+        )),
     }
     problems
 }
@@ -596,6 +919,13 @@ fn permission_text(definition: &GoalDefinition) -> String {
         Permission::Allow => "is carried out at once",
         Permission::Ask => "is put to the owner, who approves or rejects it",
     };
+    if definition.foreman.is_some() {
+        return format!(
+            "- Sub-goals: each is a part of the goal that lands as one pull request, one open at a time. Opening one hands it to its foreman, a separate agent that starts its beads through the light pipeline, rules on their findings, and reports to you when the sub-goal is ready to ship or when it needs you. You do not start beads: `start` is refused.\n- Answering the foreman: `tell_foreman` reaches the foreman of the open sub-goal, and wakes it.\n- Shipping: yours to decide, once nothing is running in the sub-goal. It runs the whole verification once, opens one pull request for all of it and lands it, which closes its beads.\n- Filing a new bead {}.\n- Changing a bead that exists (criteria, priority, deferral) {}.\n- Ending the goal: you propose, the owner decides.",
+            say(definition.permissions.file_beads),
+            say(definition.permissions.edit_beads),
+        );
+    }
     format!(
         "- Starting a pipeline: carried out at once, on a launchable bead, up to {} at a time.{}\n- Filing a new bead {}.\n- Changing a bead that exists (criteria, priority, deferral) {}.\n- Ending the goal: you propose, the owner decides.",
         definition.max_pipelines,
@@ -609,27 +939,11 @@ fn permission_text(definition: &GoalDefinition) -> String {
     )
 }
 
-/// The briefing for one wake of the director. The same inputs give the same text.
-pub fn wake_brief(
-    definition: &GoalDefinition,
-    goal: &Goal,
-    tracker: &[Summary],
-    journal: &str,
-    memory: &str,
-) -> String {
-    let charter = goal.charter.clone().unwrap_or_default();
-    let mut out = format!(
-        "# Goal `{}` on project `{}`, wake {}\n\n## Objective\n\n{}\n\n## Stop when\n\n{}\n\n## The plan the owner agreed to\n\n{}\n\n",
-        goal.id,
-        goal.project,
-        goal.wakes + 1,
-        charter.objective,
-        charter.stop_when,
-        charter.plan
-    );
-    out.push_str("## What happened since you last ran\n\n");
+/// What an agent has not been told yet, as the list its brief opens with.
+fn told(inbox: &[Happening]) -> String {
+    let mut out = String::new();
     let mut label = 0;
-    for happening in &goal.inbox {
+    for happening in inbox {
         match happening {
             Happening::Started => out.push_str("- The owner started the goal.\n"),
             Happening::OwnerSaid { text } => {
@@ -638,6 +952,31 @@ pub fn wake_brief(
                     quote_plain(text)
                 ));
             }
+            Happening::Note { text } => out.push_str(&format!("- {text}\n")),
+            Happening::Opened => out.push_str(
+                "- The director opened this sub-goal and handed it to you. Nothing has run in it yet.\n",
+            ),
+            Happening::DirectorSaid { text } => out.push_str(&format!(
+                "- The director wrote to you:\n\n{}\n\n",
+                quote_plain(text)
+            )),
+            Happening::Filed { beads } => out.push_str(&format!(
+                "- The beads you filed to run here now exist and are part of this sub-goal: {}.\n",
+                beads.join(", ")
+            )),
+            Happening::ForemanReported {
+                subgoal,
+                report,
+                message,
+            } => out.push_str(&format!(
+                "- The foreman of sub-goal `{subgoal}` {} and waits for you:\n\n{}\n\n",
+                if report == "ready" {
+                    "reports it **ready** to ship"
+                } else {
+                    "has **escalated**"
+                },
+                quote_plain(message)
+            )),
             Happening::RequestAnswered { approved, what } => out.push_str(&format!(
                 "- The owner {} your request: {what}\n",
                 if *approved { "approved" } else { "rejected" }
@@ -679,6 +1018,29 @@ pub fn wake_brief(
             }
         }
     }
+    out
+}
+
+/// The briefing for one wake of the director. The same inputs give the same text.
+pub fn wake_brief(
+    definition: &GoalDefinition,
+    goal: &Goal,
+    tracker: &[Summary],
+    journal: &str,
+    memory: &str,
+) -> String {
+    let charter = goal.charter.clone().unwrap_or_default();
+    let mut out = format!(
+        "# Goal `{}` on project `{}`, wake {}\n\n## Objective\n\n{}\n\n## Stop when\n\n{}\n\n## The plan the owner agreed to\n\n{}\n\n",
+        goal.id,
+        goal.project,
+        goal.wakes + 1,
+        charter.objective,
+        charter.stop_when,
+        charter.plan
+    );
+    out.push_str("## What happened since you last ran\n\n");
+    out.push_str(&told(&goal.inbox));
     if definition.ship_flow.is_some() {
         out.push_str("\n## Sub-goals\n\n");
         if goal.subgoals.is_empty() {
@@ -692,8 +1054,22 @@ pub fn wake_brief(
                 .map(String::as_str)
                 .filter(|bead| !absorbed.contains(bead))
                 .collect();
+            let foreman = match &sub.foreman {
+                Some(foreman) if sub.state == "open" => match foreman.waiting.as_deref() {
+                    Some("ready") => format!(
+                        " Its foreman reports it ready to ship and waits for you: {}",
+                        foreman.message
+                    ),
+                    Some(_) => format!(
+                        " Its foreman has escalated and waits for you: {}",
+                        foreman.message
+                    ),
+                    None => " Its foreman is working on it and will report.".to_string(),
+                },
+                _ => String::new(),
+            };
             out.push_str(&format!(
-                "- `{}` ({}): {}. Branch `{}`. Absorbed: {}. Planned and not yet absorbed: {}.{}\n",
+                "- `{}` ({}): {}. Branch `{}`. Absorbed: {}. Planned and not yet absorbed: {}.{}{foreman}\n",
                 sub.id,
                 sub.state,
                 sub.title,
@@ -750,6 +1126,105 @@ pub fn wake_brief(
     out
 }
 
+/// The briefing for one wake of a sub-goal's foreman. The same inputs give
+/// the same text.
+pub fn foreman_brief(
+    definition: &GoalDefinition,
+    goal: &Goal,
+    sub: &SubGoal,
+    tracker: &[Summary],
+    journal: &str,
+    memory: &str,
+) -> String {
+    let foreman = sub.foreman.clone().unwrap_or_default();
+    let charter = goal.charter.clone().unwrap_or_default();
+    let slots = definition.foreman.as_ref().map_or(1, |tier| tier.slots);
+    let mut out = format!(
+        "# Sub-goal `{}` of goal `{}` on project `{}`, wake {}\n\n## What this sub-goal delivers\n\n{}\n\n{}\n\nIts branch is `{}`, and your working directory is a checkout of it as it is now.\n\n## The goal it is part of\n\n{}\n\n",
+        sub.id,
+        goal.id,
+        goal.project,
+        foreman.wakes + 1,
+        sub.title,
+        sub.objective,
+        sub.branch,
+        charter.objective,
+    );
+    out.push_str("## What happened since you last ran\n\n");
+    out.push_str(&told(&foreman.inbox));
+
+    let done: Vec<String> = sub.absorbed.iter().map(|(bead, _)| bead.clone()).collect();
+    let list = |beads: &[String]| {
+        if beads.is_empty() {
+            "none".to_string()
+        } else {
+            beads.join(", ")
+        }
+    };
+    let waiting: Vec<String> = sub
+        .planned
+        .iter()
+        .chain(&sub.added)
+        .filter(|bead| !done.contains(bead))
+        .cloned()
+        .collect();
+    out.push_str(&format!(
+        "\n## Its beads\n\n- Planned by the director, in the order it would run them: {}.\n- Filed by you to run here: {}.\n- Absorbed, one commit each on the branch: {}.\n- Not yet absorbed: {}.\n\n## Its pipelines\n\n{} running; you may run {slots} at a time.\n",
+        list(&sub.planned),
+        list(&sub.added),
+        list(&done),
+        list(&waiting),
+        goal.running_in(&sub.id),
+    ));
+    for unit in goal
+        .units
+        .iter()
+        .filter(|unit| !unit.ship && unit.subgoal.as_deref() == Some(sub.id.as_str()))
+    {
+        out.push_str(&format!(
+            "- `{}`: {} {}\n",
+            unit.bead, unit.state, unit.detail
+        ));
+    }
+    let own: Vec<Summary> = tracker
+        .iter()
+        .filter(|bead| {
+            sub.planned
+                .iter()
+                .chain(&sub.added)
+                .any(|id| id == &bead.id)
+        })
+        .cloned()
+        .collect();
+    out.push_str(&format!(
+        "\n## The tracker: this sub-goal's beads\n\n{}\nOnly a `launchable` bead can be started. Look at any bead in full with `bd show <id>`.\n",
+        table(&own, &done)
+    ));
+    for (title, text) in [
+        ("Your journal for this sub-goal", journal),
+        ("Project memory", memory),
+    ] {
+        out.push_str(&format!(
+            "\n## {title}\n\n{}\n",
+            if text.trim().is_empty() {
+                "(empty)"
+            } else {
+                text.trim()
+            }
+        ));
+    }
+    out.push_str(&format!(
+        "\n## What you may decide\n\n- Starting a pipeline: carried out at once, on a launchable bead of this sub-goal, up to {slots} at a time. A bead blocked only by beads this sub-goal has absorbed is launchable.\n- Filing a new bead: {}\n- Reporting: `working` while a pipeline runs; `ready` hands the sub-goal to the director to ship; `escalate` asks the director, and you are woken with the answer.\n- Not yours: shipping, changing a bead that exists, and talking to the owner. Those are the director's; escalate.\n\nReturn the structured result. Code checks every decision against the tracker before carrying it out, and sends back what it refuses.\n",
+        match definition.permissions.file_beads {
+            Permission::Allow =>
+                "carried out at once. One filed with `run_here` joins this sub-goal, and you are woken again to start it.",
+            Permission::Ask =>
+                "not yours on this goal. Describe it in `message` and escalate.",
+        },
+    ));
+    out
+}
+
 fn quote_plain(text: &str) -> String {
     text.lines()
         .map(|line| format!("> {line}"))
@@ -766,10 +1241,16 @@ fn command(text: &str) -> String {
 /// the time to try again.
 const LIMITED: &str = "limited until ";
 
-/// One run of the director: which prompt it works to, what it must return,
-/// and what it is told.
+/// One run of a director or a foreman: who it is, which prompt it works to,
+/// where it reads the code, what it must return, and what it is told.
 struct Turn {
+    /// `director` or `foreman`, as the goal's log names the run.
+    who: &'static str,
     role: &'static str,
+    tier: Tier,
+    /// The checkout it works in: a name under the goal's directory, and the
+    /// revision it shows. `None` is the project's default branch, fetched.
+    place: Option<(String, String)>,
     schema: Value,
     session: Session,
     prompt: String,
@@ -828,8 +1309,19 @@ pub fn check_definitions(config: &ConfigDir) -> Result<Vec<String>, DriverError>
             for role in ["director", "director-intake"] {
                 config.role_prompt(role)?;
             }
+            let mut foreman = String::new();
+            if let Some(tier) = &definition.foreman {
+                if !factory.allowed_models.contains(&tier.model) {
+                    return Err(refuse(format!(
+                        "the foreman's model `{}` is not allowed",
+                        tier.model
+                    )));
+                }
+                config.role_prompt("foreman")?;
+                foreman = format!(", foreman {} ({})", tier.model, tier.effort);
+            }
             lines.push(format!(
-                "{id}/{}: director {} ({}), pipeline `{}`, {} at a time{}",
+                "{id}/{}: director {} ({}){foreman}, pipeline `{}`, {} at a time{}",
                 definition.id,
                 definition.director.model,
                 definition.director.effort,
@@ -1314,7 +1806,7 @@ impl Supervisor {
                     let project = self.config.project(&goal.project)?;
                     let source = bead_source(&project);
                     for file in &request.files {
-                        what.push(self.file_bead(&goal, &source, &project, file));
+                        what.push(self.file_bead(&goal, &source, &project, file).1);
                     }
                     for edit in &request.edits {
                         what.push(self.edit_bead(&goal, &source, &project, edit));
@@ -1368,12 +1860,25 @@ impl Supervisor {
             .unwrap_or_else(|| model.to_string())
     }
 
-    /// A checkout of the default branch for the director to read, kept apart
-    /// from the owner's own checkout and from every pipeline's worktree.
-    fn checkout(&self, goal: &Goal, project: &Project) -> Result<PathBuf, DriverError> {
-        let dir = self.dir(&goal.id).join("checkout");
-        let head = format!("{}/{}", project.remote, project.default_branch);
-        factory_git::fetch(&project.repo, &project.remote)?;
+    /// A checkout for an agent to read, kept apart from the owner's own
+    /// checkout and from every pipeline's worktree: the default branch for
+    /// the director, a sub-goal's branch for its foreman.
+    fn checkout(
+        &self,
+        goal: &Goal,
+        project: &Project,
+        place: &Option<(String, String)>,
+    ) -> Result<PathBuf, DriverError> {
+        let (dir, head) = match place {
+            Some((name, rev)) => (self.dir(&goal.id).join(name), rev.clone()),
+            None => {
+                factory_git::fetch(&project.repo, &project.remote)?;
+                (
+                    self.dir(&goal.id).join("checkout"),
+                    format!("{}/{}", project.remote, project.default_branch),
+                )
+            }
+        };
         if dir.exists() {
             factory_git::checkout_detached(&dir, &head)?;
         } else {
@@ -1382,17 +1887,20 @@ impl Supervisor {
         Ok(dir)
     }
 
-    /// Run the director once, sending a result that code refuses back to the
-    /// same session up to twice. Returns the result and the session.
-    fn run_director(
+    /// Run a director or a foreman once, sending a result that code refuses
+    /// back to the same session up to twice. Returns the result and the
+    /// session.
+    fn run_agent(
         &mut self,
         goal: &mut Goal,
-        definition: &GoalDefinition,
         turn: Turn,
         check: &dyn Fn(&Value) -> Vec<String>,
     ) -> Result<(Value, String), String> {
         let Turn {
+            who,
             role,
+            tier,
+            place,
             schema,
             mut session,
             mut prompt,
@@ -1402,7 +1910,7 @@ impl Supervisor {
             .project(&goal.project)
             .map_err(|err| err.to_string())?;
         let cwd = self
-            .checkout(goal, &project)
+            .checkout(goal, &project, &place)
             .map_err(|err| err.to_string())?;
         let system_prompt = self
             .config
@@ -1416,7 +1924,7 @@ impl Supervisor {
                 / 2
                 + 1;
             let _ = std::fs::write(dir.join(format!("{run:03}-{role}-brief.md")), &prompt);
-            let model = self.model(&definition.director.model);
+            let model = self.model(&tier.model);
             let (account, oauth_token) = match crate::pick_account(&self.factory, &model) {
                 Ok(crate::AccountPick::Use { id, token }) => (id, token),
                 Ok(crate::AccountPick::Wait { until }) => return Err(format!("{LIMITED}{until}")),
@@ -1425,14 +1933,14 @@ impl Supervisor {
             let spec = RunSpec {
                 claude_bin: self.factory.claude_bin.clone(),
                 model,
-                effort: definition.director.effort.clone(),
+                effort: tier.effort.clone(),
                 session: session.clone(),
                 system_prompt: system_prompt.clone(),
                 schema: schema.clone(),
                 cwd: cwd.clone(),
                 prompt: prompt.clone(),
                 budget_usd: project.limits.step_budget_usd,
-                timeout: Duration::from_secs(definition.director.timeout_secs),
+                timeout: Duration::from_secs(tier.timeout_secs),
                 oauth_token,
             };
             let finished = factory_claude::run(
@@ -1451,7 +1959,7 @@ impl Supervisor {
             goal.usage.add(&usage);
             self.log(
                 goal,
-                "director.ran",
+                &format!("{who}.ran"),
                 json!({ "role": role, "run": run, "account": account, "outcome": finished.outcome.name(), "session": finished.transcript.session_id, "usage": usage }),
             );
             let id = finished.transcript.session_id.clone().unwrap_or_default();
@@ -1461,7 +1969,11 @@ impl Supervisor {
                     if problems.is_empty() {
                         return Ok((result, id));
                     }
-                    self.log(goal, "director.refused", json!({ "problems": problems }));
+                    self.log(
+                        goal,
+                        &format!("{who}.refused"),
+                        json!({ "problems": problems }),
+                    );
                     if attempt == 3 {
                         return Err(format!(
                             "its decisions were refused three times: {}",
@@ -1485,10 +1997,10 @@ impl Supervisor {
                         session = Session::Resume(id);
                     }
                 }
-                other => return Err(format!("the director's run ended as `{}`", other.name())),
+                other => return Err(format!("the {who}'s run ended as `{}`", other.name())),
             }
         }
-        Err("the director did not return a result".to_string())
+        Err(format!("the {who} did not return a result"))
     }
 
     /// What to do when the director could not be run: try again later, and
@@ -1600,12 +2112,15 @@ impl Supervisor {
             problems
         };
         let turn = Turn {
+            who: "director",
             role: "director-intake",
+            tier: definition.director.clone(),
+            place: None,
             schema: intake_schema(),
             session,
             prompt,
         };
-        let result = self.run_director(&mut goal, &definition, turn, &check);
+        let result = self.run_agent(&mut goal, turn, &check);
         let (result, session) = match result {
             Ok(done) => done,
             Err(reason) => {
@@ -1647,8 +2162,13 @@ impl Supervisor {
                 ));
             }
             text.push_str(&format!(
-                "\n\n_Director: `{}` · pipeline: `{}` · {} at a time. Press *Start*, or reply to change anything._",
+                "\n\n_Director: `{}`{} · pipeline: `{}` · {} at a time. Press *Start*, or reply to change anything._",
                 self.model(&definition.director.model),
+                definition
+                    .foreman
+                    .as_ref()
+                    .map(|tier| format!(" · foreman of each sub-goal: `{}`", self.model(&tier.model)))
+                    .unwrap_or_default(),
                 definition.flow.as_deref().unwrap_or(&project.flow),
                 definition.max_pipelines
             ));
@@ -1678,7 +2198,15 @@ impl Supervisor {
             .join("memory.md")
     }
 
-    fn file_bead(&self, goal: &Goal, source: &Source, project: &Project, file: &Value) -> String {
+    /// File a bead. Returns its ID, if it was filed, and a line saying what
+    /// happened.
+    fn file_bead(
+        &self,
+        goal: &Goal,
+        source: &Source,
+        project: &Project,
+        file: &Value,
+    ) -> (Option<String>, String) {
         let optional = |key: &str| {
             let value = strings(file, key).trim();
             (!value.is_empty()).then(|| value.to_string())
@@ -1714,14 +2242,15 @@ impl Supervisor {
                     "bead.filed",
                     json!({ "bead": bead.id, "request": file }),
                 );
-                format!(
+                let line = format!(
                     "filed `{}` ({}, P{}{}): {}",
                     bead.id,
                     new.issue_type,
                     new.priority,
                     if new.deferred { ", deferred" } else { "" },
                     new.title
-                )
+                );
+                (Some(bead.id), line)
             }
             Err(err) => {
                 self.log(
@@ -1729,7 +2258,7 @@ impl Supervisor {
                     "bead.failed",
                     json!({ "request": file, "error": err.to_string() }),
                 );
-                format!("could not file `{}`: {err}", new.title)
+                (None, format!("could not file `{}`: {err}", new.title))
             }
         }
     }
@@ -1788,12 +2317,15 @@ impl Supervisor {
             decision_problems(&definition, &snapshot, &tracker, &launchable, result)
         };
         let turn = Turn {
+            who: "director",
             role: "director",
+            tier: definition.director.clone(),
+            place: None,
             schema: wake_schema(),
             session: Session::Fresh,
             prompt: brief,
         };
-        let result = self.run_director(&mut goal, &definition, turn, &check);
+        let result = self.run_agent(&mut goal, turn, &check);
         let result = match result {
             Ok((result, _)) => result,
             Err(reason) => return self.director_failed(goal, &reason),
@@ -1807,7 +2339,7 @@ impl Supervisor {
         let mut request = Request::default();
         for file in items(&result, "file") {
             match definition.permissions.file_beads {
-                Permission::Allow => did.push(self.file_bead(&goal, &source, &project, file)),
+                Permission::Allow => did.push(self.file_bead(&goal, &source, &project, file).1),
                 Permission::Ask => request.files.push(file.clone()),
             }
         }
@@ -1949,7 +2481,15 @@ impl Supervisor {
                         quote(&truncate(&sub.objective, 800)),
                         escape(&sub.branch)
                     ));
-                    self.log(&goal, "subgoal.opened", json!({ "id": sub.id, "branch": sub.branch, "base": sub.base, "planned": sub.planned }));
+                    self.log(&goal, "subgoal.opened", json!({ "id": sub.id, "branch": sub.branch, "base": sub.base, "planned": sub.planned, "foreman": definition.foreman.is_some() }));
+                    let mut sub = sub;
+                    if definition.foreman.is_some() {
+                        // Its foreman takes it from here, woken below.
+                        sub.foreman = Some(Foreman {
+                            inbox: vec![Happening::Opened],
+                            ..Foreman::default()
+                        });
+                    }
                     goal.subgoals.push(sub);
                 }
                 Err(err) => {
@@ -1961,10 +2501,9 @@ impl Supervisor {
                             escape(&err.to_string())
                         ),
                     );
-                    goal.inbox.push(Happening::RequestAnswered {
-                        approved: false,
-                        what: format!(
-                            "the factory could not open the sub-goal ({err}); nothing was started"
+                    goal.inbox.push(Happening::Note {
+                        text: format!(
+                            "The factory could not open the sub-goal ({err}). Nothing was started."
                         ),
                     });
                     goal.retry_at = Some(now_unix() + 60);
@@ -1972,34 +2511,344 @@ impl Supervisor {
                 }
             }
         }
-        for start in items(&result, "start") {
-            let bead = strings(start, "bead").to_string();
-            let within = match goal.current() {
-                Some(sub) if definition.ship_flow.is_some() => Some(Within::Bead {
-                    tip: factory_git::rev_parse(&sub.worktree, "HEAD")?,
-                    worktree: sub.worktree.clone(),
-                    absorbed: goal.absorbed(),
-                }),
-                _ => None,
-            };
-            goal.units.push(GoalUnit {
-                bead: bead.clone(),
-                unit: None,
-                state: "running".to_string(),
-                detail: String::new(),
-                ship: false,
+        let tell = strings(&result, "tell_foreman").trim();
+        let told = goal
+            .subgoals
+            .iter_mut()
+            .find(|sub| sub.state == "open")
+            .filter(|_| !tell.is_empty())
+            .and_then(|sub| {
+                let foreman = sub.foreman.as_mut()?;
+                foreman.inbox.push(Happening::DirectorSaid {
+                    text: tell.to_string(),
+                });
+                foreman.waiting = None;
+                foreman.exchanges += 1;
+                Some(sub.id.clone())
             });
+        if let Some(sub) = told {
             self.log(
                 &goal,
-                "pipeline.started",
-                json!({ "bead": bead, "reason": strings(start, "reason"), "subgoal": goal.current().map(|sub| sub.id.clone()) }),
+                "foreman.told",
+                json!({ "subgoal": sub, "text": tell }),
             );
-            self.launch(&goal, definition.flow.clone(), bead, within, None);
+        }
+        let open = goal
+            .current()
+            .filter(|_| definition.ship_flow.is_some())
+            .map(|sub| sub.id.clone());
+        for start in items(&result, "start") {
+            self.start_bead(
+                &mut goal,
+                &definition,
+                open.as_deref(),
+                strings(start, "bead"),
+                strings(start, "reason"),
+            )?;
         }
         if result.get("ship").and_then(Value::as_bool) == Some(true) {
             self.ship(&mut goal, &definition, &source)?;
         }
-        self.save(goal)
+        self.save(goal)?;
+        self.wake_foremen(id)
+    }
+
+    /// Start one bead's pipeline: inside a sub-goal, from that sub-goal's
+    /// tip, or by itself when the goal has no sub-goals.
+    fn start_bead(
+        &self,
+        goal: &mut Goal,
+        definition: &GoalDefinition,
+        subgoal: Option<&str>,
+        bead: &str,
+        reason: &str,
+    ) -> Result<(), DriverError> {
+        let mut within = None;
+        if let Some(sub) = goal
+            .subgoals
+            .iter_mut()
+            .find(|sub| Some(sub.id.as_str()) == subgoal)
+        {
+            within = Some(Within::Bead {
+                tip: factory_git::rev_parse(&sub.worktree, "HEAD")?,
+                worktree: sub.worktree.clone(),
+                absorbed: sub.absorbed.iter().map(|(bead, _)| bead.clone()).collect(),
+            });
+            if let Some(foreman) = sub.foreman.as_mut() {
+                // Work has started: the talking has got somewhere.
+                foreman.exchanges = 0;
+            }
+        }
+        goal.units.push(GoalUnit {
+            bead: bead.to_string(),
+            unit: None,
+            state: "running".to_string(),
+            detail: String::new(),
+            ship: false,
+            subgoal: subgoal.map(str::to_string),
+        });
+        self.log(
+            goal,
+            "pipeline.started",
+            json!({ "bead": bead, "reason": reason, "subgoal": subgoal }),
+        );
+        self.launch(
+            goal,
+            definition.flow.clone(),
+            bead.to_string(),
+            within,
+            None,
+        );
+        Ok(())
+    }
+
+    /// Wake every foreman of a goal that is owed an event and is not
+    /// waiting for the director.
+    fn wake_foremen(&mut self, id: &str) -> Result<(), DriverError> {
+        let owed: Vec<String> = self
+            .goals
+            .get(id)
+            .map(|goal| {
+                goal.subgoals
+                    .iter()
+                    .filter(|sub| {
+                        sub.state == "open"
+                            && sub.foreman.as_ref().is_some_and(|foreman| {
+                                foreman.waiting.is_none() && !foreman.inbox.is_empty()
+                            })
+                    })
+                    .map(|sub| sub.id.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for sub in owed {
+            self.wake_foreman(id, &sub)?;
+        }
+        Ok(())
+    }
+
+    /// Wake the foreman of one sub-goal with everything it has not been
+    /// told, and carry out what it decides.
+    fn wake_foreman(&mut self, id: &str, sub_id: &str) -> Result<(), DriverError> {
+        let mut goal = self.goals[id].clone();
+        let Some(index) = goal.subgoals.iter().position(|sub| sub.id == sub_id) else {
+            return Ok(());
+        };
+        let sub = goal.subgoals[index].clone();
+        let Some(mut foreman) = sub.foreman.clone() else {
+            return Ok(());
+        };
+        if goal.phase != Phase::Running || sub.state != "open" || foreman.inbox.is_empty() {
+            return Ok(());
+        }
+        let definition = self.definition(&goal)?;
+        let project = self.config.project(&goal.project)?;
+        let source = bead_source(&project);
+        let tracker = source.list_open()?;
+        let journal_path = self.dir(id).join(format!("foreman-{sub_id}.md"));
+        let journal = std::fs::read_to_string(&journal_path).unwrap_or_default();
+        let memory = std::fs::read_to_string(self.memory_path(&goal.project)).unwrap_or_default();
+        let brief = foreman_brief(&definition, &goal, &sub, &tracker, &journal, &memory);
+
+        let done: Vec<String> = sub.absorbed.iter().map(|(bead, _)| bead.clone()).collect();
+        let launchable = |bead: &str| match source.read(bead) {
+            Ok(mut bead) => {
+                // Work this sub-goal has absorbed counts as done.
+                bead.open_blockers.retain(|blocker| !done.contains(blocker));
+                readiness(&bead, &project.bead_actor)
+            }
+            Err(_) => vec!["unknown".to_string()],
+        };
+        let snapshot = goal.clone();
+        let check = |result: &Value| {
+            foreman_problems(&definition, &snapshot, &sub, &tracker, &launchable, result)
+        };
+        let turn = Turn {
+            who: "foreman",
+            role: "foreman",
+            // A definition that lost its foreman mid-goal still has to
+            // finish the sub-goals that were opened with one.
+            tier: definition
+                .foreman
+                .clone()
+                .unwrap_or_else(|| definition.director.clone()),
+            place: Some((format!("foreman-{sub_id}"), sub.branch.clone())),
+            schema: foreman_schema(),
+            session: Session::Fresh,
+            prompt: brief,
+        };
+        let result = match self.run_agent(&mut goal, turn, &check) {
+            Ok((result, _)) => result,
+            Err(reason) => return self.foreman_failed(goal, index, &reason),
+        };
+        foreman.failures = 0;
+        foreman.retry_at = None;
+        foreman.wakes += 1;
+        foreman.inbox.clear();
+
+        let mut did: Vec<String> = Vec::new();
+        let mut here: Vec<String> = Vec::new();
+        for file in items(&result, "file") {
+            let (bead, line) = self.file_bead(&goal, &source, &project, file);
+            did.push(line);
+            if let Some(bead) = bead.filter(|_| flag(file, "run_here")) {
+                here.push(bead);
+            }
+        }
+        for dropped in items(&result, "dropped_findings") {
+            self.log(&goal, "finding.dropped", dropped.clone());
+            did.push(format!(
+                "dropped finding {}: {}",
+                strings(dropped, "finding"),
+                strings(dropped, "reason")
+            ));
+        }
+        let entry = strings(&result, "journal_entry").trim();
+        if !entry.is_empty() {
+            let text = format!("{journal}\n## Wake {}\n\n{entry}\n", foreman.wakes);
+            let _ = std::fs::write(&journal_path, text.trim_start());
+        }
+
+        let message = strings(&result, "message").trim().to_string();
+        foreman.waiting = match strings(&result, "report") {
+            "ready" => Some("ready".to_string()),
+            "escalate" => Some("escalated".to_string()),
+            _ => None,
+        };
+        let mut text = format!(
+            ":construction_worker: *Foreman* of `{sub_id}` · wake {}\n{}",
+            foreman.wakes,
+            quote(&truncate(strings(&result, "summary"), 2000))
+        );
+        if !did.is_empty() {
+            text.push_str(&format!(
+                "\n{}",
+                did.iter()
+                    .map(|line| format!("• {}", escape(line)))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ));
+        }
+        if let Some(waiting) = &foreman.waiting {
+            foreman.message = message.clone();
+            foreman.exchanges += 1;
+            text.push_str(&format!(
+                "\n:arrow_up: *{}*\n{}",
+                if waiting == "ready" {
+                    "Ready to ship: over to the director."
+                } else {
+                    "Escalated to the director."
+                },
+                quote(&truncate(&message, 1500))
+            ));
+            goal.inbox.push(Happening::ForemanReported {
+                subgoal: sub_id.to_string(),
+                report: waiting.clone(),
+                message,
+            });
+        }
+        if !here.is_empty() {
+            // The beads it filed to run here join the sub-goal, and it is
+            // woken again at once to start them.
+            foreman.inbox.push(Happening::Filed {
+                beads: here.clone(),
+            });
+            goal.subgoals[index].added.extend(here);
+        }
+        self.log(
+            &goal,
+            "foreman.decided",
+            json!({ "subgoal": sub_id, "wake": foreman.wakes, "report": strings(&result, "report") }),
+        );
+        let again = !foreman.inbox.is_empty();
+        goal.subgoals[index].foreman = Some(foreman);
+        self.say(&goal, &text);
+        for start in items(&result, "start") {
+            self.start_bead(
+                &mut goal,
+                &definition,
+                Some(sub_id),
+                strings(start, "bead"),
+                strings(start, "reason"),
+            )?;
+        }
+        self.save(goal)?;
+        if again {
+            self.wake_foreman(id, sub_id)?;
+        }
+        // The director, if this left something for it.
+        self.wake(id)
+    }
+
+    /// What to do when a foreman could not be run: try again later, and
+    /// after five failures in a row hand the sub-goal to the director.
+    fn foreman_failed(
+        &mut self,
+        mut goal: Goal,
+        index: usize,
+        reason: &str,
+    ) -> Result<(), DriverError> {
+        let id = goal.id.clone();
+        let sub_id = goal.subgoals[index].id.clone();
+        let Some(mut foreman) = goal.subgoals[index].foreman.clone() else {
+            return self.save(goal);
+        };
+        let mut gave_up = false;
+        if let Some(until) = reason
+            .strip_prefix(LIMITED)
+            .and_then(|at| at.parse::<u64>().ok())
+        {
+            // Waiting for a usage window is not a failure.
+            foreman.retry_at = Some(until);
+            self.log(
+                &goal,
+                "accounts.limited",
+                json!({ "until": until, "subgoal": sub_id }),
+            );
+            self.say(&goal, &format!(
+                ":hourglass: Every account is at a usage limit. The foreman of `{sub_id}` wakes at {:02}:{:02} UTC.",
+                (until % 86_400) / 3600,
+                (until % 3600) / 60
+            ));
+        } else {
+            foreman.failures += 1;
+            self.log(
+                &goal,
+                "foreman.failed",
+                json!({ "subgoal": sub_id, "reason": reason, "failures": foreman.failures }),
+            );
+            gave_up = foreman.failures >= 5;
+            if gave_up {
+                foreman.failures = 0;
+                foreman.retry_at = None;
+                foreman.waiting = Some("escalated".to_string());
+                foreman.message = format!(
+                    "The foreman could not be run five times in a row, so the sub-goal is yours to rule on. The last reason: {reason}"
+                );
+                foreman.exchanges += 1;
+                goal.inbox.push(Happening::ForemanReported {
+                    subgoal: sub_id.clone(),
+                    report: "escalated".to_string(),
+                    message: foreman.message.clone(),
+                });
+                self.say(&goal, &format!(
+                    ":x: The foreman of `{sub_id}` failed five times in a row ({}). Over to the director.",
+                    escape(reason)
+                ));
+            } else {
+                foreman.retry_at = Some(now_unix() + 300);
+                self.say(&goal, &format!(
+                    ":warning: The foreman of `{sub_id}` could not run ({}). Trying again in 5 minutes.",
+                    escape(reason)
+                ));
+            }
+        }
+        goal.subgoals[index].foreman = Some(foreman);
+        self.save(goal)?;
+        if gave_up {
+            self.wake(&id)?;
+        }
+        Ok(())
     }
 
     /// Give a new sub-goal its branch and worktree, from the default branch
@@ -2063,6 +2912,8 @@ impl Supervisor {
             absorbed: Vec::new(),
             ship_unit: None,
             pull_request: None,
+            foreman: None,
+            added: Vec::new(),
         })
     }
 
@@ -2121,6 +2972,7 @@ impl Supervisor {
             state: "running".to_string(),
             detail: String::new(),
             ship: true,
+            subgoal: Some(sub.id.clone()),
         });
         goal.subgoals[index].state = "shipping".to_string();
         self.log(
@@ -2263,6 +3115,28 @@ impl Supervisor {
             happened = true;
             self.wake(&id)?;
         }
+        let due: Vec<(String, String)> = self
+            .goals
+            .values()
+            .filter(|goal| goal.phase == Phase::Running)
+            .flat_map(|goal| {
+                goal.subgoals
+                    .iter()
+                    .filter(|sub| {
+                        sub.state == "open"
+                            && sub
+                                .foreman
+                                .as_ref()
+                                .and_then(|foreman| foreman.retry_at)
+                                .is_some_and(|at| at <= now_unix())
+                    })
+                    .map(|sub| (goal.id.clone(), sub.id.clone()))
+            })
+            .collect();
+        for (goal, sub) in due {
+            happened = true;
+            self.wake_foreman(&goal, &sub)?;
+        }
         let Ok(first) = self.receiver.recv_timeout(wait) else {
             return Ok(happened);
         };
@@ -2302,6 +3176,8 @@ impl Supervisor {
                     let id = goal.id.clone();
                     let mut happening = happening;
                     mark_shipping(&goal, &mut happening);
+                    // The sub-goal a bead's pipeline ran in.
+                    let mut belongs: Option<String> = None;
                     if let Happening::PipelineEnded {
                         bead,
                         outcome,
@@ -2322,6 +3198,15 @@ impl Supervisor {
                             entry.state = outcome.clone();
                             entry.detail = truncate(detail, 300);
                             entry.unit = unit.clone().or(entry.unit.take());
+                            belongs = entry.subgoal.clone().filter(|_| !*ship);
+                        }
+                        if !*ship && belongs.is_none() {
+                            // A record from before pipelines named their sub-goal.
+                            belongs = goal
+                                .subgoals
+                                .iter()
+                                .find(|sub| sub.state == "open")
+                                .map(|sub| sub.id.clone());
                         }
                         if *ship {
                             if let Some(sub) = goal.subgoals.iter_mut().find(|sub| &sub.id == bead)
@@ -2334,9 +3219,19 @@ impl Supervisor {
                                 .to_string();
                                 sub.pull_request = pull_request.clone().or(sub.pull_request.take());
                             }
+                            // A landed sub-goal's foreman has nothing left to read.
+                            let reading = self.dir(&goal.id).join(format!("foreman-{bead}"));
+                            if outcome == "landed"
+                                && reading.exists()
+                                && let Ok(project) = self.config.project(&goal.project)
+                            {
+                                let _ = factory_git::worktree_remove(&project.repo, &reading);
+                            }
                         } else if let (Some(commit), Some(sub)) = (
                             commit,
-                            goal.subgoals.iter_mut().find(|sub| sub.state == "open"),
+                            goal.subgoals
+                                .iter_mut()
+                                .find(|sub| Some(&sub.id) == belongs.as_ref()),
                         ) {
                             sub.absorbed.push((bead.clone(), commit.clone()));
                         }
@@ -2363,9 +3258,25 @@ impl Supervisor {
                             ),
                         );
                     }
-                    goal.inbox.push(happening);
-                    self.save(goal)?;
-                    self.wake(&id)?;
+                    // A bead's pipeline reports to its sub-goal's foreman,
+                    // when there is one; everything else to the director.
+                    let foreman = goal
+                        .subgoals
+                        .iter_mut()
+                        .find(|sub| Some(&sub.id) == belongs.as_ref())
+                        .and_then(|sub| sub.foreman.as_mut());
+                    match (foreman, belongs) {
+                        (Some(foreman), Some(sub)) => {
+                            foreman.inbox.push(happening);
+                            self.save(goal)?;
+                            self.wake_foreman(&id, &sub)?;
+                        }
+                        _ => {
+                            goal.inbox.push(happening);
+                            self.save(goal)?;
+                            self.wake(&id)?;
+                        }
+                    }
                 }
             }
         }
@@ -2382,7 +3293,7 @@ impl Supervisor {
                 continue;
             }
             let definition = self.definition(&goal)?;
-            let mut lost = Vec::new();
+            let mut lost: Vec<(String, Option<String>)> = Vec::new();
             for unit in goal.units.iter().filter(|unit| unit.state == "running") {
                 match &unit.unit {
                     Some(unit_id) => {
@@ -2393,12 +3304,16 @@ impl Supervisor {
                         };
                         self.launch(&goal, flow, unit.bead.clone(), None, Some(unit_id.clone()));
                     }
-                    // It never got as far as having a unit. The director is
-                    // told, and decides again with the tracker as it is now.
-                    None => lost.push(unit.bead.clone()),
+                    // It never got as far as having a unit. Whoever started
+                    // it is told, and decides again with the tracker as it
+                    // is now.
+                    None => lost.push((
+                        unit.bead.clone(),
+                        unit.subgoal.clone().filter(|_| !unit.ship),
+                    )),
                 }
             }
-            for bead in lost {
+            for (bead, subgoal) in lost {
                 if let Some(entry) = goal
                     .units
                     .iter_mut()
@@ -2413,15 +3328,24 @@ impl Supervisor {
                 {
                     sub.state = "parked".to_string();
                 }
-                goal.inbox.push(Happening::RequestAnswered {
-                    approved: false,
-                    what: format!(
-                        "the factory restarted before `{bead}` had started; it did not run"
+                let note = Happening::Note {
+                    text: format!(
+                        "The factory restarted before `{bead}` had started. It did not run."
                     ),
-                });
+                };
+                match goal
+                    .subgoals
+                    .iter_mut()
+                    .find(|sub| Some(&sub.id) == subgoal.as_ref())
+                    .and_then(|sub| sub.foreman.as_mut())
+                {
+                    Some(foreman) => foreman.inbox.push(note),
+                    None => goal.inbox.push(note),
+                }
             }
             self.save(goal)?;
             self.wake(&id)?;
+            self.wake_foremen(&id)?;
         }
         // A goal may have ended just before the restart.
         let projects: std::collections::BTreeSet<String> = self
@@ -2546,6 +3470,7 @@ mod tests {
             state: "running".into(),
             detail: String::new(),
             ship: false,
+            subgoal: None,
         });
         assert_eq!(
             problems(
@@ -2588,8 +3513,303 @@ mod tests {
                 .collect(),
             ship_unit: None,
             pull_request: None,
+            foreman: None,
+            added: Vec::new(),
         });
         goal
+    }
+
+    /// A definition whose sub-goals are each run by a foreman.
+    fn tiered(file: &str) -> GoalDefinition {
+        toml::from_str(&format!(
+            "id = \"d\"\nflow = \"bead\"\nship_flow = \"ship\"\n[director]\nmodel = \"m\"\neffort = \"high\"\n[foreman]\nmodel = \"f\"\neffort = \"high\"\n[permissions]\nfile_beads = \"{file}\"\n"
+        ))
+        .unwrap()
+    }
+
+    fn with_foreman(absorbed: &[&str], waiting: Option<&str>) -> Goal {
+        let mut goal = with_subgoal("open", absorbed);
+        goal.subgoals[0].foreman = Some(Foreman {
+            waiting: waiting.map(str::to_string),
+            message: "Both are in.".into(),
+            ..Foreman::default()
+        });
+        goal
+    }
+
+    fn foreman_says(definition: &GoalDefinition, goal: &Goal, extra: Value) -> Vec<String> {
+        let mut result = json!({
+            "summary": "Decided.", "start": [], "file": [], "dropped_findings": [],
+            "report": "working", "message": "", "journal_entry": ""
+        });
+        for (key, value) in extra.as_object().unwrap() {
+            result[key] = value.clone();
+        }
+        foreman_problems(
+            definition,
+            goal,
+            &goal.subgoals[0],
+            &tracker(),
+            &launchable,
+            &result,
+        )
+    }
+
+    #[test]
+    fn a_director_with_foremen_opens_answers_and_ships_but_starts_no_bead() {
+        let d = tiered("allow");
+        let open = json!({"id": "signals", "title": "Signals", "objective": "They work.", "beads": ["toy-1"]});
+        // Opening a sub-goal is enough: its foreman takes it from there.
+        assert!(problems(&d, &goal(), json!({"open_subgoal": open.clone()})).is_empty());
+        let both = problems(
+            &d,
+            &goal(),
+            json!({"open_subgoal": open, "start": [{"bead": "toy-1", "reason": ""}]}),
+        );
+        assert_eq!(both.len(), 1, "{both:?}");
+        assert!(both[0].starts_with("start: each sub-goal of this goal is run by its foreman"));
+
+        // While the foreman works, the director may simply answer the owner.
+        assert!(problems(&d, &with_foreman(&[], None), json!({})).is_empty());
+        // Once the foreman waits, the director has to move the goal itself.
+        let waiting = with_foreman(&["toy-1"], Some("ready"));
+        let idle = problems(&d, &waiting, json!({}));
+        assert_eq!(idle.len(), 1, "{idle:?}");
+        assert!(idle[0].contains("answer the foreman with `tell_foreman`"));
+        assert!(problems(&d, &waiting, json!({"ship": true})).is_empty());
+        assert!(problems(&d, &waiting, json!({"tell_foreman": "Run toy-2 too."})).is_empty());
+        assert!(problems(&d, &waiting, json!({"ask_owner": "Ship without toy-2?"})).is_empty());
+        assert_eq!(
+            problems(
+                &d,
+                &waiting,
+                json!({"ship": true, "tell_foreman": "And another thing."})
+            ),
+            ["tell_foreman: ship the sub-goal or write to its foreman, not both"]
+        );
+
+        // Talk that starts nothing is cut off.
+        let mut circling = with_foreman(&["toy-1"], Some("escalated"));
+        circling.subgoals[0].foreman.as_mut().unwrap().exchanges = MAX_EXCHANGES;
+        let cut = problems(&d, &circling, json!({"tell_foreman": "Try again."}));
+        assert!(
+            cut[0].contains("have passed 6 messages without a pipeline starting"),
+            "{cut:?}"
+        );
+
+        // There has to be a foreman to tell.
+        assert!(
+            problems(
+                &d,
+                &goal(),
+                json!({"tell_foreman": "Hello?", "ask_owner": "?"})
+            )
+            .contains(&"tell_foreman: no sub-goal is open".to_string())
+        );
+        assert_eq!(
+            problems(
+                &d,
+                &with_subgoal("open", &[]),
+                json!({"tell_foreman": "Hello?"})
+            ),
+            ["tell_foreman: sub-goal `signals` has no foreman: you start its beads yourself"]
+        );
+        // A sub-goal opened before the definition had a foreman stays the
+        // director's to run.
+        assert!(
+            problems(
+                &d,
+                &with_subgoal("open", &[]),
+                json!({"start": [{"bead": "toy-1", "reason": ""}]})
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_foreman_starts_its_own_beads_and_never_leaves_its_sub_goal_idle() {
+        let d = tiered("allow");
+        let fresh = with_foreman(&[], None);
+        let start = |bead: &str| json!({"start": [{"bead": bead, "reason": ""}]});
+        assert!(foreman_says(&d, &fresh, start("toy-1")).is_empty());
+        // Planned, but it cannot run.
+        assert_eq!(
+            foreman_says(&d, &fresh, start("toy-2")),
+            ["start: `toy-2` may not be launched: it has no acceptance criteria"]
+        );
+        // Not this sub-goal's.
+        let stray = foreman_says(&d, &fresh, start("toy-9"));
+        assert!(stray[0].starts_with("start: `toy-9` is not one of this sub-goal's beads. The director planned toy-1, toy-2"), "{stray:?}");
+        // A bead it filed to run here is.
+        let mut grown = with_foreman(&[], None);
+        grown.subgoals[0].planned = vec!["toy-2".into()];
+        assert!(
+            foreman_says(&d, &grown, start("toy-1"))[0]
+                .contains("not one of this sub-goal's beads")
+        );
+        grown.subgoals[0].added = vec!["toy-1".into()];
+        assert!(foreman_says(&d, &grown, start("toy-1")).is_empty());
+
+        // Nothing running and nobody told: refused.
+        let idle = foreman_says(&d, &fresh, json!({}));
+        assert!(
+            idle[0].starts_with("working: nothing would be running in this sub-goal"),
+            "{idle:?}"
+        );
+        // One at a time.
+        let mut busy = with_foreman(&[], None);
+        busy.units.push(GoalUnit {
+            bead: "toy-0".into(),
+            unit: None,
+            state: "running".into(),
+            detail: String::new(),
+            ship: false,
+            subgoal: Some("signals".into()),
+        });
+        assert!(foreman_says(&d, &busy, json!({})).is_empty());
+        assert_eq!(
+            foreman_says(&d, &busy, start("toy-1")),
+            [
+                "start: that would make 2 pipelines at once in this sub-goal, and its foreman may run 1"
+            ]
+        );
+
+        // Ready means absorbed work, nothing running, and a word to the director.
+        let ready = |message: &str| json!({"report": "ready", "message": message});
+        assert_eq!(
+            foreman_says(&d, &fresh, ready("Done.")),
+            [
+                "ready: this sub-goal has absorbed nothing, so there is nothing to ship: escalate instead"
+            ]
+        );
+        let absorbed = with_foreman(&["toy-1"], None);
+        assert!(foreman_says(&d, &absorbed, ready("toy-1 is in; toy-2 cannot run.")).is_empty());
+        assert!(foreman_says(&d, &absorbed, ready(""))[0].starts_with("ready: say in `message`"));
+        assert_eq!(
+            foreman_says(&d, &absorbed, start("toy-1")),
+            ["start: `toy-1` is already absorbed in this sub-goal"]
+        );
+        let mut both = ready("Done.");
+        both["start"] = start("toy-2")["start"].clone();
+        assert!(foreman_says(&d, &absorbed, both).contains(
+            &"ready: a sub-goal is ready when nothing in it is running, starting or waiting to run"
+                .to_string()
+        ));
+        // Escalating needs the question.
+        assert_eq!(
+            foreman_says(&d, &fresh, json!({"report": "escalate"})),
+            ["escalate: say in `message` what you need from the director"]
+        );
+        assert!(
+            foreman_says(
+                &d,
+                &fresh,
+                json!({"report": "escalate", "message": "toy-2 has no criteria."})
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            foreman_says(&d, &fresh, json!({"report": "done"})),
+            ["`report` is `done`, not `working`, `ready` or `escalate`"]
+        );
+
+        // A bead filed to run here keeps the sub-goal moving by itself.
+        let file = |here: bool, deferred: bool| {
+            json!({"file": [{"title": "Fix the race", "type": "bug", "priority": 1,
+                "description": "The tester found it.", "acceptance_criteria": "- fixed",
+                "parent": "", "discovered_from": "", "deferred": deferred, "run_here": here}]})
+        };
+        assert!(foreman_says(&d, &fresh, file(true, false)).is_empty());
+        assert!(foreman_says(&d, &fresh, file(false, false))[0].starts_with("working: nothing"));
+        assert_eq!(
+            foreman_says(&d, &busy, file(true, true)),
+            ["file: a bead that is to run here cannot be filed deferred"]
+        );
+        // One at a time: a bead filed to run here is started before the next.
+        let mut owed = with_foreman(&[], None);
+        owed.subgoals[0].added = vec!["toy-1".into()];
+        assert_eq!(
+            foreman_says(&d, &owed, file(true, false)),
+            [
+                "file: you already filed toy-1 to run here and have not started it: start it, or escalate, before filing another to run here"
+            ]
+        );
+        let mut and_start = file(true, false);
+        and_start["start"] = start("toy-1")["start"].clone();
+        assert!(foreman_says(&d, &owed, and_start).is_empty());
+        // Where filing is the owner's to approve, it goes through the director.
+        assert!(
+            foreman_says(&tiered("ask"), &busy, file(false, false))[0]
+                .starts_with("file: on this goal a new bead is put to the owner")
+        );
+    }
+
+    #[test]
+    fn each_tier_is_briefed_on_the_other() {
+        let d = tiered("allow");
+        let mut goal = with_foreman(&["toy-1"], None);
+        let foreman = goal.subgoals[0].foreman.as_mut().unwrap();
+        foreman.inbox = vec![
+            Happening::Opened,
+            Happening::DirectorSaid {
+                text: "Leave toy-2 out.".into(),
+            },
+            Happening::PipelineEnded {
+                bead: "toy-1".into(),
+                unit: Some("u1".into()),
+                outcome: "absorbed".into(),
+                detail: String::new(),
+                pull_request: None,
+                findings: vec![
+                    json!({"step": "review", "severity": "minor", "title": "The doc omits the timeout", "location": "a.zig:1"}),
+                ],
+                commit: Some("c0ffee".into()),
+                ship: false,
+            },
+        ];
+        let sub = goal.subgoals[0].clone();
+        let brief = foreman_brief(&d, &goal, &sub, &tracker(), "Earlier: started toy-1.", "");
+        assert_eq!(
+            brief,
+            foreman_brief(&d, &goal, &sub, &tracker(), "Earlier: started toy-1.", ""),
+            "the same inputs give the same text"
+        );
+        for expected in [
+            "# Sub-goal `signals` of goal `toy-g1` on project `toy`, wake 1",
+            "- The director opened this sub-goal and handed it to you.",
+            "- The director wrote to you:\n\n> Leave toy-2 out.",
+            "- The pipeline for `toy-1` ended: **absorbed**.",
+            "  - F1 (review, minor): The doc omits the timeout at `a.zig:1`",
+            "- Absorbed, one commit each on the branch: toy-1.",
+            "- Not yet absorbed: toy-2.",
+            "toy-1 | P1 | task | absorbed in the open sub-goal",
+            "Earlier: started toy-1.",
+            "- Not yours: shipping, changing a bead that exists, and talking to the owner.",
+        ] {
+            assert!(
+                brief.contains(expected),
+                "missing {expected:?} in:\n{brief}"
+            );
+        }
+
+        // The director is told what the foreman reported, and sees it wait.
+        let mut waiting = with_foreman(&["toy-1"], Some("ready"));
+        waiting.inbox = vec![Happening::ForemanReported {
+            subgoal: "signals".into(),
+            report: "ready".into(),
+            message: "Both are in.".into(),
+        }];
+        let brief = wake_brief(&d, &waiting, &tracker(), "", "");
+        for expected in [
+            "- The foreman of sub-goal `signals` reports it **ready** to ship and waits for you:\n\n> Both are in.",
+            "Its foreman reports it ready to ship and waits for you: Both are in.",
+            "You do not start beads: `start` is refused.",
+        ] {
+            assert!(
+                brief.contains(expected),
+                "missing {expected:?} in:\n{brief}"
+            );
+        }
     }
 
     const OPEN: &str = r#"{"id": "signals", "title": "Signals", "objective": "Signals work.", "beads": ["toy-1"]}"#;
@@ -2669,6 +3889,7 @@ mod tests {
             state: "running".into(),
             detail: String::new(),
             ship: false,
+            subgoal: None,
         });
         assert_eq!(
             problems(&d, &busy, ship),
@@ -2697,6 +3918,7 @@ mod tests {
             state: "running".into(),
             detail: String::new(),
             ship: true,
+            subgoal: None,
         });
         let ended = |bead: &str| Happening::PipelineEnded {
             bead: bead.into(),

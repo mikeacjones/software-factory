@@ -15,8 +15,9 @@
 #                      limit-default-once
 #                                    the first run without an account token is refused
 #                                    at the five-hour limit
-#   state/director-N.json, state/intake-N.json
-#                    what a goal's director returns on its Nth call
+#   state/director-N.json, state/intake-N.json, state/foreman-N.json
+#                    what a goal's director, or a sub-goal's foreman, returns
+#                    on its Nth call
 here=$(cd "$(dirname "$0")" && pwd)
 state="$here/state"
 mkdir -p "$state"
@@ -45,6 +46,7 @@ scenario=$(cat "$state/scenario" 2>/dev/null)
 
 case "$system" in
   *"You direct a goal"*) role=director ;;
+  *"You are the foreman"*) role=foreman ;;
   *"You are opening a goal"*) role=intake ;;
   *"You are the builder"*) role=builder ;;
   *"You are the adversarial tester"*) role=tester ;;
@@ -68,9 +70,10 @@ case "$scenario" in
 esac
 printf '%s\n' "$brief" > "$state/brief-$count.md"
 
-# A goal's director says whatever the test wrote for its nth call.
+# A goal's director, and a sub-goal's foreman, say whatever the test wrote
+# for their nth call.
 case "$role" in
-  director|intake)
+  director|intake|foreman)
     n=$(( $(cat "$state/n-$role" 2>/dev/null || echo 0) + 1 ))
     echo "$n" > "$state/n-$role"
     output=$(cat "$state/$role-$n.json" 2>/dev/null || echo '{}')
