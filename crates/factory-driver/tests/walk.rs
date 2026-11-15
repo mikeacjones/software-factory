@@ -496,6 +496,45 @@ fn a_unit_is_built_broken_fixed_reviewed_and_published() {
 }
 
 #[test]
+fn a_run_cut_off_by_the_death_of_the_factory_resumes_its_session() {
+    let world = World::new("cut-off", "true");
+    // The tester holds, so the only builder run is the build itself.
+    std::fs::create_dir_all(world.path("bin/state")).unwrap();
+    std::fs::write(world.path("bin/state/broke"), "").unwrap();
+    let driver = Driver::start(world.config(), "toy", "toy-1", &OPTIONS).unwrap();
+    let unit = driver.unit().id.to_string();
+    // The factory died while the builder was running: the unit is at its
+    // first step, and the run's session was written down when it began.
+    drop(driver);
+    let dir = world.path(&format!("state/units/{unit}"));
+    std::fs::write(dir.join("in-flight-build.session"), "sess-cut-off\n").unwrap();
+
+    let mut driver = Driver::resume(world.config(), &unit, &OPTIONS, None).unwrap();
+    assert_eq!(driver.run().unwrap(), Status::Ended);
+    let calls = world.calls();
+    let builds: Vec<&Vec<String>> = calls.iter().filter(|call| call[0] == "builder").collect();
+    // The build was not started over: the cut-off session was resumed and
+    // told to carry on, with no new briefing.
+    assert_eq!(builds[0][1], "sess-cut-off");
+    let told = std::fs::read_to_string(world.path("bin/state/brief-1.md")).unwrap();
+    assert!(
+        told.starts_with("You were interrupted before you finished this step."),
+        "{told}"
+    );
+    assert!(
+        !dir.join("in-flight-build.session").exists(),
+        "nothing is in flight any more"
+    );
+    let kinds = world.event_kinds(&driver);
+    assert!(kinds.contains(&"run.cut_off".to_string()));
+    // Later steps of the same unit are briefed as usual.
+    let tester = calls.iter().position(|call| call[0] == "tester").unwrap();
+    let brief =
+        std::fs::read_to_string(world.path(&format!("bin/state/brief-{}.md", tester + 1))).unwrap();
+    assert!(!brief.starts_with("You were interrupted"), "{brief}");
+}
+
+#[test]
 fn a_parked_unit_continues_from_the_step_it_stopped_at() {
     let world = World::new("resume", "test -f $ALLOW || exit 127");
     let allow = world.path("allow");

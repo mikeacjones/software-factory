@@ -1383,12 +1383,28 @@ impl Driver {
             }
         };
 
-        let own_session = self
-            .unit
-            .in_step
-            .as_ref()
-            .filter(|current| current.step == step.id)
-            .map(|current| current.session.clone());
+        // A run of this step that was cut off when whatever was watching it
+        // died left its session's ID behind. That session has the work it
+        // had done: it is resumed, not started over.
+        let in_flight = self.dir.join(format!("in-flight-{}.session", step.id));
+        let cut_off = std::fs::read_to_string(&in_flight)
+            .ok()
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty());
+        if let Some(id) = &cut_off {
+            self.event("run.cut_off", Some(&step.id), json!({ "session": id }))?;
+            self.thread.say(&format!(
+                ":adhesive_bandage: *{}* was cut off in the middle of a run. It resumes that session and carries on.",
+                step.id
+            ));
+        }
+        let own_session = cut_off.clone().or_else(|| {
+            self.unit
+                .in_step
+                .as_ref()
+                .filter(|current| current.step == step.id)
+                .map(|current| current.session.clone())
+        });
         let mut briefed = own_session.is_some();
         let mut session = match (own_session, session_rule) {
             (Some(id), _) => Session::Resume(id),
@@ -1498,7 +1514,7 @@ impl Driver {
 
         let mut rejected: Vec<String> = Vec::new();
         let mut answer = self.unit.answer.take();
-        let mut interrupted = false;
+        let mut interrupted = cut_off.is_some();
         let (mut attempts, mut limit_waits, mut retries) = (0, 0, 0);
 
         self.thread.say(&format!(
@@ -1557,6 +1573,7 @@ impl Driver {
                 budget_usd: self.project.limits.step_budget_usd,
                 timeout,
                 oauth_token,
+                session_file: Some(in_flight.clone()),
             };
             self.event("run.started", Some(&step.id), json!({
                 "run": self.unit.runs, "role": role, "model": model, "effort": effort,
@@ -1598,6 +1615,8 @@ impl Driver {
                     Control::Continue
                 })?
             };
+            // The run is over, however it ended: nothing is in flight.
+            let _ = std::fs::remove_file(&in_flight);
             // Said while the step ran: for the next agent step.
             self.unit.owner_messages.extend(heard);
             let usage = finished.transcript.usage();

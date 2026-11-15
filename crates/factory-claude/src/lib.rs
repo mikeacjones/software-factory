@@ -43,6 +43,11 @@ pub struct RunSpec {
     pub timeout: Duration,
     /// The account's token, for an account that is not the CLI's own login.
     pub oauth_token: Option<String>,
+    /// A file to write the run's session ID to as soon as the CLI reports
+    /// it, which is at the start. If whatever is watching the run dies, the
+    /// file says which session to resume instead of starting over. The
+    /// caller removes it when the run has ended.
+    pub session_file: Option<PathBuf>,
 }
 
 /// The exact command for a run. Always headless, always bypass mode, never
@@ -535,7 +540,16 @@ pub fn run(
     let exit = factory_supervise::stream(
         &command(spec),
         log,
-        &mut |line| transcript.borrow_mut().observe(line),
+        &mut |line| {
+            let mut transcript = transcript.borrow_mut();
+            let known = transcript.session_id.is_some();
+            transcript.observe(line);
+            if let (false, Some(id), Some(file)) =
+                (known, &transcript.session_id, &spec.session_file)
+            {
+                let _ = std::fs::write(file, id);
+            }
+        },
         &mut || tick(&transcript.borrow()),
     )?;
     let transcript = transcript.into_inner();
@@ -714,7 +728,39 @@ mod tests {
             budget_usd: Some(25.0),
             timeout: Duration::from_secs(60),
             oauth_token: None,
+            session_file: None,
         }
+    }
+
+    #[test]
+    fn a_runs_session_is_written_down_as_soon_as_it_is_known() {
+        let dir = std::env::temp_dir().join(format!("factory-session-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A stand-in for the CLI that says which session it is, and then is
+        // still working when the watcher's patience runs out.
+        let stand_in = dir.join("claude");
+        std::fs::write(
+            &stand_in,
+            "#!/bin/sh\ncat > /dev/null\necho '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"sess-42\",\"model\":\"m\"}'\nsleep 30\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&stand_in, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let file = dir.join("in-flight.session");
+        let mut run = spec(Session::Fresh);
+        run.claude_bin = stand_in.to_string_lossy().into_owned();
+        run.cwd = dir.clone();
+        run.timeout = Duration::from_millis(1500);
+        run.session_file = Some(file.clone());
+        let finished =
+            super::run(&run, &dir.join("run.jsonl"), &mut |_| Control::Continue).unwrap();
+        // The run never finished, but which session it was is on disk.
+        assert!(finished.exit.timed_out);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "sess-42");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

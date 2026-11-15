@@ -3119,6 +3119,7 @@ impl Supervisor {
                 budget_usd: project.limits.step_budget_usd,
                 timeout: Duration::from_secs(tier.timeout_secs),
                 oauth_token,
+                session_file: None,
             };
             let finished = factory_claude::run(
                 &spec,
