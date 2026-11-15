@@ -114,13 +114,14 @@ impl StepRunner for FactoryRunner {
                 other => NotPrepared::Failed(other.to_string()),
             })?;
         let unit = driver.unit().id.to_string();
+        let title = driver.unit().title.clone();
         let pinned = self
             .unit_dir(&unit)
             .map_err(NotPrepared::Failed)?
             .join("flow.toml");
         let flow = std::fs::read_to_string(&pinned)
             .map_err(|err| NotPrepared::Failed(format!("{}: {err}", pinned.display())))?;
-        Ok(Prepared { unit, flow })
+        Ok(Prepared { unit, flow, title })
     }
 
     fn agent(

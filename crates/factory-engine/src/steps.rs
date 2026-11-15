@@ -74,6 +74,9 @@ pub struct Prepared {
     /// The text of the unit's flow definition, as it was when the unit was
     /// made. This is what the engine runs.
     pub flow: String,
+    /// The bead's title, for what the pipeline says about itself.
+    #[serde(default)]
+    pub title: String,
 }
 
 /// A unit the engine has parked, and why.

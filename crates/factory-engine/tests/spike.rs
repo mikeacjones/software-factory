@@ -273,6 +273,7 @@ async fn a_parked_pipeline_waits_until_someone_continues_it() {
         noted[0].starts_with("toy-1 agent fix round=3 ")
             && noted[0].contains("note=The config path is wrong, not the parser.")
     );
+    rig.assert_steps_described("toy-1").await;
     rig.stop().await;
 }
 
@@ -389,6 +390,7 @@ async fn a_usage_limit_is_waited_out_on_a_timer_with_nothing_running() {
             "toy-1 agent break round=1 session=sess-toy-1-break-1 note=- build=b1"
         ]
     );
+    rig.assert_steps_described("toy-1").await;
     rig.stop().await;
 }
 

@@ -2,16 +2,17 @@
 
 use std::time::Duration;
 
-use factory_flow::{Flow, Next, Position, StepKind};
+use factory_flow::{Flow, Next, Position, Step, StepKind};
 use futures::FutureExt;
 use serde::{Deserialize, Serialize};
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{
-    ActivityOptions, ApplicationFailure, SignalWorkflowOptions, SyncWorkflowContext,
+    ActivityOptions, ApplicationFailure, SignalWorkflowOptions, SyncWorkflowContext, TimerOptions,
     WorkflowContext, WorkflowContextView, WorkflowResult,
 };
 
 use crate::accounts::{AccountCall, Accounts, Lease, Limit};
+use crate::describe::{self, Showing};
 use crate::steps::{ParkCall, PrepareCall, StepCall, StepDone, Steps};
 
 /// How much longer than it was told to expect a pipeline waits for word
@@ -90,6 +91,46 @@ pub struct Pipeline {
     given_up: bool,
     /// The accounts workflow has said an account is back.
     account_ready: bool,
+    /// What it says about itself to someone reading it on the server.
+    showing: Showing,
+}
+
+/// The options of an activity that is over quickly, with what it is for.
+fn quick(secs: u64, summary: String) -> ActivityOptions {
+    ActivityOptions::with_start_to_close_timeout(Duration::from_secs(secs))
+        .summary(describe::line(&summary))
+        .build()
+}
+
+/// A timer, with what it waits for.
+fn timer(secs: u64, summary: String) -> TimerOptions {
+    TimerOptions::builder(Duration::from_secs(secs))
+        .summary(describe::line(&summary))
+        .build()
+}
+
+/// Say where the pipeline stands, for someone reading it on the server.
+fn show(ctx: &WorkflowContext<Pipeline>, doing: String) {
+    let details = ctx.state_mut(|state| {
+        state.showing.doing = doing;
+        describe::pipeline_details(&state.showing, &state.standing)
+    });
+    ctx.set_current_details(details);
+}
+
+/// A step and its round, as the details name them.
+fn at(step: &Step, round: u32) -> String {
+    if round > 1 {
+        format!("step `{}`, round {round}", step.id)
+    } else {
+        format!("step `{}`", step.id)
+    }
+}
+
+fn unix(time: Option<std::time::SystemTime>) -> u64 {
+    time.and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|since| since.as_secs())
+        .unwrap_or(0)
 }
 
 /// A definition the engine cannot run. Trying again would not help.
@@ -104,23 +145,37 @@ impl Pipeline {
         ctx: &mut WorkflowContext<Self>,
         input: PipelineInput,
     ) -> WorkflowResult<PipelineEnd> {
-        let brief = |limit: u64| {
+        let brief = |limit: u64, summary: String| {
             ActivityOptions::with_start_to_close_timeout(Duration::from_secs(limit))
                 .heartbeat_timeout(Duration::from_secs(input.beat_secs.max(1) * 3))
+                .summary(describe::line(&summary))
                 .build()
         };
+        ctx.state_mut(|state| {
+            state.showing.project = input.project.clone();
+            state.showing.bead = input.bead.clone();
+        });
         // A bead with no unit yet gets one: its worktree and branch, and
         // its own copy of the flow, which is what this pipeline then runs.
-        let (unit, definition) = if input.unit.is_empty() {
+        let (unit, definition, title) = if input.unit.is_empty() {
+            show(
+                ctx,
+                "making the bead ready: claiming it, giving it a worktree and a branch".to_string(),
+            );
             let call = PrepareCall {
                 project: input.project.clone(),
                 bead: input.bead.clone(),
                 flow_name: input.flow_name.clone(),
             };
-            let options =
-                ActivityOptions::with_start_to_close_timeout(Duration::from_secs(1800)).build();
+            let options = quick(
+                1800,
+                format!(
+                    "Make bead `{}` of `{}` ready: claim it, give it a worktree and a branch, pin its flow",
+                    input.bead, input.project
+                ),
+            );
             match ctx.execute_activity(Steps::prepare, call, options).await {
-                Ok(prepared) => (prepared.unit, prepared.flow),
+                Ok(prepared) => (prepared.unit, prepared.flow, prepared.title),
                 // Only a refusal comes back: anything else is tried again.
                 // It is kept where someone who asks can read it, and the
                 // pipeline ends.
@@ -133,16 +188,22 @@ impl Pipeline {
                         .map(|cause| cause.message.clone())
                         .unwrap_or_else(|| err.to_string());
                     ctx.state_mut(|state| state.standing.refused = Some(reason.clone()));
+                    show(ctx, String::new());
                     return Err(refused(reason).into());
                 }
             }
         } else {
-            (input.unit.clone(), input.flow.clone())
+            (input.unit.clone(), input.flow.clone(), String::new())
         };
-        ctx.state_mut(|state| state.standing.unit = unit.clone());
+        let about = describe::subject(&input.bead, &unit, &title);
+        ctx.state_mut(|state| {
+            state.standing.unit = unit.clone();
+            state.showing.title = title.clone();
+        });
         // Reading a definition is a pure function of its text, so it is the
         // same on every replay.
         let flow = Flow::parse(&definition).map_err(|err| refused(err.to_string()))?;
+        ctx.state_mut(|state| state.showing.flow = flow.id.clone());
         let mut position = Position::start(&flow);
         let mut note: Option<String> = None;
         // The session of a run that stopped at a usage limit.
@@ -168,9 +229,20 @@ impl Pipeline {
                             who: who.clone(),
                             model: model.clone(),
                         };
-                        let options =
-                            ActivityOptions::with_start_to_close_timeout(Duration::from_secs(60))
-                                .build();
+                        show(
+                            ctx,
+                            format!(
+                                "{}: asking which account it runs under",
+                                at(&step, position.round())
+                            ),
+                        );
+                        let options = quick(
+                            60,
+                            format!(
+                                "Ask which account step `{}` ({model}) of {about} runs under",
+                                step.id
+                            ),
+                        );
                         match ctx.execute_activity(Steps::account, ask, options).await? {
                             Lease::Use { account } => break Some(account),
                             Lease::Wait { secs } => {
@@ -178,8 +250,24 @@ impl Pipeline {
                                 // workflow says when to ask again; the timer
                                 // is only in case that word never comes.
                                 ctx.state_mut(|state| state.standing.limited_secs = Some(secs));
-                                let mut timer =
-                                    ctx.timer(Duration::from_secs(secs + ASK_AGAIN_SECS)).fuse();
+                                let until = describe::clock(unix(ctx.workflow_time()) + secs);
+                                show(
+                                    ctx,
+                                    format!(
+                                        "{}: waiting for an account. None is free for {model}; the first is expected back in {}, at {until}",
+                                        at(&step, position.round()),
+                                        describe::span(secs)
+                                    ),
+                                );
+                                let mut timer = ctx
+                                    .timer(timer(
+                                        secs + ASK_AGAIN_SECS,
+                                        format!(
+                                            "No account is free for step `{}` of {about}: ask again by {until} if the accounts workflow has not said one is back",
+                                            step.id
+                                        ),
+                                    ))
+                                    .fuse();
                                 let mut told =
                                     ctx.wait_condition(|state| state.account_ready).fuse();
                                 futures::select_biased! {
@@ -211,13 +299,26 @@ impl Pipeline {
             // lost its worker is that it stops saying it is alive: it is
             // then given to another.
             let limit = step.timeout_secs.unwrap_or(0).max(6 * 3600) + 600;
+            let summary = describe::step(&step, position.round(), account.as_deref(), &about);
+            show(
+                ctx,
+                format!(
+                    "{}: {}{}",
+                    at(&step, position.round()),
+                    describe::step_kind(&step),
+                    account
+                        .as_ref()
+                        .map(|account| format!(", under account `{account}`"))
+                        .unwrap_or_default()
+                ),
+            );
             let done: StepDone = match &step.kind {
                 StepKind::Agent { .. } => {
-                    ctx.execute_activity(Steps::agent, call, brief(limit))
+                    ctx.execute_activity(Steps::agent, call, brief(limit, summary))
                         .await?
                 }
                 _ => {
-                    ctx.execute_activity(Steps::plain, call, brief(limit))
+                    ctx.execute_activity(Steps::plain, call, brief(limit, summary))
                         .await?
                 }
             };
@@ -232,8 +333,15 @@ impl Pipeline {
                     model: model.clone(),
                     secs,
                 };
+                let options = SignalWorkflowOptions::builder()
+                    .summary(describe::line(&format!(
+                        "Account `{account}` stopped step `{}` of {about} at a usage limit on {model} that ends in {}",
+                        step.id,
+                        describe::span(secs)
+                    )))
+                    .build();
                 ctx.external_workflow(input.accounts.clone(), None)
-                    .signal(Accounts::limited, limit, SignalWorkflowOptions::default())
+                    .signal(Accounts::limited, limit, options)
                     .await
                     .map_err(|err| refused(format!("the accounts could not be told: {err}")))?;
                 session = done.session;
@@ -243,7 +351,23 @@ impl Pipeline {
                 // Every account is at a limit. Nothing needs to run while
                 // the factory waits: the timer is the server's.
                 ctx.state_mut(|state| state.standing.limited_secs = Some(secs));
-                ctx.timer(Duration::from_secs(secs)).await;
+                let until = describe::clock(unix(ctx.workflow_time()) + secs);
+                show(
+                    ctx,
+                    format!(
+                        "{}: every account is at a usage limit. It goes on in its session in {}, at {until}",
+                        at(&step, position.round()),
+                        describe::span(secs)
+                    ),
+                );
+                ctx.timer(timer(
+                    secs,
+                    format!(
+                        "Every account is at a usage limit: step `{}` of {about} goes on in its session at {until}",
+                        step.id
+                    ),
+                ))
+                .await;
                 ctx.state_mut(|state| state.standing.limited_secs = None);
                 // The same step again, in the session it had.
                 session = done.session;
@@ -267,8 +391,17 @@ impl Pipeline {
                 let reason = match next {
                     Next::Step(_) => continue,
                     Next::End => {
-                        ctx.execute_activity(Steps::finish, unit.clone(), brief(600))
+                        show(
+                            ctx,
+                            "ending the unit: every step of its flow is done".to_string(),
+                        );
+                        let summary = format!(
+                            "End the unit of {about}: every step of flow `{}` is done",
+                            flow.id
+                        );
+                        ctx.execute_activity(Steps::finish, unit.clone(), brief(600, summary))
                             .await?;
+                        show(ctx, "ended: every step of its flow is done".to_string());
                         return Ok(PipelineEnd {
                             ended: true,
                             done: ctx.state(|state| state.standing.done.clone()),
@@ -281,15 +414,24 @@ impl Pipeline {
                     unit: unit.clone(),
                     reason: reason.clone(),
                 };
-                ctx.execute_activity(Steps::park, call, brief(600)).await?;
+                let summary = format!(
+                    "Park {about} at step `{}` and tell whoever watches it: {}",
+                    step.id,
+                    reason.lines().next().unwrap_or_default()
+                );
+                ctx.execute_activity(Steps::park, call, brief(600, summary))
+                    .await?;
                 reason
             };
             // Parked: it waits, for as long as it takes and with nothing
             // running, until someone continues it or gives it up.
             ctx.state_mut(|state| state.standing.parked = Some(reason));
+            show(ctx, String::new());
             ctx.wait_condition(|state| state.go_on.is_some() || state.given_up)
                 .await?;
             let Some(go_on) = ctx.state_mut(|state| state.go_on.take()) else {
+                ctx.state_mut(|state| state.showing.given_up = true);
+                show(ctx, String::new());
                 return Ok(PipelineEnd {
                     ended: false,
                     done: ctx.state(|state| state.standing.done.clone()),

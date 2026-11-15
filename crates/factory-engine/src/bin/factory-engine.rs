@@ -23,10 +23,8 @@ use factory_config::{ConfigDir, Temporal};
 use factory_engine::accounts::{ACCOUNTS_ID, Accounts};
 use factory_engine::engine::{GoOn, Pipeline, PipelineInput};
 use factory_engine::factory::FactoryRunner;
-use factory_engine::worker::{WorkerSettings, connect, ensure_accounts, run};
-use temporalio_client::{
-    WorkflowGetResultOptions, WorkflowQueryOptions, WorkflowSignalOptions, WorkflowStartOptions,
-};
+use factory_engine::worker::{WorkerSettings, connect, ensure_accounts, pipeline_options, run};
+use temporalio_client::{WorkflowGetResultOptions, WorkflowQueryOptions, WorkflowSignalOptions};
 
 /// What this build of the engine is called: its release, when it runs
 /// from one, so that a pipeline's history says which build ran each step.
@@ -106,7 +104,16 @@ async fn command(args: &[String]) -> Result<(), String> {
                 accounts: ACCOUNTS_ID.to_string(),
                 ..PipelineInput::default()
             };
-            let options = WorkflowStartOptions::new(temporal.task_queue.clone(), id.clone()).build();
+            // What the bead is called, for whoever reads the pipeline on
+            // the server. A bead that cannot be read is refused by the
+            // pipeline itself, with the reason.
+            let title = config
+                .project(project)
+                .ok()
+                .and_then(|project| factory_driver::bead_source(&project).read(bead).ok())
+                .map(|bead| bead.title)
+                .unwrap_or_default();
+            let options = pipeline_options(&temporal.task_queue, &id, &input, &title);
             let handle = client
                 .start_workflow(Pipeline::run, input, options)
                 .await

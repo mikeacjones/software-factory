@@ -279,6 +279,9 @@ async fn accounts_are_handed_out_by_the_rule_and_only_their_names_travel() {
             !text.contains("tok-secret"),
             "a token is in the history of `{workflow}`"
         );
+        // A run stopped at a limit, and the accounts were told: that
+        // too says what it is for.
+        rig.assert_steps_described(workflow).await;
     }
     rig.stop().await;
 }
@@ -299,7 +302,10 @@ async fn a_pipeline_waits_for_an_account_with_nothing_running_until_a_recheck_fi
         .start_workflow(
             Pipeline::run,
             rig.input_under_accounts("toy-1", BUILD_AND_REVIEW),
-            WorkflowStartOptions::new(rig.queue.clone(), "toy-1".to_string()).build(),
+            rig.options(
+                "toy-1",
+                &rig.input_under_accounts("toy-1", BUILD_AND_REVIEW),
+            ),
         )
         .await
         .unwrap();
@@ -341,6 +347,11 @@ async fn a_pipeline_waits_for_an_account_with_nothing_running_until_a_recheck_fi
         board.picture.states["first"].blocked.contains_key("*"),
         "{board:?}"
     );
+    // Someone reading either workflow on the server is told what each
+    // thing in it is for: the wait, the check, the word that an account
+    // is back, and every step.
+    rig.assert_described("toy-1").await;
+    rig.assert_described(ACCOUNTS_ID).await;
     rig.stop().await;
 }
 

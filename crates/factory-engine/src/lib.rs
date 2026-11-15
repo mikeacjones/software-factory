@@ -11,6 +11,7 @@
 //! business: see [`steps::StepRunner`].
 
 pub mod accounts;
+pub mod describe;
 pub mod engine;
 pub mod factory;
 pub mod steps;

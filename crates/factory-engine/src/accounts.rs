@@ -20,9 +20,10 @@ use serde::{Deserialize, Serialize};
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{
     ActivityOptions, ContinueAsNewOptions, SignalWorkflowOptions, SyncWorkflowContext,
-    WorkflowContext, WorkflowContextView, WorkflowResult,
+    TimerOptions, WorkflowContext, WorkflowContextView, WorkflowResult,
 };
 
+use crate::describe;
 use crate::engine::Pipeline;
 use crate::steps::Steps;
 
@@ -181,6 +182,17 @@ impl Accounts {
         self.trouble = None;
     }
 
+    /// What it shows someone reading it on the server.
+    fn details(&self, now: u64) -> String {
+        describe::accounts_details(
+            &self.picture,
+            &self.waiting,
+            self.checked_at,
+            self.trouble.as_deref(),
+            now,
+        )
+    }
+
     /// Those waiting for whom there is an account now. They stop waiting.
     fn release(&mut self, now: u64) -> Vec<Waiting> {
         let picture = &self.picture;
@@ -241,8 +253,17 @@ impl Accounts {
                     max_age_secs: if demanded { 0 } else { check_secs / 2 },
                     forget_limits: demanded,
                 };
+                let summary = if demanded {
+                    "Read what every account has left, now, because someone asked: what is found is believed over the limits runs reported"
+                } else if checked_at == 0 {
+                    "Read what every account has left, for the first time: none is handed out before"
+                } else {
+                    "Read what every account has left: the regular check"
+                };
                 let options =
-                    ActivityOptions::with_start_to_close_timeout(Duration::from_secs(300)).build();
+                    ActivityOptions::with_start_to_close_timeout(Duration::from_secs(300))
+                        .summary(describe::line(summary))
+                        .build();
                 let checked = ctx.execute_activity(Steps::accounts, call, options).await;
                 let now = unix(ctx.workflow_time());
                 ctx.state_mut(|state| match checked {
@@ -261,15 +282,19 @@ impl Accounts {
                 state.stirred = false;
                 state.release(now)
             });
+            let details = ctx.state(|state| state.details(now));
+            ctx.set_current_details(details);
             for waiting in ready {
+                let options = SignalWorkflowOptions::builder()
+                    .summary(describe::line(&format!(
+                        "An account is free for {} again: `{}` may ask for it",
+                        waiting.model, waiting.who
+                    )))
+                    .build();
                 // One that has ended since it asked is not there to tell.
                 let _ = ctx
                     .external_workflow(waiting.who, None)
-                    .signal(
-                        Pipeline::account_ready,
-                        (),
-                        SignalWorkflowOptions::default(),
-                    )
+                    .signal(Pipeline::account_ready, (), options)
                     .await;
             }
             if checks >= checks_per_run && !ctx.state(|state| state.demanded || state.stirred) {
@@ -285,14 +310,31 @@ impl Accounts {
             // Asleep, with nothing running, until the next check is due,
             // a limit someone is waiting on ends, or someone speaks.
             let now = unix(ctx.workflow_time());
-            let wake = ctx.state(|state| {
+            let (wake, why) = ctx.state(|state| {
                 let check = state.checked_at + check_secs;
-                state
-                    .next_release(now)
-                    .map_or(check, |release| release.min(check))
+                match state.next_release(now) {
+                    Some(release) if release < check => (
+                        release,
+                        format!(
+                            "a limit that {} pipeline(s) wait on ends",
+                            state.waiting.len()
+                        ),
+                    ),
+                    _ => (
+                        check,
+                        "the next regular check of the accounts is due".to_string(),
+                    ),
+                }
             });
             let sleep = wake.saturating_sub(now).max(1);
-            let mut timer = ctx.timer(Duration::from_secs(sleep)).fuse();
+            let options = TimerOptions::builder(Duration::from_secs(sleep))
+                .summary(describe::line(&format!(
+                    "Nothing to do for {}: at {} {why}",
+                    describe::span(sleep),
+                    describe::clock(now + sleep)
+                )))
+                .build();
+            let mut timer = ctx.timer(options).fuse();
             let mut spoken = ctx
                 .wait_condition(|state| state.demanded || state.stirred)
                 .fuse();
@@ -319,7 +361,7 @@ impl Accounts {
         } else {
             self.picture.pick(&waiting.model, now)
         };
-        match picked {
+        let lease = match picked {
             Ok(account) => Lease::Use { account },
             Err(until) => {
                 self.waiting.push(waiting);
@@ -328,7 +370,9 @@ impl Accounts {
                     secs: until.saturating_sub(now).max(1),
                 }
             }
-        }
+        };
+        ctx.set_current_details(self.details(now));
+        lease
     }
 
     /// A run was stopped by a usage limit. The account is not handed out
@@ -342,6 +386,7 @@ impl Accounts {
             .or_default()
             .blocked
             .insert(family(&limit.model), now + limit.secs.max(1));
+        ctx.set_current_details(self.details(now));
     }
 
     /// Look at every account again now, and believe what is found: for

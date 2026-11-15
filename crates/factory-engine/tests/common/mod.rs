@@ -9,7 +9,11 @@ use std::time::{Duration, Instant};
 
 use factory_engine::accounts::{ACCOUNTS_ID, Accounts, AccountsInput, Board, Picture};
 use factory_engine::engine::PipelineInput;
-use temporalio_client::{Client, WorkflowQueryOptions, WorkflowStartOptions};
+use factory_engine::worker::{accounts_options, pipeline_options};
+use temporalio_client::{
+    Client, UntypedWorkflow, WorkflowFetchHistoryOptions, WorkflowQueryOptions,
+    WorkflowStartOptions,
+};
 use temporalio_sdk::testing::{
     EphemeralExe, LocalServer, LocalWorkflowEnvironmentOptions, WorkflowEnvironment,
 };
@@ -138,11 +142,7 @@ impl Rig {
             ..AccountsInput::default()
         };
         self.client()
-            .start_workflow(
-                Accounts::run,
-                input,
-                WorkflowStartOptions::new(self.queue.clone(), ACCOUNTS_ID.to_string()).build(),
-            )
+            .start_workflow(Accounts::run, input, accounts_options(&self.queue))
             .await
             .unwrap();
     }
@@ -161,6 +161,65 @@ impl Rig {
             accounts: ACCOUNTS_ID.to_string(),
             ..self.input(unit, flow)
         }
+    }
+
+    /// What a pipeline is started with, as the factory starts one: with
+    /// what it says about itself.
+    pub fn options(&self, id: &str, input: &PipelineInput) -> WorkflowStartOptions {
+        pipeline_options(&self.queue, id, input, "A bead of the toy project")
+    }
+
+    /// Fail unless everything in a workflow's history says what it is
+    /// for: the workflow itself, and every activity, timer and signal it
+    /// started. Someone reading it on the server has only that to go by.
+    pub async fn assert_described(&self, workflow: &str) {
+        self.described(workflow, true).await;
+    }
+
+    /// The same, for a workflow a test started bare: only what the
+    /// workflow started itself is looked at.
+    pub async fn assert_steps_described(&self, workflow: &str) {
+        self.described(workflow, false).await;
+    }
+
+    async fn described(&self, workflow: &str, from_its_start: bool) {
+        let json = self
+            .client()
+            .get_workflow_handle::<UntypedWorkflow>(workflow.to_string())
+            .fetch_history(WorkflowFetchHistoryOptions::default())
+            .to_json()
+            .await
+            .unwrap();
+        let history: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        let events = history["events"].as_array().unwrap();
+        let mut seen = 0;
+        for event in events {
+            // The kind of an event is the name of its attributes.
+            let kind = event["attributes"]
+                .as_object()
+                .and_then(|attributes| attributes.keys().next().cloned())
+                .unwrap_or_default();
+            let start = kind.starts_with("WorkflowExecutionStarted");
+            let started = (start && from_its_start)
+                || [
+                    "ActivityTaskScheduled",
+                    "TimerStarted",
+                    "SignalExternalWorkflowExecutionInitiated",
+                ]
+                .iter()
+                .any(|name| kind.starts_with(name));
+            if !started {
+                continue;
+            }
+            seen += 1;
+            let summary = &event["user_metadata"]["summary"]["data"];
+            assert!(
+                summary.as_str().is_some_and(|data| !data.is_empty())
+                    || summary.as_array().is_some_and(|data| !data.is_empty()),
+                "`{workflow}` started something that does not say what it is for: {event}"
+            );
+        }
+        assert!(seen > 1, "`{workflow}` started nothing: {history}");
     }
 
     /// How many times the accounts were checked.

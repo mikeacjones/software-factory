@@ -13,7 +13,8 @@ use temporalio_common::worker::{
 use temporalio_sdk::{Runtime, Worker, WorkerOptions};
 
 use crate::accounts::{ACCOUNTS_ID, Accounts, AccountsInput};
-use crate::engine::Pipeline;
+use crate::describe;
+use crate::engine::{Pipeline, PipelineInput};
 use crate::steps::{StepRunner, Steps};
 
 /// Where a worker connects and what it calls itself.
@@ -43,6 +44,47 @@ pub async fn connect(address: &str, namespace: &str) -> Result<Client, String> {
         .map_err(|err| format!("could not make a client: {err}"))
 }
 
+/// What the accounts workflow is started with: its ID, and what it says
+/// about itself. One that is already running is left as it is.
+pub fn accounts_options(task_queue: &str) -> WorkflowStartOptions {
+    WorkflowStartOptions::new(task_queue.to_string(), ACCOUNTS_ID.to_string())
+        .id_conflict_policy(WorkflowIdConflictPolicy::UseExisting)
+        .static_summary(
+            "Says which Claude account each agent step runs under, and holds steps while none is free"
+                .to_string(),
+        )
+        .static_details(describe::accounts_static())
+        .build()
+}
+
+/// What a pipeline is started with: its ID, and what it says about itself
+/// before it has run. `title` is its bead's title, if that is known.
+pub fn pipeline_options(
+    task_queue: &str,
+    id: &str,
+    input: &PipelineInput,
+    title: &str,
+) -> WorkflowStartOptions {
+    let about = describe::subject(&input.bead, &input.unit, title);
+    let summary = if input.bead.is_empty() {
+        format!("Unit {about}: take it through its flow")
+    } else {
+        format!(
+            "Bead {about} of project `{}`: take it through its flow",
+            input.project
+        )
+    };
+    WorkflowStartOptions::new(task_queue.to_string(), id.to_string())
+        .static_summary(describe::line(&summary))
+        .static_details(describe::pipeline_static(
+            &input.project,
+            &input.bead,
+            &input.unit,
+            input.flow_name.as_deref(),
+        ))
+        .build()
+}
+
 /// See that the accounts workflow is running. One that is already running
 /// is left as it is, with what it knows.
 pub async fn ensure_accounts(
@@ -50,9 +92,7 @@ pub async fn ensure_accounts(
     task_queue: &str,
     check_secs: u64,
 ) -> Result<(), String> {
-    let options = WorkflowStartOptions::new(task_queue.to_string(), ACCOUNTS_ID.to_string())
-        .id_conflict_policy(WorkflowIdConflictPolicy::UseExisting)
-        .build();
+    let options = accounts_options(task_queue);
     let input = AccountsInput {
         check_secs,
         ..AccountsInput::default()

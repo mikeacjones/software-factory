@@ -41,6 +41,14 @@ command = ["cargo", "test", "--locked", "--offline", "--package", "factory-engin
 timeout_secs = 900
 
 [[check]]
+id = "engine-described"
+tier = "host"
+bead = "sf-9a0.6"
+claim = "Someone reading a workflow on the Temporal server is told what everything in it is for: a pipeline and the accounts workflow are started with a summary and details of their own, and every activity, timer and signal they start carries a one-line summary naming the step and what it is run on. A history with one that says nothing fails the tests, in a pipeline that waited for an account and was released, one that parked and went on, one that waited out a limit, and the accounts workflow that served them."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-engine", "--", "--test-threads=1", "a_pipeline_waits_for_an_account_with_nothing_running", "accounts_are_handed_out_by_the_rule", "a_parked_pipeline_waits", "a_usage_limit_is_waited_out", "describe::"]
+timeout_secs = 900
+
+[[check]]
 id = "engine-live"
 tier = "owner"
 bead = "sf-9a0.4"
