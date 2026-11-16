@@ -50,6 +50,21 @@ effort = "high"
 timeout_secs = 1800
 slots = 2
 
+# Before anything is built in a sub-goal, its designer decides what every
+# builder would otherwise decide alone, one bead at a time: the public
+# interface the sub-goal adds or changes, its errors and invariants, where
+# the code goes, and the order of the beads. The director accepts the design
+# or sends it back, and every builder, tester and reviewer of the sub-goal
+# is given what was accepted. A designer may also say the sub-goal is split
+# wrongly, which goes to the director.
+#
+# It runs as a turn of the project's tiers, like the foreman, so while it
+# reads no other tier of the project is woken. Pipelines carry on.
+[designer]
+model = "claude-fable-5-2"
+effort = "high"
+timeout_secs = 2700
+
 [permissions]
 # New beads, with their type, priority and deferral, are the director's call.
 file_beads = "allow"

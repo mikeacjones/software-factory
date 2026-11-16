@@ -629,6 +629,13 @@ pub struct GoalDefinition {
     /// rules on their findings and reports to the director. Without it the
     /// director does that itself.
     pub foreman: Option<Tier>,
+    /// The agent that designs each sub-goal before any of its beads is
+    /// built: the public interface it adds or changes, its error sets and
+    /// invariants, where the code goes and the order of its beads. The
+    /// director accepts the design or sends it back, and every agent that
+    /// works on the sub-goal's beads is given it. Without it each builder
+    /// settles those for its own bead.
+    pub designer: Option<Tier>,
     #[serde(default)]
     pub permissions: GoalPermissions,
 }
@@ -925,6 +932,12 @@ impl ConfigDir {
             if definition.foreman.is_some() && definition.ship_flow.is_none() {
                 return Err(invalid(
                     "a foreman runs a sub-goal, so the definition needs a ship_flow".to_string(),
+                ));
+            }
+            if definition.designer.is_some() && definition.ship_flow.is_none() {
+                return Err(invalid(
+                    "a designer designs a sub-goal, so the definition needs a ship_flow"
+                        .to_string(),
                 ));
             }
             definitions.push(definition);

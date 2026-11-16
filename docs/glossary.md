@@ -86,6 +86,10 @@ It is also where tracker work that is no goal's goes. A director that finds an o
 
 The agent that runs one sub-goal under the director: it starts the sub-goal's beads, rules on their findings, and reports to the director when the sub-goal is ready to ship or when it needs an answer. Like the director it starts fresh at every event and its decisions are checked by code.
 
+## designer
+
+The agent that designs one sub-goal before any of its beads is built, when the goal definition has one: the public interface the sub-goal adds or changes, its errors and invariants, where the code goes, and the order of its beads. The director accepts the design or sends it back, and nothing starts in the sub-goal until it has accepted. Every agent that then works on the sub-goal is given the design. A designer may instead say that the sub-goal is split wrongly, which the director rules on.
+
 ## ruling
 
 A decision about a bead by whoever runs its sub-goal, made when they continue its pipeline: what is out of scope, or how a question of design is settled. It is kept with the unit and shown to every agent step from then on, the tester and the reviewer included, which a continue's note is not.

@@ -174,6 +174,10 @@ pub struct Unit {
     /// commit for each bead and is published as it stands.
     #[serde(default)]
     pub ship: bool,
+    /// The design of the sub-goal the unit belongs to, as its director
+    /// accepted it. Every agent step's first brief carries it.
+    #[serde(default)]
+    pub design: Option<String>,
     /// The beads closed when this unit lands. Empty means its own.
     #[serde(default)]
     pub closes: Vec<String>,
@@ -243,6 +247,19 @@ pub struct Regression {
     /// a record written before findings had one.
     #[serde(default)]
     pub category: String,
+}
+
+/// What every agent of a sub-goal's pipelines is told of its design.
+fn design_note(design: &str, ship: bool) -> Note {
+    let lead = if ship {
+        "This sub-goal was designed before any of its beads was built, and the goal's director accepted the design. The whole of it is on this branch now. Hold the branch to the design: a public name, an error set or a place for code that departs from it, and that no ruling in this brief allows, is a finding that must be fixed or ruled on."
+    } else {
+        "The sub-goal this bead belongs to was designed before any of its beads was built, and the goal's director accepted the design. It decides the public names, the error sets, the invariants and where code goes: work to it, and judge the bead's change against it. If the bead cannot be done within it, do not depart from it quietly: say so in your summary with the reason, so that whoever runs the sub-goal can rule."
+    };
+    Note {
+        title: "The design of this sub-goal".to_string(),
+        body: format!("{lead}\n\n{}", design.trim()),
+    }
 }
 
 /// What a builder and a reviewer are told about the texts the project's code
@@ -509,6 +526,10 @@ pub enum Within {
         /// The files and directories set aside for it, when other beads of
         /// the sub-goal run beside it. Empty when it runs alone.
         paths: Vec<String>,
+        /// The sub-goal's design as its director accepted it, when the
+        /// goal has a designer.
+        #[serde(default)]
+        design: Option<String>,
     },
     /// The sub-goal itself, being shipped as one pull request.
     Ship(Ship),
@@ -530,6 +551,10 @@ pub struct Ship {
     pub closes: Vec<String>,
     /// The GitHub issues of those beads, which its pull request must close.
     pub issues: Vec<u64>,
+    /// The sub-goal's design as its director accepted it, when the goal
+    /// has a designer.
+    #[serde(default)]
+    pub design: Option<String>,
 }
 
 pub struct Driver {
@@ -833,6 +858,7 @@ impl Driver {
                 synced: None,
                 held: None,
                 ship: false,
+                design: None,
                 closes: Vec::new(),
                 issues: Vec::new(),
                 regressions: Vec::new(),
@@ -869,8 +895,10 @@ impl Driver {
                 tip,
                 worktree,
                 paths,
+                design,
                 ..
             }) => {
+                driver.unit.design = design.clone();
                 driver.unit.base = tip.clone();
                 driver.unit.absorb_into = Some(worktree.clone());
                 if !paths.is_empty() {
@@ -883,6 +911,7 @@ impl Driver {
             }
             Some(Within::Ship(ship)) => {
                 driver.unit.ship = true;
+                driver.unit.design = ship.design.clone();
                 driver.unit.issues = ship.issues.clone();
                 driver.unit.closes = ship.closes.clone();
                 driver.unit.worktree = ship.worktree.clone();
@@ -1885,6 +1914,11 @@ impl Driver {
                 _ => classes_for_tester(&classes),
             };
             notes.extend(note);
+        }
+        // What was decided for the whole sub-goal before any bead of it
+        // was built.
+        if let Some(design) = self.unit.design.as_ref().filter(|_| !continuing) {
+            notes.insert(0, design_note(design, self.unit.ship));
         }
         // The texts the project's code is written to.
         if !continuing {

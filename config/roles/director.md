@@ -9,6 +9,8 @@ Sub-goals, when the brief says this goal has them:
 - Shipping is the heavy part and happens once: both test modes, every sample, a review of the whole, one pull request, CI, landing. Ship when the sub-goal is whole. Ship early, with what is absorbed, if a remaining bead turns out not to belong or cannot run: a small pull request that lands beats a large one that waits.
 - If shipping parks, read why. Shipping again continues where it stopped.
 - Order sub-goals so that each lands something useful by itself, and so that later ones build on earlier ones.
+- Some goals have a designer, a separate agent that designs each sub-goal as soon as you open it and before anything is built in it: the public interface, the errors and invariants, where the code goes, the order of the beads. The brief then shows the design under the sub-goal and asks you to rule with `design`. Accept it when a builder could work from it without deciding anything public for itself, and when what it builds first is what the later beads rest on. Send it back with a note when it leaves such a thing open or orders the work so that later beads would undo earlier ones. Everyone who works on the sub-goal is held to what you accept, so read it as you would a pull request to the interface. Nothing starts in the sub-goal until you accept.
+- A designer may say instead that the sub-goal is split wrongly. Take that seriously: it has read the code the split was made without. If it is right, change the beads (file, edit, or ask the executive to close) and send the design back with a note that says what the sub-goal now holds. If the split stands, send it back and say why.
 
 Foremen, when the brief says sub-goals have them:
 

@@ -4178,6 +4178,244 @@ fn a_new_test_that_passes_without_the_change_goes_back_to_the_builder_before_the
     }
 }
 
+/// A goal with a designer: a sub-goal is designed, and its design accepted by
+/// the director, before anything is built in it; everyone who then works on
+/// it is given the design.
+#[test]
+fn a_sub_goal_is_designed_and_the_design_accepted_before_any_bead_of_it_is_built() {
+    use factory_driver::goal::{Supervisor, check_definitions};
+    use factory_slack::socket::Incoming;
+    use std::time::{Duration, Instant};
+
+    let world = World::new("designer", "true");
+    world.with_github("green");
+    std::fs::create_dir_all(world.path("config/goals/toy")).unwrap();
+    let definition = world.path("config/goals/toy/main.toml");
+    let tiers = "[director]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\n[foreman]\nmodel = \"claude-opus-5-5\"\neffort = \"medium\"\n[designer]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\n";
+    // A designer designs sub-goals, so a goal without them cannot have one.
+    std::fs::write(
+        &definition,
+        "id = \"main\"\n[director]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\n[designer]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\n",
+    )
+    .unwrap();
+    let refused = check_definitions(&world.config()).unwrap_err().to_string();
+    assert!(
+        refused.contains("a designer designs a sub-goal, so the definition needs a ship_flow"),
+        "{refused}"
+    );
+    std::fs::write(
+        &definition,
+        format!("id = \"main\"\nflow = \"zig-sdk-bead\"\nship_flow = \"zig-sdk-ship\"\n{tiers}"),
+    )
+    .unwrap();
+    let lines = check_definitions(&world.config()).unwrap().join("\n");
+    assert!(lines.contains("designer claude-opus-5-5 (high)"), "{lines}");
+
+    let say = |role: &str, n: u32, json: serde_json::Value| {
+        std::fs::create_dir_all(world.path("bin/state")).unwrap();
+        std::fs::write(
+            world.path(&format!("bin/state/{role}-{n}.json")),
+            json.to_string(),
+        )
+        .unwrap();
+    };
+    let with = |mut result: serde_json::Value, fields: serde_json::Value| {
+        for (key, value) in fields.as_object().unwrap() {
+            result[key] = value.clone();
+        }
+        result
+    };
+    let direct = |fields: serde_json::Value| {
+        with(
+            serde_json::json!({
+                "summary": "Decided.", "start": [], "file": [], "edit": [], "dropped_findings": [],
+                "open_subgoals": [], "ship": [], "tell_foreman": [], "design": [],
+                "ask_owner": "", "complete": false, "evidence": "", "journal_entry": "", "project_memory": ""
+            }),
+            fields,
+        )
+    };
+    let foreman = |fields: serde_json::Value| {
+        with(
+            serde_json::json!({
+                "summary": "Decided.", "start": [], "file": [], "dropped_findings": [],
+                "report": "working", "message": "", "journal_entry": ""
+            }),
+            fields,
+        )
+    };
+    say(
+        "intake",
+        1,
+        serde_json::json!({"reply": "Here is the charter.", "ready": true, "objective": "Ship the feature.", "stop_when": "toy-1 has landed.", "plan": "One sub-goal.", "edits": []}),
+    );
+    say(
+        "director",
+        1,
+        direct(
+            serde_json::json!({"open_subgoals": [{"id": "feature", "title": "The feature", "objective": "It works.", "beads": ["toy-1"], "paths": []}]}),
+        ),
+    );
+    // The designer first says the split is wrong, and the director holds to it.
+    say(
+        "designer",
+        1,
+        serde_json::json!({"summary": "It cannot be designed as split.", "verdict": "split_wrong", "interface": "", "errors_and_invariants": "", "layout": "", "order": [], "open_questions": "", "split": "toy-1 needs a type that no bead adds."}),
+    );
+    say(
+        "director",
+        2,
+        direct(
+            serde_json::json!({"design": [{"subgoal": "feature", "accept": false, "note": "The split stands: toy-1 adds the type itself."}]}),
+        ),
+    );
+    say(
+        "designer",
+        2,
+        serde_json::json!({"summary": "One options type, added by toy-1.", "verdict": "designed", "interface": "`pub const FeatureOptions = struct { loud: bool = false };`", "errors_and_invariants": "`error.FeatureOff` when it is disabled. The caller owns the line it passes.", "layout": "`feature.txt` holds it.", "order": [{"bead": "toy-1", "reason": "it is the only one"}], "open_questions": "", "split": ""}),
+    );
+    say(
+        "director",
+        3,
+        direct(serde_json::json!({"design": [{"subgoal": "feature", "accept": true, "note": ""}]})),
+    );
+    say(
+        "foreman",
+        1,
+        foreman(
+            serde_json::json!({"start": [{"bead": "toy-1", "reason": "the design puts it first"}]}),
+        ),
+    );
+    say(
+        "foreman",
+        2,
+        foreman(serde_json::json!({"report": "ready", "message": "toy-1 is absorbed."})),
+    );
+    say(
+        "director",
+        4,
+        direct(serde_json::json!({"ask_owner": "Shall I ship it?"})),
+    );
+
+    let mut sup = Supervisor::new(world.config(), None, vec!["OWNER".to_string()], false).unwrap();
+    let id = sup.open_directly("toy", "Ship the feature").unwrap();
+    sup.incoming(Incoming::Action {
+        channel: String::new(),
+        user: "OWNER".to_string(),
+        action_id: "goal_start".to_string(),
+        value: id.clone(),
+        message_ts: String::new(),
+    })
+    .unwrap();
+    let goal = |sup: &Supervisor| sup.goals().next().unwrap().clone();
+    let brief = |role: &str, n: usize| {
+        let calls = world.calls();
+        let index = (0..calls.len())
+            .filter(|&i| calls[i][0] == role)
+            .nth(n - 1)
+            .unwrap_or_else(|| panic!("no call {n} of the {role}"));
+        std::fs::read_to_string(world.path(&format!("bin/state/brief-{}.md", index + 1))).unwrap()
+    };
+
+    // Starting the goal ran the whole exchange: the director opened the
+    // sub-goal, its designer objected, the director sent that back, the
+    // designer designed, the director accepted, and only then was the
+    // foreman woken, which started the bead.
+    let tiers: Vec<String> = world
+        .calls()
+        .iter()
+        .map(|call| call[0].clone())
+        .filter(|role| ["director", "designer", "foreman"].contains(&role.as_str()))
+        .collect();
+    assert_eq!(
+        tiers,
+        [
+            "director", "designer", "director", "designer", "director", "foreman"
+        ]
+    );
+    let started = goal(&sup);
+    let design = started.subgoals[0].design.clone().unwrap();
+    assert_eq!((design.state.as_str(), design.rounds), ("accepted", 2));
+    assert!(
+        design
+            .text
+            .starts_with("### The public interface\n\n`pub const FeatureOptions"),
+        "{}",
+        design.text
+    );
+    assert_eq!(
+        std::fs::read_to_string(world.path(&format!("state/goals/{id}/design-feature.md")))
+            .unwrap(),
+        design.text
+    );
+
+    let first = brief("designer", 1);
+    assert!(
+        first.starts_with("# The design of sub-goal `feature` of goal `"),
+        "{first}"
+    );
+    assert!(
+        first.contains(
+            "### toy-1: Add the feature\n\nAdd it.\n\nAcceptance criteria:\n\n- the feature exists"
+        ),
+        "{first}"
+    );
+    assert!(!first.contains("sent your last result back"), "{first}");
+    let objection = brief("director", 2);
+    assert!(
+        objection.contains("Its designer says it is split wrongly, and has designed nothing.")
+            && objection.contains("> toy-1 needs a type that no bead adds."),
+        "{objection}"
+    );
+    let again = brief("designer", 2);
+    assert!(
+        again.contains("## The director sent your last result back\n\n> The split stands: toy-1 adds the type itself.")
+            && again.contains("### What you said of the split\n\n> toy-1 needs a type that no bead adds."),
+        "{again}"
+    );
+    let proposed = brief("director", 3);
+    assert!(
+        proposed.contains("## The design of sub-goal `feature`, for you to accept or send back")
+            && proposed.contains("`pub const FeatureOptions = struct { loud: bool = false };`")
+            && proposed.contains("1. `toy-1`: it is the only one"),
+        "{proposed}"
+    );
+    let handed = brief("foreman", 1);
+    assert!(
+        handed.contains("## The design of this sub-goal")
+            && handed.contains("`error.FeatureOff` when it is disabled."),
+        "{handed}"
+    );
+
+    // The bead is built, broken, fixed and reviewed, and every agent of its
+    // pipeline was given the design in its first brief.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while goal(&sup).units.iter().any(|unit| unit.state == "running") {
+        assert!(Instant::now() < deadline, "the pipeline did not end");
+        sup.pump(Duration::from_millis(200)).unwrap();
+    }
+    let ended = goal(&sup);
+    assert_eq!(ended.units[0].state, "absorbed", "{:?}", ended.units[0]);
+    for role in ["builder", "tester", "reviewer"] {
+        let text = brief(role, 1);
+        assert!(
+            text.contains("## The design of this sub-goal\n\nThe sub-goal this bead belongs to was designed before any of its beads was built")
+                && text.contains("`pub const FeatureOptions = struct { loud: bool = false };`"),
+            "{role}: {text}"
+        );
+    }
+    let events =
+        std::fs::read_to_string(world.path(&format!("state/goals/{id}/events.jsonl"))).unwrap();
+    let at = |kind: &str| {
+        events
+            .find(&format!("\"{kind}\""))
+            .unwrap_or_else(|| panic!("no {kind} in the goal's log"))
+    };
+    assert!(at("design.disputed") < at("design.sent_back"));
+    assert!(at("design.sent_back") < at("design.proposed"));
+    assert!(at("design.proposed") < at("design.accepted"));
+}
+
 /// A goal whose definition names a stop check is complete when the command
 /// says so, not when its director does.
 #[test]

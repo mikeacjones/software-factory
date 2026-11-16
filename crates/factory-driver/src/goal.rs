@@ -167,7 +167,47 @@ pub struct SubGoal {
     /// was shipping: it waits its turn from then.
     #[serde(default)]
     pub queued_at: Option<u64>,
+    /// Its design, when the goal's definition had a designer as it was
+    /// opened. Nothing starts in it until the director has accepted one.
+    #[serde(default)]
+    pub design: Option<Design>,
 }
+
+/// The factory's record of a sub-goal's design.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Design {
+    /// `pending` while its designer is to run; `proposed` while the
+    /// director has the design to accept or send back; `disputed` while the
+    /// director has the designer's objection to how the sub-goal was split;
+    /// `failed` when the designer could not be run; `accepted`.
+    pub state: String,
+    /// The design as the designer last wrote it.
+    pub text: String,
+    /// What the designer said is wrong with the split, when it disputes it.
+    pub dispute: String,
+    /// What the director said when it last sent the design back.
+    pub note: String,
+    /// How many times the designer has returned for it.
+    pub rounds: u32,
+    pub failures: u32,
+    pub retry_at: Option<u64>,
+}
+
+impl Design {
+    /// Whether work may start in the sub-goal.
+    fn accepted(&self) -> bool {
+        self.state == "accepted"
+    }
+
+    /// Whether the director has something of it to rule on.
+    fn waits(&self) -> bool {
+        matches!(self.state.as_str(), "proposed" | "disputed" | "failed")
+    }
+}
+
+/// How many times a director may send one design back before it must
+/// accept it or take it to the owner.
+const MAX_DESIGN_ROUNDS: u32 = 3;
 
 /// The factory's record of the agent that runs one sub-goal.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -885,6 +925,11 @@ pub fn wake_schema() -> Value {
             "subgoal": text_schema("The ID of an open sub-goal."),
             "text": text_schema("What you tell its foreman."),
         }))},
+        "design": { "type": "array", "description": "Rulings on the designs of sub-goals that wait for you. Always empty when none waits.", "items": object_schema(json!({
+            "subgoal": text_schema("The ID of an open sub-goal whose design waits for you."),
+            "accept": { "type": "boolean", "description": "True to accept the design: every agent that works on the sub-goal is then held to it, and its beads may start. False to send it back to the designer." },
+            "note": text_schema("When you send it back: what must change, or why the split stands. Empty when you accept."),
+        }))},
         "tell_executive": text_schema("Something for the project's executive, the level above goals, or empty. For tracker work that is not this goal's: an open bead that should be closed because what landed already delivers it or because it duplicates another, said with the bead IDs and the reason. The executive can close a bead; you cannot, and it is not a question for the owner."),
         "ask_owner": text_schema("One question only the owner can answer, or empty."),
         "complete": { "type": "boolean", "description": "True to propose that the stop condition is met. The owner decides." },
@@ -935,6 +980,174 @@ fn edit_problems(edits: &[BeadEdit], tracker: &[Summary]) -> Vec<String> {
 ///
 /// `launchable` answers, for a bead ID, why the readiness check would refuse
 /// it (empty: it would not).
+/// The design every pipeline of a sub-goal is held to, if it has one.
+fn accepted_design(sub: &SubGoal) -> Option<String> {
+    sub.design
+        .as_ref()
+        .filter(|design| design.accepted() && !design.text.trim().is_empty())
+        .map(|design| design.text.clone())
+}
+
+/// Whether a sub-goal's designer is to run now.
+fn design_due(sub: &SubGoal) -> bool {
+    sub.design.as_ref().is_some_and(|design| {
+        design.state == "pending" && design.retry_at.is_none_or(|at| at <= now_unix())
+    })
+}
+
+/// What a designer returns for a sub-goal.
+pub fn design_schema() -> Value {
+    object_schema(json!({
+        "summary": text_schema("What you designed and the choices that mattered, for the owner, in a few plain sentences."),
+        "verdict": { "enum": ["designed", "split_wrong"], "description": "`designed`: the design is written. `split_wrong`: the sub-goal as it was split cannot be designed well, because work is missing from it, does not belong in it, or belongs to more than one sub-goal. Then design nothing and say what is wrong in `split`." },
+        "interface": text_schema("The public interface the sub-goal adds, changes or removes: every public name as the code will write it, with its signature or fields, in the project's language, and one line on what each is for. Say what stays as it is where a reader would wonder. Empty when the verdict is split_wrong."),
+        "errors_and_invariants": text_schema("The error sets: which errors each new public function returns, and when. Then the invariants: who owns each resource and releases it on every path, what must hold across calls, what may be used from more than one thread, what must stay deterministic. Empty when the verdict is split_wrong."),
+        "layout": text_schema("Where the code goes: the files and modules, what is new and what changes, and the existing code it must stay consistent with, by path. Empty when the verdict is split_wrong."),
+        "order": { "type": "array", "description": "Every bead of the sub-goal, once, in the order they should be built. Empty when the verdict is split_wrong.", "items": object_schema(json!({
+            "bead": text_schema("A bead of the sub-goal."),
+            "reason": text_schema("Why it comes at this place: what it settles that later beads build on, or what it needs from earlier ones."),
+        }))},
+        "open_questions": text_schema("What the repository and the beads did not settle, and what you assumed for each. Empty if nothing."),
+        "split": text_schema("When the verdict is split_wrong: what is wrong with the split and what would be right, naming beads. Otherwise empty."),
+    }))
+}
+
+/// What is wrong with a designer's result. Empty means it may go to the
+/// director.
+pub fn design_problems(planned: &[String], result: &Value) -> Vec<String> {
+    let mut problems = Vec::new();
+    if strings(result, "summary").trim().is_empty() {
+        problems.push("`summary` is empty".to_string());
+    }
+    match strings(result, "verdict") {
+        "split_wrong" => {
+            if strings(result, "split").trim().is_empty() {
+                problems.push(
+                    "the verdict is split_wrong but `split` is empty: say what is wrong with the split and what would be right".to_string(),
+                );
+            }
+        }
+        "designed" => {
+            for part in ["interface", "errors_and_invariants", "layout"] {
+                if strings(result, part).trim().is_empty() {
+                    problems.push(format!(
+                        "`{part}` is empty: a design says it, even where the answer is that nothing changes"
+                    ));
+                }
+            }
+            let ordered: Vec<&str> = items(result, "order")
+                .iter()
+                .map(|entry| strings(entry, "bead").trim())
+                .collect();
+            for bead in planned {
+                match ordered.iter().filter(|named| *named == bead).count() {
+                    0 => problems.push(format!(
+                        "order: `{bead}` is a bead of the sub-goal and is not in the order"
+                    )),
+                    1 => {}
+                    _ => problems.push(format!("order: `{bead}` is listed more than once")),
+                }
+            }
+            for named in &ordered {
+                if !planned.iter().any(|bead| bead == named) {
+                    problems.push(format!(
+                        "order: `{named}` is not a bead of this sub-goal. If the sub-goal needs work that no bead of it holds, the verdict is split_wrong"
+                    ));
+                }
+            }
+        }
+        other => problems.push(format!(
+            "`verdict` is `{other}`; it must be designed or split_wrong"
+        )),
+    }
+    problems
+}
+
+/// A designer's result as the text everyone after it reads.
+pub fn design_text(result: &Value) -> String {
+    let mut out = format!(
+        "### The public interface\n\n{}\n\n### Errors and invariants\n\n{}\n\n### Where the code goes\n\n{}\n\n### The order of the beads\n\n",
+        strings(result, "interface").trim(),
+        strings(result, "errors_and_invariants").trim(),
+        strings(result, "layout").trim(),
+    );
+    for (at, entry) in items(result, "order").iter().enumerate() {
+        out.push_str(&format!(
+            "{}. `{}`: {}\n",
+            at + 1,
+            strings(entry, "bead").trim(),
+            strings(entry, "reason").trim()
+        ));
+    }
+    let open = strings(result, "open_questions").trim();
+    if !open.is_empty() {
+        out.push_str(&format!("\n### Assumed, not settled\n\n{open}\n"));
+    }
+    out
+}
+
+/// What a designer is told. `beads` are the sub-goal's beads as the tracker
+/// has them: ID, title, description, acceptance criteria.
+pub fn design_brief(
+    goal: &Goal,
+    sub: &SubGoal,
+    beads: &[(String, String, String, String)],
+    memory: &str,
+) -> String {
+    let charter = goal.charter.clone().unwrap_or_default();
+    let design = sub.design.clone().unwrap_or_default();
+    let mut out = format!(
+        "# The design of sub-goal `{}` of goal `{}` on project `{}`, round {}\n\n## What the sub-goal delivers\n\n{}\n\n{}\n\n## The goal it serves\n\n{}\n\n## Where you are\n\nYour working directory is a checkout of the sub-goal's branch, `{}`, as it stands before any of its beads is built. Read anything in it and run anything that only reads. Change nothing: no file you write is kept, and the design goes in your result.\n\n## The beads of the sub-goal\n\n",
+        sub.id,
+        goal.id,
+        goal.project,
+        design.rounds + 1,
+        sub.title,
+        sub.objective,
+        charter.objective,
+        sub.branch,
+    );
+    for (id, title, description, criteria) in beads {
+        out.push_str(&format!(
+            "### {id}: {title}\n\n{}\n\nAcceptance criteria:\n\n{}\n\n",
+            description.trim(),
+            criteria.trim()
+        ));
+    }
+    for bead in &sub.planned {
+        if !beads.iter().any(|(id, ..)| id == bead) {
+            out.push_str(&format!(
+                "### {bead}\n\nThe tracker could not be read for it.\n\n"
+            ));
+        }
+    }
+    if !design.note.trim().is_empty() {
+        out.push_str(&format!(
+            "## The director sent your last result back\n\n{}\n\n",
+            quote_plain(design.note.trim())
+        ));
+        if !design.text.trim().is_empty() {
+            out.push_str(&format!(
+                "### The design you proposed\n\n{}\n\n",
+                design.text.trim()
+            ));
+        }
+        if !design.dispute.trim().is_empty() {
+            out.push_str(&format!(
+                "### What you said of the split\n\n{}\n\n",
+                quote_plain(design.dispute.trim())
+            ));
+        }
+    }
+    if !memory.trim().is_empty() {
+        out.push_str(&format!(
+            "## What the factory remembers of this project\n\n{}\n\n",
+            memory.trim()
+        ));
+    }
+    out
+}
+
 /// One run of the command that decides a goal's stop condition.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StopCheck {
@@ -1208,6 +1421,78 @@ pub fn decision_problems(
             _ => {}
         }
     }
+    // Designs: nothing starts in a sub-goal before its design is accepted,
+    // which the same result may do.
+    let rulings: Vec<(&str, bool)> = items(result, "design")
+        .iter()
+        .map(|ruling| {
+            (
+                strings(ruling, "subgoal").trim(),
+                ruling.get("accept").and_then(Value::as_bool) == Some(true),
+            )
+        })
+        .collect();
+    if batched && !starting.is_empty() {
+        match current {
+            None if opening.is_some() && definition.designer.is_some() => problems.push(
+                "start: the sub-goal you are opening is designed first: start its beads once you have accepted its design".to_string(),
+            ),
+            Some(open)
+                if open.design.as_ref().is_some_and(|design| !design.accepted())
+                    && !rulings.contains(&(open.id.as_str(), true)) =>
+            {
+                problems.push(format!(
+                    "start: the design of sub-goal `{}` is not accepted yet, and nothing starts in it before that",
+                    open.id
+                ));
+            }
+            _ => {}
+        }
+    }
+    for sub in &ships {
+        if flight
+            .iter()
+            .find(|open| &open.id == sub)
+            .and_then(|open| open.design.as_ref())
+            .is_some_and(|design| !design.accepted())
+        {
+            problems.push(format!(
+                "ship: the design of sub-goal `{sub}` is not accepted yet"
+            ));
+        }
+    }
+    let mut ruled: Vec<&str> = Vec::new();
+    for ruling in items(result, "design") {
+        let target = strings(ruling, "subgoal").trim();
+        let accept = ruling.get("accept").and_then(Value::as_bool) == Some(true);
+        if ruled.contains(&target) {
+            problems.push(format!("design: `{target}` is ruled on twice"));
+            continue;
+        }
+        ruled.push(target);
+        let waiting = goal
+            .subgoals
+            .iter()
+            .find(|sub| sub.id == target && sub.state == "open")
+            .and_then(|sub| sub.design.as_ref())
+            .filter(|design| design.waits());
+        match waiting {
+            None => problems.push(format!(
+                "design: `{target}` is not an open sub-goal with a design that waits for you"
+            )),
+            Some(design) if accept && design.state == "disputed" => problems.push(format!(
+                "design: `{target}` has no design to accept: its designer disputes the split. Send it back with a note that says why the split stands or what to design"
+            )),
+            Some(_) if !accept && strings(ruling, "note").trim().is_empty() => problems.push(format!(
+                "design: `{target}` is sent back without a `note`: say what must change"
+            )),
+            Some(design) if !accept && design.rounds >= MAX_DESIGN_ROUNDS => problems.push(format!(
+                "design: `{target}` has been designed {} times. Accept it, or ask the owner",
+                design.rounds
+            )),
+            Some(_) => {}
+        }
+    }
     let opened_now = |id: &str| openings.iter().any(|sub| strings(sub, "id").trim() == id);
     for (target, _) in &tells {
         match flight.iter().find(|sub| &sub.id == target) {
@@ -1246,19 +1531,35 @@ pub fn decision_problems(
     // A foreman that is not waiting for the director will move the goal by
     // itself: a pipeline of its sub-goal is running, or an event is on its
     // way to it. So will a sub-goal that waits its turn to ship.
+    // A design that waits for the director moves nothing until the
+    // director rules: its designer runs again if it is sent back, and its
+    // foreman is woken if it is accepted. While a designer is still to run,
+    // it will report by itself.
+    let design_moves = |sub: &SubGoal| -> Option<bool> {
+        let design = sub.design.as_ref().filter(|design| !design.accepted())?;
+        if design.state == "pending" {
+            return Some(true);
+        }
+        Some(match rulings.iter().find(|(target, _)| *target == sub.id) {
+            Some((_, false)) => true,
+            Some((_, true)) => sub.foreman.is_some(),
+            None => false,
+        })
+    };
     let moving = flight
         .iter()
         .filter(|sub| {
             sub.state == "queued"
                 || (sub.state == "open"
-                    && sub
-                        .foreman
-                        .as_ref()
-                        .is_some_and(|foreman| foreman.waiting.is_none()))
+                    && design_moves(sub).unwrap_or_else(|| {
+                        sub.foreman
+                            .as_ref()
+                            .is_some_and(|foreman| foreman.waiting.is_none())
+                    }))
         })
         .count()
         + tells.len()
-        + if definition.foreman.is_some() {
+        + if definition.foreman.is_some() || definition.designer.is_some() {
             openings.len()
         } else {
             0
@@ -2242,6 +2543,31 @@ pub fn wake_brief(
                     .map(|url| format!(" Pull request: {url}"))
                     .unwrap_or_default(),
             ));
+            if let Some(design) = sub.design.as_ref().filter(|_| sub.state == "open") {
+                out.push_str(&match design.state.as_str() {
+                    "accepted" => "  Its design is accepted, and every agent that works on it is held to it.\n".to_string(),
+                    "proposed" => "  Its design waits for you, below: accept it or send it back with `design`. Nothing starts in it until you accept.\n".to_string(),
+                    "disputed" => format!(
+                        "  Its designer says it is split wrongly, and has designed nothing. Nothing starts in it until you rule with `design`:\n\n{}\n\n",
+                        quote_plain(design.dispute.trim())
+                    ),
+                    "failed" => "  Its designer could not be run. With `design`, send it back to try again, or accept that it is built without a design.\n".to_string(),
+                    _ => "  Its designer is at work. Nothing starts in it until you have accepted the design.\n".to_string(),
+                });
+            }
+        }
+        for sub in &goal.subgoals {
+            if let Some(design) = sub
+                .design
+                .as_ref()
+                .filter(|design| sub.state == "open" && design.state == "proposed")
+            {
+                out.push_str(&format!(
+                    "\n## The design of sub-goal `{}`, for you to accept or send back\n\nRead it against the sub-goal's objective and its beads. Accept it if a builder could work from it and it shapes the later beads rightly. Send it back with what must change if it leaves a public name, an error set or an ownership rule undecided, or orders the beads so that later ones would undo earlier ones.\n\n{}\n",
+                    sub.id,
+                    design.text.trim()
+                ));
+            }
         }
     }
     out.push_str(&format!(
@@ -2319,6 +2645,12 @@ pub fn foreman_brief(
         },
         charter.objective,
     );
+    if let Some(design) = accepted_design(sub) {
+        out.push_str(&format!(
+            "## The design of this sub-goal\n\nA designer wrote it before any bead was built, and the director accepted it. Every builder, tester and reviewer of the sub-goal's beads is given it. Start the beads in the order it gives unless what has happened since makes that wrong, and rule on findings by it. If a bead cannot be done within it, escalate: the design is the director's to change.\n\n{}\n\n",
+            design.trim()
+        ));
+    }
     out.push_str("## What happened since you last ran\n\n");
     out.push_str(&told(&foreman.inbox));
 
@@ -2729,6 +3061,16 @@ pub fn check_definitions(config: &ConfigDir) -> Result<Vec<String>, DriverError>
                 }
                 config.role_prompt("foreman")?;
                 foreman = format!(", foreman {} ({})", tier.model, tier.effort);
+            }
+            if let Some(tier) = &definition.designer {
+                if !factory.allowed_models.contains(&tier.model) {
+                    return Err(refuse(format!(
+                        "the designer's model `{}` is not allowed",
+                        tier.model
+                    )));
+                }
+                config.role_prompt("designer")?;
+                foreman.push_str(&format!(", designer {} ({})", tier.model, tier.effort));
             }
             lines.push(format!(
                 "{id}/{}: director {} ({}){foreman}, pipeline `{}`, {} at a time{}",
@@ -4990,6 +5332,57 @@ impl Supervisor {
                 }],
             );
         }
+        for ruling in items(&result, "design") {
+            let target = strings(ruling, "subgoal").trim();
+            let accept = ruling.get("accept").and_then(Value::as_bool) == Some(true);
+            let note = strings(ruling, "note").trim().to_string();
+            let Some(design) = goal
+                .subgoals
+                .iter_mut()
+                .find(|sub| sub.id == target)
+                .and_then(|sub| sub.design.as_mut())
+            else {
+                continue;
+            };
+            if accept {
+                let without = design.state == "failed";
+                design.state = "accepted".to_string();
+                if without {
+                    design.text.clear();
+                }
+                self.log(
+                    &goal,
+                    "design.accepted",
+                    json!({ "subgoal": target, "without": without }),
+                );
+                self.say(
+                    &goal,
+                    &format!(
+                        ":white_check_mark: *Design of* `{target}` {}.",
+                        if without {
+                            "waived: its designer could not be run, and it is built without one"
+                        } else {
+                            "accepted. Its beads are built to it"
+                        }
+                    ),
+                );
+                did.push(format!("accepted the design of {target}"));
+            } else {
+                design.state = "pending".to_string();
+                design.retry_at = Some(now_unix());
+                design.note = note.clone();
+                self.log(
+                    &goal,
+                    "design.sent_back",
+                    json!({ "subgoal": target, "note": note }),
+                );
+                self.say(&goal, &format!(
+                    ":leftwards_arrow_with_hook: *Design of* `{target}` sent back to its designer.\n{}",
+                    quote(&truncate(&note, 1500))
+                ));
+                did.push(format!("sent the design of {target} back"));
+            }
+        }
         // What the decisions name, as they were checked: before any of
         // them changes which sub-goals there are.
         let tells = tells_of(&goal, &result);
@@ -5040,6 +5433,15 @@ impl Supervisor {
                     ));
                     self.log(&goal, "subgoal.opened", json!({ "id": sub.id, "branch": sub.branch, "base": sub.base, "planned": sub.planned, "paths": sub.paths, "foreman": definition.foreman.is_some() }));
                     let mut sub = sub;
+                    if definition.designer.is_some() {
+                        // Its designer goes first, run when this turn's
+                        // decisions are done.
+                        sub.design = Some(Design {
+                            state: "pending".to_string(),
+                            retry_at: Some(now_unix()),
+                            ..Design::default()
+                        });
+                    }
                     if definition.foreman.is_some() {
                         // Its foreman takes it from here, woken below.
                         sub.foreman = Some(Foreman {
@@ -5122,7 +5524,186 @@ impl Supervisor {
             self.ship(&mut goal, &definition, &source, sub)?;
         }
         self.save(goal)?;
+        self.run_designers(id)?;
         self.wake_foremen(id)
+    }
+
+    /// Run the designer of every sub-goal of a goal whose design is to be
+    /// written now, and then the director, which is owed what they wrote.
+    fn run_designers(&mut self, id: &str) -> Result<(), DriverError> {
+        let due: Vec<String> = self
+            .goals
+            .get(id)
+            .filter(|goal| goal.phase == Phase::Running)
+            .map(|goal| {
+                goal.subgoals
+                    .iter()
+                    .filter(|sub| sub.state == "open" && design_due(sub))
+                    .map(|sub| sub.id.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if due.is_empty() || self.draining {
+            return Ok(());
+        }
+        for sub in &due {
+            self.design(id, sub)?;
+        }
+        self.wake(id)
+    }
+
+    /// Run the designer of one sub-goal. What it returns goes to the
+    /// director: nothing starts in the sub-goal until the director has
+    /// accepted a design.
+    fn design(&mut self, id: &str, sub_id: &str) -> Result<(), DriverError> {
+        let mut goal = self.goals[id].clone();
+        let Some(index) = goal.subgoals.iter().position(|sub| sub.id == sub_id) else {
+            return Ok(());
+        };
+        let sub = goal.subgoals[index].clone();
+        let Some(mut design) = sub.design.clone() else {
+            return Ok(());
+        };
+        if self.draining || goal.phase != Phase::Running || sub.state != "open" || !design_due(&sub)
+        {
+            return Ok(());
+        }
+        let definition = self.definition(&goal)?;
+        let project = self.config.project(&goal.project)?;
+        let source = bead_source(&project);
+        let memory = std::fs::read_to_string(self.memory_path(&goal.project)).unwrap_or_default();
+        let beads: Vec<(String, String, String, String)> = sub
+            .planned
+            .iter()
+            .filter_map(|bead| source.read(bead).ok())
+            .map(|bead| {
+                (
+                    bead.id,
+                    bead.title,
+                    bead.description,
+                    bead.acceptance_criteria,
+                )
+            })
+            .collect();
+        let brief = design_brief(&goal, &sub, &beads, &memory);
+        let planned = sub.planned.clone();
+        let check = |result: &Value| design_problems(&planned, result);
+        let turn = Turn {
+            who: "designer",
+            role: "designer",
+            // A definition that lost its designer mid-goal still has to
+            // finish the designs that were asked for.
+            tier: definition
+                .designer
+                .clone()
+                .unwrap_or_else(|| definition.director.clone()),
+            place: Some((format!("designer-{sub_id}"), sub.branch.clone())),
+            schema: design_schema(),
+            session: Session::Fresh,
+            prompt: brief,
+        };
+        let seat = self.seat(&goal);
+        let result = match self.run_agent(&seat, &mut goal.usage, turn, &check) {
+            Ok((result, _)) => result,
+            Err(reason) => return self.designer_failed(goal, index, &reason),
+        };
+        design.failures = 0;
+        design.retry_at = None;
+        design.rounds += 1;
+        design.note.clear();
+        let summary = strings(&result, "summary").trim().to_string();
+        if strings(&result, "verdict") == "split_wrong" {
+            design.state = "disputed".to_string();
+            design.dispute = strings(&result, "split").trim().to_string();
+            goal.inbox.push(Happening::Note {
+                text: format!(
+                    "The designer of sub-goal `{sub_id}` says the sub-goal is split wrongly, and has designed nothing. What it said is under \"Sub-goals\". Nothing starts in the sub-goal until you rule with `design`."
+                ),
+            });
+            self.log(
+                &goal,
+                "design.disputed",
+                json!({ "subgoal": sub_id, "round": design.rounds, "split": design.dispute }),
+            );
+            self.say(&goal, &format!(
+                ":triangular_ruler: The designer of `{sub_id}` says the sub-goal is split wrongly. The director rules.\n{}",
+                quote(&truncate(&design.dispute, 1500))
+            ));
+        } else {
+            design.state = "proposed".to_string();
+            design.dispute.clear();
+            design.text = design_text(&result);
+            let path = self.dir(id).join(format!("design-{sub_id}.md"));
+            let _ = std::fs::write(&path, &design.text);
+            goal.inbox.push(Happening::Note {
+                text: format!(
+                    "The designer of sub-goal `{sub_id}` has written its design, which is below for you to accept or send back with `design`. Nothing starts in the sub-goal until you accept."
+                ),
+            });
+            self.log(
+                &goal,
+                "design.proposed",
+                json!({ "subgoal": sub_id, "round": design.rounds, "summary": summary, "path": path }),
+            );
+            self.say(&goal, &format!(
+                ":triangular_ruler: *Design of* `{sub_id}` (round {}): the director accepts it or sends it back.\n{}",
+                design.rounds,
+                quote(&truncate(&summary, 1500))
+            ));
+        }
+        goal.subgoals[index].design = Some(design);
+        self.save(goal)
+    }
+
+    /// What to do when a designer could not be run: try again later, and
+    /// after five failures in a row leave it to the director.
+    fn designer_failed(
+        &mut self,
+        mut goal: Goal,
+        index: usize,
+        reason: &str,
+    ) -> Result<(), DriverError> {
+        let sub_id = goal.subgoals[index].id.clone();
+        let Some(mut design) = goal.subgoals[index].design.clone() else {
+            return self.save(goal);
+        };
+        if let Some(until) = reason
+            .strip_prefix(LIMITED)
+            .and_then(|at| at.parse::<u64>().ok())
+        {
+            // Waiting for a usage window is not a failure.
+            design.retry_at = Some(until);
+            self.log(
+                &goal,
+                "accounts.limited",
+                json!({ "until": until, "subgoal": sub_id, "who": "designer" }),
+            );
+        } else {
+            design.failures += 1;
+            self.log(
+                &goal,
+                "designer.failed",
+                json!({ "subgoal": sub_id, "reason": reason, "failures": design.failures }),
+            );
+            if design.failures >= 5 {
+                design.failures = 0;
+                design.retry_at = None;
+                design.state = "failed".to_string();
+                goal.inbox.push(Happening::Note {
+                    text: format!(
+                        "The designer of sub-goal `{sub_id}` could not be run five times in a row, so the sub-goal has no design. The last reason: {reason}. With `design`, send it back to try again or accept that it is built without one."
+                    ),
+                });
+            } else {
+                design.retry_at = Some(now_unix() + 300);
+                self.say(&goal, &format!(
+                    ":warning: The designer of `{sub_id}` could not run ({}). Trying again in 5 minutes.",
+                    escape(reason)
+                ));
+            }
+        }
+        goal.subgoals[index].design = Some(design);
+        self.save(goal)
     }
 
     /// Start one bead's pipeline: inside a sub-goal, from that sub-goal's
@@ -5152,6 +5733,7 @@ impl Supervisor {
                 worktree: sub.worktree.clone(),
                 absorbed: sub.absorbed.iter().map(|(bead, _)| bead.clone()).collect(),
                 paths: paths.clone(),
+                design: accepted_design(sub),
             });
             if let Some(foreman) = sub.foreman.as_mut() {
                 // Work has started: the talking has got somewhere.
@@ -5306,6 +5888,7 @@ impl Supervisor {
             || goal.phase != Phase::Running
             || sub.state != "open"
             || foreman.inbox.is_empty()
+            || sub.design.as_ref().is_some_and(|design| !design.accepted())
         {
             return Ok(());
         }
@@ -5617,6 +6200,7 @@ impl Supervisor {
                     .unwrap_or_default(),
             },
             queued_at: None,
+            design: None,
         })
     }
 
@@ -5757,6 +6341,7 @@ impl Supervisor {
             branch: sub.branch.clone(),
             base: sub.base.clone(),
             closes,
+            design: accepted_design(&sub),
         };
         goal.units.push(GoalUnit {
             bead: sub.id.clone(),
@@ -6070,7 +6655,16 @@ impl Supervisor {
                 (!executive.pending.is_empty()).then_some(executive.pending_checked_at + 300);
             memos.into_iter().chain(pending)
         });
-        goals.chain(foremen).chain(desks).min()
+        let designers = self
+            .goals
+            .values()
+            .filter(|goal| goal.phase == Phase::Running)
+            .flat_map(|goal| goal.subgoals.iter())
+            .filter(|sub| sub.state == "open")
+            .filter_map(|sub| sub.design.as_ref())
+            .filter(|design| design.state == "pending")
+            .filter_map(|design| design.retry_at);
+        goals.chain(foremen).chain(designers).chain(desks).min()
     }
 
     /// When to hand the last owner's message in again, if it could not be
@@ -6204,6 +6798,21 @@ impl Supervisor {
         for (goal, sub) in due {
             happened = true;
             self.wake_foreman(&goal, &sub)?;
+        }
+        let due: Vec<String> = self
+            .goals
+            .values()
+            .filter(|goal| goal.phase == Phase::Running)
+            .filter(|goal| {
+                goal.subgoals
+                    .iter()
+                    .any(|sub| sub.state == "open" && design_due(sub))
+            })
+            .map(|goal| goal.id.clone())
+            .collect();
+        for goal in due {
+            happened = true;
+            self.run_designers(&goal)?;
         }
         let Ok(first) = self.receiver.recv_timeout(wait) else {
             return Ok(happened);
@@ -6735,6 +7344,162 @@ mod tests {
         vec![bead("toy-1", true), bead("toy-2", false)]
     }
 
+    fn designed() -> Value {
+        json!({
+            "summary": "One new option type.", "verdict": "designed",
+            "interface": "`pub const Options = struct { retries: u32 = 3 };`",
+            "errors_and_invariants": "`error.Timeout` when the deadline passes. The caller owns the buffer.",
+            "layout": "`src/options.zig`, new.",
+            "order": [{"bead": "toy-1", "reason": "it adds the type"}, {"bead": "toy-2", "reason": "it uses it"}],
+            "open_questions": "", "split": ""
+        })
+    }
+
+    #[test]
+    fn a_design_orders_every_bead_of_its_sub_goal_once_or_says_the_split_is_wrong() {
+        let planned = ["toy-1".to_string(), "toy-2".to_string()];
+        assert_eq!(design_problems(&planned, &designed()), Vec::<String>::new());
+        let mut thin = designed();
+        thin["layout"] = json!(" ");
+        thin["order"] = json!([{"bead": "toy-1", "reason": "r"}, {"bead": "toy-1", "reason": "r"}, {"bead": "toy-9", "reason": "r"}]);
+        assert_eq!(
+            design_problems(&planned, &thin),
+            [
+                "`layout` is empty: a design says it, even where the answer is that nothing changes",
+                "order: `toy-1` is listed more than once",
+                "order: `toy-2` is a bead of the sub-goal and is not in the order",
+                "order: `toy-9` is not a bead of this sub-goal. If the sub-goal needs work that no bead of it holds, the verdict is split_wrong",
+            ]
+        );
+        let disputed =
+            json!({"summary": "It cannot be designed.", "verdict": "split_wrong", "split": ""});
+        assert_eq!(
+            design_problems(&planned, &disputed),
+            [
+                "the verdict is split_wrong but `split` is empty: say what is wrong with the split and what would be right"
+            ]
+        );
+        assert_eq!(
+            design_problems(
+                &planned,
+                &json!({"summary": "s", "verdict": "split_wrong", "split": "toy-2 belongs elsewhere."})
+            ),
+            Vec::<String>::new()
+        );
+        let text = design_text(&designed());
+        assert!(
+            text.starts_with("### The public interface\n\n`pub const Options"),
+            "{text}"
+        );
+        assert!(
+            text.ends_with("### The order of the beads\n\n1. `toy-1`: it adds the type\n2. `toy-2`: it uses it\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn nothing_starts_or_ships_in_a_sub_goal_before_the_director_accepts_its_design() {
+        let mut d = batched();
+        d.designer = Some(d.director.clone());
+        let design = |state: &str, rounds: u32| Design {
+            state: state.to_string(),
+            text: design_text(&designed()),
+            dispute: "toy-2 belongs to another sub-goal.".to_string(),
+            rounds,
+            ..Design::default()
+        };
+        let with = |state: &str, rounds: u32| {
+            let mut goal = with_subgoal("open", &[]);
+            goal.subgoals[0].design = Some(design(state, rounds));
+            goal
+        };
+        let id = with("proposed", 1).subgoals[0].id.clone();
+        let rule = |accept: bool, note: &str| json!({"design": [{"subgoal": id, "accept": accept, "note": note}]});
+
+        // The director is shown the design and what it may do with it.
+        let brief = wake_brief(&d, &with("proposed", 1), &[], "", "");
+        assert!(brief.contains("Its design waits for you, below"), "{brief}");
+        assert!(
+            brief.contains(&format!(
+                "## The design of sub-goal `{id}`, for you to accept or send back"
+            )) && brief.contains("### The public interface\n\n`pub const Options"),
+            "{brief}"
+        );
+        let disputed = wake_brief(&d, &with("disputed", 1), &[], "", "");
+        assert!(
+            disputed.contains("Its designer says it is split wrongly")
+                && disputed.contains("> toy-2 belongs to another sub-goal."),
+            "{disputed}"
+        );
+        assert!(!disputed.contains("for you to accept or send back"));
+
+        // Rulings are checked against what waits. A design that waits is
+        // the director's to rule on: a turn that leaves it waiting leaves
+        // nothing that can move the goal, and where the sub-goal has no
+        // foreman, accepting it moves nothing unless a bead starts too.
+        let idle = "nothing would be running and nobody would be asked: start a pipeline, ship the sub-goal, ask the owner, or propose that the goal is complete";
+        assert_eq!(problems(&d, &with("proposed", 1), json!({})), [idle]);
+        assert_eq!(
+            problems(&d, &with("pending", 1), json!({})),
+            Vec::<String>::new()
+        );
+        assert_eq!(problems(&d, &with("proposed", 1), rule(true, "")), [idle]);
+        let start = json!([{"bead": "toy-1", "reason": "the design puts it first"}]);
+        let mut accept_and_start = rule(true, "");
+        accept_and_start["start"] = start.clone();
+        assert_eq!(
+            problems(&d, &with("proposed", 1), accept_and_start),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            problems(&d, &with("proposed", 1), json!({"start": start})),
+            [format!(
+                "start: the design of sub-goal `{id}` is not accepted yet, and nothing starts in it before that"
+            )]
+        );
+        assert_eq!(
+            problems(&d, &with("proposed", 1), rule(false, "Name the error set.")),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            problems(&d, &with("proposed", 1), rule(false, " ")),
+            [format!(
+                "design: `{id}` is sent back without a `note`: say what must change"
+            )]
+        );
+        assert_eq!(
+            problems(&d, &with("disputed", 1), rule(true, ""))[0],
+            format!(
+                "design: `{id}` has no design to accept: its designer disputes the split. Send it back with a note that says why the split stands or what to design"
+            )
+        );
+        assert_eq!(
+            problems(&d, &with("proposed", 3), rule(false, "Again.")),
+            [format!(
+                "design: `{id}` has been designed 3 times. Accept it, or ask the owner"
+            )]
+        );
+        for state in ["pending", "accepted"] {
+            assert_eq!(
+                problems(&d, &with(state, 1), rule(true, ""))[0],
+                format!("design: `{id}` is not an open sub-goal with a design that waits for you")
+            );
+        }
+        // Until it is accepted the sub-goal cannot be shipped.
+        assert!(
+            problems(&d, &with("proposed", 1), json!({"ship": [id]})).contains(&format!(
+                "ship: the design of sub-goal `{id}` is not accepted yet"
+            ))
+        );
+        // The accepted design goes with the sub-goal's pipelines; one that
+        // is not accepted goes nowhere.
+        assert_eq!(
+            accepted_design(&with("accepted", 1).subgoals[0]),
+            Some(design_text(&designed()))
+        );
+        assert_eq!(accepted_design(&with("proposed", 1).subgoals[0]), None);
+    }
+
     #[test]
     fn a_goal_with_a_stop_check_is_complete_only_while_its_command_passes() {
         let mut d = definition(1, "allow");
@@ -6969,6 +7734,7 @@ mod tests {
             added: Vec::new(),
             paths: Vec::new(),
             queued_at: None,
+            design: None,
         });
         goal
     }
