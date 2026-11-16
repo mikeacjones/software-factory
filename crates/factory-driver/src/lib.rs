@@ -1928,8 +1928,23 @@ impl Driver {
             match self.artifact_note(name) {
                 Ok(note) => notes.push(note),
                 Err(reason) => {
+                    // A unit continued from this step may have begun on a
+                    // flow that did not make it, or have new commits since
+                    // it was made. Whoever continues it is told where to.
+                    let maker = self
+                        .flow
+                        .steps
+                        .iter()
+                        .find(|other| other.produces.as_deref() == Some(name.as_str()))
+                        .map(|other| {
+                            format!(
+                                ". Step `{}` makes it: continue the unit from there, or from a step before it",
+                                other.id
+                            )
+                        })
+                        .unwrap_or_default();
                     return Ok(StepEnd::Park(format!(
-                        "step `{}` needs `{name}`: {reason}",
+                        "step `{}` needs `{name}`: {reason}{maker}",
                         step.id
                     )));
                 }

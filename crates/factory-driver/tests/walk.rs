@@ -1349,6 +1349,78 @@ fn the_owner_can_put_an_ended_unit_onto_the_projects_current_flow() {
     assert!(bead.contains("\"closed\""));
 }
 
+/// A unit continued at a step that lacks what it needs parks, and says which
+/// step makes that: here a unit that began before its flow proved tests by
+/// command, taken up at the tester on the flow as it is now. Continued from
+/// the step it is told, it makes what the flow has gained on its way.
+#[test]
+fn a_unit_continued_at_a_step_that_lacks_what_it_needs_is_told_where_to_go_on() {
+    let world = World::new("gained", "true");
+    world.with_github("green");
+    let project = world.path("config/projects/toy.toml");
+    let zig = std::fs::read_to_string(&project).unwrap();
+    // The flow as it was before it proved tests by command, and without
+    // its landing.
+    let old = std::fs::read_to_string(repo_config().join("flows/zig-sdk.toml"))
+        .unwrap()
+        .replace("id = \"zig-sdk\"", "id = \"old\"")
+        .replace("on.pass = \"proof\"", "on.pass = \"break\"")
+        .replace(
+            "needs = [\"reports\", \"test-proof\"]",
+            "needs = [\"reports\"]",
+        )
+        .replace("on.done = \"ci\"", "on.done = \"end\"");
+    assert!(
+        old.contains("on.pass = \"break\"")
+            && !old.contains("needs = [\"reports\", \"test-proof\"]")
+    );
+    let cut = old.find("# No model from here on").unwrap();
+    let old = &old[..cut];
+    // The step itself is taken out: from its comment to the step after it.
+    let from = old
+        .find("# Each test the change adds or alters is run")
+        .unwrap();
+    let to = from + old[from..].find("id = \"proof\"").unwrap();
+    let to = to + old[to..].find("\n[[step]]").unwrap();
+    let old = format!("{}{}", &old[..from], &old[to + 1..]);
+    assert!(!old.contains("test-proof"), "{old}");
+    std::fs::write(world.path("config/flows/old.toml"), &old).unwrap();
+    std::fs::write(
+        &project,
+        zig.replace("flow = \"zig-sdk\"", "flow = \"old\""),
+    )
+    .unwrap();
+
+    let mut driver = Driver::start(world.config(), "toy", "toy-1", &OPTIONS).unwrap();
+    assert_eq!(driver.run().unwrap(), Status::Ended);
+    assert!(!driver.unit().artifacts.contains_key("test-proof"));
+    let unit_id = driver.unit().id.to_string();
+    drop(driver);
+
+    // Continued at the tester on the flow as it is now, its reports are of
+    // an earlier commit and it has no proof at all. The first is said.
+    std::fs::write(&project, zig).unwrap();
+    let mut driver = Driver::resume(world.config(), &unit_id, &OPTIONS, Some("break")).unwrap();
+    let Status::Parked(reason) = driver.run().unwrap() else {
+        panic!("expected the unit to park");
+    };
+    assert!(
+        reason.starts_with("step `break` needs `reports`: it describes commit `")
+            && reason.ends_with(
+                ". Step `reports` makes it: continue the unit from there, or from a step before it"
+            ),
+        "{reason}"
+    );
+    drop(driver);
+
+    // Continued where it was told to, it passes the step the flow gained
+    // and goes on to its landing.
+    let mut driver = Driver::resume(world.config(), &unit_id, &OPTIONS, Some("reports")).unwrap();
+    assert_eq!(driver.run().unwrap(), Status::Ended);
+    assert!(driver.unit().artifacts.contains_key("test-proof"));
+    assert!(driver.unit().merged.is_some());
+}
+
 #[test]
 fn a_project_can_land_by_squashing() {
     let world = World::new("squash", "true");
