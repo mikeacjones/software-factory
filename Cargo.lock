@@ -634,6 +634,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "factory-dash"
+version = "0.0.0"
+dependencies = [
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "regex",
+ "serde_json",
+ "tokio",
+ "toml",
+]
+
+[[package]]
 name = "factory-driver"
 version = "0.0.0"
 dependencies = [
