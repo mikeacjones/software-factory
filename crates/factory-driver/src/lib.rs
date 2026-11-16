@@ -245,6 +245,37 @@ pub struct Regression {
     pub category: String,
 }
 
+/// What a builder and a reviewer are told about the texts the project's code
+/// is written to. `None` for any other step, and when the project names none.
+fn standards_note(standards: &[String], tree: &Path, contract: Contract) -> Option<Note> {
+    let lead = match contract {
+        Contract::Change => {
+            "The project's code is written to these texts, which are in the repository. Read them before you write: the reviewer judges your change against them."
+        }
+        Contract::Review => {
+            "Judge whether the change is idiomatic and of the quality a maintainer would accept against these texts, which are in the repository. Read them before you read the diff. A finding of idiom or quality says which text it rests on and where, or says that the texts are silent and names the convention of the language that decides."
+        }
+        _ => return None,
+    };
+    if standards.is_empty() {
+        return None;
+    }
+    let files: Vec<String> = standards
+        .iter()
+        .map(|path| {
+            if tree.join(path).is_file() {
+                format!("- `{path}`")
+            } else {
+                format!("- `{path}` (the project's record names it, and it is not in this tree)")
+            }
+        })
+        .collect();
+    Some(Note {
+        title: "The project's written standards".to_string(),
+        body: format!("{lead}\n\n{}", files.join("\n")),
+    })
+}
+
 /// How often each class of defect has broken beads of a project, most
 /// beads first: every critical or major finding a tester proved, read from
 /// the records of the project's units. A record that cannot be read, or
@@ -1854,6 +1885,10 @@ impl Driver {
                 _ => classes_for_tester(&classes),
             };
             notes.extend(note);
+        }
+        // The texts the project's code is written to.
+        if !continuing {
+            notes.extend(standards_note(&self.project.standards, &cwd, contract));
         }
         for name in &step.needs {
             match self.artifact_note(name) {
@@ -4367,6 +4402,39 @@ mod tests {
         // Without the file there is no token, and no falling back.
         std::fs::remove_file(&secrets).unwrap();
         assert!(account_token(&factory, "a").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_builder_and_a_reviewer_are_named_the_projects_standards_and_nobody_else_is() {
+        let dir = std::env::temp_dir().join(format!("factory-standards-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("STYLE.md"), "Free what you allocate.").unwrap();
+        let named = ["STYLE.md".to_string(), "docs/gone.md".to_string()];
+        let review = standards_note(&named, &dir, Contract::Review).unwrap();
+        assert_eq!(review.title, "The project's written standards");
+        assert!(
+            review
+                .body
+                .starts_with("Judge whether the change is idiomatic")
+        );
+        assert!(
+            review.body.ends_with(
+                "- `STYLE.md`\n- `docs/gone.md` (the project's record names it, and it is not in this tree)"
+            ),
+            "{}",
+            review.body
+        );
+        let build = standards_note(&named, &dir, Contract::Change).unwrap();
+        assert!(
+            build
+                .body
+                .starts_with("The project's code is written to these texts")
+        );
+        assert_eq!(standards_note(&named, &dir, Contract::Probe), None);
+        assert_eq!(standards_note(&named, &dir, Contract::Publication), None);
+        assert_eq!(standards_note(&[], &dir, Contract::Review), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

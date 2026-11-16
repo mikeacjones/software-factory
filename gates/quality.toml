@@ -45,3 +45,35 @@ bead = "sf-gl5.1"
 claim = "`factory findings <project>` prints each class of the project's recorded findings with how many findings and beads it has."
 command = ["cargo", "run", "--quiet", "--locked", "--offline", "--package", "factory-cli", "--", "findings", "temporal-sdk-zig", "--config", "config"]
 timeout_secs = 900
+
+[[check]]
+id = "proof-step-in-flows"
+tier = "hermetic"
+bead = "sf-gl5.2"
+claim = "The Zig project's flows name the proof step before the tester and are sound against the project's record; a step that needs an artifact is refused when a step that changes the code can come between."
+command = ["sh", "-c", "cargo test --locked --offline --package factory-flow && cargo run --quiet --locked --offline --package factory-cli -- flow check temporal-sdk-zig --config config && cargo run --quiet --locked --offline --package factory-cli -- goal check --config config && grep -q 'on.pass = \"proof\"' config/flows/zig-sdk-bead.toml config/flows/zig-sdk.toml"]
+timeout_secs = 900
+
+[[check]]
+id = "proof-routes"
+tier = "hermetic"
+bead = "sf-gl5.2"
+claim = "A unit whose new test passes at the base goes back to the builder with the test named, before any tester runs; one whose tests fail there goes on; a test that does not build there goes on, and the record and the tester's and reviewer's briefs say so."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-driver", "--test", "walk", "--", "a_new_test_that_passes_without_the_change"]
+timeout_secs = 900
+
+[[check]]
+id = "zig-test-blocks"
+tier = "hermetic"
+bead = "sf-gl5.2"
+claim = "The Zig project's tool splits a change at test blocks, runs each new test alone on the code as it was, and classes it: fails, does not build, passes, skipped, not reached, not judged; it lists removed tests and leaves the worktree as it was."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-driver", "--test", "test_proof"]
+timeout_secs = 900
+
+[[check]]
+id = "reviewer-remit"
+tier = "hermetic"
+bead = "sf-gl5.2"
+claim = "The reviewer's role no longer asks whether tests fail without the change, and says what idiom and quality are judged against; a builder and a reviewer are named the project's standards."
+command = ["sh", "-c", "! grep -q 'must fail without the change' config/roles/reviewer.md && grep -q 'written standards' config/roles/reviewer.md && cargo test --locked --offline --package factory-driver --lib -- a_builder_and_a_reviewer_are_named"]
+timeout_secs = 900

@@ -77,10 +77,22 @@ kind = "command"
 command = "reports"
 policy = "report-only"
 produces = "reports"
-on.pass = "break"
+on.pass = "proof"
 # The reports are advisory as a whole, but the project names a few results
 # that must not pass (see `fail_when` on the command). Those go back to the
 # builder before any agent spends time on the change.
+on.fail = { to = "fix", max = 2 }
+
+# Each test the change adds or alters is run on the code as it was at the
+# base, by a tool (see the command). One that passes there does not test the
+# change and goes back to the builder. The tester and the reviewer are given
+# the result, so neither is asked what a command has settled.
+[[step]]
+id = "proof"
+kind = "command"
+command = "test-proof"
+produces = "test-proof"
+on.pass = "break"
 on.fail = { to = "fix", max = 2 }
 
 [[step]]
@@ -91,7 +103,7 @@ model = "claude-opus-5-5"
 effort = "high"
 session = "fresh"
 workspace = "scratch"
-needs = ["reports"]
+needs = ["reports", "test-proof"]
 on.held = "review"
 # Every break is proved by a failing test the factory commits to the branch,
 # and a change with a failing test is not a reviewer's to wave through. So a
@@ -109,7 +121,7 @@ model = "claude-opus-5-5"
 effort = "medium"
 session = "fresh"
 workspace = "scratch"
-needs = ["reports"]
+needs = ["reports", "test-proof"]
 on.approve = "describe"
 on.rework = { to = "fix", max = 2 }
 on.needs_owner = { to = "ask", max = 2 }

@@ -1082,6 +1082,7 @@ fn a_red_check_goes_back_to_the_builder_and_green_is_merged_without_asking_anyon
             "samples:pass",
             "test-linux:pass",
             "reports:pass",
+            "proof:pass",
             "break:held",
             "review:approve",
             "describe:ready",
@@ -1093,16 +1094,17 @@ fn a_red_check_goes_back_to_the_builder_and_green_is_merged_without_asking_anyon
         ]
     );
 
-    // The reports were written by a command, once for each version of the
-    // code (the build, the fix after the tester, the fix after CI), into a
-    // directory outside the worktree, and the steps that need them were
-    // briefed with where they are and what their index says.
+    // The reports and the test proof were each written by a command, once
+    // for each version of the code (the build, the fix after the tester, the
+    // fix after CI), into a directory outside the worktree, and the steps
+    // that need them were briefed with where they are and what their index
+    // says.
     assert_eq!(
         kinds
             .iter()
             .filter(|kind| *kind == "artifact.produced")
             .count(),
-        3
+        6
     );
     let all_calls = world.calls();
     let review = all_calls
@@ -4102,6 +4104,78 @@ fn a_report_line_that_must_not_pass_goes_back_to_the_builder() {
         fix_brief.contains("FAILED: changelog-check gitleaks"),
         "{fix_brief}"
     );
+}
+
+#[test]
+fn a_new_test_that_passes_without_the_change_goes_back_to_the_builder_before_the_tester() {
+    let world = World::new("test-proof", "true");
+    world.with_github("green");
+    // The tester holds at once, so that only the proof sends work back.
+    std::fs::create_dir_all(world.path("bin/state")).unwrap();
+    std::fs::write(world.path("bin/state/broke"), "").unwrap();
+    // The project's tool, in small: the new test passes on the code as it
+    // was until the builder has been told, and one more needs the new code.
+    let project = world.path("config/projects/toy.toml");
+    let text = std::fs::read_to_string(&project).unwrap();
+    let proving = text.replace(
+        "argv = [\"sh\", \"-c\", \"echo FAILS-AT-BASE feature.txt: the feature > $0/INDEX.txt\", \"{out}\"]",
+        "argv = [\"sh\", \"-c\", \"echo NO-BUILD-AT-BASE feature.txt: needs the new code > $0/INDEX.txt; if [ -f fixed.txt ]; then echo FAILS-AT-BASE feature.txt: the feature >> $0/INDEX.txt; else echo PASSES-AT-BASE feature.txt: the feature >> $0/INDEX.txt; fi\", \"{out}\"]",
+    );
+    assert_ne!(proving, text, "the proof command was not rewritten");
+    std::fs::write(&project, proving).unwrap();
+
+    let mut driver = Driver::start(world.config(), "toy", "toy-1", &OPTIONS).unwrap();
+    assert_eq!(driver.run().unwrap(), Status::Ended);
+    let kinds = world.event_kinds(&driver);
+    let steps: Vec<&str> = kinds
+        .iter()
+        .filter(|kind| {
+            ["reports:", "proof:", "fix:", "break:", "review:"]
+                .iter()
+                .any(|step| kind.starts_with(step))
+        })
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        steps,
+        [
+            "reports:pass",
+            "proof:fail",
+            "fix:done",
+            "reports:pass",
+            "proof:pass",
+            "break:held",
+            "review:approve"
+        ]
+    );
+    // The builder is given the test by name, and no tester ran before it.
+    let calls = world.calls();
+    assert_eq!(calls[1][0], "builder");
+    let fix_brief = std::fs::read_to_string(world.path("bin/state/brief-2.md")).unwrap();
+    assert!(
+        fix_brief.contains("    PASSES-AT-BASE feature.txt: the feature"),
+        "{fix_brief}"
+    );
+    // The proof that went on is on record as it stood, with the test that
+    // could not be built without the change, and the tester and the
+    // reviewer are both given it.
+    let unit = driver.unit().clone();
+    let proof =
+        std::fs::read_to_string(unit.artifacts["test-proof"].path.join("INDEX.txt")).unwrap();
+    assert_eq!(
+        proof,
+        "NO-BUILD-AT-BASE feature.txt: needs the new code\nFAILS-AT-BASE feature.txt: the feature\n"
+    );
+    for (brief, role) in [(3, "tester"), (4, "reviewer")] {
+        assert_eq!(calls[brief - 1][0], role);
+        let text =
+            std::fs::read_to_string(world.path(&format!("bin/state/brief-{brief}.md"))).unwrap();
+        assert!(
+            text.contains("NO-BUILD-AT-BASE feature.txt: needs the new code")
+                && text.contains("FAILS-AT-BASE is proof that a test tests the change."),
+            "{text}"
+        );
+    }
 }
 
 /// A second goal on a project waits for the first, and starts by itself.

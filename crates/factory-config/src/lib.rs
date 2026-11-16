@@ -289,6 +289,11 @@ pub struct Project {
     /// Paths no step may change, whatever its scopes say.
     #[serde(default)]
     pub forbidden_paths: Vec<String>,
+    /// Files in the repository that say how its code is to be written. A
+    /// builder is told to write to them, and a reviewer to judge idiom and
+    /// quality against them and not against its own taste.
+    #[serde(default)]
+    pub standards: Vec<String>,
     /// Named commands: checks and report generators.
     #[serde(default)]
     pub commands: BTreeMap<String, CommandSpec>,

@@ -253,6 +253,14 @@ timeout_secs = 30
 summary = \"INDEX.txt\"
 note = \"A scan hit is a line to look at.\"
 
+[commands.test-proof]
+argv = [\"sh\", \"-c\", \"echo FAILS-AT-BASE feature.txt: the feature > $0/INDEX.txt\", \"{{out}}\"]
+timeout_secs = 30
+shown = \"each new test, run on the code as it was\"
+summary = \"INDEX.txt\"
+fail_when = ['^PASSES-AT-BASE ']
+note = \"FAILS-AT-BASE is proof that a test tests the change.\"
+
 [github]
 repo = \"me/toy\"
 write = [\"me/toy\"]

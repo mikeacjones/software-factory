@@ -29,6 +29,10 @@ test_patterns = ['^\s*test\s+"', '\btesting\.expect', '\bexpect(Equal|EqualStrin
 # No bead of the first runs may touch these. A core bump changes
 # deps/sdk-core and is not factory work yet.
 forbidden_paths = [".github/**", ".beads/**", ".claude/**", "deps/sdk-core", "deps/sdk-core/**", "worktrees/**"]
+# The texts the project's code is written to. A builder's first brief and a
+# reviewer's name them, and the reviewer judges idiom and quality against
+# them. When the project has a standards text of its own, it goes here.
+standards = ["AGENTS.md", "CONTRIBUTING.md"]
 
 # The executive is who the owner talks to in #temporal-sdk-zig. A new message
 # in the channel goes to it: it answers, or opens a goal under one of the
@@ -148,6 +152,21 @@ timeout_secs = 3600
 argv = ["sh", "{config}/tools/temporal-sdk-zig/test-linux.sh", "all"]
 timeout_secs = 3600
 shown = "zig build test on Linux arm64, glibc and musl, Debug and ReleaseSafe (in containers)"
+
+# Proof that the tests a change adds or alters test the change: each is run on
+# the code as it was at the unit's base, where it has to fail. Zig keeps a
+# file's tests beside its code, so the tool splits the change at `test` blocks
+# (see the tool). A test that passes at the base goes back to the builder;
+# one that cannot be compiled or reached there is weaker proof, and the
+# tester and the reviewer are told which those are.
+[commands.test-proof]
+argv = ["python3", "{config}/tools/temporal-sdk-zig/test-proof.py", "--base", "{base}", "--out", "{out}"]
+timeout_secs = 3600
+shown = "each test the change adds or alters, run on the code as it was at the base"
+summary = "INDEX.txt"
+fail_when = ['^PASSES-AT-BASE ']
+note = """
+INDEX.txt has one line for each test the change adds or alters, and for each test it removes. A tool ran each new test by name on the code as it was at the base: FAILS-AT-BASE is proof that the test tests the change. NO-BUILD-AT-BASE, NOT-RUN-AT-BASE, SKIPPED-AT-BASE and NOT-JUDGED are not proof: for those tests, and only those, whether they would fail without the change is still a question. REMOVED is a test the change takes away. runs.txt has the output of every run."""
 
 # The project's own review tooling (.review/). --quick leaves the test suites
 # out: the flow runs them as steps of their own, where a failure goes straight
