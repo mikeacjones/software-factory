@@ -35,7 +35,7 @@ fn temporal_cli() -> Option<String> {
 struct Shop {
     world: World,
     env: Option<WorkflowEnvironment<LocalServer>>,
-    worker: Child,
+    worker: std::sync::Mutex<Child>,
 }
 
 impl Shop {
@@ -92,7 +92,17 @@ impl Shop {
             ),
         )
         .unwrap();
-        let worker = Command::new(env!("CARGO_BIN_EXE_factory-engine"))
+        let worker = std::sync::Mutex::new(Shop::worker(&world));
+        Some(Shop {
+            world,
+            env: Some(env),
+            worker,
+        })
+    }
+
+    /// Start a worker of the real engine command on the world's config.
+    fn worker(world: &World) -> Child {
+        Command::new(env!("CARGO_BIN_EXE_factory-engine"))
             .args(["worker", "--config"])
             .arg(world.path("config"))
             .stdout(Stdio::null())
@@ -102,12 +112,15 @@ impl Shop {
                 Stdio::null()
             })
             .spawn()
-            .unwrap();
-        Some(Shop {
-            world,
-            env: Some(env),
-            worker,
-        })
+            .unwrap()
+    }
+
+    /// Kill the worker where it stands, as a crash would, and start another.
+    fn replace_worker(&self) {
+        let mut worker = self.worker.lock().unwrap();
+        let _ = worker.kill();
+        let _ = worker.wait();
+        *worker = Shop::worker(&self.world);
     }
 
     fn client(&self) -> Client {
@@ -128,8 +141,11 @@ impl Shop {
     }
 
     async fn close(mut self) {
-        let _ = self.worker.kill();
-        let _ = self.worker.wait();
+        {
+            let mut worker = self.worker.lock().unwrap();
+            let _ = worker.kill();
+            let _ = worker.wait();
+        }
         if let Some(env) = self.env.take() {
             env.shutdown().await.unwrap();
         }
@@ -872,11 +888,10 @@ async fn a_goal_runs_from_its_opening_to_its_end_with_its_tiers_on_the_engine() 
 
     // Asked to stop at a safe point, the worker leaves by itself: the
     // listener and the watcher, which never end otherwise, do not hold it.
-    let mut shop = shop;
     std::fs::write(factory_driver::drain_flag(&shop.world.path("state")), "").unwrap();
     let deadline = Instant::now() + Duration::from_secs(60);
     let left = loop {
-        if let Some(status) = shop.worker.try_wait().unwrap() {
+        if let Some(status) = shop.worker.lock().unwrap().try_wait().unwrap() {
             break status;
         }
         assert!(Instant::now() < deadline, "the worker never left");
@@ -995,6 +1010,10 @@ async fn what_the_owner_writes_while_no_account_is_free_is_answered_when_one_is(
         [("owner".to_string(), "What is running?".to_string())]
     );
     assert!(standing().await.trouble.is_none());
+
+    // The worker dies while the message waits. Nothing of it was in the
+    // worker: the one that starts in its place answers it.
+    shop.replace_worker();
 
     // When the account is back it is answered, once, and the owner's
     // message is on record once.

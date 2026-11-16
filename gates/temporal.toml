@@ -60,7 +60,7 @@ timeout_secs = 900
 id = "engine-owner-message-kept"
 tier = "host"
 bead = "sf-9a0.10"
-claim = "What the owner writes to a project's executive while every account is at its usage limit is neither dropped nor to be written again: the turn ends with nobody asked and the message on record once, the project's workflow keeps it and waits on a timer with nothing running, and when the account is back the executive is asked once and its answer is on record after the one message."
+claim = "What the owner writes to a project's executive while every account is at its usage limit is neither dropped nor to be written again: the turn ends with nobody asked and the message on record once, the project's workflow keeps it and waits on a timer with nothing running, the worker is killed and another started while it waits, and when the account is back the executive is asked once and its answer is on record after the one message."
 command = ["cargo", "test", "--locked", "--offline", "--package", "factory-engine", "--test", "pipeline", "--", "--test-threads=1", "what_the_owner_writes_while_no_account_is_free_is_answered_when_one_is"]
 timeout_secs = 900
 
