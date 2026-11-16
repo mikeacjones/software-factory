@@ -68,7 +68,7 @@ cargo xtask check
 
 ## Architecture Overview
 
-See [docs/architecture.md](docs/architecture.md). Use terms as [docs/glossary.md](docs/glossary.md) defines them.
+See [docs/architecture.md](docs/architecture.md), and [docs/how-it-works.md](docs/how-it-works.md) for the same in diagrams. Use terms as [docs/glossary.md](docs/glossary.md) defines them.
 
 ## Conventions & Patterns
 

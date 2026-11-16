@@ -1,6 +1,6 @@
 # Architecture
 
-The software factory takes beads from a project's backlog and turns each one into a merged pull request, without anyone watching. This page states the decisions already made. Terms in *italics* are defined in the [glossary](glossary.md).
+The software factory takes beads from a project's backlog and turns each one into a merged pull request, without anyone watching. This page states the decisions already made. Terms in *italics* are defined in the [glossary](glossary.md). [how-it-works.md](how-it-works.md) draws the same as flow and sequence diagrams.
 
 ## Who owns what
 

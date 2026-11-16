@@ -4,6 +4,7 @@ The software factory turns beads from a project's backlog into merged pull reque
 
 - [docs/architecture.md](docs/architecture.md): the decisions already made
 - [docs/glossary.md](docs/glossary.md): the one meaning of each term
+- [docs/how-it-works.md](docs/how-it-works.md): the same in diagrams, to be changed with the code they draw
 
 ## Commands
 
