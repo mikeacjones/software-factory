@@ -601,6 +601,14 @@ pub struct GoalDefinition {
     /// The most pipelines the goal may have running at once.
     #[serde(default = "default_pipelines")]
     pub max_pipelines: u32,
+    /// Files and directories that nearly every piece of work adds to: a
+    /// README, a table of what is supported, changelog entries, a
+    /// generated index. They never count when work is checked for
+    /// overlap, or none of it could ever run side by side. Two pieces of
+    /// work that change the same one are folded together when the second
+    /// is absorbed or shipped, and a conflict there goes to its builder.
+    #[serde(default)]
+    pub shared_paths: Vec<String>,
     /// A standing objective and stop condition, for a goal the owner starts
     /// without saying more.
     pub objective: Option<String>,
@@ -868,6 +876,18 @@ impl ConfigDir {
             if definition.max_pipelines == 0 {
                 return Err(invalid("max_pipelines must be at least 1".to_string()));
             }
+            for path in &definition.shared_paths {
+                let plain = !path.is_empty()
+                    && path != "."
+                    && !path.starts_with('/')
+                    && !path.split('/').any(|part| part == ".." || part.is_empty())
+                    && !path.contains(['*', '?', '[', '\\']);
+                if !plain {
+                    return Err(invalid(format!(
+                        "shared_paths: `{path}` is not a plain path inside the repository: name files and directories, with no patterns"
+                    )));
+                }
+            }
             // Work that runs side by side has to be folded back together:
             // a sub-goal's beads by its foreman's pipelines, and sub-goals
             // by shipping one at a time.
@@ -1122,6 +1142,18 @@ timeout_secs = 60
                 .unwrap_err()
                 .to_string()
                 .contains("at least 1")
+        );
+        // Shared paths are files and directories, named plainly.
+        std::fs::write(
+            goals.join("bugs.toml"),
+            definition("bugs", "shared_paths = [\"README.md\", \"docs/*.md\"]"),
+        )
+        .unwrap();
+        assert!(
+            dir.goal_definitions("toy")
+                .unwrap_err()
+                .to_string()
+                .contains("shared_paths: `docs/*.md` is not a plain path")
         );
         std::fs::write(goals.join("bugs.toml"), definition("bugs", "pipelines = 3")).unwrap();
         assert!(

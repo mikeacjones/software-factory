@@ -10,6 +10,12 @@ flow = "zig-sdk-bead"
 ship_flow = "zig-sdk-ship"
 # The most pipelines the whole goal may have running at once.
 max_pipelines = 2
+# Files nearly every bead adds to. They never count when beads or sub-goals
+# are checked for overlap, or nothing could ever run side by side: the
+# project's own rules have each bead update its PARITY.md rows, its README
+# section and a changelog fragment. What two pieces of work both changed in
+# one of these is folded together when the second is absorbed or shipped.
+shared_paths = ["README.md", "PARITY.md", "CHANGELOG.md", "changelog", "samples/README.md", "samples/dispatch.zig"]
 
 # The standing objective, for a goal the owner opens without saying more. The
 # opening conversation turns it into a charter the owner agrees to.
@@ -29,7 +35,9 @@ stop_when = "All GA features and capabilities match."
 # The foreman's are bead pipelines in its sub-goal. The bead absorbed second
 # has the first merged into it and its checks run again. The director's are
 # sub-goals that have not landed. They ship one at a time, each taking in
-# what landed before it and only then being verified.
+# what landed before it and only then being verified: a conflict there, in
+# code or in a shared file, goes to the builder on the sub-goal's branch, and
+# the whole verification runs on the result before the pull request opens.
 [director]
 model = "claude-fable-5-2"
 effort = "high"

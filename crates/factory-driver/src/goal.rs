@@ -802,7 +802,7 @@ fn start_schema(foreman: bool) -> Value {
         "reason": text_schema("Why this one next."),
     });
     if foreman {
-        properties["paths"] = json!({ "type": "array", "items": { "type": "string" }, "description": "The files and directories this bead will change, relative to the repository, such as `src/worker` or `docs/timers.md`. Required for every bead that runs while another does, and no two may overlap. Leave empty for a bead that runs alone." });
+        properties["paths"] = json!({ "type": "array", "items": { "type": "string" }, "description": "The files and directories this bead will change, relative to the repository, such as `src/worker` or `docs/timers.md`. Give them whenever you can bound them: a bead running without paths keeps every other from starting beside it. No two beads' paths may overlap. The shared files the brief names never count and need not be listed." });
     }
     json!({ "type": "array", "description": "Pipelines to start now.", "items": object_schema(properties) })
 }
@@ -869,7 +869,11 @@ pub fn wake_schema() -> Value {
             "title": text_schema("What the sub-goal delivers, as the title its one pull request could carry."),
             "objective": text_schema("What will be true when it has landed."),
             "beads": { "type": "array", "items": { "type": "string" }, "description": "The beads you mean it to hold, in the order you would run them." },
-            "paths": { "type": "array", "items": { "type": "string" }, "description": "The files and directories its beads will change, relative to the repository. Required for every sub-goal that is worked on while another has not landed, and no two may overlap. Leave empty for a sub-goal worked on alone." },
+            "paths": { "type": "array", "items": { "type": "string" }, "description": "The files and directories its beads will change, relative to the repository. Give them whenever you can bound them, also for a sub-goal opened alone: one without paths keeps every other from opening until it lands. No two sub-goals' paths may overlap. The shared files the brief names never count and need not be listed. Empty only for a sub-goal that may change anything." },
+        }))},
+        "subgoal_paths": { "type": "array", "description": "Paths for sub-goals that are already open: to give one opened without paths its own, so that another may be opened beside it, or to change them when its foreman needs a file outside them. Usually empty.", "items": object_schema(json!({
+            "subgoal": text_schema("The ID of an open sub-goal."),
+            "paths": { "type": "array", "items": { "type": "string" }, "description": "The files and directories its beads change, relative to the repository: those already absorbed, those running and those still planned." },
         }))},
         "ship": { "type": "array", "items": { "type": "string" }, "description": "The IDs of sub-goals to ship now, in the order they should land. Each gets the whole verification once on its branch, one pull request, and lands; they ship one at a time. Only a sub-goal whose beads you meant for it are absorbed and in which no pipeline is running." },
         "tell_foreman": { "type": "array", "description": "Messages to foremen: an answer to what one escalated, or an instruction. Always empty on a goal whose sub-goals have no foreman.", "items": object_schema(json!({
@@ -982,6 +986,7 @@ pub fn decision_problems(
         for path in paths_of(sub)
             .iter()
             .filter(|path| !own.is_empty() && !under(path, own))
+            .filter(|path| !under(path, &definition.shared_paths))
         {
             problems.push(format!(
                 "open_subgoal: `{path}`, declared for `{id}`, is outside this goal's own paths ({}): another goal may be running beside this one",
@@ -989,6 +994,51 @@ pub fn decision_problems(
             ));
         }
     }
+    // Paths given to a sub-goal that is already open, so that another may
+    // be worked on beside it.
+    let bounds = bounds_of(result);
+    for (index, (id, paths)) in bounds.iter().enumerate() {
+        let Some(sub) = flight.iter().find(|sub| &sub.id == id) else {
+            problems.push(format!(
+                "subgoal_paths: `{id}` is not a sub-goal that is open"
+            ));
+            continue;
+        };
+        if bounds[..index].iter().any(|(earlier, _)| earlier == id) {
+            problems.push(format!("subgoal_paths: `{id}` is listed twice"));
+        }
+        if sub.state != "open" {
+            problems.push(format!(
+                "subgoal_paths: sub-goal `{id}` is being shipped: its work is done"
+            ));
+        }
+        if paths.is_empty() {
+            problems.push(format!(
+                "subgoal_paths: `{id}` needs `paths`: the files and directories its beads change"
+            ));
+        }
+        // What is running in it goes on inside what it is given.
+        for unit in goal.units.iter().filter(|unit| {
+            unit.state == "running" && !unit.ship && unit.subgoal.as_deref() == Some(id.as_str())
+        }) {
+            for path in unit
+                .paths
+                .iter()
+                .filter(|path| !under(path, paths) && !under(path, &definition.shared_paths))
+            {
+                problems.push(format!(
+                    "subgoal_paths: `{}` is running in `{id}` on `{path}`, which is outside the paths you give it",
+                    unit.bead
+                ));
+            }
+        }
+    }
+    let paths_now = |sub: &SubGoal| {
+        bounds.iter().find(|(id, _)| id == &sub.id).map_or_else(
+            || (sub.paths.clone(), true),
+            |(_, paths)| (paths.clone(), false),
+        )
+    };
     if !openings.is_empty() {
         let waiting: Vec<String> = flight.iter().map(|sub| format!("`{}`", sub.id)).collect();
         if !batched {
@@ -1013,15 +1063,37 @@ pub fn decision_problems(
             // Within the limit: may these be worked on beside each other?
             let mut claims: Vec<(String, Vec<String>, bool)> = flight
                 .iter()
-                .map(|sub| (sub.id.clone(), sub.paths.clone(), true))
+                .map(|sub| {
+                    let (paths, old) = paths_now(sub);
+                    (sub.id.clone(), paths, old)
+                })
                 .collect();
             claims.extend(
                 openings
                     .iter()
                     .map(|sub| (strings(sub, "id").trim().to_string(), paths_of(sub), false)),
             );
-            problems.extend(claim_problems(&SUBGOAL_CLAIMS, &claims));
+            problems.extend(claim_problems(
+                &SUBGOAL_CLAIMS,
+                &claims,
+                &definition.shared_paths,
+            ));
         }
+    } else if !bounds.is_empty() {
+        // Nothing opens, but what is open is given new paths: they may
+        // not run into each other either.
+        let claims: Vec<(String, Vec<String>, bool)> = flight
+            .iter()
+            .map(|sub| {
+                let (paths, old) = paths_now(sub);
+                (sub.id.clone(), paths, old)
+            })
+            .collect();
+        problems.extend(claim_problems(
+            &SUBGOAL_CLAIMS,
+            &claims,
+            &definition.shared_paths,
+        ));
     }
     let absorbed = goal.absorbed();
     // Whether the sub-goal in question is run by a foreman: the open one as
@@ -1281,6 +1353,17 @@ fn plain_path(path: &str) -> bool {
         && !path.contains(['*', '?', '[', '\\'])
 }
 
+/// What a brief says of the files that never count as overlap.
+fn shared_words(shared: &[String]) -> String {
+    if shared.is_empty() {
+        return String::new();
+    }
+    format!(
+        " These are shared and never count: nearly all work adds to them, so do not list them, and do not hold work back because two pieces both change one: `{}`. What both changed there is folded together when the second is absorbed or shipped.",
+        shared.join("`, `")
+    )
+}
+
 /// How the rules about paths are worded for one kind of work.
 struct Claims {
     /// The field of the result the problems are about.
@@ -1449,7 +1532,7 @@ pub fn schedule_problems(
             running.len() + starting.len()
         ));
     } else if !starting.is_empty() {
-        problems.extend(claim_problems(&GOAL_CLAIMS, &claims));
+        problems.extend(claim_problems(&GOAL_CLAIMS, &claims, &[]));
     }
     problems
 }
@@ -1459,7 +1542,15 @@ pub fn schedule_problems(
 /// two declarations overlap: that is what makes it safe before any of it
 /// runs. Each claim is a name, its paths, and whether it is already going;
 /// `starting` says whether anything new is among them.
-fn claim_problems(words: &Claims, claims: &[(String, Vec<String>, bool)]) -> Vec<String> {
+///
+/// `shared` are the files nearly all work adds to. They never make two
+/// pieces of work overlap: what both changed in one is folded together
+/// when the second is absorbed or shipped.
+fn claim_problems(
+    words: &Claims,
+    claims: &[(String, Vec<String>, bool)],
+    shared: &[String],
+) -> Vec<String> {
     let mut problems = Vec::new();
     let field = words.field;
     for (name, paths, old) in claims {
@@ -1488,9 +1579,11 @@ fn claim_problems(words: &Claims, claims: &[(String, Vec<String>, bool)]) -> Vec
     }
     for (index, (name, paths, _)) in claims.iter().enumerate() {
         for (other, theirs, _) in &claims[index + 1..] {
-            let clash = paths.iter().find_map(|path| {
+            let own = |path: &&String| !under(path, shared);
+            let clash = paths.iter().filter(own).find_map(|path| {
                 theirs
                     .iter()
+                    .filter(own)
                     .find(|their| {
                         under(path, std::slice::from_ref(their))
                             || under(their, std::slice::from_ref(path))
@@ -1510,7 +1603,13 @@ fn claim_problems(words: &Claims, claims: &[(String, Vec<String>, bool)]) -> Vec
 
 /// Why the beads a foreman wants to start may not run beside each other and
 /// beside what is already running in the sub-goal.
-fn path_problems(goal: &Goal, sub: &SubGoal, starts: &[Value], continuing: &[&str]) -> Vec<String> {
+fn path_problems(
+    goal: &Goal,
+    sub: &SubGoal,
+    starts: &[Value],
+    continuing: &[&str],
+    shared: &[String],
+) -> Vec<String> {
     let mut claims: Vec<(String, Vec<String>, bool)> = goal
         .units
         .iter()
@@ -1529,6 +1628,7 @@ fn path_problems(goal: &Goal, sub: &SubGoal, starts: &[Value], continuing: &[&st
         for path in paths
             .iter()
             .filter(|path| !sub.paths.is_empty() && !under(path, &sub.paths))
+            .filter(|path| !under(path, shared))
         {
             problems.push(format!(
                 "start: `{path}`, declared for `{bead}`, is outside this sub-goal's own paths ({}): another sub-goal is being worked on beside this one",
@@ -1544,7 +1644,7 @@ fn path_problems(goal: &Goal, sub: &SubGoal, starts: &[Value], continuing: &[&st
         }
     }
     if !starts.is_empty() || !continuing.is_empty() {
-        problems.extend(claim_problems(&BEAD_CLAIMS, &claims));
+        problems.extend(claim_problems(&BEAD_CLAIMS, &claims, shared));
     }
     problems
 }
@@ -1615,6 +1715,21 @@ fn openings_of(result: &Value) -> Vec<&Value> {
         .into_iter()
         .chain(items(result, "open_subgoals"))
         .filter(|sub| !strings(sub, "id").trim().is_empty())
+        .collect()
+}
+
+/// The paths a director gives sub-goals that are already open: each a
+/// sub-goal's ID and its paths.
+fn bounds_of(result: &Value) -> Vec<(String, Vec<String>)> {
+    items(result, "subgoal_paths")
+        .iter()
+        .map(|bound| {
+            (
+                strings(bound, "subgoal").trim().to_string(),
+                paths_of(bound),
+            )
+        })
+        .filter(|(id, _)| !id.is_empty())
         .collect()
 }
 
@@ -1751,6 +1866,7 @@ pub fn foreman_problems(
             sub,
             items(result, "start"),
             &continuing,
+            &definition.shared_paths,
         ));
     }
 
@@ -1869,7 +1985,8 @@ fn permission_text(definition: &GoalDefinition) -> String {
             "- Sub-goals: each is a part of the goal that lands as one pull request. {} Opening one (`open_subgoals`) hands it to its foreman, a separate agent that starts its beads through the light pipeline, rules on their findings, and reports to you when the sub-goal is ready to ship or when it needs you. You do not start beads: `start` is refused.\n- Answering a foreman: `tell_foreman` reaches the foreman of an open sub-goal, and wakes it.\n- Shipping: yours to decide, by naming the sub-goal in `ship` once nothing is running in it. It runs the whole verification once, opens one pull request for all of it and lands it, which closes its beads. Sub-goals ship one at a time, in the order you name them, and each takes in what landed before it first.\n- Filing a new bead {}.\n- Changing a bead that exists (criteria, priority, deferral) {}.\n- Ending the goal: you propose, the owner decides.",
             if slots > 1 {
                 format!(
-                    "Up to {slots} may be waiting to land at once. That is a limit, not a target: sub-goals are worked on side by side only when each has `paths`, the files and directories its beads will change, and no two overlap, which code checks before anything opens. Open two together only when you have read the code and are certain neither needs the other's result or files; otherwise one after the other."
+                    "Up to {slots} may be waiting to land at once, and parts of the goal that change different code are meant to be worked on side by side. Each sub-goal has `paths`, the files and directories its beads will change, and code checks before anything opens that no two overlap.{} Whenever a place is free, open the next part of the plan that needs nothing an unlanded sub-goal will deliver and changes other code than it. Give every sub-goal its paths when you open it, also one opened alone: a sub-goal without paths keeps every other from opening until it lands, unless you give it paths with `subgoal_paths`. Landing stays one at a time: each sub-goal's shipping first takes in what landed before it, a conflict there is resolved on its branch, and the whole verification runs on the result before its pull request opens.",
+                    shared_words(&definition.shared_paths)
                 )
             } else {
                 "One is open at a time.".to_string()
@@ -2027,10 +2144,14 @@ pub fn wake_brief(
                 },
                 _ => String::new(),
             };
-            let foreman = if sub.paths.is_empty() {
-                foreman
-            } else {
+            let foreman = if !sub.paths.is_empty() {
                 format!(" Its paths: {}.{foreman}", sub.paths.join(", "))
+            } else if definition.director.slots > 1 && sub.state == "open" {
+                format!(
+                    " It has no paths: nothing may open beside it until it lands, or until you give it paths with `subgoal_paths`.{foreman}"
+                )
+            } else {
+                foreman
             };
             out.push_str(&format!(
                 "- `{}` ({}): {}. Branch `{}`. Absorbed: {}. Planned and not yet absorbed: {}.{}{foreman}\n",
@@ -2223,9 +2344,12 @@ pub fn foreman_brief(
     out.push_str(&format!(
         "\n## What you may decide\n\n- Starting a pipeline: carried out at once, on a launchable bead of this sub-goal, up to {slots} at a time. A bead blocked only by beads this sub-goal has absorbed is launchable.{}\n- Continuing a pipeline that parked or failed: `continue`, from the step you name, with a note for that step. It goes on in its own worktree with everything it built, and its used-up rounds are open again. A pipeline may be continued {MAX_CONTINUES} times; after that it goes to the director.\n- Filing a new bead: {}\n- Reporting: `working` while a pipeline runs; `ready` hands the sub-goal to the director to ship; `escalate` asks the director, and you are woken with the answer.\n- Not yours: shipping, changing a bead that exists, and talking to the owner. Those are the director's; escalate.\n\nReturn the structured result. Code checks every decision against the tracker before carrying it out, and sends back what it refuses.\n",
         if slots > 1 {
-            "\n- Side by side: beads may run at the same time only when each has `paths`, the files and directories it will change, and no two declarations overlap. Code checks that before anything starts. The count above is a maximum, not a target: start beads together only when you have read the code each will touch and are certain they cannot collide, and one after the other whenever you are not. Each is built from the branch as it is now; the one absorbed second has the first merged into it and its checks run again, and a conflict goes back to its builder."
+            format!(
+                "\n- Side by side: beads may run at the same time when each has `paths`, the files and directories it will change, and no two declarations overlap. Code checks that before anything starts.{} The count above is a maximum, not a target: start beads together when you have read the code each will touch, neither needs the other's result, and they change different code; one after the other when one builds on the other. Each is built from the branch as it is now; the one absorbed second has the first merged into it and its checks run again, and a conflict goes back to its builder and through the whole pipeline.",
+                shared_words(&definition.shared_paths)
+            )
         } else {
-            ""
+            String::new()
         },
         match definition.permissions.file_beads {
             Permission::Allow =>
@@ -4683,6 +4807,26 @@ impl Supervisor {
             .current()
             .filter(|_| definition.ship_flow.is_some())
             .map(|sub| sub.id.clone());
+        // An open sub-goal is given its paths before another opens beside it.
+        for (bound, paths) in bounds_of(&result) {
+            let Some(sub) = goal.subgoals.iter_mut().find(|sub| sub.id == bound) else {
+                continue;
+            };
+            sub.paths = paths.clone();
+            self.say(
+                &goal,
+                &format!(
+                    ":triangular_ruler: Sub-goal `{}` now keeps to these paths, so that another may be worked on beside it: `{}`.",
+                    escape(&bound),
+                    escape(&paths.join("`, `"))
+                ),
+            );
+            self.log(
+                &goal,
+                "subgoal.paths",
+                json!({ "id": bound, "paths": paths }),
+            );
+        }
         // A new sub-goal gets its branch before anything can start in it.
         let openings: Vec<Value> = openings_of(&result).into_iter().cloned().collect();
         let first_opened = openings
@@ -7096,6 +7240,181 @@ mod tests {
                 "start: `src/b`, declared for `toy-1`, is outside this sub-goal's own paths (src/a): another sub-goal is being worked on beside this one"
             ]
         );
+    }
+
+    #[test]
+    fn shared_files_never_count_as_overlap_and_an_open_sub_goal_can_be_given_paths() {
+        // Both tiers may run two side by side, and the project has files
+        // that nearly every bead adds to.
+        let d: GoalDefinition = toml::from_str(
+            "id = \"d\"\nflow = \"bead\"\nship_flow = \"ship\"\nmax_pipelines = 2\nshared_paths = [\"README.md\", \"changelog\"]\n[director]\nmodel = \"m\"\neffort = \"high\"\nslots = 2\n[foreman]\nmodel = \"f\"\neffort = \"high\"\nslots = 2\n",
+        )
+        .unwrap();
+        let sub = |id: &str, paths: Value| json!({"id": id, "title": "A part", "objective": "It works.", "beads": ["toy-1"], "paths": paths});
+        let open = |subs: Vec<Value>| json!({"open_subgoals": subs});
+
+        // Two sub-goals that both add to the README and the changelog,
+        // and otherwise change different code, are worked on together.
+        assert_eq!(
+            problems(
+                &d,
+                &goal(),
+                open(vec![
+                    sub("left", json!(["src/a", "README.md", "changelog/a.md"])),
+                    sub("right", json!(["src/b", "README.md", "changelog"]))
+                ])
+            ),
+            Vec::<String>::new()
+        );
+        // Code that both change keeps them apart as before, and it is the
+        // code that is named.
+        assert_eq!(
+            problems(
+                &d,
+                &goal(),
+                open(vec![
+                    sub("left", json!(["README.md", "src/a"])),
+                    sub("right", json!(["README.md", "src/a/x.zig"]))
+                ])
+            ),
+            [
+                "open_subgoal: `left` (`src/a`) and `right` (`src/a/x.zig`) would change the same files: sub-goals whose paths overlap are worked on one after the other"
+            ]
+        );
+        // A file is shared by its own name, not by one that begins like it.
+        assert_eq!(
+            problems(
+                &d,
+                &goal(),
+                open(vec![
+                    sub("left", json!(["README.md.in"])),
+                    sub("right", json!(["README.md.in"]))
+                ])
+            )
+            .len(),
+            1
+        );
+
+        // A sub-goal that is open without paths keeps every other out,
+        // until the director gives it paths in the same decision.
+        let mut one = with_foreman(&[], None);
+        let mut beside = open(vec![sub("right", json!(["src/b", "README.md"]))]);
+        assert_eq!(
+            problems(&d, &one, beside.clone()),
+            [
+                "open_subgoal: `signals` has not landed and has no paths declared, so nothing may open beside it: wait for it to land"
+            ]
+        );
+        beside["subgoal_paths"] = json!([{"subgoal": "signals", "paths": ["src/a", "README.md"]}]);
+        assert_eq!(problems(&d, &one, beside.clone()), Vec::<String>::new());
+        // The paths it is given may not run into the new one's.
+        beside["subgoal_paths"] = json!([{"subgoal": "signals", "paths": ["src"]}]);
+        assert_eq!(
+            problems(&d, &one, beside),
+            [
+                "open_subgoal: `signals` (`src`) and `right` (`src/b`) would change the same files: sub-goals whose paths overlap are worked on one after the other"
+            ]
+        );
+        // Paths go to a sub-goal that is open, and there have to be some.
+        let give =
+            |id: &str, paths: Value| json!({"subgoal_paths": [{"subgoal": id, "paths": paths}]});
+        assert_eq!(
+            problems(&d, &one, give("nowhere", json!(["src/a"]))),
+            ["subgoal_paths: `nowhere` is not a sub-goal that is open"]
+        );
+        assert_eq!(
+            problems(&d, &one, give("signals", json!([]))),
+            ["subgoal_paths: `signals` needs `paths`: the files and directories its beads change"]
+        );
+        assert_eq!(
+            problems(&d, &one, give("signals", json!(["src/a"]))),
+            Vec::<String>::new()
+        );
+        // What is running in it goes on inside what it is given, shared
+        // files aside.
+        one.units.push(GoalUnit {
+            bead: "toy-2".into(),
+            unit: Some("u2".into()),
+            state: "running".into(),
+            detail: String::new(),
+            ship: false,
+            subgoal: Some("signals".into()),
+            paths: vec!["src/worker".into(), "README.md".into()],
+            continued: 0,
+        });
+        assert_eq!(
+            problems(&d, &one, give("signals", json!(["src/client"]))),
+            [
+                "subgoal_paths: `toy-2` is running in `signals` on `src/worker`, which is outside the paths you give it"
+            ]
+        );
+        assert_eq!(
+            problems(
+                &d,
+                &one,
+                give("signals", json!(["src/worker", "src/client"]))
+            ),
+            Vec::<String>::new()
+        );
+        // Two that are open are given paths that do not overlap.
+        let mut two = with_foreman(&[], None);
+        let mut second = two.subgoals[0].clone();
+        second.id = "timers".into();
+        two.subgoals.push(second);
+        let bounds = |first: Value, second: Value| {
+            json!({"subgoal_paths": [
+            {"subgoal": "signals", "paths": first}, {"subgoal": "timers", "paths": second}]})
+        };
+        assert_eq!(
+            problems(&d, &two, bounds(json!(["src/a"]), json!(["src/b"]))),
+            Vec::<String>::new()
+        );
+        assert!(
+            problems(&d, &two, bounds(json!(["src/a"]), json!(["src/a/x.zig"])))[0]
+                .contains("would change the same files")
+        );
+
+        // Beads: two of a sub-goal that both add to the shared files run
+        // side by side, and a shared file is no step outside a sub-goal's
+        // own paths.
+        let mut fenced = with_foreman(&[], None);
+        fenced.subgoals[0].planned = vec!["toy-1".into()];
+        fenced.subgoals[0].paths = vec!["src/a".into()];
+        let start =
+            |paths: Value| json!({"start": [{"bead": "toy-1", "reason": "", "paths": paths}]});
+        assert_eq!(
+            foreman_says(
+                &d,
+                &fenced,
+                start(json!(["src/a/poll.zig", "README.md", "changelog/x.md"]))
+            ),
+            Vec::<String>::new()
+        );
+        assert_eq!(foreman_says(&d, &fenced, start(json!(["src/b"]))).len(), 1);
+        fenced.units.push(GoalUnit {
+            bead: "toy-2".into(),
+            unit: Some("u2".into()),
+            state: "running".into(),
+            detail: String::new(),
+            ship: false,
+            subgoal: Some("signals".into()),
+            paths: vec!["src/a/worker.zig".into(), "README.md".into()],
+            continued: 0,
+        });
+        assert_eq!(
+            foreman_says(&d, &fenced, start(json!(["src/a/poll.zig", "README.md"]))),
+            Vec::<String>::new()
+        );
+        assert!(
+            foreman_says(&d, &fenced, start(json!(["src/a/worker.zig", "README.md"])))[0]
+                .contains("`toy-2` (`src/a/worker.zig`) and `toy-1` (`src/a/worker.zig`) would change the same files")
+        );
+
+        // The briefs name the shared files, so that nobody holds work
+        // back for them.
+        let words = shared_words(&d.shared_paths);
+        assert!(words.contains("`README.md`, `changelog`"), "{words}");
+        assert_eq!(shared_words(&[]), "");
     }
 
     #[test]
