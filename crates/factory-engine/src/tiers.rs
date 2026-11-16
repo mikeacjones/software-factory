@@ -237,6 +237,22 @@ fn report_key(event: &Event) -> Option<String> {
 }
 
 impl Project {
+    /// Put something that happened where it waits its turn, unless it is
+    /// a report of a pipeline this project has been given already.
+    fn take(&mut self, event: Event) {
+        if let Some(key) = report_key(&event) {
+            if self.seen.contains(&key) {
+                return;
+            }
+            self.seen.push_back(key);
+            while self.seen.len() > SEEN {
+                self.seen.pop_front();
+            }
+        }
+        self.queue.push_back(event);
+        self.standing.waiting = self.queue.len();
+    }
+
     fn details(&self) -> String {
         let standing = &self.standing;
         let mut text = format!(
@@ -515,17 +531,7 @@ impl Project {
     /// Something happened. It is dealt with in its turn.
     #[signal]
     pub fn event(&mut self, _ctx: &mut SyncWorkflowContext<Self>, event: Event) {
-        if let Some(key) = report_key(&event) {
-            if self.seen.contains(&key) {
-                return;
-            }
-            self.seen.push_back(key);
-            while self.seen.len() > SEEN {
-                self.seen.pop_front();
-            }
-        }
-        self.queue.push_back(event);
-        self.standing.waiting = self.queue.len();
+        self.take(event);
     }
 
     /// Where the project stands.
@@ -626,5 +632,69 @@ impl Intake {
             ctx.timer(pause).await;
         }
         match ctx.continue_as_new(input, ContinueAsNewOptions::default())? {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ended(name: &str, word: &str) -> Event {
+        Event::Ended {
+            goal: "g".to_string(),
+            bead: "b".to_string(),
+            ship: false,
+            unit: Some("u".to_string()),
+            word: word.to_string(),
+            rest: String::new(),
+            name: name.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_report_is_known_by_its_pipeline_so_a_continued_unit_can_end_twice() {
+        // The watcher tells a project of the same ending until the goal's
+        // record shows it: that is one report.
+        assert_eq!(
+            report_key(&ended("pipeline-g-b-1-0", "end")),
+            report_key(&ended("pipeline-g-b-1-0", "end"))
+        );
+        // The unit parked, was continued by a new pipeline, and that one
+        // ended too: the same goal, bead, unit and word, and another report.
+        assert_ne!(
+            report_key(&ended("pipeline-g-b-1-0", "end")),
+            report_key(&ended("pipeline-g-b-1-1", "end"))
+        );
+        // What the owner does is never taken for a repeat.
+        assert_eq!(report_key(&Event::Tick), None);
+        assert_eq!(
+            report_key(&Event::Open {
+                project: "p".to_string(),
+                text: "t".to_string()
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn a_project_told_the_same_report_twice_queues_it_once() {
+        let mut project = Project::default();
+        for event in [
+            ended("pipeline-g-b-1-0", "end"),
+            ended("pipeline-g-b-1-0", "end"),
+            ended("pipeline-g-b-1-1", "end"),
+            Event::Tick,
+            Event::Tick,
+        ] {
+            project.take(event);
+        }
+        // Both endings once each, and both looks.
+        assert_eq!(project.queue.len(), 4);
+        assert_eq!(project.standing.waiting, 4);
+        // It remembers only so many: the oldest are forgotten first.
+        for n in 0..SEEN + 10 {
+            project.take(ended(&format!("pipeline-g-b-{n}-9"), "end"));
+        }
+        assert_eq!(project.seen.len(), SEEN);
     }
 }
