@@ -1,0 +1,41 @@
+# Upkeep of the Zig SDK: a run the factory starts by the clock, with no
+# message from the owner. It is not a goal. One agent, the maintainer, is
+# given the charter below and what the factory's records show since its last
+# run, reads the default branch, and files beads. It starts, continues,
+# ships and closes nothing, and code refuses a result that tries: whether a
+# bead it files is built is for the project's goals and the owner.
+id = "upkeep"
+
+# The agent of each run. A scheduled definition has no director; this table
+# gives the maintainer its model, effort and time limit.
+[director]
+model = "claude-fable-5-2"
+effort = "high"
+timeout_secs = 2700
+
+[schedule]
+# Once a week, at 10:00 UTC. A time the worker was away for is made up
+# once, when it is back. While a run reads, no other tier of the project is
+# woken; pipelines carry on.
+hour_utc = 10
+every_days = 7
+# The most beads one run may file. What it leaves out goes in its journal
+# for the next run.
+max_beads = 3
+charter = """
+Keep the quality of the Zig SDK from slipping between goals. Three things, \
+in this order. First, what the pipelines keep getting wrong: where a class \
+of defect has broken several beads, find what would have stopped every \
+case (a check in `zig build`, a test helper, a rule in AGENTS.md or \
+CONTRIBUTING.md, a change of structure) and file that, not the cases. \
+Second, checks that cannot be trusted: one that fails and then passes on \
+the same commit, or a pull request whose CI went red after the pipeline's \
+own checks passed, means something differs between the two; say what. \
+Third, code that has outgrown its shape: a file that keeps growing, or a \
+bead that took many rounds of fixing in one place, may need splitting or a \
+clearer boundary before the next bead lands in it.
+
+Not yours yet: bumping sdk-core, new Temporal features, moving features \
+from contrib to GA, and anything the open goals' beads already cover. If \
+you see such work, say so in a sentence in the digest.
+"""

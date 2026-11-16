@@ -4416,6 +4416,221 @@ fn a_sub_goal_is_designed_and_the_design_accepted_before_any_bead_of_it_is_built
     assert!(at("design.proposed") < at("design.accepted"));
 }
 
+/// A definition with a schedule is run by the factory at its times: one
+/// agent, shown what the records say, which files beads and starts nothing.
+#[test]
+fn a_scheduled_definition_is_run_when_due_and_its_agent_only_files_beads() {
+    use factory_driver::goal::{Scheduled, Supervisor, check_definitions};
+    use std::time::Duration;
+
+    let world = World::new("maintainer", "true");
+    world.with_github("green");
+    std::fs::create_dir_all(world.path("config/goals/toy")).unwrap();
+    let tier = "[director]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\n";
+    let timed = "[schedule]\nhour_utc = 4\nevery_days = 7\nmax_beads = 2\ncharter = \"Turn what keeps breaking into checks.\"\n";
+    std::fs::write(
+        world.path("config/goals/toy/main.toml"),
+        format!("id = \"main\"\ndefault = true\n{tier}"),
+    )
+    .unwrap();
+    let upkeep = world.path("config/goals/toy/upkeep.toml");
+    // The factory runs it, so the owner cannot open it, and it has nothing
+    // of a goal that builds.
+    for (extra, why) in [
+        (
+            "default = true\n",
+            "it cannot be the default for goals the owner opens",
+        ),
+        (
+            "stop_check = \"test-proof\"\n",
+            "it cannot have a foreman, a designer or a stop_check",
+        ),
+    ] {
+        std::fs::write(&upkeep, format!("id = \"upkeep\"\n{extra}{tier}{timed}")).unwrap();
+        let refused = match check_definitions(&world.config()) {
+            Err(err) => err.to_string(),
+            Ok(lines) => panic!("accepted: {lines:?}"),
+        };
+        assert!(refused.contains(why), "{refused}");
+    }
+    std::fs::write(&upkeep, format!("id = \"upkeep\"\n{tier}{timed}")).unwrap();
+    let lines = check_definitions(&world.config()).unwrap().join("\n");
+    assert!(
+        lines.contains("toy/upkeep: scheduled, maintainer claude-opus-5-5 (high), every 7 day(s) at 04:00 UTC, at most 2 bead(s) a run"),
+        "{lines}"
+    );
+
+    // Three beads of the project were broken by the same class of defect.
+    for bead in ["toy-7", "toy-8", "toy-9"] {
+        let dir = world.path(&format!("state/units/{bead}-1"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("unit.json"),
+            serde_json::json!({"project": "toy", "bead": bead, "regressions": [{"category": "error-path-cleanup"}]}).to_string(),
+        )
+        .unwrap();
+    }
+    let say = |n: u32, json: serde_json::Value| {
+        std::fs::create_dir_all(world.path("bin/state")).unwrap();
+        std::fs::write(
+            world.path(&format!("bin/state/maintainer-{n}.json")),
+            json.to_string(),
+        )
+        .unwrap();
+    };
+    let bead = |title: &str| {
+        serde_json::json!({"title": title, "type": "task", "priority": 3,
+            "description": "Three beads leaked on an error path: toy-7, toy-8, toy-9.",
+            "acceptance_criteria": "A check fails when an error path leaks.",
+            "parent": "", "discovered_from": "", "deferred": true})
+    };
+    // It first asks for more than it may: three beads, and a pipeline.
+    say(
+        1,
+        serde_json::json!({"summary": "Looked.", "digest": "Three things.", "journal": "",
+            "file": [bead("One"), bead("Two"), bead("Three")],
+            "start": [{"bead": "toy-1", "reason": "it is ready"}]}),
+    );
+    say(
+        2,
+        serde_json::json!({"summary": "Cleanup on error paths keeps breaking.",
+            "digest": "Error paths have leaked in three beads. One bead: a check that injects allocation failure.",
+            "journal": "I did not file the README drift: it is one line.",
+            "file": [bead("Check every error path for leaks")]}),
+    );
+    say(
+        3,
+        serde_json::json!({"summary": "Nothing new.", "digest": "Nothing was worth a bead; I read the unit records.", "journal": "Quiet week.", "file": []}),
+    );
+
+    let mut sup = Supervisor::new(world.config(), None, vec!["OWNER".to_string()], false).unwrap();
+    let record_path = world.path("state/projects/toy/schedules/upkeep/scheduled.json");
+    let record = || -> Scheduled {
+        serde_json::from_str(&std::fs::read_to_string(&record_path).unwrap()).unwrap()
+    };
+    let now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    };
+    let maintainers = || {
+        world
+            .calls()
+            .into_iter()
+            .filter(|call| call[0] == "maintainer")
+            .collect::<Vec<_>>()
+    };
+    let brief =
+        |n: usize| std::fs::read_to_string(world.path(&format!("bin/state/brief-{n}.md"))).unwrap();
+    let overdue = |record: Scheduled| {
+        let back = Scheduled {
+            since: now() - 8 * 86_400,
+            ..record
+        };
+        std::fs::write(&record_path, serde_json::to_string(&back).unwrap()).unwrap();
+    };
+
+    // Seen for the first time, it counts from now: nothing runs, and it is
+    // next due within the week.
+    assert!(!sup.pump(Duration::ZERO).unwrap());
+    assert!(world.calls().is_empty());
+    let first = record();
+    assert_eq!((first.runs, first.commit.as_str()), (0, ""));
+    let due = sup.next_due().unwrap();
+    assert!(due > now() && due <= now() + 7 * 86_400, "{due}");
+
+    // A worker that was away over its time runs it once when it is back.
+    overdue(first);
+    assert!(sup.pump(Duration::ZERO).unwrap());
+    let calls = maintainers();
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    assert_eq!(world.calls().len(), 2, "nobody else was run");
+    assert_eq!(
+        calls[0][1], calls[1][1],
+        "the refusal went back to the same session"
+    );
+    assert!(
+        calls[0][2].ends_with("state/projects/toy/schedules/upkeep/checkout"),
+        "{calls:?}"
+    );
+    let shown = brief(1);
+    assert!(
+        shown.starts_with("# Maintenance of project `toy`, run 1\n\n## What these runs are for\n\nTurn what keeps breaking into checks.")
+            && shown.contains("File beads: at most 2 in this run")
+            && shown.contains("- `error-path-cleanup`: 3 findings on 3 beads")
+            && shown.contains("no earlier run to compare with")
+            && shown.contains("toy-1 | P"),
+        "{shown}"
+    );
+    let sent_back = brief(2);
+    assert!(
+        sent_back.contains("`start`: a maintenance run files beads and does nothing else")
+            && sent_back.contains("file: 3 beads, and one run may file 2."),
+        "{sent_back}"
+    );
+    // One bead is in the tracker, deferred, and nothing was started.
+    let filed: Vec<String> = std::fs::read_dir(world.path("beads"))
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("filed-"))
+        .collect();
+    assert_eq!(filed.len(), 1, "{filed:?}");
+    let text = std::fs::read_to_string(world.path("beads").join(&filed[0])).unwrap();
+    assert!(
+        text.contains("Check every error path for leaks") && text.contains("\"deferred\""),
+        "{text}"
+    );
+    assert!(
+        sup.goals().next().is_none(),
+        "a scheduled run is not a goal"
+    );
+    assert!(!world.path("state/units/toy-1").exists());
+    let ran = record();
+    assert_eq!(ran.runs, 1);
+    assert_eq!(
+        ran.journal,
+        "I did not file the README drift: it is one line."
+    );
+    assert_eq!(ran.commit.len(), 40, "{}", ran.commit);
+    assert!(ran.since + 60 > now());
+    let events =
+        std::fs::read_to_string(world.path("state/projects/toy/schedules/upkeep/events.jsonl"))
+            .unwrap();
+    for part in [
+        "\"schedule.ran\"",
+        "\"bead.filed\"",
+        ":broom: *upkeep* · run 1 of `toy`",
+        "Error paths have leaked in three beads.",
+        "• filed `filed-",
+    ] {
+        assert!(events.contains(part), "no {part} in {events}");
+    }
+    // It is not due again until its next time.
+    assert!(!sup.pump(Duration::ZERO).unwrap());
+    assert!(sup.next_due().unwrap() > now());
+    assert_eq!(maintainers().len(), 2);
+
+    // The next run is given what this one left, and may file nothing.
+    overdue(ran);
+    assert!(sup.pump(Duration::ZERO).unwrap());
+    assert_eq!(maintainers().len(), 3);
+    let next = brief(3);
+    assert!(
+        next.starts_with("# Maintenance of project `toy`, run 2\n")
+            && next.contains("## What the last run left for you\n\nI did not file the README drift: it is one line.")
+            && next.contains("nothing has landed since the last run")
+            && next.contains("Check every error path for leaks"),
+        "{next}"
+    );
+    let events =
+        std::fs::read_to_string(world.path("state/projects/toy/schedules/upkeep/events.jsonl"))
+            .unwrap();
+    assert!(events.contains("It filed nothing."), "{events}");
+    assert_eq!(record().runs, 2);
+}
+
 /// A goal whose definition names a stop check is complete when the command
 /// says so, not when its director does.
 #[test]

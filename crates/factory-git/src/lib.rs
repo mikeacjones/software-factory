@@ -174,6 +174,20 @@ pub fn diff_stat(dir: &Path, from: &str, to: &str) -> Result<String, GitError> {
     git(dir, &["diff", "--stat", from, to], LOCAL)
 }
 
+/// Lines added and removed in each file between two commits.
+pub fn numstat(dir: &Path, from: &str, to: &str) -> Result<Vec<(u64, u64, String)>, GitError> {
+    let out = git(dir, &["diff", "--numstat", from, to], LOCAL)?;
+    Ok(out
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(3, '\t');
+            let added = parts.next()?.parse().unwrap_or(0);
+            let removed = parts.next()?.parse().unwrap_or(0);
+            Some((added, removed, parts.next()?.to_string()))
+        })
+        .collect())
+}
+
 /// Everything a worktree holds beyond `commit`, new files included and
 /// whether committed since or not, as a patch.
 pub fn patch_since(dir: &Path, commit: &str) -> Result<String, GitError> {

@@ -636,8 +636,37 @@ pub struct GoalDefinition {
     /// works on the sub-goal's beads is given it. Without it each builder
     /// settles those for its own bead.
     pub designer: Option<Tier>,
+    /// When the factory runs this definition by itself, with no message
+    /// from the owner. A definition with a schedule is not a goal the owner
+    /// opens: its `director` tier is the agent of each run, which is given
+    /// the charter and what the records show, and may only file beads.
+    pub schedule: Option<Schedule>,
     #[serde(default)]
     pub permissions: GoalPermissions,
+}
+
+/// When a definition runs by itself, and what each run is for.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Schedule {
+    /// The hour of the day, in UTC, a run is due at.
+    pub hour_utc: u32,
+    /// A run is due every so many days.
+    #[serde(default = "default_every_days")]
+    pub every_days: u32,
+    /// What the runs are for, given to the agent at every run.
+    pub charter: String,
+    /// The most beads one run may file.
+    #[serde(default = "default_max_beads")]
+    pub max_beads: u32,
+}
+
+fn default_every_days() -> u32 {
+    1
+}
+
+fn default_max_beads() -> u32 {
+    3
 }
 
 fn default_pipelines() -> u32 {
@@ -933,6 +962,23 @@ impl ConfigDir {
                 return Err(invalid(
                     "a foreman runs a sub-goal, so the definition needs a ship_flow".to_string(),
                 ));
+            }
+            if let Some(schedule) = &definition.schedule {
+                if definition.default {
+                    return Err(invalid(
+                        "a definition with a schedule is run by the factory, so it cannot be the default for goals the owner opens".to_string(),
+                    ));
+                }
+                if schedule.hour_utc > 23 || schedule.every_days == 0 {
+                    return Err(invalid(
+                        "schedule: hour_utc is 0 to 23 and every_days is at least 1".to_string(),
+                    ));
+                }
+                if schedule.charter.trim().is_empty() || !(1..=10).contains(&schedule.max_beads) {
+                    return Err(invalid(
+                        "schedule: it needs a charter, and max_beads from 1 to 10".to_string(),
+                    ));
+                }
             }
             if definition.designer.is_some() && definition.ship_flow.is_none() {
                 return Err(invalid(

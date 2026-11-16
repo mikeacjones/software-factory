@@ -133,3 +133,15 @@ A command step that runs each test a change adds or alters on the code as it was
 ## stop check
 
 A command of the project that a goal definition names to decide the goal's stop condition. Code runs it on the default branch, shows the director what it said, and refuses a proposal that the goal is complete while it fails.
+
+## schedule
+
+The times a goal definition is run at by the factory itself: an hour of the day, every so many days. A definition with one is not a goal. Each run is one agent, which files beads and starts nothing.
+
+## maintainer
+
+The agent of a scheduled run. It is given the run's charter and the measures, reads the default branch, and files beads up to the definition's limit. Code refuses anything else it asks for.
+
+## measures
+
+What code computes from a project's unit records for a scheduled run: the classes of defect that keep coming back, flaky checks, red CI, beads that took many rounds, parked pipelines and removed tests. The same records give the same measures.

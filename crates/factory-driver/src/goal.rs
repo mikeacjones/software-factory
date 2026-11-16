@@ -34,6 +34,7 @@ use std::time::Duration;
 use factory_beads::{Change, NewBead, Source, Summary, readiness};
 use factory_checks::{Verdict, first_match, run_command};
 use factory_claude::{Outcome, RunSpec, Session, Usage};
+use factory_config::Schedule;
 use factory_config::{
     ConfigDir, Factory, GoalDefinition, Permission, Project, Tier, read_env_file,
 };
@@ -980,6 +981,341 @@ fn edit_problems(edits: &[BeadEdit], tracker: &[Summary]) -> Vec<String> {
 ///
 /// `launchable` answers, for a bead ID, why the readiness check would refuse
 /// it (empty: it would not).
+/// The factory's record of a definition it runs on a schedule.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Scheduled {
+    /// When the definition was first seen, or last ran. The next run is
+    /// the first due time after this, so a time that was missed is made up
+    /// once and not once for each miss.
+    pub since: u64,
+    pub runs: u32,
+    pub failures: u32,
+    pub retry_at: Option<u64>,
+    /// The default branch's commit at the last run.
+    pub commit: String,
+    /// What the agent of the last run wanted the next one to know.
+    pub journal: String,
+    pub usage: Usage,
+}
+
+/// The first time a schedule is due after `since`: its hour of the day,
+/// on the day its interval reaches.
+pub fn schedule_due(schedule: &Schedule, since: u64) -> u64 {
+    let at = since / 86_400 * 86_400 + u64::from(schedule.hour_utc) * 3600;
+    let first = if at > since { at } else { at + 86_400 };
+    first + u64::from(schedule.every_days.max(1) - 1) * 86_400
+}
+
+/// A time as people read it, in UTC.
+fn date_utc(unix: u64) -> String {
+    // Days to a civil date, after Howard Hinnant's algorithm.
+    let days = (unix / 86_400) as i64 + 719_468;
+    let era = days.div_euclid(146_097);
+    let day_of_era = days.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
+    let month = if shifted_month < 10 {
+        shifted_month + 3
+    } else {
+        shifted_month - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02} UTC",
+        (unix % 86_400) / 3600,
+        (unix % 3600) / 60
+    )
+}
+
+/// What the records of a project's units show since a time, for a
+/// maintenance run. Read from the units' records and logs only, so the same
+/// records give the same measures.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Measures {
+    /// Classes of defect that have broken three beads or more, ever.
+    pub classes: Vec<factory_brief::ClassCount>,
+    /// A check that failed and then passed on the same commit: the
+    /// command, the commit and the unit.
+    pub flaky: Vec<(String, String, String)>,
+    /// Units whose pull request had a red CI run.
+    pub red: Vec<String>,
+    /// Units that needed three rounds of fixing or more, with how many.
+    pub rounds: Vec<(String, usize)>,
+    /// Pipelines that parked: the unit, the step and the first line of why.
+    pub parked: Vec<(String, String, String)>,
+    /// Units in which a fix removed tests or assertions.
+    pub tests_removed: Vec<String>,
+}
+
+pub fn measures(state_dir: &Path, project: &str, from: u64) -> Measures {
+    let mut out = Measures {
+        classes: crate::finding_classes(state_dir, project)
+            .into_iter()
+            .filter(|class| class.beads >= 3)
+            .collect(),
+        ..Measures::default()
+    };
+    let mut units: Vec<PathBuf> = std::fs::read_dir(state_dir.join("units"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .collect();
+    units.sort();
+    for dir in units {
+        let Ok(text) = std::fs::read_to_string(dir.join("events.jsonl")) else {
+            continue;
+        };
+        let unit = dir
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default();
+        // Which commits each command has failed on, in this unit.
+        let mut failed: Vec<(String, String)> = Vec::new();
+        let mut fixes = 0;
+        for line in text.lines() {
+            let Ok(event) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            if strings(&event, "project") != project
+                || event.get("time_unix").and_then(Value::as_u64).unwrap_or(0) < from
+            {
+                continue;
+            }
+            let data = event.get("data").cloned().unwrap_or(Value::Null);
+            let step = strings(&event, "step");
+            match strings(&event, "kind") {
+                "command.ran" => {
+                    let run = (
+                        strings(&data, "command").to_string(),
+                        strings(&data, "commit").to_string(),
+                    );
+                    let verdict = strings(&data, "verdict");
+                    if verdict.starts_with("Failed") {
+                        failed.push(run);
+                    } else if verdict == "Passed" && failed.contains(&run) {
+                        failed.retain(|other| other != &run);
+                        out.flaky.push((run.0, run.1, unit.clone()));
+                    }
+                }
+                "step.ended" if step == "ci" && strings(&data, "outcome") == "red" => {
+                    if !out.red.contains(&unit) {
+                        out.red.push(unit.clone());
+                    }
+                }
+                "step.ended" if step == "fix" => fixes += 1,
+                "unit.parked" => out.parked.push((
+                    unit.clone(),
+                    step.to_string(),
+                    strings(&data, "reason")
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .to_string(),
+                )),
+                "tests.removed" if !out.tests_removed.contains(&unit) => {
+                    out.tests_removed.push(unit.clone());
+                }
+                _ => {}
+            }
+        }
+        if fixes >= 3 {
+            out.rounds.push((unit, fixes));
+        }
+    }
+    out.rounds
+        .sort_by_key(|(_, fixes)| std::cmp::Reverse(*fixes));
+    out
+}
+
+impl Measures {
+    /// The measures as a maintenance run is shown them.
+    pub fn text(&self) -> String {
+        let mut out = String::new();
+        let mut part = |title: &str, lines: Vec<String>| {
+            out.push_str(&format!("### {title}\n\n"));
+            if lines.is_empty() {
+                out.push_str("None.\n\n");
+            } else {
+                for line in lines.iter().take(15) {
+                    out.push_str(&format!("- {line}\n"));
+                }
+                if lines.len() > 15 {
+                    out.push_str(&format!("- and {} more\n", lines.len() - 15));
+                }
+                out.push('\n');
+            }
+        };
+        let short = |commit: &str| commit[..commit.len().min(10)].to_string();
+        part(
+            "Classes of defect that have broken three beads or more",
+            self.classes
+                .iter()
+                .map(|class| {
+                    format!(
+                        "`{}`: {} findings on {} beads",
+                        class.class, class.findings, class.beads
+                    )
+                })
+                .collect(),
+        );
+        part(
+            "Checks that failed and then passed on the same commit",
+            self.flaky
+                .iter()
+                .map(|(command, commit, unit)| {
+                    format!("`{command}` on `{}`, in unit `{unit}`", short(commit))
+                })
+                .collect(),
+        );
+        part(
+            "Pull requests whose CI went red",
+            self.red
+                .iter()
+                .map(|unit| format!("unit `{unit}`"))
+                .collect(),
+        );
+        part(
+            "Beads that took three rounds of fixing or more",
+            self.rounds
+                .iter()
+                .map(|(unit, fixes)| format!("unit `{unit}`: {fixes} rounds"))
+                .collect(),
+        );
+        part(
+            "Pipelines that parked",
+            self.parked
+                .iter()
+                .map(|(unit, step, why)| {
+                    format!("unit `{unit}` at `{step}`: {}", truncate(why, 200))
+                })
+                .collect(),
+        );
+        part(
+            "Fixes that removed tests or assertions",
+            self.tests_removed
+                .iter()
+                .map(|unit| format!("unit `{unit}`"))
+                .collect(),
+        );
+        out
+    }
+}
+
+/// What a maintenance run returns.
+pub fn maintenance_schema() -> Value {
+    object_schema(json!({
+        "summary": text_schema("What you looked at and concluded, in a few plain sentences."),
+        "file": file_schema(false),
+        "digest": text_schema("For the owner, who reads it in the project's channel: what you found, then one line for each bead you filed and why it is worth doing. If nothing was worth a bead, say so and say what you looked at."),
+        "journal": text_schema("What the next run should know: what you looked at, what you chose not to file and why, what to look at next. You start fresh each time; this is all that is kept."),
+    }))
+}
+
+/// What is wrong with what a maintenance run returned. It files beads and
+/// does nothing else.
+pub fn maintenance_problems(schedule: &Schedule, result: &Value) -> Vec<String> {
+    let mut problems = Vec::new();
+    for key in ["summary", "digest"] {
+        if strings(result, key).trim().is_empty() {
+            problems.push(format!("`{key}` is empty"));
+        }
+    }
+    let empty = |value: &Value| match value {
+        Value::Null | Value::Bool(false) => true,
+        Value::String(text) => text.trim().is_empty(),
+        Value::Array(items) => items.is_empty(),
+        _ => false,
+    };
+    for key in [
+        "start",
+        "continue",
+        "ship",
+        "close",
+        "edit",
+        "open_subgoals",
+        "open_subgoal",
+        "complete",
+        "design",
+        "tell_foreman",
+        "tell_executive",
+    ] {
+        if result.get(key).is_some_and(|value| !empty(value)) {
+            problems.push(format!(
+                "`{key}`: a maintenance run files beads and does nothing else"
+            ));
+        }
+    }
+    let files = items(result, "file");
+    if files.len() > schedule.max_beads as usize {
+        problems.push(format!(
+            "file: {} beads, and one run may file {}. Keep the ones most worth doing, and put the rest in `journal` for the next run",
+            files.len(),
+            schedule.max_beads
+        ));
+    }
+    problems.extend(file_problems(files, &|_| Vec::new()));
+    for file in files {
+        if strings(file, "acceptance_criteria").trim().is_empty() {
+            problems.push(format!(
+                "file: `{}` has no acceptance criteria: say how anyone will know it is done",
+                strings(file, "title")
+            ));
+        }
+    }
+    problems
+}
+
+/// What a maintenance run is told. `grown` is the files that grew most on
+/// the default branch since the last run, each with its net lines, and
+/// `span` says between which commits.
+#[allow(clippy::too_many_arguments)]
+pub fn maintenance_brief(
+    project: &str,
+    schedule: &Schedule,
+    record: &Scheduled,
+    from: u64,
+    measures: &Measures,
+    span: &str,
+    grown: &[(String, i64)],
+    tracker: &[Summary],
+) -> String {
+    let mut out = format!(
+        "# Maintenance of project `{project}`, run {}\n\n## What these runs are for\n\n{}\n\n## What you may do\n\nFile beads: at most {} in this run, each with a type, a priority, acceptance criteria and the evidence for it in its description, and deferred unless it should be worked on soon. You start nothing, continue nothing, ship nothing and close nothing: what you file is taken up by the project's goals, or by the owner. Your working directory is a checkout of the default branch: read it and run what only reads.\n\n## What the factory's records show since {}\n\n{}",
+        record.runs + 1,
+        schedule.charter.trim(),
+        schedule.max_beads,
+        date_utc(from),
+        measures.text(),
+    );
+    out.push_str(&format!(
+        "### Files that grew most on the default branch ({span})\n\n"
+    ));
+    if grown.is_empty() {
+        out.push_str("None to show.\n\n");
+    }
+    for (path, lines) in grown {
+        out.push_str(&format!("- `{path}`: {lines:+} lines\n"));
+    }
+    if !grown.is_empty() {
+        out.push('\n');
+    }
+    out.push_str(&format!(
+        "## The tracker: open work, most urgent first\n\nFile nothing that is already here. Look at any bead in full with `bd show <id>`.\n\n{}\n",
+        table(tracker, &[])
+    ));
+    if !record.journal.trim().is_empty() {
+        out.push_str(&format!(
+            "## What the last run left for you\n\n{}\n",
+            record.journal.trim()
+        ));
+    }
+    out
+}
+
 /// The design every pipeline of a sub-goal is held to, if it has one.
 fn accepted_design(sub: &SubGoal) -> Option<String> {
     sub.design
@@ -3048,6 +3384,29 @@ pub fn check_definitions(config: &ConfigDir) -> Result<Vec<String>, DriverError>
                     definition.director.model
                 )));
             }
+            if let Some(schedule) = &definition.schedule {
+                // The factory runs it by the clock: one agent, which files
+                // beads and starts nothing.
+                if definition.foreman.is_some()
+                    || definition.designer.is_some()
+                    || definition.stop_check.is_some()
+                {
+                    return Err(refuse(
+                        "it has a schedule, so it starts nothing: it cannot have a foreman, a designer or a stop_check".to_string(),
+                    ));
+                }
+                config.role_prompt("maintainer")?;
+                lines.push(format!(
+                    "{id}/{}: scheduled, maintainer {} ({}), every {} day(s) at {:02}:00 UTC, at most {} bead(s) a run",
+                    definition.id,
+                    definition.director.model,
+                    definition.director.effort,
+                    schedule.every_days,
+                    schedule.hour_utc,
+                    schedule.max_beads
+                ));
+                continue;
+            }
             for role in ["director", "director-intake"] {
                 config.role_prompt(role)?;
             }
@@ -3111,6 +3470,9 @@ pub struct Supervisor {
     /// When an owner's message could not be answered because every
     /// account is at a limit: the time to hand the same message in again.
     again_at: Option<u64>,
+    /// The one project this supervisor acts for, when it was made for a
+    /// turn of that project. Otherwise it acts for every project.
+    scope: Option<String>,
 }
 
 impl Supervisor {
@@ -3215,6 +3577,7 @@ impl Supervisor {
             draining: false,
             collecting: None,
             again_at: None,
+            scope: None,
         })
     }
 
@@ -3240,6 +3603,7 @@ impl Supervisor {
                 .executives
                 .retain(|_, executive| executive.project == project);
             supervisor.channels.retain(|_, id| id == project);
+            supervisor.scope = Some(project.to_string());
         }
         supervisor.collect_launches();
         Ok(supervisor)
@@ -3564,7 +3928,14 @@ impl Supervisor {
         user: &str,
         text: &str,
     ) -> Result<Option<String>, DriverError> {
-        let definitions = self.config.goal_definitions(project)?;
+        // A definition with a schedule is the factory's to run, not a goal
+        // the owner opens.
+        let definitions: Vec<GoalDefinition> = self
+            .config
+            .goal_definitions(project)?
+            .into_iter()
+            .filter(|definition| definition.schedule.is_none())
+            .collect();
         // "name: what I want" picks a definition by name.
         let named = text
             .split_once(':')
@@ -3679,7 +4050,12 @@ impl Supervisor {
         let Some(tier) = project.executive.clone() else {
             return Ok(None);
         };
-        let definitions = self.config.goal_definitions(project_id)?;
+        let definitions: Vec<GoalDefinition> = self
+            .config
+            .goal_definitions(project_id)?
+            .into_iter()
+            .filter(|definition| definition.schedule.is_none())
+            .collect();
         let mut executive = self
             .executives
             .get(project_id)
@@ -4997,6 +5373,17 @@ impl Supervisor {
         project: &Project,
         file: &Value,
     ) -> (Option<String>, String) {
+        self.file_bead_at(&self.seat(goal), source, project, file)
+    }
+
+    /// File one bead for whoever sits at `seat`, whose log records it.
+    fn file_bead_at(
+        &self,
+        seat: &Seat,
+        source: &Source,
+        project: &Project,
+        file: &Value,
+    ) -> (Option<String>, String) {
         let optional = |key: &str| {
             let value = strings(file, key).trim();
             (!value.is_empty()).then(|| value.to_string())
@@ -5016,24 +5403,24 @@ impl Supervisor {
                 // A bead the factory files has a GitHub issue from the start.
                 match crate::ensure_issue(&self.factory, project, source, &bead) {
                     Ok(Some(url)) => {
-                        self.log(
-                            goal,
+                        self.log_at(
+                            seat,
                             "issue.created",
                             json!({ "bead": bead.id, "url": url }),
                         );
                         let mut linked = bead.clone();
                         linked.external_ref = url;
-                        self.sync_issue(goal, project, &linked);
+                        self.sync_issue_at(seat, project, &linked);
                     }
                     Ok(None) => {}
-                    Err(err) => self.log(
-                        goal,
+                    Err(err) => self.log_at(
+                        seat,
                         "issue.failed",
                         json!({ "bead": bead.id, "error": err.to_string() }),
                     ),
                 }
-                self.log(
-                    goal,
+                self.log_at(
+                    seat,
                     "bead.filed",
                     json!({ "bead": bead.id, "request": file }),
                 );
@@ -5048,8 +5435,8 @@ impl Supervisor {
                 (Some(bead.id), line)
             }
             Err(err) => {
-                self.log(
-                    goal,
+                self.log_at(
+                    seat,
                     "bead.failed",
                     json!({ "request": file, "error": err.to_string() }),
                 );
@@ -5061,15 +5448,19 @@ impl Supervisor {
     /// Set a bead's issue to the bead's type and priority, and record how
     /// that went. It never holds anything else up.
     fn sync_issue(&self, goal: &Goal, project: &Project, bead: &factory_beads::Bead) {
+        self.sync_issue_at(&self.seat(goal), project, bead);
+    }
+
+    fn sync_issue_at(&self, seat: &Seat, project: &Project, bead: &factory_beads::Bead) {
         match crate::sync_issue_fields(&self.factory, project, bead) {
             Ok(changed) if changed.is_empty() => {}
-            Ok(changed) => self.log(
-                goal,
+            Ok(changed) => self.log_at(
+                seat,
                 "issue.fields",
                 json!({ "bead": bead.id, "set": changed }),
             ),
-            Err(err) => self.log(
-                goal,
+            Err(err) => self.log_at(
+                seat,
                 "issue.fields_failed",
                 json!({ "bead": bead.id, "error": err.to_string() }),
             ),
@@ -5526,6 +5917,243 @@ impl Supervisor {
         self.save(goal)?;
         self.run_designers(id)?;
         self.wake_foremen(id)
+    }
+
+    /// Every definition this supervisor runs on a schedule, with its project.
+    fn scheduled(&self) -> Vec<(Project, GoalDefinition)> {
+        let mut out = Vec::new();
+        for id in self.config.projects().unwrap_or_default() {
+            if self.scope.as_ref().is_some_and(|scope| scope != &id) {
+                continue;
+            }
+            let Ok(project) = self.config.project(&id) else {
+                continue;
+            };
+            for definition in self.config.goal_definitions(&id).unwrap_or_default() {
+                if definition.schedule.is_some() {
+                    out.push((project.clone(), definition));
+                }
+            }
+        }
+        out
+    }
+
+    fn schedule_seat(&self, project: &Project, definition: &str) -> Seat {
+        Seat {
+            project: project.id.to_string(),
+            id: format!("{}-{definition}", project.id),
+            dir: self
+                .factory
+                .state_dir
+                .join("projects")
+                .join(project.id.as_str())
+                .join("schedules")
+                .join(definition),
+        }
+    }
+
+    /// The record of a scheduled definition. One never seen before counts
+    /// from now, so its first run is at its next due time.
+    fn schedule_record(&self, project: &Project, definition: &str) -> Scheduled {
+        let path = self
+            .schedule_seat(project, definition)
+            .dir
+            .join("scheduled.json");
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_else(|| Scheduled {
+                since: now_unix(),
+                ..Scheduled::default()
+            })
+    }
+
+    fn save_schedule(&self, seat: &Seat, record: &Scheduled) -> Result<(), DriverError> {
+        std::fs::create_dir_all(seat.dir.join("runs")).map_err(crate::io(&seat.dir))?;
+        let path = seat.dir.join("scheduled.json");
+        let text = serde_json::to_string_pretty(record).map_err(|source| DriverError::Json {
+            path: path.clone(),
+            source,
+        })?;
+        let temp = seat.dir.join("scheduled.json.tmp");
+        std::fs::write(&temp, text).map_err(crate::io(&temp))?;
+        std::fs::rename(&temp, &path).map_err(crate::io(&path))
+    }
+
+    /// Run a scheduled definition if it is due: its agent is given the
+    /// charter and what the records show, and files beads. Returns whether
+    /// anything was done.
+    fn run_schedule(
+        &mut self,
+        project: &Project,
+        definition: &GoalDefinition,
+    ) -> Result<bool, DriverError> {
+        let Some(schedule) = &definition.schedule else {
+            return Ok(false);
+        };
+        let seat = self.schedule_seat(project, &definition.id);
+        let mut record = self.schedule_record(project, &definition.id);
+        if !seat.dir.join("scheduled.json").exists() {
+            // Seen for the first time: it counts from now.
+            self.save_schedule(&seat, &record)?;
+        }
+        let due = record
+            .retry_at
+            .unwrap_or_else(|| schedule_due(schedule, record.since));
+        if self.draining || due > now_unix() {
+            return Ok(false);
+        }
+        // The first run looks back two weeks; later ones, to the run before.
+        let from = if record.runs == 0 {
+            record.since.saturating_sub(14 * 86_400)
+        } else {
+            record.since
+        };
+        let source = bead_source(project);
+        let tracker = source.list_open()?;
+        let found = measures(&self.factory.state_dir, project.id.as_str(), from);
+        // The default branch as it is now, and what grew on it.
+        let cwd = self.checkout(&seat.dir, project, &None)?;
+        let tip = factory_git::rev_parse(&cwd, "HEAD")?;
+        let short = |commit: &str| commit[..commit.len().min(10)].to_string();
+        let (span, grown) = if record.commit.is_empty() || record.commit == tip {
+            (
+                if record.commit.is_empty() {
+                    "no earlier run to compare with".to_string()
+                } else {
+                    "nothing has landed since the last run".to_string()
+                },
+                Vec::new(),
+            )
+        } else {
+            let mut grown: Vec<(String, i64)> = factory_git::numstat(&cwd, &record.commit, &tip)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(added, removed, path)| (path, added as i64 - removed as i64))
+                .filter(|(_, lines)| *lines >= 100)
+                .collect();
+            grown.sort_by_key(|(_, lines)| std::cmp::Reverse(*lines));
+            grown.truncate(10);
+            (
+                format!(
+                    "`{}` to `{}`, 100 lines or more",
+                    short(&record.commit),
+                    short(&tip)
+                ),
+                grown,
+            )
+        };
+        let brief = maintenance_brief(
+            project.id.as_str(),
+            schedule,
+            &record,
+            from,
+            &found,
+            &span,
+            &grown,
+            &tracker,
+        );
+        let check = |result: &Value| maintenance_problems(schedule, result);
+        let turn = Turn {
+            who: "maintainer",
+            role: "maintainer",
+            tier: definition.director.clone(),
+            place: None,
+            schema: maintenance_schema(),
+            session: Session::Fresh,
+            prompt: brief,
+        };
+        let result = match self.run_agent(&seat, &mut record.usage, turn, &check) {
+            Ok((result, _)) => result,
+            Err(reason) => {
+                if let Some(until) = reason
+                    .strip_prefix(LIMITED)
+                    .and_then(|at| at.parse::<u64>().ok())
+                {
+                    // Waiting for a usage window is not a failure.
+                    record.retry_at = Some(until);
+                } else {
+                    record.failures += 1;
+                    self.log_at(
+                        &seat,
+                        "schedule.failed",
+                        json!({ "reason": reason, "failures": record.failures }),
+                    );
+                    if record.failures >= 3 {
+                        // Given up until its next due time.
+                        record.failures = 0;
+                        record.retry_at = None;
+                        record.since = now_unix();
+                        self.tell_channel(project, &seat, &format!(
+                            ":warning: The scheduled run `{}` of `{}` could not be run three times and is put off to its next time. The last reason: {}",
+                            definition.id,
+                            project.id,
+                            escape(&truncate(&reason, 600))
+                        ));
+                    } else {
+                        record.retry_at = Some(now_unix() + 1800);
+                    }
+                }
+                self.save_schedule(&seat, &record)?;
+                return Ok(true);
+            }
+        };
+        let mut filed: Vec<String> = Vec::new();
+        for file in items(&result, "file")
+            .iter()
+            .take(schedule.max_beads as usize)
+        {
+            filed.push(self.file_bead_at(&seat, &source, project, file).1);
+        }
+        record.runs += 1;
+        record.failures = 0;
+        record.retry_at = None;
+        record.since = now_unix();
+        record.commit = tip.clone();
+        record.journal = strings(&result, "journal").trim().to_string();
+        self.log_at(
+            &seat,
+            "schedule.ran",
+            json!({ "definition": definition.id, "run": record.runs, "commit": tip, "filed": filed,
+                    "summary": strings(&result, "summary") }),
+        );
+        self.tell_channel(
+            project,
+            &seat,
+            &format!(
+                ":broom: *{}* · run {} of `{}`\n{}\n{}",
+                escape(&definition.id),
+                record.runs,
+                project.id,
+                quote(&truncate(strings(&result, "digest").trim(), 2500)),
+                if filed.is_empty() {
+                    "It filed nothing.".to_string()
+                } else {
+                    filed
+                        .iter()
+                        .map(|line| format!("• {}", escape(line)))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                }
+            ),
+        );
+        self.save_schedule(&seat, &record)?;
+        Ok(true)
+    }
+
+    /// Say something in a project's channel, outside any goal's thread.
+    fn tell_channel(&self, project: &Project, seat: &Seat, text: &str) {
+        self.log_at(seat, "slack.say", json!({ "text": text }));
+        let channel = self
+            .channels
+            .iter()
+            .find(|(_, id)| id.as_str() == project.id.as_str())
+            .map(|(channel, _)| channel.clone());
+        if let (Some(slack), Some(channel)) = (&self.slack, channel)
+            && let Err(err) = slack.post(&channel, None, text)
+        {
+            self.log_at(seat, "slack.failed", json!({ "error": err.to_string() }));
+        }
     }
 
     /// Run the designer of every sub-goal of a goal whose design is to be
@@ -6664,7 +7292,24 @@ impl Supervisor {
             .filter_map(|sub| sub.design.as_ref())
             .filter(|design| design.state == "pending")
             .filter_map(|design| design.retry_at);
-        goals.chain(foremen).chain(designers).chain(desks).min()
+        let schedules = self
+            .scheduled()
+            .into_iter()
+            .filter_map(|(project, definition)| {
+                let schedule = definition.schedule.as_ref()?;
+                let record = self.schedule_record(&project, &definition.id);
+                Some(
+                    record
+                        .retry_at
+                        .unwrap_or_else(|| schedule_due(schedule, record.since)),
+                )
+            });
+        goals
+            .chain(foremen)
+            .chain(designers)
+            .chain(desks)
+            .chain(schedules)
+            .min()
     }
 
     /// When to hand the last owner's message in again, if it could not be
@@ -6813,6 +7458,11 @@ impl Supervisor {
         for goal in due {
             happened = true;
             self.run_designers(&goal)?;
+        }
+        // What the factory runs by the clock, after what the goals were
+        // waiting for: a run may take a while.
+        for (project, definition) in self.scheduled() {
+            happened |= self.run_schedule(&project, &definition)?;
         }
         let Ok(first) = self.receiver.recv_timeout(wait) else {
             return Ok(happened);
@@ -8995,5 +9645,281 @@ mod tests {
         assert_eq!(command(" Accept. "), "accept");
         assert_eq!(command("START!"), "start");
         assert_ne!(command("accept, but first fix the docs"), "accept");
+    }
+
+    fn schedule(every_days: u32) -> Schedule {
+        Schedule {
+            hour_utc: 10,
+            every_days,
+            charter: "Keep quality from slipping.".to_string(),
+            max_beads: 2,
+        }
+    }
+
+    #[test]
+    fn a_schedule_is_due_at_its_hour_and_a_time_that_was_missed_is_made_up_once() {
+        let day = 86_400;
+        let midnight = 20_000 * day;
+        let at = |days: u64, hours: u64| midnight + days * day + hours * 3600;
+        // Daily: today if the hour is still to come, else tomorrow.
+        assert_eq!(schedule_due(&schedule(1), at(0, 9)), at(0, 10));
+        assert_eq!(schedule_due(&schedule(1), at(0, 10)), at(1, 10));
+        assert_eq!(schedule_due(&schedule(1), at(0, 15)), at(1, 10));
+        // Weekly: a run that ended a little after its hour is due a week
+        // after that hour, so the hour does not drift.
+        assert_eq!(schedule_due(&schedule(7), at(0, 10) + 1200), at(7, 10));
+        // A month with no worker: one run is overdue, not four, and after
+        // it the next is in the future.
+        let now = at(30, 5);
+        assert!(schedule_due(&schedule(7), at(0, 10) + 1200) < now);
+        let next = schedule_due(&schedule(7), now);
+        assert_eq!(next, at(36, 10));
+        assert_eq!(date_utc(1_794_773_136), "2026-11-15 20:05 UTC");
+        assert_eq!(date_utc(951_868_799), "2000-02-29 23:59 UTC");
+    }
+
+    #[test]
+    fn a_maintenance_run_files_beads_up_to_its_limit_and_may_do_nothing_else() {
+        let bead = |title: &str, criteria: &str| {
+            json!({ "title": title, "type": "task", "priority": 3, "description": "Why and what.",
+                    "acceptance_criteria": criteria, "parent": "", "discovered_from": "", "deferred": true })
+        };
+        let run = |fields: Value| {
+            let mut result = json!({ "summary": "Looked.", "file": [], "digest": "Nothing was worth a bead.", "journal": "" });
+            for (key, value) in fields.as_object().unwrap() {
+                result[key] = value.clone();
+            }
+            maintenance_problems(&schedule(7), &result)
+        };
+        // Filing nothing is a good run, and so is filing up to the limit.
+        assert_eq!(run(json!({})), Vec::<String>::new());
+        assert_eq!(
+            run(
+                json!({ "file": [bead("A check for cleanup", "it fails today"), bead("Another", "it passes")] })
+            ),
+            Vec::<String>::new()
+        );
+        // Anything a director could do beyond filing is refused, whatever
+        // the schema let through; an empty one is nothing.
+        assert_eq!(
+            run(json!({ "start": [], "complete": false, "ship": "", "close": null })),
+            Vec::<String>::new()
+        );
+        for (key, value) in [
+            (
+                "start",
+                json!([{ "bead": "toy-1", "reason": "it is ready" }]),
+            ),
+            ("continue", json!([{ "bead": "toy-1" }])),
+            ("ship", json!(["feature"])),
+            ("close", json!(["toy-1"])),
+            ("edit", json!([{ "bead": "toy-1", "priority": 0 }])),
+            ("open_subgoals", json!([{ "id": "s" }])),
+            ("complete", json!(true)),
+        ] {
+            let mut fields = json!({});
+            fields[key] = value;
+            assert_eq!(
+                run(fields),
+                [format!(
+                    "`{key}`: a maintenance run files beads and does nothing else"
+                )]
+            );
+        }
+        let over = run(json!({ "file": [bead("One", "x"), bead("Two", "x"), bead("Three", "x")] }));
+        assert_eq!(over.len(), 1, "{over:?}");
+        assert!(
+            over[0].starts_with("file: 3 beads, and one run may file 2."),
+            "{over:?}"
+        );
+        assert_eq!(
+            run(json!({ "file": [bead("No way to tell", " ")] })),
+            [
+                "file: `No way to tell` has no acceptance criteria: say how anyone will know it is done"
+            ]
+        );
+        assert_eq!(
+            run(
+                json!({ "file": [json!({ "title": "Bad", "type": "wish", "priority": 9, "description": "d", "acceptance_criteria": "c" })] })
+            ),
+            [
+                "file: `Bad` has no valid type",
+                "file: `Bad` needs a priority from 0 to 4"
+            ]
+        );
+        assert_eq!(run(json!({ "digest": " " })), ["`digest` is empty"]);
+    }
+
+    #[test]
+    fn a_maintenance_run_is_shown_what_the_units_records_say_since_the_last_one() {
+        let state = std::env::temp_dir().join(format!("factory-measures-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state);
+        let unit = |name: &str, project: &str, bead: &str, classes: &[&str], events: &[Value]| {
+            let dir = state.join("units").join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            let regressions: Vec<Value> = classes
+                .iter()
+                .map(|class| json!({ "category": class }))
+                .collect();
+            std::fs::write(
+                dir.join("unit.json"),
+                json!({ "project": project, "bead": bead, "regressions": regressions }).to_string(),
+            )
+            .unwrap();
+            let lines: Vec<String> = events.iter().map(Value::to_string).collect();
+            std::fs::write(dir.join("events.jsonl"), lines.join("\n")).unwrap();
+        };
+        let event = |time: u64, kind: &str, step: &str, data: Value| json!({ "time_unix": time, "kind": kind, "project": "toy", "step": step, "data": data });
+        let ran = |time: u64, command: &str, commit: &str, verdict: &str| {
+            event(
+                time,
+                "command.ran",
+                command,
+                json!({ "command": command, "commit": commit, "verdict": verdict }),
+            )
+        };
+        unit(
+            "toy-1-100",
+            "toy",
+            "toy-1",
+            &["error-path-cleanup", "empty-input"],
+            &[
+                // Before the last run: not this run's to weigh again.
+                event(
+                    50,
+                    "unit.parked",
+                    "break",
+                    json!({ "reason": "an old park" }),
+                ),
+                // Failed and then passed on one commit: flaky. Failed on
+                // one commit and passed on the next: a fix.
+                ran(200, "test", "aaaaaaaaaaaaaaaa", "Failed { code: Some(1) }"),
+                ran(210, "test", "aaaaaaaaaaaaaaaa", "Passed"),
+                ran(220, "fmt", "aaaaaaaaaaaaaaaa", "Failed { code: Some(1) }"),
+                ran(230, "fmt", "bbbbbbbbbbbbbbbb", "Passed"),
+                event(240, "step.ended", "fix", json!({ "outcome": "done" })),
+                event(250, "step.ended", "fix", json!({ "outcome": "done" })),
+                event(260, "step.ended", "fix", json!({ "outcome": "done" })),
+                event(270, "step.ended", "ci", json!({ "outcome": "red" })),
+                event(280, "step.ended", "ci", json!({ "outcome": "green" })),
+                event(
+                    290,
+                    "unit.parked",
+                    "break",
+                    json!({ "reason": "step `break` ended with `broken` more often than the flow allows\nand more" }),
+                ),
+                event(300, "tests.removed", "fix", json!({})),
+            ],
+        );
+        unit(
+            "toy-2-100",
+            "toy",
+            "toy-2",
+            &["error-path-cleanup"],
+            &[event(
+                240,
+                "step.ended",
+                "fix",
+                json!({ "outcome": "done" }),
+            )],
+        );
+        unit("toy-3-100", "toy", "toy-3", &["error-path-cleanup"], &[]);
+        // Another project's units are not this one's.
+        unit(
+            "other-1-100",
+            "other",
+            "other-1",
+            &["error-path-cleanup"],
+            &[
+                json!({ "time_unix": 300, "kind": "unit.parked", "project": "other", "step": "break", "data": { "reason": "elsewhere" } }),
+            ],
+        );
+
+        let found = measures(&state, "toy", 100);
+        assert_eq!(
+            found,
+            Measures {
+                classes: vec![factory_brief::ClassCount {
+                    class: "error-path-cleanup".to_string(),
+                    findings: 3,
+                    beads: 3
+                }],
+                flaky: vec![(
+                    "test".to_string(),
+                    "aaaaaaaaaaaaaaaa".to_string(),
+                    "toy-1-100".to_string()
+                )],
+                red: vec!["toy-1-100".to_string()],
+                rounds: vec![("toy-1-100".to_string(), 3)],
+                parked: vec![(
+                    "toy-1-100".to_string(),
+                    "break".to_string(),
+                    "step `break` ended with `broken` more often than the flow allows".to_string()
+                )],
+                tests_removed: vec!["toy-1-100".to_string()],
+            }
+        );
+        // The same records give the same measures.
+        assert_eq!(measures(&state, "toy", 100), found);
+
+        let tracker = vec![Summary {
+            id: "toy-7".to_string(),
+            title: "Bead toy-7".to_string(),
+            status: "open".to_string(),
+            issue_type: "task".to_string(),
+            priority: 1,
+            assignee: String::new(),
+            has_criteria: true,
+            blocked: false,
+            blockers: Vec::new(),
+        }];
+        let record = Scheduled {
+            since: 100,
+            runs: 4,
+            journal: "I left the fuzz corpus alone: it is the conformance goal's.".to_string(),
+            ..Scheduled::default()
+        };
+        let brief = maintenance_brief(
+            "toy",
+            &schedule(7),
+            &record,
+            100,
+            &found,
+            "`aaaaaaaaaa` to `bbbbbbbbbb`, 100 lines or more",
+            &[("src/worker.zig".to_string(), 412)],
+            &tracker,
+        );
+        for part in [
+            "# Maintenance of project `toy`, run 5\n\n## What these runs are for\n\nKeep quality from slipping.\n\n## What you may do\n\nFile beads: at most 2 in this run",
+            "## What the factory's records show since 1970-01-01 00:01 UTC\n\n### Classes of defect that have broken three beads or more\n\n- `error-path-cleanup`: 3 findings on 3 beads\n",
+            "### Checks that failed and then passed on the same commit\n\n- `test` on `aaaaaaaaaa`, in unit `toy-1-100`\n",
+            "### Pull requests whose CI went red\n\n- unit `toy-1-100`\n",
+            "### Beads that took three rounds of fixing or more\n\n- unit `toy-1-100`: 3 rounds\n",
+            "### Pipelines that parked\n\n- unit `toy-1-100` at `break`: step `break` ended with `broken` more often than the flow allows\n",
+            "### Fixes that removed tests or assertions\n\n- unit `toy-1-100`\n",
+            "### Files that grew most on the default branch (`aaaaaaaaaa` to `bbbbbbbbbb`, 100 lines or more)\n\n- `src/worker.zig`: +412 lines\n",
+            "## The tracker: open work, most urgent first\n\nFile nothing that is already here.",
+            "toy-7 | P1 | task | launchable | Bead toy-7\n",
+            "## What the last run left for you\n\nI left the fuzz corpus alone: it is the conformance goal's.\n",
+        ] {
+            assert!(brief.contains(part), "no `{part}` in:\n{brief}");
+        }
+        // With nothing to show, each measure says so.
+        let quiet = maintenance_brief(
+            "toy",
+            &schedule(7),
+            &Scheduled::default(),
+            0,
+            &Measures::default(),
+            "no earlier run to compare with",
+            &[],
+            &[],
+        );
+        assert_eq!(quiet.matches("None.\n").count(), 6, "{quiet}");
+        assert!(
+            quiet.contains("None to show.") && !quiet.contains("What the last run left"),
+            "{quiet}"
+        );
+        let _ = std::fs::remove_dir_all(&state);
     }
 }

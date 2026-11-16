@@ -109,3 +109,27 @@ bead = "sf-gl5.5"
 claim = "The Zig project's goal definition has a designer whose model is allowed and whose role prompt exists."
 command = ["sh", "-c", "cargo run --quiet --locked --offline --package factory-cli -- goal check --config config | grep -q 'designer claude-'"]
 timeout_secs = 900
+
+[[check]]
+id = "schedule-contract"
+tier = "hermetic"
+bead = "sf-gl5.6"
+claim = "A schedule is due at its hour every so many days and a missed time is made up once; a maintenance run may file beads up to its limit, each with acceptance criteria, and code refuses a result that starts, continues, ships, closes, edits or completes anything; the measures a run is shown are computed from the units' records since the last run and are the same for the same records."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-driver", "--lib", "--", "a_schedule_is_due", "a_maintenance_run"]
+timeout_secs = 900
+
+[[check]]
+id = "schedule-runs"
+tier = "hermetic"
+bead = "sf-gl5.6"
+claim = "A definition with a schedule cannot be the default or have a stop check; seen first it counts from now; overdue, it is run once: the maintainer is shown the charter, the limit, the finding classes and the tracker, a result that asks for a pipeline or too many beads goes back to the same session, the bead it files is in the tracker, no goal or unit is made, the digest is posted, and the next run is given its journal."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-driver", "--test", "walk", "--", "a_scheduled_definition_is_run_when_due"]
+timeout_secs = 900
+
+[[check]]
+id = "schedule-configured"
+tier = "hermetic"
+bead = "sf-gl5.6"
+claim = "The Zig project has a scheduled definition whose maintainer's model is allowed and whose role prompt exists."
+command = ["sh", "-c", "cargo run --quiet --locked --offline --package factory-cli -- goal check --config config | grep -q 'temporal-sdk-zig/upkeep: scheduled, maintainer claude-'"]
+timeout_secs = 900

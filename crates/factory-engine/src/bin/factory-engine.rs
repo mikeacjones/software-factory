@@ -211,6 +211,20 @@ async fn command(args: &[String]) -> Result<(), String> {
                     }
                 }
                 ensure_tiers(&client, &reach(&temporal), &projects).await?;
+                // A project's workflow learns when it is next due from its
+                // last turn. A schedule this release brought is in no turn
+                // yet, so a project that has one is looked at now.
+                for id in &projects {
+                    let scheduled = config
+                        .goal_definitions(id)
+                        .map_err(|err| err.to_string())?
+                        .iter()
+                        .any(|definition| definition.schedule.is_some());
+                    if scheduled {
+                        tell(&client, &reach(&temporal), id, factory_driver::goal::Event::Tick)
+                            .await?;
+                    }
+                }
                 eprintln!(
                     "factory-engine: the tiers are on the engine, for: {}",
                     projects.join(", ")
