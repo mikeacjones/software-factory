@@ -977,10 +977,6 @@ fn edit_problems(edits: &[BeadEdit], tracker: &[Summary]) -> Vec<String> {
     problems
 }
 
-/// Why a director's decisions may not be carried out. Empty means they may.
-///
-/// `launchable` answers, for a bead ID, why the readiness check would refuse
-/// it (empty: it would not).
 /// The factory's record of a definition it runs on a schedule.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Scheduled {
@@ -1529,6 +1525,10 @@ impl StopCheck {
 }
 
 pub fn decision_problems(
+/// Why a director's decisions may not be carried out. Empty means they may.
+///
+/// `launchable` answers, for a bead ID, why the readiness check would refuse
+/// it (empty: it would not).
     definition: &GoalDefinition,
     goal: &Goal,
     tracker: &[Summary],
