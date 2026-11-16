@@ -979,6 +979,7 @@ fn edit_problems(edits: &[BeadEdit], tracker: &[Summary]) -> Vec<String> {
 
 /// The factory's record of a definition it runs on a schedule.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Scheduled {
     /// When the definition was first seen, or last ran. The next run is
     /// the first due time after this, so a time that was missed is made up
@@ -1524,11 +1525,11 @@ impl StopCheck {
     }
 }
 
-pub fn decision_problems(
 /// Why a director's decisions may not be carried out. Empty means they may.
 ///
 /// `launchable` answers, for a bead ID, why the readiness check would refuse
 /// it (empty: it would not).
+pub fn decision_problems(
     definition: &GoalDefinition,
     goal: &Goal,
     tracker: &[Summary],
@@ -5952,20 +5953,14 @@ impl Supervisor {
         }
     }
 
-    /// The record of a scheduled definition. One never seen before counts
-    /// from now, so its first run is at its next due time.
-    fn schedule_record(&self, project: &Project, definition: &str) -> Scheduled {
+    /// The record of a scheduled definition, if there is one that can be
+    /// read.
+    fn schedule_record(&self, project: &Project, definition: &str) -> Option<Scheduled> {
         let path = self
             .schedule_seat(project, definition)
             .dir
             .join("scheduled.json");
-        std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|text| serde_json::from_str(&text).ok())
-            .unwrap_or_else(|| Scheduled {
-                since: now_unix(),
-                ..Scheduled::default()
-            })
+        serde_json::from_str(&std::fs::read_to_string(&path).ok()?).ok()
     }
 
     fn save_schedule(&self, seat: &Seat, record: &Scheduled) -> Result<(), DriverError> {
@@ -5992,11 +5987,28 @@ impl Supervisor {
             return Ok(false);
         };
         let seat = self.schedule_seat(project, &definition.id);
-        let mut record = self.schedule_record(project, &definition.id);
-        if !seat.dir.join("scheduled.json").exists() {
-            // Seen for the first time: it counts from now.
-            self.save_schedule(&seat, &record)?;
-        }
+        let mut record = match self.schedule_record(project, &definition.id) {
+            Some(record) => record,
+            None => {
+                // Seen for the first time, it counts from now: its first
+                // run is at its next time. So does one whose record cannot
+                // be read, and the record is written again, or every look
+                // would count from that look and no run would ever be due.
+                let record = Scheduled {
+                    since: now_unix(),
+                    ..Scheduled::default()
+                };
+                if seat.dir.join("scheduled.json").exists() {
+                    self.log_at(
+                        &seat,
+                        "schedule.unreadable",
+                        json!({ "definition": definition.id, "counts_from": record.since }),
+                    );
+                }
+                self.save_schedule(&seat, &record)?;
+                record
+            }
+        };
         let due = record
             .retry_at
             .unwrap_or_else(|| schedule_due(schedule, record.since));
@@ -6054,6 +6066,9 @@ impl Supervisor {
             &tracker,
         );
         let check = |result: &Value| maintenance_problems(schedule, result);
+        // Where the run's transcript goes. A record put there by hand has
+        // no such directory beside it.
+        std::fs::create_dir_all(seat.dir.join("runs")).map_err(crate::io(&seat.dir))?;
         let turn = Turn {
             who: "maintainer",
             role: "maintainer",
@@ -7297,7 +7312,10 @@ impl Supervisor {
             .into_iter()
             .filter_map(|(project, definition)| {
                 let schedule = definition.schedule.as_ref()?;
-                let record = self.schedule_record(&project, &definition.id);
+                // One with no record yet gets it at the next look.
+                let Some(record) = self.schedule_record(&project, &definition.id) else {
+                    return Some(now_unix());
+                };
                 Some(
                     record
                         .retry_at

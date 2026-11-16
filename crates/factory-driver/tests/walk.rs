@@ -4629,6 +4629,26 @@ fn a_scheduled_definition_is_run_when_due_and_its_agent_only_files_beads() {
             .unwrap();
     assert!(events.contains("It filed nothing."), "{events}");
     assert_eq!(record().runs, 2);
+
+    // A record that cannot be read does not leave a schedule that never
+    // runs: it is written again, counting from now, and the log says so. A
+    // record that only lacks what a later release added is read.
+    std::fs::write(&record_path, "{\"since\": \"long ago\"}").unwrap();
+    assert!(!sup.pump(Duration::ZERO).unwrap());
+    let again = record();
+    assert!(again.runs == 0 && again.since + 60 > now(), "{again:?}");
+    let due = sup.next_due().unwrap();
+    assert!(due > now() && due <= now() + 7 * 86_400, "{due}");
+    let events =
+        std::fs::read_to_string(world.path("state/projects/toy/schedules/upkeep/events.jsonl"))
+            .unwrap();
+    assert!(events.contains("\"schedule.unreadable\""), "{events}");
+    assert_eq!(maintainers().len(), 3);
+    let partial: Scheduled = serde_json::from_str("{\"since\": 5, \"runs\": 2}").unwrap();
+    assert_eq!(
+        (partial.since, partial.runs, partial.retry_at),
+        (5, 2, None)
+    );
 }
 
 /// A goal whose definition names a stop check is complete when the command

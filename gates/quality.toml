@@ -133,3 +133,11 @@ bead = "sf-gl5.6"
 claim = "The Zig project has a scheduled definition whose maintainer's model is allowed and whose role prompt exists."
 command = ["sh", "-c", "cargo run --quiet --locked --offline --package factory-cli -- goal check --config config | grep -q 'temporal-sdk-zig/upkeep: scheduled, maintainer claude-'"]
 timeout_secs = 900
+
+[[check]]
+id = "schedule-found-at-start"
+tier = "host"
+bead = "sf-gl5.6"
+claim = "On a Temporal server started on this machine, with the real engine command: a project whose workflow waits with nothing due is given a schedule whose time has passed, and the worker started in the old one's place has it look at once; the overdue run is made in that turn, its bead is filed, and the workflow then waits for the next time without looking again."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-engine", "--test", "pipeline", "--", "a_schedule_new_to_a_project_is_run_when_a_worker_starts_with_it_overdue"]
+timeout_secs = 900

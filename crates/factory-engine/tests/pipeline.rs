@@ -1152,3 +1152,153 @@ async fn a_real_run_refused_at_a_limit_is_handed_the_next_account_by_the_account
     }
     shop.close().await;
 }
+
+/// A schedule a release brings is found when its worker starts. The
+/// project's workflow was waiting with nothing due, and learns of a due
+/// time only from a turn: the starting worker has it look, the run that is
+/// overdue is made in that turn, and the workflow then waits for the next.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_schedule_new_to_a_project_is_run_when_a_worker_starts_with_it_overdue() {
+    use factory_engine::tiers::{Project, project_id};
+
+    let prepare = |world: &World| {
+        world.with_github("green");
+        std::fs::create_dir_all(world.path("config/goals/toy")).unwrap();
+        std::fs::write(
+            world.path("config/goals/toy/main.toml"),
+            "id = \"main\"\ndefault = true\n[director]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\n",
+        )
+        .unwrap();
+    };
+    let Some(shop) =
+        Shop::open_with("engine-schedule", "true", "", prepare, "tiers = true\n").await
+    else {
+        return;
+    };
+    let world = &shop.world;
+    let client = shop.client();
+    let standing = || async {
+        client
+            .get_workflow_handle::<Project>(project_id("toy"))
+            .query(Project::standing, (), WorkflowQueryOptions::default())
+            .await
+            .ok()
+    };
+    let now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    };
+    let maintainers = || {
+        world
+            .calls()
+            .iter()
+            .filter(|call| call[0] == "maintainer")
+            .count()
+    };
+
+    // The project has no schedule yet: its workflow takes its first turn
+    // and waits, with nothing due.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let stands = standing().await;
+        if stands
+            .as_ref()
+            .is_some_and(|stands| stands.turns >= 1 && stands.waiting == 0)
+        {
+            let stands = stands.unwrap();
+            assert_eq!(
+                (stands.due_at, stands.trouble.clone()),
+                (None, None),
+                "{stands:?}"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the project never took a turn: {stands:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(world.calls().is_empty(), "{:?}", world.calls());
+
+    // A release brings a schedule, whose time passed while the old worker
+    // ran: the worker of that release is started in its place.
+    std::fs::write(
+        world.path("config/goals/toy/upkeep.toml"),
+        "id = \"upkeep\"\n[director]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\n[schedule]\nhour_utc = 4\nevery_days = 7\nmax_beads = 2\ncharter = \"Turn what keeps breaking into checks.\"\n",
+    )
+    .unwrap();
+    let record = world.path("state/projects/toy/schedules/upkeep/scheduled.json");
+    std::fs::create_dir_all(record.parent().unwrap()).unwrap();
+    std::fs::write(
+        &record,
+        serde_json::json!({ "since": now() - 8 * 86_400 }).to_string(),
+    )
+    .unwrap();
+    std::fs::create_dir_all(world.path("bin/state")).unwrap();
+    std::fs::write(
+        world.path("bin/state/maintainer-1.json"),
+        serde_json::json!({
+            "summary": "Cleanup on error paths keeps breaking.",
+            "digest": "One bead: a check that injects allocation failure.",
+            "journal": "Nothing else was worth a bead.",
+            "file": [{"title": "Check every error path for leaks", "type": "task", "priority": 3,
+                "description": "Error paths have leaked.", "acceptance_criteria": "A check fails when one leaks.",
+                "parent": "", "discovered_from": "", "deferred": true}]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    shop.replace_worker();
+
+    let ran = || -> u64 {
+        std::fs::read_to_string(&record)
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .and_then(|record| record["runs"].as_u64())
+            .unwrap_or(0)
+    };
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while ran() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the schedule was never run: {:?}, {:?}, {}",
+            world.calls(),
+            standing().await,
+            std::fs::read_to_string(record.with_file_name("events.jsonl")).unwrap_or_default()
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(maintainers(), 1, "{:?}", world.calls());
+    let filed = std::fs::read_dir(world.path("beads"))
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("filed-"))
+        .count();
+    assert_eq!(filed, 1);
+
+    // The workflow now knows when the next run is, and waits for it: it
+    // does not look again and again.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let stands = loop {
+        let stands = standing().await;
+        if let Some(stands) = stands.as_ref().filter(|stands| stands.due_at.is_some()) {
+            break stands.clone();
+        }
+        assert!(Instant::now() < deadline, "no next time: {stands:?}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    let due = stands.due_at.unwrap();
+    assert!(
+        due > now() + 3600 && due <= now() + 7 * 86_400,
+        "{stands:?}"
+    );
+    assert_eq!(stands.trouble, None, "{stands:?}");
+    let turns = stands.turns;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let later = standing().await.unwrap();
+    assert_eq!((later.turns, maintainers()), (turns, 1), "{later:?}");
+    shop.close().await;
+}
