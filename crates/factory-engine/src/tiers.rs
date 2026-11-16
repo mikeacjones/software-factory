@@ -20,7 +20,7 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 use factory_driver::Within;
-use factory_driver::goal::Event;
+use factory_driver::goal::{Event, Turned};
 use futures::FutureExt;
 use serde::{Deserialize, Serialize};
 use temporalio_client::errors::WorkflowInteractionError;
@@ -61,6 +61,14 @@ const AFTER_TROUBLE_SECS: u64 = 300;
 /// How long the listener and the watcher run before the intake hands
 /// over to a new run of itself, in seconds.
 pub const INTAKE_RUN_SECS: u64 = 24 * 3600;
+
+/// The least a project waits after a turn before it looks by itself
+/// again, in seconds, doubled each time a look changed nothing, up to
+/// [`IDLE_LOOK_MAX_SECS`]. Whatever was due when a turn was taken was
+/// dealt with in it, so a time that is still in the past afterwards is
+/// one no look will move.
+const IDLE_LOOK_SECS: u64 = 30;
+const IDLE_LOOK_MAX_SECS: u64 = 900;
 
 /// How a project's workflow is reached, and started if it is not there.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -218,19 +226,12 @@ fn unix(time: Option<std::time::SystemTime>) -> u64 {
 
 /// What a report of a pipeline is known by, if the event is one: the
 /// watcher tells a project again until the goal's record shows it heard.
+/// The pipeline's own name is part of it, since a unit that parked and
+/// was continued ends more than once.
 fn report_key(event: &Event) -> Option<String> {
     match event {
-        Event::Began { goal, bead, unit } => Some(format!("began {goal} {bead} {unit}")),
-        Event::Ended {
-            goal,
-            bead,
-            unit,
-            word,
-            ..
-        } => Some(format!(
-            "ended {goal} {bead} {} {word}",
-            unit.as_deref().unwrap_or("-")
-        )),
+        Event::Began { name, unit, .. } => Some(format!("began {name} {unit}")),
+        Event::Ended { name, word, .. } => Some(format!("ended {name} {word}")),
         _ => None,
     }
 }
@@ -304,6 +305,8 @@ impl Project {
         let mut later = input.later.clone();
         let mut due_at = input.due_at;
         let mut turns_here = 0u32;
+        // How many looks in a row found the same thing still due.
+        let mut idle_looks = 0u32;
         loop {
             let now = unix(ctx.workflow_time());
             // What was put off until now is handed in again.
@@ -377,7 +380,16 @@ impl Project {
                 event: event.clone(),
                 beat_secs: beat,
             };
-            let turned = ctx.execute_activity(Steps::turn, call, options).await?;
+            // A turn that could not be taken at all is the project's
+            // trouble, not its end: it goes on with the next thing.
+            let turned = match ctx.execute_activity(Steps::turn, call, options).await {
+                Ok(turned) => turned,
+                Err(err) => Turned {
+                    due_at,
+                    trouble: Some(format!("the turn could not be taken: {err}")),
+                    ..Turned::default()
+                },
+            };
             let now = unix(ctx.workflow_time());
             let mut started = Vec::new();
             let mut unread = None;
@@ -440,7 +452,15 @@ impl Project {
                     .await;
                 started.push(launch.bead.clone());
             }
-            due_at = turned.due_at;
+            // A look that leaves something overdue changed nothing about
+            // it: the next one comes later each time, never at once.
+            let overdue = turned.due_at.is_some_and(|at| at <= now);
+            idle_looks = match (&event, overdue) {
+                (Event::Tick, true) => idle_looks.saturating_add(1),
+                _ => 0,
+            };
+            let least = (IDLE_LOOK_SECS << idle_looks.min(5)).min(IDLE_LOOK_MAX_SECS);
+            due_at = turned.due_at.map(|at| at.max(now + least));
             let trouble = turned.trouble.clone().or(unread);
             if let Some(at) = turned.again_at {
                 later.push((at.max(now + 1), event));
@@ -574,21 +594,37 @@ impl Intake {
             beat_secs: beat,
             reach: input.reach.clone(),
         };
-        let listen = ctx.execute_activity(
-            Steps::listen,
-            call.clone(),
-            pump("Listen on Slack: each message or button press of the owner's is signalled to its project's workflow"),
-        );
-        let watch = ctx.execute_activity(
-            Steps::watch,
-            call,
-            pump("Watch the pipelines the goals' records say are running: tell each one's project when it has a unit and when it has ended"),
-        );
-        // When both have run their time, a new run takes over with a
-        // short history.
-        let (heard, seen) = futures::join!(listen, watch);
-        heard?;
-        seen?;
+        let mut listen = ctx
+            .execute_activity(
+                Steps::listen,
+                call.clone(),
+                pump("Listen on Slack: each message or button press of the owner's is signalled to its project's workflow"),
+            )
+            .fuse();
+        let mut watch = ctx
+            .execute_activity(
+                Steps::watch,
+                call,
+                pump("Watch the pipelines the goals' records say are running: tell each one's project when it has a unit and when it has ended"),
+            )
+            .fuse();
+        // When either has run its time, or has ended for a reason the
+        // server will not try again, a new run takes over and starts both
+        // afresh. The one still running finds out with its next sign of
+        // life, and ends.
+        let ended_well = futures::select_biased! {
+            heard = listen => heard.is_ok(),
+            seen = watch => seen.is_ok(),
+        };
+        if !ended_well {
+            let pause = TimerOptions::builder(Duration::from_secs(30))
+                .summary(
+                    "The listener or the watcher ended in a failure the server does not try again: wait a little, then start both afresh"
+                        .to_string(),
+                )
+                .build();
+            ctx.timer(pause).await;
+        }
         match ctx.continue_as_new(input, ContinueAsNewOptions::default())? {}
     }
 }

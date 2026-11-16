@@ -259,7 +259,9 @@ pub fn event(event: &factory_driver::goal::Event) -> String {
         Event::Slack(Incoming::Action {
             action_id, value, ..
         }) => format!("the owner pressed `{action_id}` on `{value}`"),
-        Event::Began { goal, bead, unit } => {
+        Event::Began {
+            goal, bead, unit, ..
+        } => {
             format!("the pipeline for `{bead}` of goal `{goal}` has its unit, `{unit}`")
         }
         Event::Ended {

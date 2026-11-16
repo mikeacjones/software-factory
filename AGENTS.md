@@ -27,7 +27,10 @@ factory bead <project> <bead> --config config  # may this bead be launched, and 
 factory run <project> <bead> --config config   # walk one bead to a pull request
 factory run --unit <unit> --config config      # continue a stopped or parked unit
 factory run --unit <unit> --from <step> --config config  # owner's override: move a unit to a step of the current flow
-factory serve --config config                  # the always-on service: Slack socket, goals, pipelines
+factory serve --config config                  # what launchd starts: becomes the engine's worker
+factory-engine project <project> --config config   # where a project's tiers stand on the engine
+factory-engine standing <pipeline> --config config # where a pipeline stands
+factory-engine accounts --config config            # what the accounts workflow knows
 factory goal check --config config             # are the goal definitions sound?
 factory goal list --config config              # every goal and where it stands
 factory slack check --config config            # does the Slack socket connect?

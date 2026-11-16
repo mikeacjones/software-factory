@@ -704,6 +704,7 @@ impl Steps {
                         .or(pipeline.unit.clone()),
                     word: word.to_string(),
                     rest,
+                    name: pipeline.name.clone(),
                 };
                 let status = match handle.describe(WorkflowDescribeOptions::default()).await {
                     Ok(description) => description.status(),
@@ -743,6 +744,7 @@ impl Steps {
                                 goal: pipeline.goal.clone(),
                                 bead: pipeline.bead.clone(),
                                 unit: standing.unit,
+                                name: pipeline.name.clone(),
                             },
                             _ => continue,
                         }

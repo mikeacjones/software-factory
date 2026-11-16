@@ -499,11 +499,14 @@ fn engine_ended(
 pub enum Event {
     /// The owner wrote or pressed something in Slack.
     Slack(Incoming),
-    /// A pipeline has a unit.
+    /// A pipeline has a unit. `name` is what the pipeline is called
+    /// where it runs: a bead may have more than one pipeline in its time.
     Began {
         goal: String,
         bead: String,
         unit: String,
+        #[serde(default)]
+        name: String,
     },
     /// A pipeline ended. `word` and `rest` are what the engine said of
     /// it: `end` with how as JSON, `refused` or `failed` with why.
@@ -514,6 +517,8 @@ pub enum Event {
         unit: Option<String>,
         word: String,
         rest: String,
+        #[serde(default)]
+        name: String,
     },
     /// Nothing happened, but something may have come due.
     Tick,
@@ -2715,7 +2720,9 @@ impl Supervisor {
     fn apply(&mut self, event: Event) -> Result<(), DriverError> {
         match event {
             Event::Slack(incoming) => self.incoming(incoming)?,
-            Event::Began { goal, bead, unit } => self.pipeline_began(&goal, &bead, &unit),
+            Event::Began {
+                goal, bead, unit, ..
+            } => self.pipeline_began(&goal, &bead, &unit),
             Event::Ended {
                 goal,
                 bead,
@@ -2723,6 +2730,7 @@ impl Supervisor {
                 unit,
                 word,
                 rest,
+                ..
             } => self.pipeline_ended(&goal, &bead, ship, unit.as_deref(), &word, &rest),
             Event::Tick => {}
             Event::Resume => self.resume()?,
@@ -5698,16 +5706,29 @@ impl Supervisor {
     /// to try again, a note to an executive to deal with, a bead waiting
     /// to be closed. `None` if only an event can move it.
     pub fn next_due(&self) -> Option<u64> {
-        let goals = self.goals.values().filter_map(|goal| goal.retry_at);
+        // Only what a later look would act on: a time left on the record
+        // of an agent that has nothing to read, or whose goal has
+        // stopped, moves nothing however often it is looked at.
+        let goals = self
+            .goals
+            .values()
+            .filter(|goal| goal.phase == Phase::Running && !goal.inbox.is_empty())
+            .filter_map(|goal| goal.retry_at);
         let foremen = self
             .goals
             .values()
             .filter(|goal| goal.phase == Phase::Running)
             .flat_map(|goal| goal.subgoals.iter())
             .filter(|sub| sub.state == "open")
-            .filter_map(|sub| sub.foreman.as_ref().and_then(|foreman| foreman.retry_at));
+            .filter_map(|sub| sub.foreman.as_ref())
+            .filter(|foreman| !foreman.inbox.is_empty())
+            .filter_map(|foreman| foreman.retry_at);
         let desks = self.executives.values().flat_map(|executive| {
-            let memos = (!executive.memos.is_empty()).then_some(executive.desk_retry_at);
+            let seated = self
+                .config
+                .project(&executive.project)
+                .is_ok_and(|project| project.executive.is_some());
+            let memos = (seated && !executive.memos.is_empty()).then_some(executive.desk_retry_at);
             // A bead waiting for another to land is looked at when
             // something ends, and now and then besides.
             let pending =

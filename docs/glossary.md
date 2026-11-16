@@ -100,7 +100,15 @@ The files and directories a foreman sets aside for a bead that runs beside other
 
 ## release
 
-One build of the factory together with the config that build reads, kept in a directory of its own. launchd runs the service from the current release, which a link names; a deploy makes a new release and moves the link.
+One build of the factory and of the engine together with the config that build reads, kept in a directory of its own. launchd runs the worker from the current release, which a link names; a deploy makes a new release and moves the link.
+
+## worker
+
+The one process of the factory on a machine: it does the work of the workflows on the Temporal server, which are where everything waits. (Before the engine, "worker" also meant an agent's session; a role's run is now called a run.)
+
+## turn
+
+One thing that happened to a project, dealt with by its tiers: what the owner wrote or pressed, a pipeline that has its unit or has ended, or a time that came due. A project's workflow takes its turns one at a time, each as one activity, in which the executive, the directors and the foremen concerned read the goals' records, decide, and leave the records as they decided.
 
 ## tick
 
