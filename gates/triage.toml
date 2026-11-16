@@ -67,3 +67,11 @@ bead = "sf-0kw.8"
 claim = "In every flow, each fix step routes already_done, and the ship flow's sends it to sync."
 command = ["sh", "-c", "for f in config/flows/*.toml; do awk '/^\\[\\[step\\]\\]/{if(fix&&!ad){print FILENAME\": fix does not route already_done\"; bad=1} fix=0; ad=0} /^id = \"fix\"/{fix=1} fix&&/^on\\.already_done/{ad=1} END{if(fix&&!ad){print FILENAME\": fix does not route already_done\"; bad=1} exit bad}' \"$f\" || exit 1; done; grep -q 'on.already_done = { to = \"sync\"' config/flows/zig-sdk-ship.toml"]
 timeout_secs = 60
+
+[[check]]
+id = "parked-ship-starts-from-sync"
+tier = "hermetic"
+bead = "sf-0kw.7"
+claim = "A sub-goal whose ship parked before its pull request was opened, shipped again by its director, goes on from the start of the ship flow: the default branch is taken in again, every check runs, no builder is sent to the step it parked in, and it lands; a unit whose base moves forgets the failures it remembered."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-driver", "--test", "walk", "--", "a_parked_ship_shipped_again_starts_from_its_sync"]
+timeout_secs = 900

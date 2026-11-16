@@ -7723,6 +7723,28 @@ impl Supervisor {
             sub.id,
             ship.closes.len()
         ));
+        // A ship that parked before its pull request was opened goes on from
+        // the start of its flow, not from where it stopped: the default
+        // branch may have moved while it waited, and what parked it may
+        // have been dealt with there. Its first step takes the default
+        // branch in, and every check runs on what will land.
+        let again = sub.ship_unit.as_deref().and_then(|unit| {
+            let record = crate::Driver::read_unit(&self.config, unit).ok()?;
+            if record.pull_request.is_some() {
+                return None;
+            }
+            let mut with_ship = project.clone();
+            with_ship.flow = definition.ship_flow.clone()?;
+            let (flow, _) = crate::load_flow(&self.config, &self.factory, &with_ship).ok()?;
+            Some(Again {
+                from: flow.start.clone(),
+                note: format!(
+                    "The sub-goal is shipped again after its ship stopped at `{}`. It goes on from the start of the ship's flow, so the default branch is taken in again and every check runs on what will land.",
+                    record.position.step
+                ),
+                ruling: None,
+            })
+        });
         let flow = definition.ship_flow.clone();
         self.launch(
             goal,
@@ -7730,7 +7752,7 @@ impl Supervisor {
             sub.id.clone(),
             Some(Within::Ship(ship)),
             sub.ship_unit.clone(),
-            None,
+            again,
         );
         Ok(())
     }

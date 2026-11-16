@@ -4294,6 +4294,8 @@ impl Driver {
         let head = factory_git::rev_parse(&worktree, "HEAD")?;
         let from = std::mem::replace(&mut self.unit.base, tip.to_string());
         self.unit.checkpoint = head.clone();
+        // On a new base a failure seen before says nothing about the next.
+        self.unit.failures.clear();
         self.event(
             "tip.merged",
             Some(&step.id),

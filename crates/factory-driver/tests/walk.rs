@@ -6026,3 +6026,137 @@ fn a_fix_that_finds_nothing_to_change_goes_on_through_the_checks() {
         "an already_done fix is accepted as it is"
     );
 }
+
+/// A ship that parked before its pull request, shipped again, goes on from
+/// the start of its flow: the default branch is taken in again and every
+/// check runs, and no builder is sent to the step it parked in.
+#[test]
+fn a_parked_ship_shipped_again_starts_from_its_sync() {
+    use factory_driver::goal::{Phase, Supervisor};
+    use factory_slack::socket::Incoming;
+    use std::time::{Duration, Instant};
+
+    // The ship's first test run fails for the host (a broken download), in
+    // the sub-goal's worktree only; every later run passes.
+    let world = triage_world(
+        "ship-again",
+        "case $PWD in *feature*) if [ ! -f {root}/failed-once ]; then touch {root}/failed-once; echo 'invalid ephemeral server download'; exit 1; fi ;; esac",
+        "could_not_run_when = [\"invalid ephemeral server download\"]\n",
+    );
+    world.with_github("green");
+    let project = world.path("config/projects/toy.toml");
+    let text = std::fs::read_to_string(&project).unwrap().replace(
+        "merge_subject = \"Merge bead/{bead_short}: {title}\"",
+        "merge_method = \"squash\"\nmerge_subject = \"{title} (#{number})\"",
+    );
+    std::fs::write(&project, text).unwrap();
+    std::fs::create_dir_all(world.path("config/goals/toy")).unwrap();
+    std::fs::write(
+        world.path("config/goals/toy/main.toml"),
+        "id = \"main\"\nflow = \"zig-sdk-bead\"\nship_flow = \"zig-sdk-ship\"\n[director]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\n",
+    )
+    .unwrap();
+    let say = |role: &str, n: u32, json: String| {
+        std::fs::create_dir_all(world.path("bin/state")).unwrap();
+        std::fs::write(world.path(&format!("bin/state/{role}-{n}.json")), json).unwrap();
+    };
+    let decide = |fields: &str| {
+        let mut result = serde_json::json!({
+            "summary": "Decided.", "start": [], "file": [], "edit": [], "dropped_findings": [],
+            "open_subgoal": {"id": "", "title": "", "objective": "", "beads": []}, "ship": false,
+            "ask_owner": "", "complete": false, "evidence": "", "journal_entry": "", "project_memory": ""
+        });
+        let extra: serde_json::Value = serde_json::from_str(fields).unwrap();
+        for (key, value) in extra.as_object().unwrap() {
+            result[key] = value.clone();
+        }
+        result.to_string()
+    };
+    say("intake", 1, r#"{"reply":"Here is the charter.","ready":true,"objective":"Ship the feature.","stop_when":"It has landed.","plan":"One sub-goal: toy-1.","edits":[]}"#.to_string());
+    say(
+        "director",
+        1,
+        decide(
+            r#"{"open_subgoal":{"id":"feature","title":"The feature","objective":"It works.","beads":["toy-1"]},"start":[{"bead":"toy-1","reason":"first"}]}"#,
+        ),
+    );
+    say("director", 2, decide(r#"{"ship":true}"#));
+    say("director", 3, decide(r#"{"ship":true}"#));
+    say(
+        "director",
+        4,
+        decide(r#"{"complete":true,"evidence":"It landed."}"#),
+    );
+
+    let mut sup = Supervisor::new(world.config(), None, vec!["OWNER".to_string()], false).unwrap();
+    let id = sup.open_directly("toy", "Ship the feature").unwrap();
+    sup.incoming(Incoming::Action {
+        channel: String::new(),
+        user: "OWNER".to_string(),
+        action_id: "goal_start".to_string(),
+        value: id.clone(),
+        message_ts: String::new(),
+    })
+    .unwrap();
+    let goal = |sup: &Supervisor| sup.goals().next().unwrap().clone();
+    let wait_for = |sup: &mut Supervisor, wakes: u32| {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while sup.goals().next().unwrap().wakes < wakes {
+            assert!(
+                Instant::now() < deadline,
+                "the goal never reached wake {wakes}"
+            );
+            sup.pump(Duration::from_millis(200)).unwrap();
+        }
+    };
+
+    // The ship parks at its first test run, for the host.
+    wait_for(&mut sup, 3);
+    let ship_unit = goal(&sup)
+        .units
+        .iter()
+        .find(|unit| unit.ship)
+        .and_then(|unit| unit.unit.clone())
+        .expect("the ship has a unit");
+    let ship_log = || {
+        std::fs::read_to_string(world.path(&format!("state/units/{ship_unit}/events.jsonl")))
+            .unwrap()
+    };
+    assert!(
+        ship_log().contains("\"kind\":\"command.host_fault\""),
+        "{}",
+        ship_log()
+    );
+
+    // Shipped again, it goes on from its sync and lands.
+    wait_for(&mut sup, 4);
+    let done = goal(&sup);
+    assert_eq!(done.phase, Phase::ProposedComplete);
+    assert_eq!(done.subgoals[0].state, "landed");
+    let log = ship_log();
+    let resumed: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("\"kind\":\"unit.redirected\""))
+        .collect();
+    let steps: Vec<String> = log
+        .lines()
+        .filter(|line| line.contains("\"kind\":\"step.") || line.contains("\"kind\":\"unit."))
+        .map(|line| {
+            let event: serde_json::Value = serde_json::from_str(line).unwrap();
+            format!("{} {} {}", event["kind"], event["step"], event["data"])
+        })
+        .collect();
+    assert_eq!(resumed.len(), 1, "{steps:#?}");
+    assert!(resumed[0].contains("\"step\":\"sync\""), "{resumed:?}");
+    let syncs = log
+        .lines()
+        .filter(|line| {
+            line.contains("\"kind\":\"step.started\"") && line.contains("\"step\":\"sync\"")
+        })
+        .count();
+    assert_eq!(syncs, 2, "the default branch is taken in again");
+    assert!(
+        !log.contains("\"step\":\"fix\""),
+        "no builder was sent to the ship"
+    );
+}
