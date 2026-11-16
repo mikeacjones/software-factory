@@ -23,7 +23,10 @@ use factory_brief::{
     Brief, ClassCount, Contract, Note, classes_for_builder, classes_for_tester, contract_of,
     findings_text, render, result_problems,
 };
-use factory_checks::{Verdict, first_match, run_command, scope_violations, weakened_tests};
+use factory_checks::{
+    CommandResult, Verdict, copy_at_base, failure_signature, first_match, host_fault, run_command,
+    run_command_with_grace, scope_violations, weakened_tests,
+};
 use factory_claude::accounts::{
     AccountError, Choice, Known, Refresh, TOKEN_URL, TokenSource, Tracker, USAGE_API, Vault,
     choose, read_usage, session_token,
@@ -213,8 +216,22 @@ pub struct Unit {
     /// merged into this unit's, for the builder to resolve.
     #[serde(default)]
     pub conflicts: Vec<String>,
+    /// How each command step last failed, until it passes again: a step that
+    /// fails the same way once more parks, since another fix round is
+    /// likely to go as the last one did.
+    #[serde(default)]
+    pub failures: BTreeMap<String, Failure>,
     pub runs: u32,
     pub started_at: u64,
+}
+
+/// A command step's failure, made comparable with its next one.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Failure {
+    /// [`factory_checks::failure_signature`] of its output.
+    pub signature: String,
+    /// The commit it failed on.
+    pub commit: String,
 }
 
 /// Something a command step wrote for later steps, such as a directory of
@@ -772,6 +789,50 @@ pub fn bead_source(project: &Project) -> Source {
     }
 }
 
+/// A command step's run that failed, as the factory looks into it.
+struct Failed<'a> {
+    name: &'a str,
+    command: &'a factory_config::CommandSpec,
+    argv: &'a [String],
+    result: &'a CommandResult,
+    /// How it failed, as the thread says it.
+    how: &'a str,
+    /// Where its output was kept.
+    output: &'a Path,
+}
+
+/// What looking into a failure came to.
+enum Triaged {
+    /// The step ends here, not at a builder: passed as a flake, or parked.
+    End(StepEnd),
+    /// The failure goes to the builder, with what was found on the way.
+    Found(Vec<String>),
+}
+
+/// What a run on the base said.
+enum AtBase {
+    /// It failed there too: the park reason.
+    FailsToo(String),
+    /// Something for the builder to know; the failure stays the change's.
+    Found(String),
+}
+
+fn verdict_text(verdict: &Verdict) -> String {
+    match verdict {
+        Verdict::Passed => "passed".to_string(),
+        Verdict::Failed { code } => format!(
+            "failed (exit code {})",
+            code.map_or("none".to_string(), |c| c.to_string())
+        ),
+        Verdict::TimedOut => "timed out".to_string(),
+        Verdict::CouldNotRun(why) => format!("could not run ({why})"),
+    }
+}
+
+fn short_commit(commit: &str) -> &str {
+    &commit[..commit.len().min(10)]
+}
+
 fn duration_text(seconds: u64) -> String {
     match (seconds / 3600, (seconds % 3600) / 60, seconds % 60) {
         (0, 0, s) => format!("{s}s"),
@@ -1003,6 +1064,7 @@ impl Driver {
                 strayed: Vec::new(),
                 trespassed: BTreeMap::new(),
                 rulings: Vec::new(),
+                failures: BTreeMap::new(),
                 conflicts: Vec::new(),
                 runs: 0,
                 started_at,
@@ -1131,6 +1193,9 @@ impl Driver {
                 unit.position.step = step.to_string();
                 *unit.position.rounds.entry(step.to_string()).or_insert(0) += 1;
                 unit.in_step = None;
+                // Whoever moves a unit by hand has a reason to try again: a
+                // failure seen before is no reason to stop this time.
+                unit.failures.clear();
                 flow
             }
         };
@@ -2879,10 +2944,11 @@ impl Driver {
             step.id,
             escape(&shown)
         ));
-        let result = run_command(
+        let result = run_command_with_grace(
             &argv,
             &self.unit.worktree,
             Duration::from_secs(command.timeout_secs),
+            Duration::from_secs(command.stop_grace_secs),
         );
         let output_path = self.artifact(&format!("{}-output.txt", step.id), &result.output)?;
         let secs = result.duration.as_secs();
@@ -3009,6 +3075,7 @@ impl Driver {
             },
         );
         if passed {
+            self.unit.failures.remove(&step.id);
             self.thread.say(&format!(
                 ":white_check_mark: *{}* · `{}` {how} · {}",
                 step.id,
@@ -3017,8 +3084,37 @@ impl Driver {
             ));
             return Ok(StepEnd::Outcome("pass".to_string()));
         }
+        let mut found = Vec::new();
+        if matches!(policy, ExitPolicy::MustPass)
+            && matches!(result.verdict, Verdict::Failed { .. } | Verdict::TimedOut)
+        {
+            let failed = Failed {
+                name,
+                command: &command,
+                argv: &argv,
+                result: &result,
+                how: &how,
+                output: &output_path,
+            };
+            match self.triage(step, &failed)? {
+                Triaged::End(end) => return Ok(end),
+                Triaged::Found(lines) => found = lines,
+            }
+        }
+        let found = if found.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n\nWhat the factory found out before sending you:\n\n{}",
+                found
+                    .iter()
+                    .map(|line| format!("- {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        };
         self.unit.feedback = Some(format!(
-            "The command `{name}` (`{runnable}`) {how}, run by the factory in your worktree on commit `{short}`.\n\nThe end of its output:\n\n```\n{}\n```\n\nThe full output is in `{}`.",
+            "The command `{name}` (`{runnable}`) {how}, run by the factory in your worktree on commit `{short}`.\n\nThe end of its output:\n\n```\n{}\n```\n\nThe full output is in `{}`.{found}",
             tail(&result.output, 150),
             output_path.display()
         ));
@@ -3030,6 +3126,220 @@ impl Driver {
             code_block(&truncate(&tail(&result.output, 25), 2400))
         ));
         Ok(StepEnd::Outcome("fail".to_string()))
+    }
+
+    /// Find out, before a builder is sent, whether a failed check is the
+    /// change's: the project's word that the host was at fault, a run once
+    /// more on the change, a run on the code as it was at the base, and
+    /// whether it failed the same way as the last time. Each but the first
+    /// and the last only where the project's command turns it on.
+    fn triage(&mut self, step: &Step, failed: &Failed) -> Result<Triaged, DriverError> {
+        let name = failed.name;
+        let command = failed.command;
+        let code = match failed.result.verdict {
+            Verdict::Failed { code } => code,
+            _ => None,
+        };
+        if let Some(why) = host_fault(
+            &failed.result.output,
+            code,
+            &command.could_not_run_when,
+            &command.could_not_run_exit,
+        )? {
+            self.event(
+                "command.host_fault",
+                Some(&step.id),
+                json!({ "command": name, "why": why }),
+            )?;
+            return Ok(Triaged::End(StepEnd::Park(format!(
+                "the command `{name}` {} and could not run properly: {why}. The host is at fault, not the change, so no builder was sent. Its output is in `{}`.",
+                failed.how,
+                failed.output.display()
+            ))));
+        }
+        let mut found = Vec::new();
+        if command.triage.rerun {
+            self.thread.status(&format!(
+                ":arrows_counterclockwise: *{}* · `{}` {}: running it once more",
+                step.id,
+                escape(&command.display()),
+                failed.how
+            ));
+            let again = run_command_with_grace(
+                failed.argv,
+                &self.unit.worktree,
+                Duration::from_secs(command.timeout_secs),
+                Duration::from_secs(command.stop_grace_secs),
+            );
+            let path = self.artifact(&format!("{}-rerun-output.txt", step.id), &again.output)?;
+            self.event(
+                "command.rerun",
+                Some(&step.id),
+                json!({
+                    "command": name, "verdict": format!("{:?}", again.verdict),
+                    "secs": again.duration.as_secs(), "output": path,
+                }),
+            )?;
+            if again.verdict == Verdict::Passed {
+                self.event(
+                    "command.flaky",
+                    Some(&step.id),
+                    json!({ "command": name, "first": failed.output, "rerun": path }),
+                )?;
+                self.unit.failures.remove(&step.id);
+                self.unit.notes.insert(
+                    step.id.clone(),
+                    Note {
+                        title: format!("Check `{name}`"),
+                        body: format!(
+                            "`{}` {} on commit `{}` and passed when run again: a flake. Both outputs are kept (`{}`, `{}`).",
+                            command.display(),
+                            failed.how,
+                            short_commit(&self.unit.checkpoint),
+                            failed.output.display(),
+                            path.display()
+                        ),
+                    },
+                );
+                self.thread.say(&format!(
+                    ":recycle: *{}* · `{}` {} and then passed when run again: a flake, not the change's, recorded and passed",
+                    step.id,
+                    escape(&command.display()),
+                    failed.how
+                ));
+                return Ok(Triaged::End(StepEnd::Outcome("pass".to_string())));
+            }
+            found.push(format!(
+                "Run once more on the change, it {} again (`{}`).",
+                verdict_text(&again.verdict),
+                path.display()
+            ));
+        }
+        if command.triage.base {
+            match self.run_at_base(step, failed)? {
+                AtBase::FailsToo(reason) => return Ok(Triaged::End(StepEnd::Park(reason))),
+                AtBase::Found(line) => found.push(line),
+            }
+        }
+        let signature = failure_signature(&failed.result.output, &command.failure_lines)?;
+        if let Some(previous) = self.unit.failures.get(&step.id)
+            && previous.signature == signature
+        {
+            let reason = format!(
+                "the command `{name}` {} the same way as it did on commit `{}`, after the fix round between: another round is likely to go as that one did, so none was sent. What failed, both times:\n\n{}\n\nThe output is in `{}`.",
+                failed.how,
+                short_commit(&previous.commit),
+                truncate(&signature, 1500),
+                failed.output.display()
+            );
+            self.event(
+                "command.repeated",
+                Some(&step.id),
+                json!({ "command": name, "commit": self.unit.checkpoint, "previous": previous.commit }),
+            )?;
+            return Ok(Triaged::End(StepEnd::Park(reason)));
+        }
+        self.unit.failures.insert(
+            step.id.clone(),
+            Failure {
+                signature,
+                commit: self.unit.checkpoint.clone(),
+            },
+        );
+        Ok(Triaged::Found(found))
+    }
+
+    /// Run a failed command on a copy of the worktree with every file the
+    /// change touched put back as it is at the unit's base.
+    fn run_at_base(&mut self, step: &Step, failed: &Failed) -> Result<AtBase, DriverError> {
+        let name = failed.name;
+        let command = failed.command;
+        let base = self.unit.base.clone();
+        let short_base = short_commit(&base);
+        self.thread.status(&format!(
+            ":arrows_counterclockwise: *{}* · `{}` {}: running it on the base `{short_base}`",
+            step.id,
+            escape(&command.display()),
+            failed.how
+        ));
+        let dest = self.dir.join(format!("at-base-{:03}", self.unit.runs));
+        let result = match copy_at_base(&self.unit.worktree, &base, &dest) {
+            Ok(_) => run_command_with_grace(
+                failed.argv,
+                &dest,
+                Duration::from_secs(command.timeout_secs),
+                Duration::from_secs(command.stop_grace_secs),
+            ),
+            Err(err) => {
+                let _ = std::fs::remove_dir_all(&dest);
+                self.event(
+                    "command.base",
+                    Some(&step.id),
+                    json!({ "command": name, "base": base, "error": err.to_string() }),
+                )?;
+                return Ok(AtBase::Found(format!(
+                    "It could not be run on the base `{short_base}`: {err}."
+                )));
+            }
+        };
+        let _ = std::fs::remove_dir_all(&dest);
+        let _ = std::fs::remove_file(dest.with_extension("index"));
+        let path = self.artifact(&format!("{}-base-output.txt", step.id), &result.output)?;
+        self.event(
+            "command.base",
+            Some(&step.id),
+            json!({
+                "command": name, "base": base, "verdict": format!("{:?}", result.verdict),
+                "secs": result.duration.as_secs(), "output": path,
+            }),
+        )?;
+        let code = match result.verdict {
+            Verdict::Passed => {
+                return Ok(AtBase::Found(format!(
+                    "On the base `{short_base}`, with every file the change touched put back, it passed: the failure comes with the change (`{}`).",
+                    path.display()
+                )));
+            }
+            Verdict::CouldNotRun(ref why) => {
+                return Ok(AtBase::Found(format!(
+                    "On the base `{short_base}` it could not run ({why}), so nothing is known from there."
+                )));
+            }
+            Verdict::Failed { code } => code,
+            Verdict::TimedOut => None,
+        };
+        if let Some(why) = host_fault(
+            &result.output,
+            code,
+            &command.could_not_run_when,
+            &command.could_not_run_exit,
+        )? {
+            return Ok(AtBase::Found(format!(
+                "On the base `{short_base}` it could not run properly ({why}), so nothing is known from there."
+            )));
+        }
+        if !command.failure_lines.is_empty() {
+            let here = failure_signature(&failed.result.output, &command.failure_lines)?;
+            let there = failure_signature(&result.output, &command.failure_lines)?;
+            if !here
+                .lines()
+                .any(|line| there.lines().any(|other| other == line))
+            {
+                return Ok(AtBase::Found(format!(
+                    "On the base `{short_base}` it {} too, but on other things: what fails with the change does not fail there, so it is the change's (`{}`).",
+                    verdict_text(&result.verdict),
+                    path.display()
+                )));
+            }
+        }
+        Ok(AtBase::FailsToo(format!(
+            "the command `{name}` {} on the change, and {} on the base `{short_base}` as well, with every file the change touched put back: the failure is not the change's, so no builder was sent. The change's output is in `{}`, the base's in `{}`. The end of the base's:\n\n```\n{}\n```",
+            failed.how,
+            verdict_text(&result.verdict),
+            failed.output.display(),
+            path.display(),
+            tail(&result.output, 30)
+        )))
     }
 
     /// An action could not do its job. Routed as `failed` if the flow routes

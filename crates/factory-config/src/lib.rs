@@ -540,6 +540,50 @@ pub struct CommandSpec {
     /// results that must never pass.
     #[serde(default)]
     pub fail_when: Vec<String>,
+    /// How long the command has, after SIGTERM at its timeout, to stop what
+    /// it started and print what it has before it is killed.
+    #[serde(default = "default_stop_grace")]
+    pub stop_grace_secs: u64,
+    /// Patterns (regular expressions, matched line by line on the output of
+    /// a run that failed or timed out) that mean the host was at fault, not
+    /// the code: a download that came back broken, a daemon that is not
+    /// running. Such a run counts as one that could not run, and parks the
+    /// step: no fix round can help.
+    #[serde(default)]
+    pub could_not_run_when: Vec<String>,
+    /// Exit codes that mean the same, for a tool that says so by its code.
+    #[serde(default)]
+    pub could_not_run_exit: Vec<i32>,
+    /// Patterns that pick out the lines of a failed run's output that name
+    /// what failed (a test, a compiler error), for telling one failure from
+    /// another. Without them the last lines of the output stand for it.
+    #[serde(default)]
+    pub failure_lines: Vec<String>,
+    /// What the factory finds out about a failed run before a builder is
+    /// sent to fix it.
+    #[serde(default)]
+    pub triage: Triage,
+}
+
+/// Runs the factory makes of a command that failed, to tell a failure of the
+/// change from one that is not: each is off unless the project turns it on,
+/// because each costs another run of the command.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Triage {
+    /// Run it once more on the change. A pass makes the failure a flake: the
+    /// step passes, and the flake is recorded.
+    #[serde(default)]
+    pub rerun: bool,
+    /// Run it on the code as it was at the unit's base: a copy of the
+    /// worktree with every file the change touched put back. A failure there
+    /// too is not the change's, and parks the step for whoever decides.
+    #[serde(default)]
+    pub base: bool,
+}
+
+fn default_stop_grace() -> u64 {
+    30
 }
 
 impl CommandSpec {

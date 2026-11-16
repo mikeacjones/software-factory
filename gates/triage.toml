@@ -1,0 +1,53 @@
+# Triage: a check that fails for a reason outside the change does not go to a
+# builder. Each check is an acceptance line of a bead in epic sf-0kw.
+id = "triage"
+title = "A failed check is looked into before a builder is sent"
+bead = "sf-0kw"
+
+[[check]]
+id = "stop-at-the-limit"
+tier = "hermetic"
+bead = "sf-0kw.1"
+claim = "At its time limit a command's process group gets SIGTERM and a grace period before SIGKILL: a script's trap runs, stops what it started and what it prints then is in the output; one that ignores the request is killed when its grace is over; and a copy of a worktree is given the files a change touched back as they were, modes and binary contents included, without touching the worktree or its index."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-supervise", "--package", "factory-git", "--", "a_command_at_its_timeout_is_asked_to_stop", "a_command_that_ignores_the_request_to_stop", "a_copy_of_a_worktree_gets_the_files"]
+timeout_secs = 600
+
+[[check]]
+id = "test-linux-stops-and-says"
+tier = "hermetic"
+bead = "sf-0kw.1"
+claim = "test-linux.sh parses, stops its containers and prints what each configuration got to when it is sent SIGTERM, and passes --test-timeout to zig build test unless one is given; the Zig project's own test commands pass --test-timeout."
+command = ["sh", "-c", "sh -n config/tools/temporal-sdk-zig/test-linux.sh && grep -q 'trap stopped TERM' config/tools/temporal-sdk-zig/test-linux.sh && grep -q -- '--test-timeout \"$TEST_TIMEOUT\"' config/tools/temporal-sdk-zig/test-linux.sh && test $(grep -c '\"--test-timeout\", \"10m\"' config/projects/temporal-sdk-zig.toml) -eq 3"]
+timeout_secs = 60
+
+[[check]]
+id = "run-on-the-base"
+tier = "hermetic"
+bead = "sf-0kw.2"
+claim = "A failed check whose command turns on triage.base is run on a copy of the worktree with every file the change touched put back as at the unit's base; a failure there too parks the unit with both results and no builder is sent, and a pass there sends the builder with a line saying the base passed. The copy is removed and the worktree keeps the change."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-checks", "--package", "factory-driver", "--", "a_copy_at_the_base_holds_the_code_as_it_was", "a_check_that_fails_on_the_base_too_parks_without_a_fix_round", "a_check_that_passes_on_the_base_goes_to_the_builder_with_that_said"]
+timeout_secs = 900
+
+[[check]]
+id = "flake"
+tier = "hermetic"
+bead = "sf-0kw.3"
+claim = "A failed check whose command turns on triage.rerun and passes when run again passes the step, records a command.flaky event and says so in the thread, and no builder is sent."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-driver", "--test", "walk", "--", "a_check_that_passes_when_run_again_is_a_flake"]
+timeout_secs = 900
+
+[[check]]
+id = "host-fault"
+tier = "hermetic"
+bead = "sf-0kw.4"
+claim = "A failed run whose output matches one of its command's could_not_run_when patterns, or whose exit code is one of could_not_run_exit, parks the step with the line that matched, and no builder is sent."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-checks", "--package", "factory-driver", "--", "the_host_is_named_at_fault", "a_failure_the_project_names_as_the_hosts_parks_without_a_fix_round"]
+timeout_secs = 900
+
+[[check]]
+id = "same-failure-twice"
+tier = "hermetic"
+bead = "sf-0kw.5"
+claim = "A failure's signature is the lines its command's failure_lines pick out, or its last lines, with numbers, hex and paths taken out, and is the same across runs of the same failure and different for another; a check that fails with the same signature after a fix round parks with both, instead of routing another fix."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-checks", "--package", "factory-driver", "--", "a_failure_is_the_same_failure_across_runs", "a_check_that_fails_the_same_way_after_a_fix_parks_instead_of_another_round"]
+timeout_secs = 900

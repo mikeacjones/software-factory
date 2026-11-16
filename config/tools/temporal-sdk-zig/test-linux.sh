@@ -17,7 +17,10 @@
 # the tests takes about 3 GiB in Debug and 6 GiB in ReleaseSafe, and those
 # that do not fit together run in turn. With 18 GiB or more all four run at
 # once and cost little more time than the slowest. TEST_LINUX_JOBS, if set,
-# is the most to run at once.
+# is the most to run at once. Each test may run for TEST_LINUX_TEST_TIMEOUT
+# (10m unless set, or a --test-timeout after `--`) before it fails as hung.
+# Asked to stop with SIGTERM, it stops its containers and prints what each
+# configuration got to, keeping the logs.
 #
 # It needs Docker. The containers are the architecture Docker runs natively
 # (arm64 on Apple silicon; CI's x86_64 rows are not covered) and are set up
@@ -111,7 +114,30 @@ stop() {
     docker kill "$run-$config" >/dev/null 2>&1 || true
   done
 }
-trap 'stop; rm -rf "$work"; exit 2' INT TERM HUP
+# Asked to stop (the factory does at a command's time limit): stop the
+# containers, then say what each configuration got to, so that whoever reads
+# the end of the output knows which test it was on. The logs are kept.
+stopped() {
+  stop
+  wait 2>/dev/null || true
+  echo "===== test-linux: stopped before it ended ====="
+  for config in $configs; do
+    [ -f "$work/$config.log" ] || continue
+    if [ -f "$work/$config.status" ]; then
+      read -r status secs <"$work/$config.status" || status=?
+      echo "$config: had ended (exit $status)."
+    else
+      echo "$config: still running. What failed so far, then its last lines:"
+      grep -E '^error: ' "$work/$config.log" | cut -c1-400 | head -n 20
+      tail -n 15 "$work/$config.log" | cut -c1-400
+    fi
+  done
+  rm -f "$work/src.tar"
+  echo "The whole logs are in $work"
+  exit 2
+}
+trap stopped TERM
+trap 'stop; rm -rf "$work"; exit 2' INT HUP
 
 # The checkout goes in as an archive: a build over a shared folder is slow,
 # and this way a container cannot change the checkout. The caches are the
@@ -140,6 +166,7 @@ one() {
       -v zig-linux-test-cargo-registry:/opt/cargo/registry \
       -v zig-linux-test-cargo-git:/opt/cargo/git \
       -e "OPTIMIZE=$optimize" -e "TARGET=$target" -e "ARCH=$arch" \
+      -e "TEST_TIMEOUT=${TEST_LINUX_TEST_TIMEOUT:-10m}" \
       "$image" sh -euc '
         tar -xf - -C /work 2>/dev/null
         # Copying stamps every file with the current time, and cargo would
@@ -151,6 +178,11 @@ one() {
           export "CC_${ARCH}_unknown_linux_musl=musl-gcc"
           set -- "-Dtarget=$TARGET" "$@"
         fi
+        # A test that hangs fails by name instead of holding the run.
+        case " $* " in
+          *" --test-timeout "*) ;;
+          *) set -- --test-timeout "$TEST_TIMEOUT" "$@" ;;
+        esac
         echo "test-linux: $(uname -sm), zig $(zig version), $(rustc --version), -Doptimize=$OPTIMIZE ${TARGET:+-Dtarget=$TARGET}" >&2
         exec zig build test "-Doptimize=$OPTIMIZE" --summary all "$@"
       ' sh "$@" <"$work/src.tar" >"$work/$config.log" 2>&1 || status=$?

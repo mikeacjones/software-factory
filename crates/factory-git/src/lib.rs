@@ -116,6 +116,91 @@ pub fn worktree_add(repo: &Path, dir: &Path, branch: &str, start: &str) -> Resul
     git(repo, &["worktree", "add", "-b", branch, &dir, start], LOCAL).map(|_| ())
 }
 
+/// One file a worktree's content differs in from a commit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Changed {
+    pub path: String,
+    /// The file is not in the commit: the change added it.
+    pub added: bool,
+    /// The path is a submodule on either side, which cannot be put back from
+    /// the repository's own objects.
+    pub submodule: bool,
+}
+
+/// Every tracked file whose content in the worktree `dir` differs from
+/// `commit`, committed since or not.
+pub fn changed_since(dir: &Path, commit: &str) -> Result<Vec<Changed>, GitError> {
+    let out = git(dir, &["diff", "--raw", "--no-renames", "-z", commit], LOCAL)?;
+    // `:<old mode> <new mode> <old> <new> <status>\0<path>\0`, once per file.
+    let mut fields = out.split('\0');
+    let mut changed = Vec::new();
+    while let (Some(meta), Some(path)) = (fields.next(), fields.next()) {
+        let parts: Vec<&str> = meta.trim_start_matches(':').split(' ').collect();
+        let (Some(old_mode), Some(new_mode), Some(status)) =
+            (parts.first(), parts.get(1), parts.get(4))
+        else {
+            continue;
+        };
+        changed.push(Changed {
+            path: path.to_string(),
+            added: status.starts_with('A'),
+            submodule: *old_mode == "160000" || *new_mode == "160000",
+        });
+    }
+    Ok(changed)
+}
+
+/// Write `paths` into `tree`, a directory git knows nothing of, as they are
+/// in `commit` of the worktree `dir`'s repository, contents and modes. An
+/// index of its own (`index`, a file path) is used, so neither the
+/// worktree's index nor its files are touched. A path that is not in
+/// `commit` is an error: remove it from `tree` instead.
+pub fn write_paths_at(
+    dir: &Path,
+    tree: &Path,
+    commit: &str,
+    paths: &[String],
+    index: &Path,
+) -> Result<(), GitError> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let git_dir = git(dir, &["rev-parse", "--absolute-git-dir"], LOCAL)?;
+    let git_dir = git_dir.trim();
+    let work_tree = tree.to_string_lossy();
+    let run = |args: &[&str]| -> Result<(), GitError> {
+        let mut argv = vec!["git", "--git-dir", git_dir, "--work-tree", &work_tree];
+        argv.extend_from_slice(args);
+        let mut spec = Spec::new(argv, tree, LOCAL);
+        spec.env = vec![
+            ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
+            (
+                "GIT_INDEX_FILE".to_string(),
+                index.to_string_lossy().into_owned(),
+            ),
+        ];
+        let out = capture(&spec)?;
+        if out.timed_out {
+            return Err(GitError::TimedOut {
+                command: args.join(" "),
+                dir: tree.to_path_buf(),
+            });
+        }
+        if !out.success() {
+            return Err(GitError::Failed {
+                command: args.join(" "),
+                dir: tree.to_path_buf(),
+                detail: out.combined().trim().to_string(),
+            });
+        }
+        Ok(())
+    };
+    run(&["read-tree", commit])?;
+    let mut args = vec!["checkout-index", "--force", "--"];
+    args.extend(paths.iter().map(String::as_str));
+    run(&args)
+}
+
 /// A new worktree with no branch, at `commit`. For steps whose changes are
 /// thrown away.
 pub fn worktree_add_detached(repo: &Path, dir: &Path, commit: &str) -> Result<(), GitError> {
@@ -422,6 +507,87 @@ mod tests {
         std::fs::write(dir.join("a.txt"), "one\n").unwrap();
         checkpoint(&dir, "first").unwrap();
         dir
+    }
+
+    #[test]
+    fn a_copy_of_a_worktree_gets_the_files_a_change_touched_back_as_they_were() {
+        use std::os::unix::fs::PermissionsExt;
+        let repo = repo("base-copy");
+        std::fs::write(repo.join("gone.txt"), "kept at the base\n").unwrap();
+        std::fs::write(repo.join("tool.sh"), "#!/bin/sh\necho base\n").unwrap();
+        std::fs::set_permissions(repo.join("tool.sh"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        std::fs::write(repo.join("blob.bin"), [0u8, 159, 146, 150, 255]).unwrap();
+        let (base, _) = checkpoint(&repo, "base").unwrap();
+        // The change: one file edited (and a binary one), one added, one
+        // removed; and one edit not committed yet.
+        std::fs::write(repo.join("tool.sh"), "#!/bin/sh\necho change\n").unwrap();
+        std::fs::write(repo.join("blob.bin"), [1u8, 2, 3]).unwrap();
+        std::fs::write(repo.join("new.txt"), "added\n").unwrap();
+        std::fs::remove_file(repo.join("gone.txt")).unwrap();
+        checkpoint(&repo, "change").unwrap();
+        std::fs::write(repo.join("a.txt"), "edited, not committed\n").unwrap();
+        let status_before = git(&repo, &["status", "--porcelain"], LOCAL).unwrap();
+
+        let mut changed = changed_since(&repo, &base).unwrap();
+        changed.sort_by(|a, b| a.path.cmp(&b.path));
+        let paths: Vec<(&str, bool)> = changed.iter().map(|c| (c.path.as_str(), c.added)).collect();
+        assert_eq!(
+            paths,
+            [
+                ("a.txt", false),
+                ("blob.bin", false),
+                ("gone.txt", false),
+                ("new.txt", true),
+                ("tool.sh", false)
+            ]
+        );
+        assert!(changed.iter().all(|c| !c.submodule));
+
+        // A plain copy, without the link to git, as the factory makes one.
+        let tree = temp("base-copy-tree");
+        for name in ["a.txt", "tool.sh", "blob.bin", "new.txt"] {
+            std::fs::copy(repo.join(name), tree.join(name)).unwrap();
+        }
+        let back: Vec<String> = changed
+            .iter()
+            .filter(|c| !c.added)
+            .map(|c| c.path.clone())
+            .collect();
+        let index = temp("base-copy-index").join("index");
+        write_paths_at(&repo, &tree, &base, &back, &index).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(tree.join("a.txt")).unwrap(),
+            "one\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tree.join("gone.txt")).unwrap(),
+            "kept at the base\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tree.join("tool.sh")).unwrap(),
+            "#!/bin/sh\necho base\n"
+        );
+        let mode = std::fs::metadata(tree.join("tool.sh"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o111, 0o111, "an executable stays executable");
+        assert_eq!(
+            std::fs::read(tree.join("blob.bin")).unwrap(),
+            [0u8, 159, 146, 150, 255]
+        );
+        // The worktree itself, its index included, is as it was.
+        assert_eq!(
+            std::fs::read_to_string(repo.join("a.txt")).unwrap(),
+            "edited, not committed\n"
+        );
+        assert_eq!(
+            git(&repo, &["status", "--porcelain"], LOCAL).unwrap(),
+            status_before
+        );
+        assert!(!tree.join(".git").exists());
     }
 
     #[test]

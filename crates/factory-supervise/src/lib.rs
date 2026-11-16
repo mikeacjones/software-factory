@@ -45,7 +45,13 @@ pub struct Spec {
     /// Text to feed to stdin. The child sees end of input either way.
     pub stdin: Option<String>,
     pub timeout: Duration,
+    /// How long a run that reached its timeout has, after SIGTERM, to stop
+    /// what it started and print what it has before it is killed.
+    pub grace: Duration,
 }
+
+/// The grace period of a [`Spec`] made with [`Spec::new`].
+pub const DEFAULT_GRACE: Duration = Duration::from_secs(5);
 
 impl Spec {
     pub fn new<S: Into<String>>(
@@ -60,6 +66,7 @@ impl Spec {
             env_remove: Vec::new(),
             stdin: None,
             timeout,
+            grace: DEFAULT_GRACE,
         }
     }
 
@@ -204,14 +211,37 @@ pub fn reap_leftovers(dir: &Path) -> Vec<String> {
     killed
 }
 
-/// SIGKILL a whole process group. Done through `kill` because this workspace
-/// forbids unsafe code, which a direct system call would need.
+/// SIGKILL a whole process group.
 fn kill_group(pgid: u32) {
+    signal_group(pgid, "-KILL");
+}
+
+/// Send a signal to a whole process group. Done through `kill` because this
+/// workspace forbids unsafe code, which a direct system call would need.
+fn signal_group(pgid: u32, signal: &str) {
     let _ = Command::new("/bin/kill")
-        .args(["-KILL", "--", &format!("-{pgid}")])
+        .args([signal, "--", &format!("-{pgid}")])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
+}
+
+/// Stop a run that reached its timeout: SIGTERM to its whole process group,
+/// so that a script can stop what it started (containers, servers) and print
+/// what it has, then SIGKILL to the group once `grace` is over or the run has
+/// ended. A SIGKILL alone gives a script's trap no chance to run.
+fn stop_group(pgid: u32, child: &mut Child, grace: Duration) {
+    signal_group(pgid, "-TERM");
+    let deadline = Instant::now() + grace;
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Ok(Some(_)) | Err(_) => break,
+        }
+    }
+    kill_group(pgid);
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn read_all(mut source: impl Read + Send + 'static) -> mpsc::Receiver<String> {
@@ -225,7 +255,8 @@ fn read_all(mut source: impl Read + Send + 'static) -> mpsc::Receiver<String> {
 }
 
 /// Run a command to the end and return its output. A command still running at
-/// its timeout is killed, with everything it started.
+/// its timeout is stopped, with everything it started (see `stop_group`), and
+/// what it printed until then, its grace period included, is returned.
 pub fn capture(spec: &Spec) -> Result<Captured, Error> {
     let started = Instant::now();
     let mut child = spawn(spec, Stdio::piped(), Stdio::piped())?;
@@ -243,9 +274,7 @@ pub fn capture(spec: &Spec) -> Result<Captured, Error> {
             Some(status) => break status.code(),
             None if started.elapsed() >= spec.timeout => {
                 timed_out = true;
-                kill_group(pgid);
-                let _ = child.kill();
-                let _ = child.wait();
+                stop_group(pgid, &mut child, spec.grace);
                 break None;
             }
             None => std::thread::sleep(Duration::from_millis(20)),
@@ -355,7 +384,11 @@ pub fn stream(
                 killed = Some(reason);
             }
         }
-        if timed_out || killed.is_some() {
+        if timed_out {
+            stop_group(pgid, &mut child, spec.grace);
+            break None;
+        }
+        if killed.is_some() {
             kill_group(pgid);
             let _ = child.kill();
             let _ = child.wait();
@@ -470,6 +503,50 @@ mod tests {
         assert!(out.timed_out);
         assert_eq!(out.code, None);
         assert!(out.duration < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_command_at_its_timeout_is_asked_to_stop_and_what_it_says_then_is_kept() {
+        // A script whose trap stops what it started and prints what it has,
+        // as the factory's test-linux.sh does with its containers and logs.
+        let dir = std::env::temp_dir().join(format!("factory-term-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut spec = sh(
+            "echo started; trap 'echo cleaned up; touch stopped; exit 2' TERM; sleep 30 & wait",
+            300,
+        );
+        spec.cwd = dir.clone();
+        spec.grace = Duration::from_secs(5);
+        let out = capture(&spec).unwrap();
+        assert!(out.timed_out);
+        assert!(out.stdout.contains("started"), "{}", out.stdout);
+        assert!(out.stdout.contains("cleaned up"), "{}", out.stdout);
+        assert!(dir.join("stopped").exists(), "the trap ran");
+        assert!(
+            out.duration < Duration::from_secs(4),
+            "a run that stops by itself is not held for the whole grace period: {:?}",
+            out.duration
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_command_that_ignores_the_request_to_stop_is_killed_when_its_grace_is_over() {
+        let mut spec = sh(
+            "trap '' TERM; echo stubborn; while :; do sleep 1; done",
+            200,
+        );
+        spec.grace = Duration::from_millis(600);
+        let started = Instant::now();
+        let out = capture(&spec).unwrap();
+        assert!(out.timed_out);
+        assert!(out.stdout.contains("stubborn"), "{}", out.stdout);
+        let took = started.elapsed();
+        assert!(
+            took >= Duration::from_millis(700) && took < Duration::from_secs(5),
+            "killed after the grace period: {took:?}"
+        );
     }
 
     #[test]

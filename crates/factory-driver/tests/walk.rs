@@ -5797,3 +5797,202 @@ fn the_issue_sweep_gives_each_open_bead_one_issue_and_leaves_those_being_given_o
     let sweep = factory_driver::sweep_issues(&factory, &quiet, 0).unwrap();
     assert_eq!(sweep, factory_driver::IssueSweep::default());
 }
+
+/// A world whose `test` command is `script`, with `extra` lines added to the
+/// command's table (the last table of the project file). `{root}` in the
+/// script is the world's own directory, outside the worktree.
+fn triage_world(name: &str, script: &str, extra: &str) -> World {
+    let world = World::new(name, "true");
+    let script = script.replace("{root}", &world.path("").display().to_string());
+    let project = world.path("config/projects/toy.toml");
+    let text = std::fs::read_to_string(&project).unwrap();
+    let old = "[commands.test]\nargv = [\"sh\", \"-c\", \"true\"]\ntimeout_secs = 30\n";
+    assert!(text.ends_with(old), "{text}");
+    let script = script.replace('"', "\\\"");
+    std::fs::write(
+        &project,
+        text.replace(
+            old,
+            &format!(
+                "[commands.test]\nargv = [\"sh\", \"-c\", \"{script}\"]\ntimeout_secs = 30\n{extra}"
+            ),
+        ),
+    )
+    .unwrap();
+    world
+}
+
+/// How many times a builder was run: the build and each fix.
+fn builder_runs(world: &World) -> usize {
+    world
+        .calls()
+        .iter()
+        .filter(|call| call[0] == "builder")
+        .count()
+}
+
+fn events_named(world: &World, driver: &Driver, kind: &str) -> Vec<serde_json::Value> {
+    events_of(world, &driver.unit().id.to_string())
+        .into_iter()
+        .filter(|(k, _, _)| k == kind)
+        .map(|(_, _, data)| data)
+        .collect()
+}
+
+/// A check that fails on the base too, with every file the change touched
+/// put back, is not the change's: the unit parks with both results and no
+/// builder is sent to fix it.
+#[test]
+fn a_check_that_fails_on_the_base_too_parks_without_a_fix_round() {
+    let world = triage_world(
+        "triage-base-fails",
+        "echo 'error: the server never answers'; exit 1",
+        "triage = { base = true }\n",
+    );
+    let mut driver = Driver::start(world.config(), "toy", "toy-1", &OPTIONS).unwrap();
+    let Status::Parked(reason) = driver.run().unwrap() else {
+        panic!("the unit should park");
+    };
+    assert!(reason.contains("on the base"), "{reason}");
+    assert!(reason.contains("not the change's"), "{reason}");
+    assert!(reason.contains("the server never answers"), "{reason}");
+    let base = events_named(&world, &driver, "command.base");
+    assert_eq!(base.len(), 1, "{base:?}");
+    assert_eq!(base[0]["verdict"], "Failed { code: Some(1) }");
+    assert_eq!(
+        builder_runs(&world),
+        1,
+        "only the build ran: {:?}",
+        world.calls()
+    );
+    // The copy at the base is gone, and the worktree still has the change.
+    let unit_dir = world.path(&format!("state/units/{}", driver.unit().id));
+    assert!(
+        !std::fs::read_dir(&unit_dir).unwrap().any(|e| e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("at-base-")),
+        "the copy at the base is removed"
+    );
+    assert!(driver.unit().worktree.join("feature.txt").exists());
+}
+
+/// A check that passes on the base fails because of the change: the builder
+/// is sent, and told that the base passed.
+#[test]
+fn a_check_that_passes_on_the_base_goes_to_the_builder_with_that_said() {
+    let world = triage_world(
+        "triage-base-passes",
+        "if [ -f feature.txt ] && [ ! -f {root}/failed-once ]; then touch {root}/failed-once; echo 'error: feature broke it'; exit 1; fi",
+        "triage = { base = true }\n",
+    );
+    let mut driver = Driver::start(world.config(), "toy", "toy-1", &OPTIONS).unwrap();
+    assert_eq!(driver.run().unwrap(), Status::Ended);
+    let base = events_named(&world, &driver, "command.base");
+    assert_eq!(base.len(), 1, "{base:?}");
+    assert_eq!(base[0]["verdict"], "Passed");
+    let ended: Vec<String> = world
+        .event_kinds(&driver)
+        .into_iter()
+        .filter(|k| k.contains(':'))
+        .collect();
+    let at = ended
+        .iter()
+        .position(|k| k == "test:fail")
+        .expect("test failed once");
+    assert_eq!(ended[at + 1], "fix:done", "{ended:?}");
+    assert_eq!(
+        ended.iter().filter(|k| *k == "test:fail").count(),
+        1,
+        "{ended:?}"
+    );
+    // The builder run sent for the failure is the first after the build.
+    let calls = world.calls();
+    let fix = (0..calls.len())
+        .filter(|&i| calls[i][0] == "builder")
+        .nth(1)
+        .unwrap();
+    let brief =
+        std::fs::read_to_string(world.path(&format!("bin/state/brief-{}.md", fix + 1))).unwrap();
+    assert!(
+        brief.contains("it passed: the failure comes with the change"),
+        "{brief}"
+    );
+}
+
+/// A check that passes when run again was a flake: the step passes, the flake
+/// is recorded, and no builder is sent.
+#[test]
+fn a_check_that_passes_when_run_again_is_a_flake_and_no_builder_is_sent() {
+    let world = triage_world(
+        "triage-flaky",
+        "if [ ! -f {root}/failed-once ]; then touch {root}/failed-once; echo 'connection reset'; exit 1; fi",
+        "triage = { rerun = true }\n",
+    );
+    let mut driver = Driver::start(world.config(), "toy", "toy-1", &OPTIONS).unwrap();
+    assert_eq!(driver.run().unwrap(), Status::Ended);
+    let flaky = events_named(&world, &driver, "command.flaky");
+    assert_eq!(flaky.len(), 1, "{flaky:?}");
+    // The tester's scripted break sends one fix round of its own; the flake
+    // sends none.
+    let kinds = world.event_kinds(&driver);
+    assert!(kinds.contains(&"test:pass".to_string()), "{kinds:?}");
+    assert!(!kinds.contains(&"test:fail".to_string()), "{kinds:?}");
+    let said: Vec<String> = events_named(&world, &driver, "slack.say")
+        .iter()
+        .map(|data| data["text"].as_str().unwrap_or("").to_string())
+        .collect();
+    assert!(said.iter().any(|t| t.contains("a flake")), "{said:?}");
+}
+
+/// Output the project names as the host's fault parks the step: no fix
+/// round can help.
+#[test]
+fn a_failure_the_project_names_as_the_hosts_parks_without_a_fix_round() {
+    let world = triage_world(
+        "triage-host",
+        "echo 'starting the dev server failed: invalid ephemeral server download'; exit 1",
+        "could_not_run_when = [\"invalid ephemeral server download\"]\n",
+    );
+    let mut driver = Driver::start(world.config(), "toy", "toy-1", &OPTIONS).unwrap();
+    let Status::Parked(reason) = driver.run().unwrap() else {
+        panic!("the unit should park");
+    };
+    assert!(reason.contains("could not run properly"), "{reason}");
+    assert!(
+        reason.contains("invalid ephemeral server download"),
+        "{reason}"
+    );
+    assert_eq!(events_named(&world, &driver, "command.host_fault").len(), 1);
+    assert_eq!(
+        builder_runs(&world),
+        1,
+        "only the build ran: {:?}",
+        world.calls()
+    );
+}
+
+/// A check that fails the same way after a fix round parks: another round
+/// would likely go as the last one did.
+#[test]
+fn a_check_that_fails_the_same_way_after_a_fix_parks_instead_of_another_round() {
+    let world = triage_world(
+        "triage-repeat",
+        "if [ -f feature.txt ]; then echo \"error: 'feature test' failed\"; exit 1; fi",
+        "failure_lines = [\"^error: \"]\n",
+    );
+    let mut driver = Driver::start(world.config(), "toy", "toy-1", &OPTIONS).unwrap();
+    let Status::Parked(reason) = driver.run().unwrap() else {
+        panic!("the unit should park");
+    };
+    assert!(reason.contains("the same way"), "{reason}");
+    assert!(reason.contains("feature test"), "{reason}");
+    assert_eq!(events_named(&world, &driver, "command.repeated").len(), 1);
+    assert_eq!(
+        builder_runs(&world),
+        2,
+        "the build and one fix: {:?}",
+        world.calls()
+    );
+}

@@ -134,13 +134,24 @@ timeout_secs = 300
 argv = ["scripts/changelog-check.sh", "origin/main"]
 timeout_secs = 300
 
+# What the factory finds out before a builder is sent for a failed test run
+# (see `triage` in the factory's docs): whether the code as it was at the
+# unit's base fails the same way, and whether a run failed because the host
+# did. sdk-core downloads the dev server and the test server on first use,
+# and a download that comes back broken is not the change's.
 [commands.test]
-argv = ["zig", "build", "test"]
+argv = ["zig", "build", "test", "--test-timeout", "10m"]
 timeout_secs = 3600
+could_not_run_when = ["invalid ephemeral server download", "failed to download ephemeral server executable", "Docker is not running"]
+failure_lines = ['^error: .* (failed|timed out)', ': error: ', '^panic: ']
+triage = { base = true }
 
 [commands.test-releasesafe]
-argv = ["zig", "build", "test", "-Doptimize=ReleaseSafe"]
+argv = ["zig", "build", "test", "-Doptimize=ReleaseSafe", "--test-timeout", "10m"]
 timeout_secs = 3600
+could_not_run_when = ["invalid ephemeral server download", "failed to download ephemeral server executable", "Docker is not running"]
+failure_lines = ['^error: .* (failed|timed out)', ': error: ', '^panic: ']
+triage = { base = true }
 
 # The unit tests on Linux arm64, in containers on this machine, with a tool
 # the factory keeps for this project: the four arm64 rows of CI's Linux
@@ -152,6 +163,13 @@ timeout_secs = 3600
 argv = ["sh", "{config}/tools/temporal-sdk-zig/test-linux.sh", "all"]
 timeout_secs = 3600
 shown = "zig build test on Linux arm64, glibc and musl, Debug and ReleaseSafe (in containers)"
+# Long enough for the script to stop four containers and print their logs.
+stop_grace_secs = 60
+# The script exits 2 when a container was killed or did not start.
+could_not_run_exit = [2]
+could_not_run_when = ["invalid ephemeral server download", "failed to download ephemeral server executable", "Docker is not running"]
+failure_lines = ['^error: .* (failed|timed out)', ': error: ', '^panic: ']
+triage = { rerun = true, base = true }
 
 # Proof that the tests a change adds or alters test the change: each is run on
 # the code as it was at the unit's base, where it has to fail. Zig keeps a
@@ -185,8 +203,11 @@ Read INDEX.txt first, then the files it points to: diff.patch, added-lines.txt, 
 Two lines of the index need care. Its changelog-check reads the factory's checkpoint commits, which carry no changelog trailer, so a failure there means only that the change adds no changelog fragment: judge for yourself whether it needs one. The factory runs the same check on the final commit before it pushes. And the test suites are not in these reports: the factory ran them, in Debug and ReleaseSafe, as steps of their own."""
 
 [commands.samples-test]
-argv = ["zig", "build", "samples-test"]
+argv = ["zig", "build", "samples-test", "--test-timeout", "10m"]
 timeout_secs = 3600
+could_not_run_when = ["invalid ephemeral server download", "failed to download ephemeral server executable", "Docker is not running"]
+failure_lines = ['^error: .* (failed|timed out)', ': error: ', '^panic: ']
+triage = { rerun = true, base = true }
 
 [limits]
 step_timeout_secs = 7200
