@@ -167,7 +167,7 @@ case "$role" in
       case "$scenario" in
         *bogus-finding*) [ "$retry" = 0 ] && proof='true' ;;
       esac
-      output='{"outcome":"broken","summary":"It fails on empty input.",'$common',"probes":'$probes',"findings":[{"title":"fails on empty input","severity":"major","location":"feature.txt:1","test_names":["empty-input"],"reproduction":{"command":"'"$proof"'","expected":"exit 0","observed":"exit 1"}}]}'
+      output='{"outcome":"broken","summary":"It fails on empty input.",'$common',"probes":'$probes',"findings":[{"title":"fails on empty input","severity":"major","location":"feature.txt:1","category":"empty-input","test_names":["empty-input"],"reproduction":{"command":"'"$proof"'","expected":"exit 0","observed":"exit 1"}}]}'
     else
       echo "probe" > probe.txt
       output='{"outcome":"held","summary":"Could not break it.",'$common',"probes":'$probes',"findings":[]}'

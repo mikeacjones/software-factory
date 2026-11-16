@@ -35,6 +35,7 @@ factory goal check --config config             # are the goal definitions sound?
 factory goal list --config config              # every goal and where it stands
 factory slack check --config config            # does the Slack socket connect?
 factory accounts --config config               # each Claude account's windows, and which a run would use
+factory findings <project> --config config     # the classes of defect the project's testers have proved
 factory-dash serve --allow <network>           # the live page of all of it, read-only (docs/architecture.md)
 ```
 

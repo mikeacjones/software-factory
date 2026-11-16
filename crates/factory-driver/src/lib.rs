@@ -19,7 +19,10 @@ use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use factory_beads::{Bead, Source, readiness};
-use factory_brief::{Brief, Contract, Note, contract_of, findings_text, render, result_problems};
+use factory_brief::{
+    Brief, ClassCount, Contract, Note, classes_for_builder, classes_for_tester, contract_of,
+    findings_text, render, result_problems,
+};
 use factory_checks::{Verdict, first_match, run_command, scope_violations, weakened_tests};
 use factory_claude::accounts::{
     AccountError, Choice, Known, Refresh, TOKEN_URL, TokenSource, Tracker, USAGE_API, Vault,
@@ -236,6 +239,62 @@ pub struct Regression {
     /// The tests' names as written in the code, so that deleting a test
     /// cannot make its command pass.
     pub test_names: Vec<String>,
+    /// The class of defect the tester gave the finding, as a key. Empty on
+    /// a record written before findings had one.
+    #[serde(default)]
+    pub category: String,
+}
+
+/// How often each class of defect has broken beads of a project, most
+/// beads first: every critical or major finding a tester proved, read from
+/// the records of the project's units. A record that cannot be read, or
+/// that has another shape, is left out.
+pub fn finding_classes(state_dir: &Path, project: &str) -> Vec<ClassCount> {
+    let mut classes: BTreeMap<String, (usize, std::collections::BTreeSet<String>)> =
+        BTreeMap::new();
+    let units = std::fs::read_dir(state_dir.join("units"))
+        .into_iter()
+        .flatten()
+        .flatten();
+    for entry in units {
+        let Ok(text) = std::fs::read_to_string(entry.path().join("unit.json")) else {
+            continue;
+        };
+        let Ok(unit) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        if unit.get("project").and_then(Value::as_str) != Some(project) {
+            continue;
+        }
+        let bead = unit.get("bead").and_then(Value::as_str).unwrap_or("");
+        let regressions = unit
+            .get("regressions")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        for regression in regressions {
+            let class = regression
+                .get("category")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if factory_brief::is_class_key(class) {
+                let (findings, beads) = classes.entry(class.to_string()).or_default();
+                *findings += 1;
+                beads.insert(bead.to_string());
+            }
+        }
+    }
+    let mut counts: Vec<ClassCount> = classes
+        .into_iter()
+        .map(|(class, (findings, beads))| ClassCount {
+            class,
+            findings,
+            beads: beads.len(),
+        })
+        .collect();
+    // The map gave them by name; a stable sort keeps that among equals.
+    counts.sort_by_key(|count| std::cmp::Reverse((count.beads, count.findings)));
+    counts
 }
 
 /// The findings of a tester's result that must come with a regression test.
@@ -1784,6 +1843,17 @@ impl Driver {
                     ),
                 },
             );
+        }
+        // What testers proved on earlier beads of the project: a builder is
+        // told before it writes anything, and a tester so that it names a
+        // class as the others did.
+        if !continuing && matches!(contract, Contract::Change | Contract::Probe) {
+            let classes = finding_classes(&self.factory.state_dir, self.unit.project.as_str());
+            let note = match contract {
+                Contract::Change => classes_for_builder(&classes),
+                _ => classes_for_tester(&classes),
+            };
+            notes.extend(note);
         }
         for name in &step.needs {
             match self.artifact_note(name) {
@@ -3465,6 +3535,7 @@ impl Driver {
                             .collect()
                     })
                     .unwrap_or_default(),
+                category: text("/category"),
             });
         }
         self.event(

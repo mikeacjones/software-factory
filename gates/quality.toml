@@ -1,0 +1,47 @@
+# Quality around the pipeline: what testers find is counted and told to the
+# next builder, a command proves that new tests test the change, and the
+# reviewer judges idiom and quality against a text. Each check is an
+# acceptance line of a bead in epic E20 (sf-gl5). The beads land in order,
+# and each adds its checks here.
+id = "quality"
+title = "Defects become checks, and code proves what a model was asked to judge"
+
+[[tool]]
+name = "git"
+command = ["git", "--version"]
+
+[[tool]]
+name = "python3"
+command = ["python3", "--version"]
+
+[[check]]
+id = "finding-class-contract"
+tier = "hermetic"
+bead = "sf-gl5.1"
+claim = "A tester's result with a critical or major finding that has no category, or one not written as a key, is rejected by code, and the classes are listed most frequent first or not at all."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-brief"]
+timeout_secs = 900
+
+[[check]]
+id = "finding-classes-in-briefs"
+tier = "hermetic"
+bead = "sf-gl5.1"
+claim = "A builder's first brief on a project with recorded findings lists the most frequent classes and a tester's lists the keys to reuse; neither has the section while nothing is recorded; findings of another project and records that cannot be read are left out."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-driver", "--test", "walk", "--", "a_builder_is_told_the_classes", "a_unit_is_built_broken_fixed"]
+timeout_secs = 900
+
+[[check]]
+id = "finding-class-role"
+tier = "hermetic"
+bead = "sf-gl5.1"
+claim = "The tester's role says how to choose a finding's class and to reuse a key the brief lists."
+command = ["grep", "-q", "reuse a key the brief lists", "config/roles/tester.md"]
+timeout_secs = 30
+
+[[check]]
+id = "findings-command"
+tier = "host"
+bead = "sf-gl5.1"
+claim = "`factory findings <project>` prints each class of the project's recorded findings with how many findings and beads it has."
+command = ["cargo", "run", "--quiet", "--locked", "--offline", "--package", "factory-cli", "--", "findings", "temporal-sdk-zig", "--config", "config"]
+timeout_secs = 900

@@ -193,6 +193,10 @@ pub fn schema(contract: Contract, outcomes: &[String]) -> Value {
                     "type": "string",
                     "description": "`path:line` of the code at fault."
                 },
+                "category": {
+                    "type": "string",
+                    "description": "The class of defect, as a short stable key in lowercase words joined by dashes, such as `error-path-cleanup`, `empty-input`, `double-call`, `cancel-midway`. Name the mistake, not the place: the same key must fit the same mistake in another file. Reuse a key the brief lists when the finding is of that class. Required for a critical or major finding; empty for a minor one you cannot class."
+                },
                 "test_names": {
                     "type": "array",
                     "items": { "type": "string" },
@@ -324,6 +328,16 @@ pub fn result_problems(contract: Contract, outcomes: &[String], result: &Value) 
                     ));
                 }
             }
+            for finding in findings {
+                let class = string_at(finding, "category").trim();
+                let serious = matches!(string_at(finding, "severity"), "critical" | "major");
+                if (serious || !class.is_empty()) && !is_class_key(class) {
+                    problems.push(format!(
+                        "the finding `{}` needs a `category`: the class of defect as a short key in lowercase words joined by dashes, such as `error-path-cleanup`",
+                        string_at(finding, "title")
+                    ));
+                }
+            }
             let serious = findings
                 .iter()
                 .any(|finding| matches!(string_at(finding, "severity"), "critical" | "major"));
@@ -411,6 +425,69 @@ pub fn findings_text(result: &Value) -> String {
         }
     }
     out
+}
+
+/// Whether a finding's class is written as a key: lowercase letters and
+/// digits in words joined by single dashes.
+pub fn is_class_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= 60
+        && key.split('-').all(|word| {
+            !word.is_empty()
+                && word
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        })
+}
+
+/// How often one class of defect has broken beads of a project: the
+/// critical and major findings its testers proved, and the beads they were
+/// found on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClassCount {
+    pub class: String,
+    pub findings: usize,
+    pub beads: usize,
+}
+
+/// The most classes a brief lists.
+const CLASSES_SHOWN: usize = 8;
+
+fn class_lines(counts: &[ClassCount]) -> String {
+    bullets(counts.iter().take(CLASSES_SHOWN).map(|count| {
+        format!(
+            "`{}`: {} finding{} on {} bead{}",
+            count.class,
+            count.findings,
+            if count.findings == 1 { "" } else { "s" },
+            count.beads,
+            if count.beads == 1 { "" } else { "s" },
+        )
+    }))
+}
+
+/// What a builder is told, before it writes anything, about the defects
+/// that broke earlier beads of its project. `None` when none is recorded.
+pub fn classes_for_builder(counts: &[ClassCount]) -> Option<Note> {
+    (!counts.is_empty()).then(|| Note {
+        title: "What has broken earlier beads of this project".to_string(),
+        body: format!(
+            "The adversarial testers of this project's earlier beads proved these classes of defect, most frequent first. Each cost a round of fixing and testing. Check your change for each one that could apply before you return.\n\n{}",
+            class_lines(counts)
+        ),
+    })
+}
+
+/// The classes a tester should reuse when it gives a finding its
+/// `category`. `None` when none is recorded.
+pub fn classes_for_tester(counts: &[ClassCount]) -> Option<Note> {
+    (!counts.is_empty()).then(|| Note {
+        title: "Classes of finding recorded on this project".to_string(),
+        body: format!(
+            "Give each finding the `category` of its class. Reuse a key from this list when the finding is of that class, so that the counts stay true, and make a new key only for a class that is not here.\n\n{}",
+            class_lines(counts)
+        ),
+    })
 }
 
 /// Something an earlier step produced that this step is given.
@@ -927,6 +1004,7 @@ timeout_secs = 60
                 "title": "panics on empty input",
                 "severity": "major",
                 "location": "src/greet.zig:3",
+                "category": "empty-input",
                 "reproduction": {"command": "", "expected": "an error", "observed": ""}
             }],
         });
@@ -955,13 +1033,88 @@ timeout_secs = 60
         let lenient = json!({
             "outcome": "held", "summary": "One problem.",
             "probes": [{"what": "x", "command": "c", "observed": "o"}],
-            "findings": [{"title": "t", "severity": "major", "location": "a:1",
+            "findings": [{"title": "t", "severity": "major", "location": "a:1", "category": "c",
                           "reproduction": {"command": "c", "expected": "e", "observed": "o"}}],
         });
         assert_eq!(
             result_problems(Contract::Probe, &allowed, &lenient),
             ["the outcome is held but a finding is critical or major: that is broken"]
         );
+    }
+
+    #[test]
+    fn a_serious_finding_of_a_tester_needs_its_class_as_a_key() {
+        let allowed = outcomes(&["held", "broken"]);
+        let result = |severity: &str, category: &str| {
+            json!({
+                "outcome": if severity == "minor" { "held" } else { "broken" },
+                "summary": "s",
+                "probes": [{"what": "x", "command": "c", "observed": "o"}],
+                "findings": [{"title": "t", "severity": severity, "location": "a:1", "category": category,
+                              "reproduction": {"command": "c", "expected": "e", "observed": "o"}}],
+            })
+        };
+        let refusal = "the finding `t` needs a `category`: the class of defect as a short key in lowercase words joined by dashes, such as `error-path-cleanup`";
+        for (severity, category, problems) in [
+            ("major", "", vec![refusal]),
+            ("critical", "Error Path", vec![refusal]),
+            ("major", "error-path-cleanup", vec![]),
+            ("minor", "", vec![]),
+            ("minor", "not a key", vec![refusal]),
+        ] {
+            assert_eq!(
+                result_problems(Contract::Probe, &allowed, &result(severity, category)),
+                problems,
+                "{severity} `{category}`"
+            );
+        }
+        for (key, is_key) in [
+            ("a", true),
+            ("a-2b", true),
+            ("", false),
+            ("a--b", false),
+            ("-a", false),
+            ("A", false),
+        ] {
+            assert_eq!(is_class_key(key), is_key, "{key}");
+        }
+    }
+
+    #[test]
+    fn the_classes_that_broke_earlier_beads_are_listed_most_frequent_first_or_not_at_all() {
+        assert_eq!(classes_for_builder(&[]), None);
+        assert_eq!(classes_for_tester(&[]), None);
+        let counts = [
+            ClassCount {
+                class: "error-path-cleanup".to_string(),
+                findings: 5,
+                beads: 3,
+            },
+            ClassCount {
+                class: "empty-input".to_string(),
+                findings: 1,
+                beads: 1,
+            },
+        ];
+        let builder = classes_for_builder(&counts).unwrap();
+        assert_eq!(
+            builder.title,
+            "What has broken earlier beads of this project"
+        );
+        assert!(
+            builder.body.ends_with(
+                "- `error-path-cleanup`: 5 findings on 3 beads\n- `empty-input`: 1 finding on 1 bead"
+            ),
+            "{}",
+            builder.body
+        );
+        let tester = classes_for_tester(&counts).unwrap();
+        assert!(
+            tester.body.contains("Reuse a key from this list"),
+            "{}",
+            tester.body
+        );
+        assert!(tester.body.contains("- `empty-input`: 1 finding on 1 bead"));
     }
 
     #[test]

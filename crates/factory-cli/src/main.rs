@@ -43,6 +43,8 @@ usage:
   factory goal check                          check every project's goal definitions
   factory goal list                           the goals the factory knows and where each stands
   factory bead <project> <bead>               show a bead and whether it may be launched
+  factory findings <project>                  the classes of defect the project's testers have
+                                              proved, with how many findings and beads each
   factory flow check <project>                check the flow a project names
 
 options:
@@ -626,6 +628,21 @@ fn run(args: &[String]) -> Result<u8, String> {
                         .as_ref()
                         .map(|charter| charter.objective.replace('\n', " "))
                         .unwrap_or_else(|| "(still being agreed)".to_string())
+                );
+            }
+            Ok(0)
+        }
+        ["findings", project] => {
+            let factory = args.config.factory().map_err(|err| fail(&err))?;
+            let project = args.config.project(project).map_err(|err| fail(&err))?;
+            let classes = factory_driver::finding_classes(&factory.state_dir, project.id.as_str());
+            if classes.is_empty() {
+                println!("no classed findings are recorded for {}", project.id);
+            }
+            for count in classes {
+                println!(
+                    "{:<40} {:>3} finding(s) on {:>3} bead(s)",
+                    count.class, count.findings, count.beads
                 );
             }
             Ok(0)

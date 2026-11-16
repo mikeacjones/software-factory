@@ -141,6 +141,27 @@ fn a_unit_is_built_broken_fixed_reviewed_and_published() {
         second_test.contains("- fix (round 1): done"),
         "{second_test}"
     );
+    // The finding's class is on record, the next tester is given the key
+    // to reuse, and nobody was told of classes while none was recorded.
+    assert_eq!(unit_now.regressions[0].category, "empty-input");
+    assert_eq!(
+        factory_driver::finding_classes(&world.path("state"), "toy"),
+        [factory_brief::ClassCount {
+            class: "empty-input".to_string(),
+            findings: 1,
+            beads: 1
+        }]
+    );
+    assert!(
+        second_test.contains("## Classes of finding recorded on this project")
+            && second_test.contains("- `empty-input`: 1 finding on 1 bead"),
+        "{second_test}"
+    );
+    for first in ["brief-1.md", "brief-2.md"] {
+        let brief = std::fs::read_to_string(world.path(&format!("bin/state/{first}"))).unwrap();
+        assert!(!brief.contains("earlier beads of this project"), "{brief}");
+        assert!(!brief.contains("Classes of finding"), "{brief}");
+    }
     assert!(
         !fix_brief.contains("## Acceptance criteria"),
         "a continued session gets only what is new"
@@ -201,6 +222,75 @@ fn a_unit_is_built_broken_fixed_reviewed_and_published() {
     // The bead stays claimed until the pull request merges.
     let bead = std::fs::read_to_string(world.path("beads/toy-1.json")).unwrap();
     assert!(bead.contains("\"in_progress\"") && bead.contains("\"factory\""));
+}
+
+#[test]
+fn a_builder_is_told_the_classes_of_defect_that_broke_earlier_beads_of_its_project() {
+    let world = World::new("classes", "test -f feature.txt");
+    // The tester holds, so this run adds nothing to the record.
+    std::fs::create_dir_all(world.path("bin/state")).unwrap();
+    std::fs::write(world.path("bin/state/broke"), "").unwrap();
+    // What earlier units left: two beads of this project broken by one class,
+    // one by another, a finding from before findings had a class, a bead of
+    // another project, and a record that is not one.
+    let record = |name: &str, project: &str, bead: &str, classes: &[&str]| {
+        let dir = world.path(&format!("state/units/{name}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let regressions: Vec<String> = classes
+            .iter()
+            .map(|class| format!(r#"{{"round":1,"finding":"f","command":"c","test_names":[],"category":"{class}"}}"#))
+            .collect();
+        std::fs::write(
+            dir.join("unit.json"),
+            format!(
+                r#"{{"project":"{project}","bead":"{bead}","regressions":[{}]}}"#,
+                regressions.join(",")
+            ),
+        )
+        .unwrap();
+    };
+    record(
+        "old-1",
+        "toy",
+        "toy-8",
+        &["error-path-cleanup", "double-call"],
+    );
+    record(
+        "old-2",
+        "toy",
+        "toy-9",
+        &["error-path-cleanup", "error-path-cleanup", ""],
+    );
+    record("old-3", "other", "other-1", &["elsewhere"]);
+    std::fs::create_dir_all(world.path("state/units/old-4")).unwrap();
+    std::fs::write(world.path("state/units/old-4/unit.json"), "not json").unwrap();
+
+    let mut driver = Driver::start(world.config(), "toy", "toy-1", &OPTIONS).unwrap();
+    assert_eq!(driver.run().unwrap(), Status::Ended);
+
+    let build = std::fs::read_to_string(world.path("bin/state/brief-1.md")).unwrap();
+    assert!(
+        build.contains(
+            "## What has broken earlier beads of this project\n\nThe adversarial testers of this project's earlier beads proved these classes of defect, most frequent first."
+        ),
+        "{build}"
+    );
+    assert!(
+        build.contains(
+            "- `error-path-cleanup`: 3 findings on 2 beads\n- `double-call`: 1 finding on 1 bead\n"
+        ),
+        "{build}"
+    );
+    assert!(!build.contains("elsewhere"), "{build}");
+    // The tester is given the same keys, to reuse. The reviewer is not.
+    let test = std::fs::read_to_string(world.path("bin/state/brief-2.md")).unwrap();
+    assert!(
+        test.contains("## Classes of finding recorded on this project")
+            && test.contains("- `error-path-cleanup`: 3 findings on 2 beads"),
+        "{test}"
+    );
+    let review = std::fs::read_to_string(world.path("bin/state/brief-3.md")).unwrap();
+    assert!(!review.contains("error-path-cleanup"), "{review}");
 }
 
 #[test]

@@ -117,3 +117,7 @@ One pass of the driver: preflight, observe, step every unit, execute actions wit
 ## gate
 
 The proof of a milestone: a manifest of checks, each a command with a tier, a timeout and the claim it proves. A gate passes only if every check passed and no tier was skipped.
+
+## finding class
+
+The kind of mistake a tester's finding is, as a short key such as `error-path-cleanup`. Every critical or major finding has one. They are counted across a project's units, and the most frequent are told to the next builder.
