@@ -51,3 +51,19 @@ bead = "sf-0kw.5"
 claim = "A failure's signature is the lines its command's failure_lines pick out, or its last lines, with numbers, hex and paths taken out, and is the same across runs of the same failure and different for another; a check that fails with the same signature after a fix round parks with both, instead of routing another fix."
 command = ["cargo", "test", "--locked", "--offline", "--package", "factory-checks", "--package", "factory-driver", "--", "a_failure_is_the_same_failure_across_runs", "a_check_that_fails_the_same_way_after_a_fix_parks_instead_of_another_round"]
 timeout_secs = 900
+
+[[check]]
+id = "nothing-to-change"
+tier = "hermetic"
+bead = "sf-0kw.8"
+claim = "Every fix step routes already_done (the ship's to sync, the others' to the checks), and a builder sent to fix a failure that is not its branch's returns already_done and the unit goes on through the checks with no rejected result; a done result with no files names already_done only where the step routes it, and needs_owner otherwise."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-brief", "--package", "factory-driver", "--", "a_change_with_no_files_is_told_of_an_outcome", "a_fix_that_finds_nothing_to_change_goes_on_through_the_checks"]
+timeout_secs = 900
+
+[[check]]
+id = "fix-steps-route-nothing-to-change"
+tier = "hermetic"
+bead = "sf-0kw.8"
+claim = "In every flow, each fix step routes already_done, and the ship flow's sends it to sync."
+command = ["sh", "-c", "for f in config/flows/*.toml; do awk '/^\\[\\[step\\]\\]/{if(fix&&!ad){print FILENAME\": fix does not route already_done\"; bad=1} fix=0; ad=0} /^id = \"fix\"/{fix=1} fix&&/^on\\.already_done/{ad=1} END{if(fix&&!ad){print FILENAME\": fix does not route already_done\"; bad=1} exit bad}' \"$f\" || exit 1; done; grep -q 'on.already_done = { to = \"sync\"' config/flows/zig-sdk-ship.toml"]
+timeout_secs = 60

@@ -5996,3 +5996,33 @@ fn a_check_that_fails_the_same_way_after_a_fix_parks_instead_of_another_round() 
         world.calls()
     );
 }
+
+/// A builder sent to fix a failure that is not its branch's may say so: the
+/// fix ends `already_done`, nothing is committed, and the checks run again
+/// without another builder run or a rejected result.
+#[test]
+fn a_fix_that_finds_nothing_to_change_goes_on_through_the_checks() {
+    let world = triage_world(
+        "fix-nothing",
+        "if [ ! -f {root}/failed-once ]; then touch {root}/failed-once; echo 'error: the server never answers'; exit 1; fi",
+        "",
+    );
+    world.scenario("fix-nothing");
+    let mut driver = Driver::start(world.config(), "toy", "toy-1", &OPTIONS).unwrap();
+    assert_eq!(driver.run().unwrap(), Status::Ended);
+    let ended: Vec<String> = world
+        .event_kinds(&driver)
+        .into_iter()
+        .filter(|k| k.contains(':'))
+        .collect();
+    let at = ended
+        .iter()
+        .position(|k| k == "fix:already_done")
+        .unwrap_or_else(|| panic!("no fix ended already_done: {ended:?}"));
+    assert_eq!(ended[at - 1], "test:fail", "{ended:?}");
+    assert_eq!(ended[at + 1], "fmt:pass", "{ended:?}");
+    assert!(
+        events_named(&world, &driver, "result.rejected").is_empty(),
+        "an already_done fix is accepted as it is"
+    );
+}

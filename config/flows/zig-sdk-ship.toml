@@ -125,6 +125,10 @@ effort_by_round = ["medium", "high"]
 writes = ["code"]
 on.done = { to = "fmt", max = 6 }
 on.needs_owner = { to = "ask", max = 2 }
+# Nothing in the branch needed changing: the failure it was sent for is
+# not the branch's, or is fixed on the default branch. The ship takes the
+# default branch in again and runs every check.
+on.already_done = { to = "sync", max = 2 }
 
 # The text of the one pull request, and of the one commit it becomes.
 [[step]]

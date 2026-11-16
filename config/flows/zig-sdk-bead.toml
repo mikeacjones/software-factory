@@ -139,6 +139,8 @@ effort_by_round = ["medium", "high"]
 writes = ["code"]
 on.done = { to = "fmt", max = 8 }
 on.needs_owner = { to = "ask", max = 2 }
+# Nothing in the branch needed changing: every check runs again.
+on.already_done = { to = "fmt", max = 2 }
 
 # The bead's commit message. The pull-request text it also writes is not
 # used here: the sub-goal's pull request is written when it ships.

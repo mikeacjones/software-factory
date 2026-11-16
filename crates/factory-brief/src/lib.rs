@@ -53,7 +53,7 @@ impl Contract {
                 ),
                 (
                     "already_done",
-                    "The default branch already does this. Nothing was changed, and the evidence says where it is done.",
+                    "Nothing needed changing: the default branch already does this, or, sent to fix a failure, the failure is not this branch's to fix (it fails on the default branch too, or is fixed there and comes in when the default branch is taken in). Nothing was changed, and the evidence says why.",
                 ),
                 (
                     "needs_owner",
@@ -303,10 +303,17 @@ pub fn result_problems(contract: Contract, outcomes: &[String], result: &Value) 
                 }
             }
             if outcome == "done" && array_at(result, "files_touched").is_empty() {
-                problems.push(
-                    "the outcome is done but `files_touched` is empty; if nothing needed changing the outcome is already_done"
-                        .to_string(),
-                );
+                // Name another outcome only where this step may end with it.
+                let instead = if outcomes.iter().any(|o| o == "already_done") {
+                    "if nothing needed changing, return already_done and say why in the evidence"
+                } else if outcomes.iter().any(|o| o == "needs_owner") {
+                    "this step cannot end with already_done; if nothing needs changing, return needs_owner and say why in `question`"
+                } else {
+                    "this step must change something"
+                };
+                problems.push(format!(
+                    "the outcome is done but `files_touched` is empty; {instead}"
+                ));
             }
         }
         Contract::Probe => {
@@ -804,6 +811,36 @@ fn outcome_text(brief: &Brief<'_>, contract: Option<Contract>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_change_with_no_files_is_told_of_an_outcome_its_step_can_end_with() {
+        let result = json!({
+            "outcome": "done", "summary": "Nothing needed changing.", "question": "",
+            "reply_to_owner": "", "files_touched": [], "tests": [],
+            "evidence": [{"criterion": "c", "evidence": "e"}],
+        });
+        let outcomes = |list: &[&str]| list.iter().map(|o| o.to_string()).collect::<Vec<_>>();
+        let routed = result_problems(
+            Contract::Change,
+            &outcomes(&["done", "already_done", "needs_owner"]),
+            &result,
+        );
+        assert!(
+            routed.iter().any(|p| p.contains("return already_done")),
+            "{routed:?}"
+        );
+        let unrouted = result_problems(
+            Contract::Change,
+            &outcomes(&["done", "needs_owner"]),
+            &result,
+        );
+        assert!(
+            unrouted
+                .iter()
+                .any(|p| p.contains("cannot end with already_done") && p.contains("needs_owner")),
+            "{unrouted:?}"
+        );
+    }
     use factory_flow::Flow;
 
     const FLOW: &str = r#"

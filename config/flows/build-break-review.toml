@@ -94,6 +94,8 @@ effort_by_round = ["medium", "high"]
 writes = ["code"]
 on.done = { to = "fmt", max = 8 }
 on.needs_owner = { to = "ask", max = 2 }
+# Nothing in the branch needed changing: every check runs again.
+on.already_done = { to = "fmt", max = 2 }
 
 [[step]]
 id = "describe"

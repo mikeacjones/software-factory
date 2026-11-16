@@ -20,6 +20,8 @@
 #                      trespass      the builder first also writes a file under .github, which
 #                                    no step may change, and takes it away when it is
 #                                    told to put it back
+#                      fix-nothing   sent to fix a failed `test` check, the builder changes
+#                                    nothing and returns already_done
 #                      limit-default-once
 #                                    the first run without an account token is refused
 #                                    at the five-hour limit
@@ -102,7 +104,12 @@ esac
 common='"question":"","reply_to_owner":""'
 case "$role" in
   builder)
-    case "$brief" in
+    nothing=0
+    case "$scenario" in
+      *fix-nothing*) case "$brief" in *"The command \`test\`"*) nothing=1 ;; esac ;;
+    esac
+    # A builder with nothing to change writes nothing.
+    [ "$nothing" = 1 ] || case "$brief" in
       *"Your result was not accepted"*) ;;
       *"conflict markers"*)
         # The sub-goal's branch was merged in and conflicted: keep both sides.
@@ -150,6 +157,9 @@ case "$role" in
         fi ;;
     esac
     output='{"outcome":"done","summary":"Added a line to feature.txt.",'$common',"files_touched":["feature.txt"],"tests":[],"evidence":'$evidence'}'
+    if [ "$nothing" = 1 ]; then
+      output='{"outcome":"already_done","summary":"Nothing in this branch needs changing: the failure is not the branch'"'"'s.",'$common',"files_touched":[],"tests":[],"evidence":[{"criterion":"the feature exists","evidence":"the check fails without the change too"}]}'
+    fi
     case "$scenario" in
       *ask-once*)
         if [ ! -f "$state/asked" ]; then
