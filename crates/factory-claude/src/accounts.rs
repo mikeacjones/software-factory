@@ -415,7 +415,7 @@ pub fn state_from_usage(answer: &Value, now: u64) -> Option<AccountState> {
 }
 
 /// Where the CLI refreshes a login, and the client it does so as. Taken from
-/// the pinned CLI's own code (2.1.325), which is the only authority on them.
+/// the CLI's own code (as read in 2.1.325), which is the only authority on them.
 pub const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
 const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 pub const USAGE_API: &str = "https://api.anthropic.com";

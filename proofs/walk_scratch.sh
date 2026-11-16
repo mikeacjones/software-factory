@@ -76,7 +76,6 @@ JSON
 cp -R "$root/config/flows" "$root/config/roles" "$work/config/"
 cat > "$work/config/factory.toml" <<TOML
 state_dir = "$work/state"
-cli_version = "2.1.325"
 allowed_models = ["claude-opus-5-5", "claude-haiku-5-5"]
 
 [model_override]

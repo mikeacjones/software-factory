@@ -115,7 +115,7 @@ impl World {
         std::fs::write(
             path("config/factory.toml"),
             format!(
-                "state_dir = \"{}\"\nclaude_bin = \"{}\"\ncli_version = \"2.1.325\"\nallowed_models = [\"claude-opus-5-5\"]\n",
+                "state_dir = \"{}\"\nclaude_bin = \"{}\"\nallowed_models = [\"claude-opus-5-5\"]\n",
                 path("state").display(),
                 fake.display()
             ),

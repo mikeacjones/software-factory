@@ -31,9 +31,6 @@ pub struct Factory {
     pub claude_bin: String,
     #[serde(default = "default_gh")]
     pub gh_bin: String,
-    /// The one Claude CLI version the factory runs. A different installed
-    /// version stops a run before it starts.
-    pub cli_version: String,
     pub allowed_models: Vec<String>,
     /// Replace a model wherever a flow names it. Tests map everything to Haiku.
     #[serde(default)]
@@ -1384,7 +1381,7 @@ timeout_secs = 60
         let factory = |accounts: &str| {
             std::fs::write(
                 dir.0.join("factory.toml"),
-                format!("state_dir = \"/tmp/s\"\ncli_version = \"1\"\nallowed_models = [\"m\"]\n{accounts}"),
+                format!("state_dir = \"/tmp/s\"\nallowed_models = [\"m\"]\n{accounts}"),
             )
             .unwrap();
             dir.factory()

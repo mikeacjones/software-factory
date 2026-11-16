@@ -76,8 +76,6 @@ pub enum DriverError {
     },
     #[error("bead `{bead}` may not be launched:\n  - {}", reasons.join("\n  - "))]
     NotLaunchable { bead: String, reasons: Vec<String> },
-    #[error("the installed Claude CLI is `{installed}`, but the factory is pinned to `{pinned}`")]
-    CliVersion { installed: String, pinned: String },
     #[error(transparent)]
     Account(#[from] factory_claude::accounts::AccountError),
     #[error("{0}")]
@@ -4954,15 +4952,12 @@ pub(crate) fn github_client(factory: &Factory, settings: &factory_config::GitHub
     github
 }
 
-/// Checks before a unit is prepared or continued: the pinned CLI and the repo.
+/// Checks before a unit is prepared or continued: that the Claude CLI runs
+/// and the repo is there. The CLI's version is not pinned: it updates
+/// itself, and a run on a newer one goes ahead (its stream lines the
+/// factory does not know are counted, not fatal).
 fn preflight(factory: &Factory, project: &Project) -> Result<(), DriverError> {
-    let installed = factory_claude::installed_version(&factory.claude_bin)?;
-    if installed != factory.cli_version {
-        return Err(DriverError::CliVersion {
-            installed,
-            pinned: factory.cli_version.clone(),
-        });
-    }
+    factory_claude::installed_version(&factory.claude_bin)?;
     if !project.repo.join(".git").exists() {
         return Err(DriverError::Preflight(format!(
             "{} is not a git checkout",
@@ -5064,7 +5059,7 @@ mod tests {
         std::fs::write(
             dir.join("factory.toml"),
             format!(
-                "state_dir = \"/tmp/s\"\ncli_version = \"1\"\nallowed_models = [\"m\"]\n[[account]]\nid = \"a\"\ntoken_env_file = \"{0}\"\ntoken_env = \"A_TOKEN\"\n[[account]]\nid = \"b\"\ntoken_env_file = \"{0}\"\ntoken_env = \"B_TOKEN\"\n",
+                "state_dir = \"/tmp/s\"\nallowed_models = [\"m\"]\n[[account]]\nid = \"a\"\ntoken_env_file = \"{0}\"\ntoken_env = \"A_TOKEN\"\n[[account]]\nid = \"b\"\ntoken_env_file = \"{0}\"\ntoken_env = \"B_TOKEN\"\n",
                 secrets.display()
             ),
         )
