@@ -21,8 +21,14 @@ path = ["~/.local/bin", "/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/b
 [temporal]
 address = "http://192.168.101.240:7233"
 namespace = "software-factory"
-# Every pipeline of a goal is a workflow on the engine: the service starts
-# and follows each through `bin/factory-engine` under the state directory.
+# Everything runs on the engine: each project's executive, directors and
+# foremen take their turns in a workflow (`project-<id>`), their pipelines
+# are workflows it starts, and `intake` listens to Slack and watches the
+# pipelines. `factory serve` only becomes the engine's worker, which runs
+# from `bin/factory-engine` under the state directory.
+tiers = true
+# What a supervisor inside the service does with its pipelines when
+# `tiers` is taken out again: it runs them on the engine too.
 pipelines = true
 
 # The Claude accounts workers run under. Capacity left in a window when it
