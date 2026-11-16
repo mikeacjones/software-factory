@@ -1266,9 +1266,52 @@ pub fn maintenance_problems(schedule: &Schedule, result: &Value) -> Vec<String> 
     problems
 }
 
+/// What the default branch's own CI says, as a maintenance run is told it.
+/// `tip` is the commit the branch is at now.
+pub fn default_ci_text(branch: &str, tip: &str, ci: &factory_github::BranchCi) -> String {
+    use factory_github::BranchCi;
+    let short = |commit: &str| commit[..commit.len().min(10)].to_string();
+    let since = |commit: &str| {
+        if commit == tip {
+            String::new()
+        } else {
+            format!(
+                " The branch has moved on since, to `{}`, which has no run yet.",
+                short(tip)
+            )
+        }
+    };
+    match ci {
+        BranchCi::Unknown => format!("No CI run that finished was found on `{branch}`.\n"),
+        BranchCi::Pending { commit } => format!(
+            "CI on `{branch}` has not finished on `{}`, and nothing has failed so far.{}\n",
+            short(commit),
+            since(commit)
+        ),
+        BranchCi::Green { commit, runs } => format!(
+            "The last CI run on `{branch}` passed, on `{}`: {runs} workflow(s).{}\n",
+            short(commit),
+            since(commit)
+        ),
+        BranchCi::Red { commit, failed } => {
+            let mut out = format!(
+                "The last CI run on `{branch}` failed, on `{}`.{} Every sub-goal that ships takes that in.\n\n",
+                short(commit),
+                since(commit)
+            );
+            for run in failed {
+                out.push_str(&format!("- `{}`: {}\n", run.workflow, run.url));
+            }
+            out
+        }
+    }
+}
+
 /// What a maintenance run is told. `grown` is the files that grew most on
 /// the default branch since the last run, each with its net lines, and
-/// `span` says between which commits.
+/// `span` says between which commits. `ci` is what the default branch's own
+/// CI says, and `reports` what the schedule's report commands printed, each
+/// with what the command is called.
 #[allow(clippy::too_many_arguments)]
 pub fn maintenance_brief(
     project: &str,
@@ -1278,6 +1321,8 @@ pub fn maintenance_brief(
     measures: &Measures,
     span: &str,
     grown: &[(String, i64)],
+    ci: &str,
+    reports: &[(String, String)],
     tracker: &[Summary],
 ) -> String {
     let mut out = format!(
@@ -1299,6 +1344,16 @@ pub fn maintenance_brief(
     }
     if !grown.is_empty() {
         out.push('\n');
+    }
+    out.push_str(&format!(
+        "### The default branch's own CI\n\n{}\n\n",
+        ci.trim_end()
+    ));
+    for (shown, text) in reports {
+        out.push_str(&format!(
+            "### Report: {shown}\n\nRun on the default branch just now.\n\n```\n{}\n```\n\n",
+            text.trim_end()
+        ));
     }
     out.push_str(&format!(
         "## The tracker: open work, most urgent first\n\nFile nothing that is already here. Look at any bead in full with `bd show <id>`.\n\n{}\n",
@@ -3397,6 +3452,15 @@ pub fn check_definitions(config: &ConfigDir) -> Result<Vec<String>, DriverError>
                     ));
                 }
                 config.role_prompt("maintainer")?;
+                if let Some(name) = schedule
+                    .reports
+                    .iter()
+                    .find(|name| !project.commands.contains_key(name.as_str()))
+                {
+                    return Err(refuse(format!(
+                        "its schedule's report `{name}` is not a command of the project"
+                    )));
+                }
                 lines.push(format!(
                     "{id}/{}: scheduled, maintainer {} ({}), every {} day(s) at {:02}:00 UTC, at most {} bead(s) a run",
                     definition.id,
@@ -4896,6 +4960,34 @@ impl Supervisor {
             .unwrap_or_else(|| model.to_string())
     }
 
+    /// Run a command of a project outside any pipeline, in a checkout at
+    /// `commit`, which stands for `{base}`. Returns how it went and what its
+    /// summary file holds, if it names one.
+    fn run_apart(
+        &self,
+        command: &factory_config::CommandSpec,
+        cwd: &Path,
+        commit: &str,
+        out: &Path,
+    ) -> (factory_checks::CommandResult, String) {
+        let argv: Vec<String> = command
+            .argv
+            .iter()
+            .map(|arg| {
+                arg.replace("{base}", commit)
+                    .replace("{config}", &self.config.0.to_string_lossy())
+                    .replace("{out}", &out.to_string_lossy())
+            })
+            .collect();
+        let result = run_command(&argv, cwd, Duration::from_secs(command.timeout_secs));
+        let summary = command
+            .summary
+            .as_ref()
+            .and_then(|file| std::fs::read_to_string(out.join(file)).ok())
+            .unwrap_or_default();
+        (result, summary)
+    }
+
     /// Run the command that decides a goal's stop condition, if its
     /// definition names one and the default branch has moved since the
     /// command last ran. What it said is kept on the goal: the director's
@@ -4944,21 +5036,7 @@ impl Supervisor {
             goal.stop_check = Some(could_not(&shown, format!("{}: {err}", out.display())));
             return;
         }
-        let argv: Vec<String> = command
-            .argv
-            .iter()
-            .map(|arg| {
-                arg.replace("{base}", &commit)
-                    .replace("{config}", &self.config.0.to_string_lossy())
-                    .replace("{out}", &out.to_string_lossy())
-            })
-            .collect();
-        let result = run_command(&argv, &cwd, Duration::from_secs(command.timeout_secs));
-        let summary = command
-            .summary
-            .as_ref()
-            .and_then(|file| std::fs::read_to_string(out.join(file)).ok())
-            .unwrap_or_default();
+        let (result, summary) = self.run_apart(command, &cwd, &commit, &out);
         let blocked = first_match(&summary, &command.fail_when).unwrap_or(None);
         let (passed, how) = match (&result.verdict, blocked) {
             (Verdict::Passed, None) => (true, "passed".to_string()),
@@ -6055,6 +6133,59 @@ impl Supervisor {
                 grown,
             )
         };
+        let ci = match &project.github {
+            None => "The project has no GitHub repository on record, so there is no CI to read.\n"
+                .to_string(),
+            Some(settings) => match crate::github_client(&self.factory, settings).branch_runs(
+                &cwd,
+                &settings.repo,
+                &project.default_branch,
+            ) {
+                Ok(runs) => default_ci_text(
+                    &project.default_branch,
+                    &tip,
+                    &factory_github::branch_ci(&runs),
+                ),
+                Err(err) => format!(
+                    "It could not be read: {}\n",
+                    truncate(&err.to_string(), 300)
+                ),
+            },
+        };
+        let mut reports: Vec<(String, String)> = Vec::new();
+        for name in &schedule.reports {
+            let Some(command) = project.commands.get(name) else {
+                continue;
+            };
+            let out = seat.dir.join("reports").join(name);
+            let _ = std::fs::remove_dir_all(&out);
+            std::fs::create_dir_all(&out).map_err(crate::io(&out))?;
+            let (result, summary) = self.run_apart(command, &cwd, &tip, &out);
+            let how = match &result.verdict {
+                Verdict::Passed => String::new(),
+                Verdict::Failed { code } => format!(
+                    "(it exited with code {})\n",
+                    code.map_or("none".to_string(), |code| code.to_string())
+                ),
+                Verdict::TimedOut => format!(
+                    "(it was still running after {} seconds and was killed)\n",
+                    command.timeout_secs
+                ),
+                Verdict::CouldNotRun(reason) => format!("(it could not be run: {reason})\n"),
+            };
+            self.log_at(
+                &seat,
+                "schedule.report",
+                json!({ "command": name, "commit": tip, "secs": result.duration.as_secs(),
+                        "passed": result.verdict == Verdict::Passed }),
+            );
+            let text = if summary.trim().is_empty() {
+                tail(&result.output, 80)
+            } else {
+                truncate(summary.trim_end(), 6000)
+            };
+            reports.push((command.display(), format!("{how}{text}")));
+        }
         let brief = maintenance_brief(
             project.id.as_str(),
             schedule,
@@ -6063,6 +6194,8 @@ impl Supervisor {
             &found,
             &span,
             &grown,
+            &ci,
+            &reports,
             &tracker,
         );
         let check = |result: &Value| maintenance_problems(schedule, result);
@@ -9671,6 +9804,7 @@ mod tests {
             every_days,
             charter: "Keep quality from slipping.".to_string(),
             max_beads: 2,
+            reports: Vec::new(),
         }
     }
 
@@ -9891,6 +10025,37 @@ mod tests {
             blocked: false,
             blockers: Vec::new(),
         }];
+        use factory_github::{BranchCi, Run};
+        let red = BranchCi::Red {
+            commit: "aaaaaaaaaaaaaaaa".to_string(),
+            failed: vec![Run {
+                workflow: "ci".to_string(),
+                commit: "aaaaaaaaaaaaaaaa".to_string(),
+                status: "completed".to_string(),
+                conclusion: "failure".to_string(),
+                url: "https://github.com/me/toy/actions/runs/55".to_string(),
+            }],
+        };
+        let at = |commit: &str| commit.to_string();
+        assert_eq!(
+            default_ci_text(
+                "main",
+                "cccc",
+                &BranchCi::Green {
+                    commit: at("cccc"),
+                    runs: 2
+                }
+            ),
+            "The last CI run on `main` passed, on `cccc`: 2 workflow(s).\n"
+        );
+        assert_eq!(
+            default_ci_text("main", "cccc", &BranchCi::Pending { commit: at("cccc") }),
+            "CI on `main` has not finished on `cccc`, and nothing has failed so far.\n"
+        );
+        assert_eq!(
+            default_ci_text("main", "cccc", &BranchCi::Unknown),
+            "No CI run that finished was found on `main`.\n"
+        );
         let record = Scheduled {
             since: 100,
             runs: 4,
@@ -9905,6 +10070,11 @@ mod tests {
             &found,
             "`aaaaaaaaaa` to `bbbbbbbbbb`, 100 lines or more",
             &[("src/worker.zig".to_string(), 412)],
+            &default_ci_text("main", "bbbbbbbbbbbbbbbb", &red),
+            &[(
+                "duplicated code".to_string(),
+                "(it exited with code 1)\nsrc/a.zig:10-40 = src/b.zig:5-35\n".to_string(),
+            )],
             &tracker,
         );
         for part in [
@@ -9915,7 +10085,7 @@ mod tests {
             "### Beads that took three rounds of fixing or more\n\n- unit `toy-1-100`: 3 rounds\n",
             "### Pipelines that parked\n\n- unit `toy-1-100` at `break`: step `break` ended with `broken` more often than the flow allows\n",
             "### Fixes that removed tests or assertions\n\n- unit `toy-1-100`\n",
-            "### Files that grew most on the default branch (`aaaaaaaaaa` to `bbbbbbbbbb`, 100 lines or more)\n\n- `src/worker.zig`: +412 lines\n",
+            "### Files that grew most on the default branch (`aaaaaaaaaa` to `bbbbbbbbbb`, 100 lines or more)\n\n- `src/worker.zig`: +412 lines\n\n### The default branch's own CI\n\nThe last CI run on `main` failed, on `aaaaaaaaaa`. The branch has moved on since, to `bbbbbbbbbb`, which has no run yet. Every sub-goal that ships takes that in.\n\n- `ci`: https://github.com/me/toy/actions/runs/55\n\n### Report: duplicated code\n\nRun on the default branch just now.\n\n```\n(it exited with code 1)\nsrc/a.zig:10-40 = src/b.zig:5-35\n```\n\n## The tracker",
             "## The tracker: open work, most urgent first\n\nFile nothing that is already here.",
             "toy-7 | P1 | task | launchable | Bead toy-7\n",
             "## What the last run left for you\n\nI left the fuzz corpus alone: it is the conformance goal's.\n",
@@ -9931,9 +10101,12 @@ mod tests {
             &Measures::default(),
             "no earlier run to compare with",
             &[],
+            "No CI run that finished was found on `main`.\n",
+            &[],
             &[],
         );
         assert_eq!(quiet.matches("None.\n").count(), 6, "{quiet}");
+        assert!(!quiet.contains("### Report"), "{quiet}");
         assert!(
             quiet.contains("None to show.") && !quiet.contains("What the last run left"),
             "{quiet}"

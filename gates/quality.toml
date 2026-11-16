@@ -114,7 +114,7 @@ timeout_secs = 900
 id = "schedule-contract"
 tier = "hermetic"
 bead = "sf-gl5.6"
-claim = "A schedule is due at its hour every so many days and a missed time is made up once; a maintenance run may file beads up to its limit, each with acceptance criteria, and code refuses a result that starts, continues, ships, closes, edits or completes anything; the measures a run is shown are computed from the units' records since the last run and are the same for the same records."
+claim = "A schedule is due at its hour every so many days and a missed time is made up once; a maintenance run may file beads up to its limit, each with acceptance criteria, and code refuses a result that starts, continues, ships, closes, edits or completes anything; the measures a run is shown are computed from the units' records since the last run and are the same for the same records; the brief says what the default branch's own CI said and on which commit, and holds what each report command printed."
 command = ["cargo", "test", "--locked", "--offline", "--package", "factory-driver", "--lib", "--", "a_schedule_is_due", "a_maintenance_run"]
 timeout_secs = 900
 
@@ -122,7 +122,7 @@ timeout_secs = 900
 id = "schedule-runs"
 tier = "hermetic"
 bead = "sf-gl5.6"
-claim = "A definition with a schedule cannot be the default or have a stop check; seen first it counts from now; overdue, it is run once: the maintainer is shown the charter, the limit, the finding classes and the tracker, a result that asks for a pipeline or too many beads goes back to the same session, the bead it files is in the tracker, no goal or unit is made, the digest is posted, and the next run is given its journal."
+claim = "A definition with a schedule cannot be the default or have a stop check, and a report it names must be a command of the project; seen first it counts from now; overdue, it is run once: the maintainer is shown the charter, the limit, the finding classes, the default branch's CI as passed and later as failed with the run, the output of a report command that failed, and the tracker, a result that asks for a pipeline or too many beads goes back to the same session, the bead it files is in the tracker, no goal or unit is made, the digest is posted, and the next run is given its journal."
 command = ["cargo", "test", "--locked", "--offline", "--package", "factory-driver", "--test", "walk", "--", "a_scheduled_definition_is_run_when_due"]
 timeout_secs = 900
 
@@ -140,4 +140,12 @@ tier = "host"
 bead = "sf-gl5.6"
 claim = "On a Temporal server started on this machine, with the real engine command: a project whose workflow waits with nothing due is given a schedule whose time has passed, and the worker started in the old one's place has it look at once; the overdue run is made in that turn, its bead is filed, and the workflow then waits for the next time without looking again."
 command = ["cargo", "test", "--locked", "--offline", "--package", "factory-engine", "--test", "pipeline", "--", "a_schedule_new_to_a_project_is_run_when_a_worker_starts_with_it_overdue"]
+timeout_secs = 900
+
+[[check]]
+id = "branch-ci-verdict"
+tier = "hermetic"
+bead = "sf-gl5.8"
+claim = "A branch's own CI is judged by the workflow runs on the newest commit it ran on: one failure is red whatever else is running, an older commit's failure says nothing, and runs that were only cancelled or skipped are neither a pass nor a failure."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-github", "--lib", "--", "a_branch_is_judged_by_the_runs"]
 timeout_secs = 900

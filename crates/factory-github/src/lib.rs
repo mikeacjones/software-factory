@@ -369,6 +369,52 @@ impl GitHub {
         })
     }
 
+    /// The newest workflow runs on a branch, newest first.
+    pub fn branch_runs(
+        &self,
+        cwd: &Path,
+        repo: &str,
+        branch: &str,
+    ) -> Result<Vec<Run>, GitHubError> {
+        let args = [
+            "run",
+            "list",
+            "--repo",
+            repo,
+            "--branch",
+            branch,
+            "--limit",
+            "30",
+            "--json",
+            "workflowName,headSha,status,conclusion,url",
+        ];
+        let out = self.gh(cwd, &args, None)?;
+        let answer: Value =
+            serde_json::from_str(out.trim()).map_err(|err| GitHubError::Answer {
+                command: format!("gh {}", args.join(" ")),
+                detail: err.to_string(),
+            })?;
+        let text = |run: &Value, key: &str| {
+            run.get(key)
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string()
+        };
+        Ok(answer
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .map(|run| Run {
+                workflow: text(run, "workflowName"),
+                commit: text(run, "headSha"),
+                status: text(run, "status").to_lowercase(),
+                conclusion: text(run, "conclusion").to_lowercase(),
+                url: text(run, "url"),
+            })
+            .collect())
+    }
+
     /// The failing part of a check's log, if GitHub will give it.
     pub fn failed_log(&self, cwd: &Path, repo: &str, check: &Check) -> Option<String> {
         // .../actions/runs/<run>/job/<job>
@@ -740,6 +786,61 @@ fn check_of(entry: &Value) -> Check {
     }
 }
 
+/// One run of a workflow on a branch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Run {
+    pub workflow: String,
+    /// The commit it ran on.
+    pub commit: String,
+    /// `completed`, or where it is on the way there.
+    pub status: String,
+    /// `success`, `failure`, `cancelled` and so on. Empty until it completes.
+    pub conclusion: String,
+    pub url: String,
+}
+
+/// What a branch's own CI says of the newest commit it has run on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BranchCi {
+    /// There is no run, or none that says anything: every one was
+    /// cancelled or skipped.
+    Unknown,
+    /// Nothing on the commit has failed, and something has not finished.
+    Pending { commit: String },
+    /// Every run on the commit that finished passed; `runs` of them did.
+    Green { commit: String, runs: usize },
+    /// At least one run on the commit failed.
+    Red { commit: String, failed: Vec<Run> },
+}
+
+/// Judge a branch by its runs, newest first: those on the commit of the
+/// newest run. A run that was cancelled is no failure, since a later push
+/// cancels the runs before it.
+pub fn branch_ci(runs: &[Run]) -> BranchCi {
+    let Some(newest) = runs.first() else {
+        return BranchCi::Unknown;
+    };
+    let commit = newest.commit.clone();
+    let on: Vec<&Run> = runs.iter().filter(|run| run.commit == commit).collect();
+    let failed: Vec<Run> = on
+        .iter()
+        .filter(|run| {
+            ["failure", "timed_out", "startup_failure"].contains(&run.conclusion.as_str())
+        })
+        .map(|run| (*run).clone())
+        .collect();
+    if !failed.is_empty() {
+        return BranchCi::Red { commit, failed };
+    }
+    if on.iter().any(|run| run.status != "completed") {
+        return BranchCi::Pending { commit };
+    }
+    match on.iter().filter(|run| run.conclusion == "success").count() {
+        0 => BranchCi::Unknown,
+        runs => BranchCi::Green { commit, runs },
+    }
+}
+
 /// What a pull request's checks say, taken together.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CiVerdict {
@@ -1079,6 +1180,59 @@ mod tests {
             state,
             url: None,
         }
+    }
+
+    #[test]
+    fn a_branch_is_judged_by_the_runs_on_the_newest_commit_it_ran_on() {
+        let run = |workflow: &str, commit: &str, status: &str, conclusion: &str| Run {
+            workflow: workflow.to_string(),
+            commit: commit.to_string(),
+            status: status.to_string(),
+            conclusion: conclusion.to_string(),
+            url: format!("https://github.com/me/toy/actions/runs/{workflow}"),
+        };
+        assert_eq!(branch_ci(&[]), BranchCi::Unknown);
+        // An older commit's failure says nothing of the newest.
+        let old_red = run("ci", "aaa", "completed", "failure");
+        assert_eq!(
+            branch_ci(&[
+                run("ci", "bbb", "completed", "success"),
+                run("docs", "bbb", "completed", "skipped"),
+                old_red.clone()
+            ]),
+            BranchCi::Green {
+                commit: "bbb".to_string(),
+                runs: 1
+            }
+        );
+        // One failure is red, whatever else is still running.
+        let failed = run("ci", "bbb", "completed", "timed_out");
+        assert_eq!(
+            branch_ci(&[
+                run("docs", "bbb", "in_progress", ""),
+                failed.clone(),
+                old_red.clone()
+            ]),
+            BranchCi::Red {
+                commit: "bbb".to_string(),
+                failed: vec![failed]
+            }
+        );
+        assert_eq!(
+            branch_ci(&[
+                run("docs", "bbb", "queued", ""),
+                run("ci", "bbb", "completed", "success")
+            ]),
+            BranchCi::Pending {
+                commit: "bbb".to_string()
+            }
+        );
+        // A later push cancels the runs before it: that is not a failure,
+        // and not a pass.
+        assert_eq!(
+            branch_ci(&[run("ci", "bbb", "completed", "cancelled"), old_red]),
+            BranchCi::Unknown
+        );
     }
 
     #[test]

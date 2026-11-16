@@ -6,6 +6,8 @@
 #                     pending, red or green. The last line repeats.
 #   state/pr          the head branch, once a pull request is open
 #   state/merged      the merge commit, once it is merged
+#   state/branch-ci   how the one workflow run on a branch's tip ended, when
+#                     it did not pass: `failure`, `cancelled` and so on
 #   state/calls       one line per call
 here=$(cd "$(dirname "$0")" && pwd)
 state="$here/state-gh"
@@ -78,6 +80,13 @@ case "$1 $2" in
     esac
     mergeable=$(cat "$state/mergeable" 2>/dev/null || echo MERGEABLE)
     printf '{"state":"OPEN","headRefOid":"%s","mergeable":"%s","mergeCommit":null,"statusCheckRollup":[%s]}\n' "$head" "$mergeable" "$checks" ;;
+  "run list")
+    # The default branch's own CI: one workflow run on the branch's tip,
+    # which passed unless `state/branch-ci` says `failure` or another word.
+    branch=$(arg_after --branch "$@")
+    tip=$(git --git-dir="$remote" rev-parse "refs/heads/$branch")
+    conclusion=$(cat "$state/branch-ci" 2>/dev/null || echo success)
+    printf '[{"workflowName":"ci","headSha":"%s","status":"completed","conclusion":"%s","url":"https://github.com/me/toy/actions/runs/55"}]\n' "$tip" "$conclusion" ;;
   "run view")
     echo "unit	test	error: expected 4, found 5"
     echo "unit	test	1 test failed on linux" ;;

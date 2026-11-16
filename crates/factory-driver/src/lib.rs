@@ -4363,7 +4363,7 @@ pub fn ensure_issue(
     Ok(Some(url))
 }
 
-fn github_client(factory: &Factory, settings: &factory_config::GitHub) -> GitHub {
+pub(crate) fn github_client(factory: &Factory, settings: &factory_config::GitHub) -> GitHub {
     let mut github = GitHub::new(settings.write.clone());
     github.gh_bin = factory.gh_bin.clone();
     github

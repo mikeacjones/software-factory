@@ -4453,7 +4453,25 @@ fn a_scheduled_definition_is_run_when_due_and_its_agent_only_files_beads() {
         };
         assert!(refused.contains(why), "{refused}");
     }
-    std::fs::write(&upkeep, format!("id = \"upkeep\"\n{tier}{timed}")).unwrap();
+    std::fs::write(
+        &upkeep,
+        format!("id = \"upkeep\"\n{tier}{timed}reports = [\"clones\"]\n"),
+    )
+    .unwrap();
+    let refused = check_definitions(&world.config()).unwrap_err().to_string();
+    assert!(
+        refused.contains("its schedule's report `clones` is not a command of the project"),
+        "{refused}"
+    );
+    // A report is a command of the project, run on the default branch
+    // before each run. This one finds something, and says so by failing.
+    let toy = world.path("config/projects/toy.toml");
+    let text = std::fs::read_to_string(&toy).unwrap();
+    std::fs::write(
+        &toy,
+        format!("{text}\n[commands.clones]\nargv = [\"sh\", \"-c\", \"echo feature.txt:1-9 = other.txt:1-9 at $1; exit 3\", \"clones\", \"{{base}}\"]\ntimeout_secs = 30\nshown = \"duplicated code\"\n"),
+    )
+    .unwrap();
     let lines = check_definitions(&world.config()).unwrap().join("\n");
     assert!(
         lines.contains("toy/upkeep: scheduled, maintainer claude-opus-5-5 (high), every 7 day(s) at 04:00 UTC, at most 2 bead(s) a run"),
@@ -4563,6 +4581,21 @@ fn a_scheduled_definition_is_run_when_due_and_its_agent_only_files_beads() {
             && shown.contains("toy-1 | P"),
         "{shown}"
     );
+    // The default branch's own CI, and the report, as they are now.
+    let tip = run(
+        &world.path("remote.git"),
+        "git",
+        &["rev-parse", "refs/heads/main"],
+    )
+    .trim()
+    .to_string();
+    assert!(
+        shown.contains(&format!(
+            "### The default branch's own CI\n\nThe last CI run on `main` passed, on `{}`: 1 workflow(s).\n\n### Report: duplicated code\n\nRun on the default branch just now.\n\n```\n(it exited with code 3)\nfeature.txt:1-9 = other.txt:1-9 at {tip}\n```\n\n## The tracker",
+            &tip[..10]
+        )),
+        "{shown}"
+    );
     let sent_back = brief(2);
     assert!(
         sent_back.contains("`start`: a maintenance run files beads and does nothing else")
@@ -4612,7 +4645,9 @@ fn a_scheduled_definition_is_run_when_due_and_its_agent_only_files_beads() {
     assert!(sup.next_due().unwrap() > now());
     assert_eq!(maintainers().len(), 2);
 
-    // The next run is given what this one left, and may file nothing.
+    // The next run is given what this one left, and may file nothing. The
+    // default branch's CI has gone red meanwhile.
+    std::fs::write(world.path("bin/state-gh/branch-ci"), "failure\n").unwrap();
     overdue(ran);
     assert!(sup.pump(Duration::ZERO).unwrap());
     assert_eq!(maintainers().len(), 3);
@@ -4621,6 +4656,10 @@ fn a_scheduled_definition_is_run_when_due_and_its_agent_only_files_beads() {
         next.starts_with("# Maintenance of project `toy`, run 2\n")
             && next.contains("## What the last run left for you\n\nI did not file the README drift: it is one line.")
             && next.contains("nothing has landed since the last run")
+            && next.contains(&format!(
+                "The last CI run on `main` failed, on `{}`. Every sub-goal that ships takes that in.\n\n- `ci`: https://github.com/me/toy/actions/runs/55\n",
+                &tip[..10]
+            ))
             && next.contains("Check every error path for leaks"),
         "{next}"
     );

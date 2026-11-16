@@ -22,6 +22,11 @@ every_days = 7
 # The most beads one run may file. What it leaves out goes in its journal
 # for the next run.
 max_beads = 3
+# Commands of the project to run on the default branch before each run, for
+# what the factory's own records cannot show. Their output goes in the
+# maintainer's brief, whether they pass or fail. None yet: a report of
+# duplicated code waits for the project to have a command that makes one.
+reports = []
 charter = """
 Keep the quality of the Zig SDK from slipping between goals. Three things, \
 in this order. First, what the pipelines keep getting wrong: where a class \

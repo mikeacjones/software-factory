@@ -659,6 +659,12 @@ pub struct Schedule {
     /// The most beads one run may file.
     #[serde(default = "default_max_beads")]
     pub max_beads: u32,
+    /// Commands of the project to run on the default branch before each
+    /// run, whose output the agent is shown: a report code cannot compute
+    /// from the factory's own records, such as one of duplicated code. A
+    /// command that fails is shown too, and holds nothing up.
+    #[serde(default)]
+    pub reports: Vec<String>,
 }
 
 fn default_every_days() -> u32 {
