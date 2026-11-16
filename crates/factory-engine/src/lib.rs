@@ -14,6 +14,7 @@ pub mod accounts;
 pub mod describe;
 pub mod engine;
 pub mod factory;
+pub mod issues;
 pub mod steps;
 pub mod tiers;
 pub mod worker;

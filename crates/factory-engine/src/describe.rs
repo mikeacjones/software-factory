@@ -328,6 +328,50 @@ pub fn intake_static() -> String {
         .to_string()
 }
 
+/// What a project's sweep of its issues is for. Markdown.
+pub fn issue_sync_static(project: &str, every_secs: u64) -> String {
+    format!(
+        "Started by the schedule `issues-{project}` every {}, one run at a time.\n\n\
+         It sweeps the open beads of `{project}`: a bead with no GitHub issue is given one, \
+         made as the factory makes it when it files a bead, and every issue's type and \
+         priority are set to its bead's. A bead filed less than ten minutes ago, or one the \
+         factory's pipeline has claimed, is left for a later run: whoever filed or claimed it \
+         is making its issue.\n\n\
+         A run fails when some bead could not be brought into step, and names each; the next \
+         run tries them again. `factory issues sync {project}` does the same sweep at once.",
+        span(every_secs)
+    )
+}
+
+/// What a sweep of a project's issues did. Markdown.
+pub fn issue_sweep_details(project: &str, sweep: &factory_driver::IssueSweep) -> String {
+    if !sweep.kept {
+        return format!("`{project}` does not keep GitHub issues in step with its beads.");
+    }
+    let mut text = format!(
+        "{} open beads of `{project}`: {} given an issue, {} brought into step, {} left for a later run, {} failed.",
+        sweep.open,
+        sweep.created.len(),
+        sweep.changed.len(),
+        sweep.left.len(),
+        sweep.failed.len()
+    );
+    for (heading, lines) in [
+        ("Given an issue", &sweep.created),
+        ("Brought into step", &sweep.changed),
+        ("Failed", &sweep.failed),
+        ("Left for a later run", &sweep.left),
+    ] {
+        if !lines.is_empty() {
+            text.push_str(&format!("\n\n**{heading}**\n"));
+            for line in lines {
+                text.push_str(&format!("\n- {}", cut(line, 300)));
+            }
+        }
+    }
+    text
+}
+
 fn percent(part: f64) -> String {
     format!("{:.0}%", part * 100.0)
 }

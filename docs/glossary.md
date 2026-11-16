@@ -138,6 +138,10 @@ A command of the project that a goal definition names to decide the goal's stop 
 
 When a goal definition is run by the factory itself: at an hour of the day, every so many days, and, if it says so, as soon as a *finding class* has broken so many beads more. A definition with one is not a goal the owner opens. Each run is one agent, which files beads; a schedule that names a definition to build under lets a run mark beads the factory then builds.
 
+## issue sweep
+
+One run of a project's Temporal Schedule `issues-<project>`, hourly unless the `[temporal]` table says otherwise: every open bead without a GitHub issue is given one, and every issue's type and priority follow its bead's. A bead filed in the last ten minutes, or claimed by the factory, is left for a later run. Not a *schedule*: no goal definition is run.
+
 ## maintainer
 
 The agent of a scheduled run. It is given the run's charter and the measures, reads the default branch, files beads up to the definition's limit, and marks which of them the factory is to build. Code refuses anything else it asks for.

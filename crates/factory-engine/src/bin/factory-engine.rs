@@ -27,6 +27,7 @@ use factory_config::{ConfigDir, Temporal};
 use factory_engine::accounts::{ACCOUNTS_ID, Accounts};
 use factory_engine::engine::{Adopt, GoOn, Pipeline, PipelineInput};
 use factory_engine::factory::FactoryRunner;
+use factory_engine::issues::{self, ensure_schedule};
 use factory_engine::tiers::{Project, Reach, project_id, tell};
 use factory_engine::worker::{
     WorkerSettings, connect, ensure_accounts, ensure_tiers, pipeline_options, run,
@@ -197,6 +198,29 @@ async fn command(args: &[String]) -> Result<(), String> {
             let _ = std::fs::remove_file(factory_driver::drain_flag(&factory.state_dir));
             let client = connect(&temporal.address, &temporal.namespace).await?;
             ensure_accounts(&client, &temporal.task_queue, temporal.accounts_check_secs).await?;
+            // Each project that keeps GitHub issues in step with its beads
+            // has its sweep's schedule, as this release makes it.
+            for id in config.projects().map_err(|err| err.to_string())? {
+                let project = config.project(&id).map_err(|err| err.to_string())?;
+                if !project.github.as_ref().is_some_and(|github| github.issues) {
+                    continue;
+                }
+                let made = ensure_schedule(
+                    &client,
+                    &temporal.task_queue,
+                    &id,
+                    temporal.issue_sync_secs,
+                    temporal.beat_secs,
+                )
+                .await?;
+                if made {
+                    eprintln!(
+                        "factory-engine: made the schedule `{}`: every {}s",
+                        issues::schedule_id(&id),
+                        temporal.issue_sync_secs
+                    );
+                }
+            }
             if temporal.tiers {
                 // A definition that cannot run must not be able to open a goal.
                 factory_driver::goal::check_definitions(&config).map_err(|err| err.to_string())?;

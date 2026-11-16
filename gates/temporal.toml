@@ -73,6 +73,22 @@ command = ["cargo", "test", "--locked", "--offline", "--package", "factory-engin
 timeout_secs = 900
 
 [[check]]
+id = "issue-sweep"
+tier = "hermetic"
+bead = "sf-9a0.18"
+claim = "A sweep of a project that keeps GitHub issues gives each open bead without an issue exactly one, made and labelled as the factory makes one, and records it on the bead; it leaves a bead filed less than the minimum age ago and one the factory's own actor has claimed, sets type and priority on a bead that has an issue, makes no second issue when run again, and does nothing for a project that keeps no issues. A bead source can say how long ago each bead was filed."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-driver", "--package", "factory-beads", "--", "the_issue_sweep_gives_each_open_bead_one_issue", "a_bead_just_filed_is_young"]
+timeout_secs = 900
+
+[[check]]
+id = "issue-schedule"
+tier = "host"
+bead = "sf-9a0.18"
+claim = "On a Temporal server started on this machine, the schedule the worker keeps for a project starts the sweep workflow on its interval, whose run and activity say what they are for and whose result is the sweep's; made again with the same settings it is left as it is, and with another interval it is replaced; a sweep slower than the interval has the runs it would overlap skipped; and a sweep in which a bead failed fails its run, naming the bead."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-engine", "--test", "issues", "--", "--test-threads=1"]
+timeout_secs = 900
+
+[[check]]
 id = "engine-live"
 tier = "owner"
 bead = "sf-9a0.4"

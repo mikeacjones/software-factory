@@ -2,6 +2,7 @@
 //! record names: reads go straight to it, and a claim made through `bd` is
 //! read back from it, so a `bd` that wrote somewhere else is caught.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -308,6 +309,53 @@ impl Source {
             });
         }
         Ok(bead)
+    }
+
+    /// How long ago each bead was filed, in seconds, by ID: in the tracker
+    /// each that is not closed, and in a directory of files each file, by
+    /// how long ago it was last written.
+    pub fn ages(&self) -> Result<HashMap<String, u64>, BeadError> {
+        match self {
+            Source::Files { dir } => {
+                let entries = std::fs::read_dir(dir).map_err(|source| BeadError::Io {
+                    path: dir.clone(),
+                    source,
+                })?;
+                let mut ages = HashMap::new();
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    let Some(id) = name.strip_suffix(".json") else {
+                        continue;
+                    };
+                    let age = entry
+                        .metadata()
+                        .and_then(|meta| meta.modified())
+                        .ok()
+                        .and_then(|at| at.elapsed().ok())
+                        .map_or(0, |age| age.as_secs());
+                    ages.insert(id.to_string(), age);
+                }
+                Ok(ages)
+            }
+            // The tracker writes its times in UTC, so the server's own
+            // clock in UTC is what they are measured against.
+            Source::Dolt { .. } => Ok(self
+                .query(
+                    "select id, timestampdiff(second, created_at, utc_timestamp()) as age_secs \
+                     from issues where status <> 'closed'",
+                )?
+                .iter()
+                .filter_map(|row| {
+                    let id = row.get("id").and_then(Value::as_str)?;
+                    let age = row.get("age_secs").and_then(|value| {
+                        value
+                            .as_i64()
+                            .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+                    })?;
+                    Some((id.to_string(), u64::try_from(age).unwrap_or(0)))
+                })
+                .collect()),
+        }
     }
 
     /// Every bead that is not closed and is a piece of work (not an epic or
@@ -697,6 +745,19 @@ mod tests {
             issue_type: "task".to_string(),
             ..Bead::default()
         }
+    }
+
+    #[test]
+    fn a_bead_just_filed_is_young() {
+        let dir = std::env::temp_dir().join(format!("factory-beads-ages-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = Source::Files { dir: dir.clone() };
+        source.write_file(&dir, &ready()).unwrap();
+        let ages = source.ages().unwrap();
+        assert!(ages["toy-1"] < 60, "{ages:?}");
+        assert_eq!(ages.len(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

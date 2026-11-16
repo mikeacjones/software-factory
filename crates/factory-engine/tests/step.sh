@@ -25,6 +25,18 @@ if [ "$FACTORY_KIND" = accounts ]; then
   echo "accounts $(tr -d '\n' < "$state/picture.json")"
   exit 0
 fi
+# Asked to sweep a project's issues (FACTORY_KIND=issues) it notes the sweep
+# in state/sweeps and says what it did; `slow-sweep` in the scenario makes it
+# take 5 seconds and `sweep-fails` makes one bead fail.
+if [ "$FACTORY_KIND" = issues ]; then
+  scenario=$(cat "$state/scenario" 2>/dev/null)
+  echo "$(date +%s) $FACTORY_PROJECT start" >> "$state/sweeps"
+  case "$scenario" in *slow-sweep*) sleep 5 ;; esac
+  failed='[]'
+  case "$scenario" in *sweep-fails*) failed='["toy-9: gh said no"]' ;; esac
+  echo "issues {\"kept\":true,\"open\":3,\"created\":[\"toy-1 https://github.com/me/toy/issues/1\"],\"changed\":[],\"left\":[],\"failed\":$failed}"
+  exit 0
+fi
 key="$FACTORY_UNIT-$FACTORY_STEP"
 n=$(( $(cat "$state/n-$key" 2>/dev/null || echo 0) + 1 ))
 echo "$n" > "$state/n-$key"

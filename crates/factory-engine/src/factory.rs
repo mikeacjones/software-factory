@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use factory_config::ConfigDir;
 use factory_driver::goal::{Event, RunningPipeline, Supervisor, Turned};
-use factory_driver::{Driver, DriverError, Options, Stepped};
+use factory_driver::{Driver, DriverError, IssueSweep, Options, Stepped};
 use factory_slack::socket::Incoming;
 
 use crate::accounts::{CheckCall, Picture};
@@ -262,6 +262,16 @@ impl StepRunner for FactoryRunner {
 
     fn running(&self) -> Result<Vec<RunningPipeline>, String> {
         Supervisor::running_pipelines(&self.config).map_err(|err| err.to_string())
+    }
+
+    fn issues(&self, project: &str) -> Result<IssueSweep, String> {
+        let factory = self.config.factory().map_err(|err| err.to_string())?;
+        let project = self
+            .config
+            .project(project)
+            .map_err(|err| err.to_string())?;
+        factory_driver::sweep_issues(&factory, &project, factory_driver::ISSUE_SWEEP_MIN_AGE_SECS)
+            .map_err(|err| err.to_string())
     }
 
     fn draining(&self) -> bool {

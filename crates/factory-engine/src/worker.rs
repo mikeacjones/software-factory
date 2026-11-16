@@ -15,6 +15,7 @@ use temporalio_sdk::{Runtime, Worker, WorkerOptions};
 use crate::accounts::{ACCOUNTS_ID, Accounts, AccountsInput};
 use crate::describe;
 use crate::engine::{Pipeline, PipelineInput};
+use crate::issues::IssueSync;
 use crate::steps::{Gate, StepRunner, Steps};
 use crate::tiers::{INTAKE_RUN_SECS, Intake, IntakeInput, Project, Reach, intake_options};
 
@@ -163,6 +164,8 @@ pub async fn run(settings: WorkerSettings, runner: Arc<dyn StepRunner>) -> Resul
         .map_err(|err| format!("the projects could not be registered: {err}"))?
         .register_workflow::<Intake>()
         .map_err(|err| format!("the intake could not be registered: {err}"))?
+        .register_workflow::<IssueSync>()
+        .map_err(|err| format!("the issue sweep could not be registered: {err}"))?
         .build();
     let mut worker = Worker::new(&runtime, client, options)
         .map_err(|err| format!("the worker could not be made: {err}"))?;

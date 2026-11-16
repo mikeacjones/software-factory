@@ -79,6 +79,12 @@ pub struct Temporal {
     /// left, in seconds. Between those it acts on what runs report.
     #[serde(default = "default_accounts_check")]
     pub accounts_check_secs: u64,
+    /// How often a Temporal Schedule sweeps the open beads of each project
+    /// that keeps GitHub issues in step with them, in seconds: a bead with
+    /// no issue gets one, and each issue's type and priority follow its
+    /// bead's.
+    #[serde(default = "default_issue_sync")]
+    pub issue_sync_secs: u64,
     /// Goals run their pipelines on the engine: every bead, sub-goal bead
     /// and sub-goal being shipped is a workflow, started through the
     /// engine's own command. Off, the service runs them itself.
@@ -95,6 +101,10 @@ pub struct Temporal {
     /// allowed to a program by its path, so it does not move.
     #[serde(default)]
     pub engine_bin: Option<PathBuf>,
+}
+
+fn default_issue_sync() -> u64 {
+    3600
 }
 
 fn default_accounts_check() -> u64 {

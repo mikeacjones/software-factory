@@ -19,6 +19,7 @@ flowchart TB
         project["Project workflow<br/>id: project-ID, one per project"]
         pipeline["Pipeline workflows<br/>id: pipeline-GOAL-BEAD-N, one per unit's walk"]
         accounts["Accounts workflow<br/>id: accounts"]
+        sweep["Issue sweep workflows<br/>id: issues-PROJECT-TIME, started hourly by the schedule issues-PROJECT"]
     end
 
     subgraph worker["The Mac: one process, the engine's worker, kept alive by launchd"]
@@ -26,6 +27,7 @@ flowchart TB
         watch["Activity watch<br/>reads the goals' records and asks the server about each pipeline"]
         turn["Activity turn<br/>a supervisor made for one event:<br/>executive, directors, designers, foremen, maintainer"]
         steps["Activities prepare, agent, plain, finish, park<br/>the driver does one step of one unit"]
+        issues["Activity issues<br/>gives open beads without one a GitHub issue, and sets type and priority"]
         claude["claude -p<br/>headless, bypass mode, one account's token"]
         records[("State directory<br/>goals, units, schedules, class checks, accounts")]
     end
@@ -53,6 +55,9 @@ flowchart TB
     steps --> beads
     steps --> git
     steps --> github
+    sweep -->|"one sweep"| issues
+    issues --> beads
+    issues --> github
     turn -->|"posts and buttons"| slack
     steps -->|"status in the run's thread"| slack
 ```

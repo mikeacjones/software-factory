@@ -4530,6 +4530,111 @@ pub fn ensure_issue(
     Ok(Some(url))
 }
 
+/// How old a bead must be before a sweep gives it an issue, in seconds.
+/// The factory gives a bead it files its issue a moment after filing it,
+/// and a sweep that came in between would give it a second.
+pub const ISSUE_SWEEP_MIN_AGE_SECS: u64 = 600;
+
+/// What one sweep of a project's issues did. Each entry names its bead.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssueSweep {
+    /// Whether the project keeps issues in step with its beads at all.
+    pub kept: bool,
+    /// How many open beads were looked at.
+    pub open: usize,
+    /// Beads given an issue, each as `<bead> <url>`.
+    pub created: Vec<String>,
+    /// Issues whose type or priority was set, each as `<bead>: <what>`.
+    pub changed: Vec<String>,
+    /// Beads with no issue left for a later sweep, each with why.
+    pub left: Vec<String>,
+    /// What went wrong, each as `<bead>: <error>`.
+    pub failed: Vec<String>,
+}
+
+/// Bring every open bead of a project into step with GitHub: a bead with
+/// no issue gets one, made as [`ensure_issue`] makes it, and each issue's
+/// type and priority follow its bead's, as [`sync_issue_fields`] sets
+/// them. A bead younger than `min_age_secs`, or one the factory has
+/// claimed, gets no issue here: whoever filed or claimed it is making
+/// one. What fails for one bead is recorded and the sweep goes on.
+pub fn sweep_issues(
+    factory: &Factory,
+    project: &Project,
+    min_age_secs: u64,
+) -> Result<IssueSweep, DriverError> {
+    let mut sweep = IssueSweep::default();
+    if !project.github.as_ref().is_some_and(|github| github.issues) {
+        return Ok(sweep);
+    }
+    sweep.kept = true;
+    let source = bead_source(project);
+    let open = source.list_open()?;
+    // Without the ages no bead can be shown to be old enough, so none is
+    // given an issue; the fields are still brought into step.
+    let ages = source.ages().unwrap_or_else(|err| {
+        sweep.failed.push(format!("(ages): {err}"));
+        Default::default()
+    });
+    sweep.open = open.len();
+    for summary in open {
+        let id = summary.id;
+        let mut bead = match source.read(&id) {
+            Ok(bead) => bead,
+            Err(err) => {
+                sweep.failed.push(format!("{id}: {err}"));
+                continue;
+            }
+        };
+        if bead.external_ref.trim().is_empty() {
+            if bead.status == "in_progress" && bead.assignee == project.bead_actor {
+                sweep
+                    .left
+                    .push(format!("{id}: its pipeline gives it its issue"));
+                continue;
+            }
+            match ages.get(&id) {
+                Some(age) if *age >= min_age_secs => {}
+                Some(age) => {
+                    sweep.left.push(format!("{id}: filed {age}s ago"));
+                    continue;
+                }
+                None => {
+                    sweep.left.push(format!("{id}: its age is not known"));
+                    continue;
+                }
+            }
+            // As it stands now: someone may have given it an issue since.
+            bead = match source.read(&id) {
+                Ok(bead) => bead,
+                Err(err) => {
+                    sweep.failed.push(format!("{id}: {err}"));
+                    continue;
+                }
+            };
+            if bead.external_ref.trim().is_empty() {
+                match ensure_issue(factory, project, &source, &bead) {
+                    Ok(Some(url)) => {
+                        sweep.created.push(format!("{id} {url}"));
+                        bead.external_ref = url;
+                    }
+                    Ok(None) => continue,
+                    Err(err) => {
+                        sweep.failed.push(format!("{id}: {err}"));
+                        continue;
+                    }
+                }
+            }
+        }
+        match sync_issue_fields(factory, project, &bead) {
+            Ok(set) if set.is_empty() => {}
+            Ok(set) => sweep.changed.push(format!("{id}: {}", set.join(", "))),
+            Err(err) => sweep.failed.push(format!("{id}: {err}")),
+        }
+    }
+    Ok(sweep)
+}
+
 pub(crate) fn github_client(factory: &Factory, settings: &factory_config::GitHub) -> GitHub {
     let mut github = GitHub::new(settings.write.clone());
     github.gh_bin = factory.gh_bin.clone();

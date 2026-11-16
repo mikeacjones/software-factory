@@ -12,8 +12,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use factory_driver::Within;
 use factory_driver::goal::{Event, RunningPipeline, Turned};
+use factory_driver::{IssueSweep, Within};
 use factory_flow::Position;
 use factory_slack::socket::Incoming;
 use serde::{Deserialize, Serialize};
@@ -141,6 +141,14 @@ pub struct TurnCall {
     pub beat_secs: u64,
 }
 
+/// A sweep of a project's open beads against its GitHub issues.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssuesCall {
+    pub project: String,
+    /// How often the sweep says it is alive, in seconds.
+    pub beat_secs: u64,
+}
+
 /// What the listener and the watcher are started with.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct PumpCall {
@@ -229,6 +237,13 @@ pub trait StepRunner: Send + Sync + 'static {
     /// what is left for the engine to do.
     fn turn(&self, project: &str, _event: &Event) -> Result<Turned, String> {
         Err(format!("this runner has no tiers for `{project}`"))
+    }
+
+    /// Bring a project's GitHub issues into step with its open beads: a
+    /// bead with none is given one, and each issue's type and priority
+    /// follow its bead's.
+    fn issues(&self, project: &str) -> Result<IssueSweep, String> {
+        Err(format!("this runner keeps no issues for `{project}`"))
     }
 
     /// Listen for what the owner does, until `stop` is set: each thing is
@@ -582,6 +597,35 @@ impl Steps {
         }
     }
 
+    /// A sweep of a project's issues. It says it is alive while it runs,
+    /// so that one whose worker died is noticed and run again.
+    #[activity]
+    pub async fn issues(
+        self: Arc<Self>,
+        ctx: ActivityContext,
+        call: IssuesCall,
+    ) -> Result<IssueSweep, ActivityError> {
+        let _busy = self.gate.enter();
+        let runner = self.runner.clone();
+        let every = Duration::from_secs(call.beat_secs.max(1));
+        let mut work = tokio::task::spawn_blocking(move || runner.issues(&call.project));
+        let mut beat = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+        loop {
+            tokio::select! {
+                done = &mut work => {
+                    return match done {
+                        Ok(Ok(sweep)) => Ok(sweep),
+                        Ok(Err(reason)) => Err(failed(reason)),
+                        Err(join) => Err(failed(format!("the sweep was lost: {join}"))),
+                    };
+                }
+                _ = beat.tick() => {
+                    ctx.record_heartbeat(String::new()).await?;
+                }
+            }
+        }
+    }
+
     /// One turn of a project's tiers. It says it is alive while an agent
     /// of theirs runs, so that one whose worker died is noticed and the
     /// turn taken again.
@@ -913,6 +957,23 @@ impl StepRunner for ExecRunner {
             "command"
         };
         self.run(kind, call, None, None)
+    }
+
+    fn issues(&self, project: &str) -> Result<IssueSweep, String> {
+        let (program, args) = self.argv.split_first().ok_or("the step command is empty")?;
+        let out = std::process::Command::new(program)
+            .args(args)
+            .env("FACTORY_KIND", "issues")
+            .env("FACTORY_PROJECT", project)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|err| format!("`{program}` could not be run: {err}"))?;
+        let said = String::from_utf8_lossy(&out.stdout);
+        let sweep = said
+            .lines()
+            .find_map(|line| line.strip_prefix("issues "))
+            .ok_or("the command did not say what the sweep did")?;
+        serde_json::from_str(sweep).map_err(|err| format!("the sweep's result: {err}"))
     }
 
     fn accounts(&self, call: &CheckCall) -> Result<Picture, String> {

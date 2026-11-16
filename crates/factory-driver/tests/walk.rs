@@ -5704,3 +5704,96 @@ fn the_executive_closes_a_bead_for_the_owner_or_a_director_now_or_once_another_l
     sup.pump(Duration::ZERO).unwrap();
     assert_eq!(world.calls().len(), calls_before);
 }
+
+#[test]
+fn the_issue_sweep_gives_each_open_bead_one_issue_and_leaves_those_being_given_one() {
+    let world = World::new("sweep", "true");
+    world.with_github("green");
+    let project = world.path("config/projects/toy.toml");
+    let text = std::fs::read_to_string(&project).unwrap().replace(
+        "write = [\"me/toy\"]",
+        "write = [\"me/toy\"]\nissues = true\nissue_labels = [\"type::{type}\"]\nissue_types = { bug = \"Bug\", \"*\" = \"Task\" }\nissue_priority = { field = \"Priority\", options = [\"Critical\", \"High\", \"Medium\"] }",
+    );
+    std::fs::write(&project, text).unwrap();
+    // One the factory's pipeline has claimed, and one with its issue.
+    std::fs::write(
+        world.path("beads/toy-4.json"),
+        r#"{"id":"toy-4","title":"Being built","acceptance_criteria":"- x","status":"in_progress","assignee":"factory"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        world.path("beads/toy-5.json"),
+        r#"{"id":"toy-5","title":"Tracked","acceptance_criteria":"- x","status":"open","issue_type":"bug","external_ref":"https://github.com/me/toy/issues/40"}"#,
+    )
+    .unwrap();
+    let config = world.config();
+    let factory = config.factory().unwrap();
+    let project = config.project("toy").unwrap();
+    let issues_made = || {
+        std::fs::read_to_string(world.path("bin/state-gh/issues"))
+            .map(|n| n.trim().parse::<u32>().unwrap())
+            .unwrap_or(0)
+    };
+
+    // Every bead was filed a moment ago: whoever filed it is making its issue.
+    let sweep = factory_driver::sweep_issues(&factory, &project, 3600).unwrap();
+    assert!(sweep.kept);
+    assert_eq!(sweep.open, 4, "{sweep:?}");
+    assert!(sweep.created.is_empty(), "{sweep:?}");
+    assert_eq!(issues_made(), 0);
+    assert!(
+        sweep
+            .left
+            .iter()
+            .any(|line| line.starts_with("toy-1: filed")),
+        "{sweep:?}"
+    );
+    assert!(
+        sweep
+            .left
+            .contains(&"toy-4: its pipeline gives it its issue".to_string()),
+        "{sweep:?}"
+    );
+    // The bead with an issue has its type and priority set all the same.
+    assert_eq!(sweep.changed.len(), 1, "{sweep:?}");
+    assert!(sweep.changed[0].starts_with("toy-5: "), "{sweep:?}");
+
+    // Old enough: each bead without an issue gets one, someone else's
+    // claimed bead too, and the factory's own is still left to its pipeline.
+    let sweep = factory_driver::sweep_issues(&factory, &project, 0).unwrap();
+    let created: Vec<&str> = sweep
+        .created
+        .iter()
+        .map(|line| line.split(' ').next().unwrap())
+        .collect();
+    assert_eq!(created, ["toy-1", "toy-2"], "{sweep:?}");
+    assert!(sweep.failed.is_empty(), "{sweep:?}");
+    assert_eq!(issues_made(), 2);
+    let source = factory_driver::bead_source(&project);
+    for (id, url) in [
+        ("toy-1", "https://github.com/me/toy/issues/1"),
+        ("toy-2", "https://github.com/me/toy/issues/2"),
+    ] {
+        assert_eq!(source.read(id).unwrap().external_ref, url);
+    }
+    assert!(source.read("toy-4").unwrap().external_ref.is_empty());
+    // Made as the factory makes an issue: labelled, and naming its bead.
+    let created_calls: Vec<String> = world
+        .gh_calls()
+        .into_iter()
+        .filter(|call| call.starts_with("issue create"))
+        .collect();
+    assert_eq!(created_calls.len(), 2);
+    assert!(created_calls[0].contains("type::task"), "{created_calls:?}");
+
+    // A second sweep makes no second issue.
+    let sweep = factory_driver::sweep_issues(&factory, &project, 0).unwrap();
+    assert!(sweep.created.is_empty(), "{sweep:?}");
+    assert_eq!(issues_made(), 2);
+
+    // A project that does not keep issues is not swept.
+    let mut quiet = project.clone();
+    quiet.github.as_mut().unwrap().issues = false;
+    let sweep = factory_driver::sweep_issues(&factory, &quiet, 0).unwrap();
+    assert_eq!(sweep, factory_driver::IssueSweep::default());
+}
