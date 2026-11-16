@@ -10,6 +10,7 @@
 //! This is the thin first cut of the driver: one unit, no ticks, no Redis.
 
 pub mod goal;
+pub mod report;
 pub mod service;
 pub mod thread;
 

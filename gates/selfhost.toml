@@ -1,0 +1,13 @@
+# Self-hosting: the factory works on its own repository and reviews itself
+# every night. Each check is an acceptance line of a bead in epic sf-yd3.
+id = "selfhost"
+title = "The factory works on its own repository and reviews itself"
+bead = "sf-yd3"
+
+[[check]]
+id = "report"
+tier = "hermetic"
+bead = "sf-yd3.1"
+claim = "factory report builds, from a state directory's records alone, for a period and optionally one project: units started, landed, absorbed, parked and ended; beads closed; cost in units and in directors and foremen, per bead closed and by unit; fix rounds per unit; runs, total and longest time per step; park reasons counted together whatever commits and numbers they name; how often each triage outcome fired; checks that ran to their time limit; owner prompts, their waits and those unanswered; and the classes of defect testers proved in the period; as text and as JSON."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-driver", "--lib", "report"]
+timeout_secs = 600

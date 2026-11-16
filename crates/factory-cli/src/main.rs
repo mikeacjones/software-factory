@@ -45,6 +45,10 @@ usage:
   factory goal check                          check every project's goal definitions
   factory goal list                           the goals the factory knows and where each stands
   factory bead <project> <bead>               show a bead and whether it may be launched
+  factory report [--since 24h] [--project <id>] [--json]
+                                              how the factory ran in a period, from its own
+                                              records: units, cost, fix rounds, step times,
+                                              parks, triage, time-outs, the owner's waits
   factory findings <project>                  the classes of defect the project's testers have
                                               proved, with how many findings and beads each
   factory flow check <project>                check the flow a project names
@@ -61,6 +65,12 @@ struct Args {
     now: bool,
     unit: Option<String>,
     from: Option<String>,
+    /// For `report`: where the period starts (`24h`, `7d`, Unix seconds).
+    since: Option<String>,
+    /// For `report`: only this project.
+    project: Option<String>,
+    /// For `report`: JSON instead of text.
+    json: bool,
     positional: Vec<String>,
 }
 
@@ -71,6 +81,9 @@ fn parse(args: &[String]) -> Result<Args, String> {
         now: false,
         unit: None,
         from: None,
+        since: None,
+        project: None,
+        json: false,
         positional: Vec::new(),
     };
     let mut args = args.iter();
@@ -82,6 +95,11 @@ fn parse(args: &[String]) -> Result<Args, String> {
             }
             "--unit" => parsed.unit = Some(args.next().ok_or("--unit needs a unit ID")?.clone()),
             "--from" => parsed.from = Some(args.next().ok_or("--from needs a step")?.clone()),
+            "--since" => parsed.since = Some(args.next().ok_or("--since needs a time")?.clone()),
+            "--project" => {
+                parsed.project = Some(args.next().ok_or("--project needs a project")?.clone())
+            }
+            "--json" => parsed.json = true,
             "--no-slack" => parsed.slack = false,
             "--now" => parsed.now = true,
             flag if flag.starts_with("--") => return Err(format!("unknown option `{flag}`")),
@@ -631,6 +649,31 @@ fn run(args: &[String]) -> Result<u8, String> {
                         .map(|charter| charter.objective.replace('\n', " "))
                         .unwrap_or_else(|| "(still being agreed)".to_string())
                 );
+            }
+            Ok(0)
+        }
+        ["report"] => {
+            let factory = args.config.factory().map_err(|err| fail(&err))?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let since = args.since.as_deref().unwrap_or("24h");
+            let since = factory_driver::report::since_time(since, now).ok_or(format!(
+                "--since `{since}` is not a time: give 24h, 7d, 90m or Unix seconds"
+            ))?;
+            let report = factory_driver::report::build(
+                &factory.state_dir,
+                factory_driver::report::Period {
+                    since,
+                    until: now + 1,
+                },
+                args.project.as_deref(),
+            );
+            if args.json {
+                println!("{}", report.json().map_err(|err| fail(&err))?);
+            } else {
+                print!("{}", report.text());
             }
             Ok(0)
         }
