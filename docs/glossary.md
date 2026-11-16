@@ -125,3 +125,7 @@ The kind of mistake a tester's finding is, as a short key such as `error-path-cl
 ## test proof
 
 A command step that runs each test a change adds or alters on the code as it was at the unit's base. A test that fails there tests the change; one that passes there goes back to the builder; one that cannot be compiled or reached there is reported as not proved.
+
+## stop check
+
+A command of the project that a goal definition names to decide the goal's stop condition. Code runs it on the default branch, shows the director what it said, and refuses a proposal that the goal is complete while it fails.

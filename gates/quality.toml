@@ -77,3 +77,11 @@ bead = "sf-gl5.2"
 claim = "The reviewer's role no longer asks whether tests fail without the change, and says what idiom and quality are judged against; a builder and a reviewer are named the project's standards."
 command = ["sh", "-c", "! grep -q 'must fail without the change' config/roles/reviewer.md && grep -q 'written standards' config/roles/reviewer.md && cargo test --locked --offline --package factory-driver --lib -- a_builder_and_a_reviewer_are_named"]
 timeout_secs = 900
+
+[[check]]
+id = "stop-check"
+tier = "hermetic"
+bead = "sf-gl5.4"
+claim = "A goal definition may name a stop_check command, and one that is not a command of the project is refused; the command runs on the default branch when it has moved; a director's complete is refused while it fails, with what it said in the brief; once it passes the proposal reaches the owner."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-driver", "--lib", "--test", "walk", "--", "a_goal_with_a_stop_check_is_complete_only", "a_goal_is_not_proposed_as_complete_while"]
+timeout_secs = 900

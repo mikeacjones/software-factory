@@ -32,6 +32,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
 use factory_beads::{Change, NewBead, Source, Summary, readiness};
+use factory_checks::{Verdict, first_match, run_command};
 use factory_claude::{Outcome, RunSpec, Session, Usage};
 use factory_config::{
     ConfigDir, Factory, GoalDefinition, Permission, Project, Tier, read_env_file,
@@ -39,7 +40,7 @@ use factory_config::{
 use factory_core::{EventLog, ProjectId, UnitId, now_unix};
 use factory_slack::socket::{Incoming, Listener};
 use factory_slack::{Button, Slack, escape, quote, truncate};
-use factory_supervise::Control;
+use factory_supervise::{Control, tail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -311,6 +312,10 @@ pub struct Goal {
     /// The message that carries buttons right now, and its text.
     pub prompt: Option<(String, String)>,
     pub evidence: Option<String>,
+    /// What the command that decides the goal's stop condition last said,
+    /// when the goal's definition names one.
+    #[serde(default)]
+    pub stop_check: Option<StopCheck>,
     pub wakes: u32,
     pub failures: u32,
     pub retry_at: Option<u64>,
@@ -930,6 +935,50 @@ fn edit_problems(edits: &[BeadEdit], tracker: &[Summary]) -> Vec<String> {
 ///
 /// `launchable` answers, for a bead ID, why the readiness check would refuse
 /// it (empty: it would not).
+/// One run of the command that decides a goal's stop condition.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StopCheck {
+    /// The command as people are shown it.
+    pub command: String,
+    /// The commit of the default branch it ran on. Empty when it could not
+    /// be run at all, so that the next wake tries again.
+    pub commit: String,
+    pub passed: bool,
+    /// How it ended, in words: `passed`, `failed (exit code 1)`.
+    pub how: String,
+    /// Its summary, or the end of its output.
+    pub text: String,
+}
+
+impl StopCheck {
+    /// What a director is shown of it.
+    fn brief(&self) -> String {
+        let on = if self.commit.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " on commit `{}` of the default branch",
+                &self.commit[..self.commit.len().min(10)]
+            )
+        };
+        let said = if self.text.trim().is_empty() {
+            String::new()
+        } else {
+            format!("\n\n```\n{}\n```", self.text.trim_end())
+        };
+        format!(
+            "## The stop check\n\nA command decides this goal's stop condition, and the factory runs it: `{}`. It {}{on}.{said}\n\n{}\n\n",
+            self.command,
+            self.how,
+            if self.passed {
+                "It passes, so you may propose `complete` if the rest of the stop condition is met."
+            } else {
+                "While it does not pass the goal is not complete, and the factory refuses `complete`. What it shows as failing or missing is work still to plan."
+            }
+        )
+    }
+}
+
 pub fn decision_problems(
     definition: &GoalDefinition,
     goal: &Goal,
@@ -946,6 +995,18 @@ pub fn decision_problems(
     let batched = definition.ship_flow.is_some();
     if strings(result, "summary").trim().is_empty() {
         problems.push("`summary` is empty".to_string());
+    }
+    if complete && definition.stop_check.is_some() {
+        match &goal.stop_check {
+            Some(check) if check.passed => {}
+            Some(check) => problems.push(format!(
+                "`complete`: the command that decides this goal's stop condition (`{}`) {}, so the goal is not complete. Your brief has what it said: decide the work that is still missing, and leave `complete` false",
+                check.command, check.how
+            )),
+            None => problems.push(
+                "`complete`: the command that decides this goal's stop condition has not been run, so the goal cannot be proposed as complete".to_string(),
+            ),
+        }
     }
 
     // Sub-goals: each lands as one pull request, and the director may have
@@ -2115,6 +2176,13 @@ pub fn wake_brief(
         charter.stop_when,
         charter.plan
     );
+    if let Some(check) = goal
+        .stop_check
+        .as_ref()
+        .filter(|_| definition.stop_check.is_some())
+    {
+        out.push_str(&check.brief());
+    }
     out.push_str("## What happened since you last ran\n\n");
     out.push_str(&told(&goal.inbox));
     if definition.ship_flow.is_some() {
@@ -2584,6 +2652,13 @@ pub fn check_definitions(config: &ConfigDir) -> Result<Vec<String>, DriverError>
                     definition.id
                 ))
             };
+            if let Some(name) = &definition.stop_check
+                && !project.commands.contains_key(name)
+            {
+                return Err(refuse(format!(
+                    "its stop_check `{name}` is not a command of the project"
+                )));
+            }
             let mut with_flow = project.clone();
             if let Some(flow) = &definition.flow {
                 with_flow.flow = flow.clone();
@@ -3202,6 +3277,7 @@ impl Supervisor {
             request: None,
             prompt: None,
             evidence: None,
+            stop_check: None,
             wakes: 0,
             failures: 0,
             retry_at: None,
@@ -4101,6 +4177,112 @@ impl Supervisor {
             .unwrap_or_else(|| model.to_string())
     }
 
+    /// Run the command that decides a goal's stop condition, if its
+    /// definition names one and the default branch has moved since the
+    /// command last ran. What it said is kept on the goal: the director's
+    /// brief shows it, and a proposal to complete is checked against it.
+    fn run_stop_check(&mut self, goal: &mut Goal, definition: &GoalDefinition, project: &Project) {
+        let Some(name) = &definition.stop_check else {
+            goal.stop_check = None;
+            return;
+        };
+        let could_not = |command: &str, reason: String| StopCheck {
+            command: command.to_string(),
+            commit: String::new(),
+            passed: false,
+            how: format!("could not be run: {reason}"),
+            text: String::new(),
+        };
+        let Some(command) = project.commands.get(name) else {
+            goal.stop_check = Some(could_not(
+                name,
+                "the project's record has no such command".to_string(),
+            ));
+            return;
+        };
+        let shown = command.display();
+        let seat = self.seat(goal);
+        let at = self
+            .checkout(&seat.dir, project, &None)
+            .and_then(|cwd| Ok((factory_git::rev_parse(&cwd, "HEAD")?, cwd)));
+        let (commit, cwd) = match at {
+            Ok(at) => at,
+            Err(err) => {
+                goal.stop_check = Some(could_not(&shown, err.to_string()));
+                return;
+            }
+        };
+        if goal
+            .stop_check
+            .as_ref()
+            .is_some_and(|last| last.commit == commit && last.command == shown)
+        {
+            return;
+        }
+        let out = seat.dir.join("stop-check");
+        let _ = std::fs::remove_dir_all(&out);
+        if let Err(err) = std::fs::create_dir_all(&out) {
+            goal.stop_check = Some(could_not(&shown, format!("{}: {err}", out.display())));
+            return;
+        }
+        let argv: Vec<String> = command
+            .argv
+            .iter()
+            .map(|arg| {
+                arg.replace("{base}", &commit)
+                    .replace("{config}", &self.config.0.to_string_lossy())
+                    .replace("{out}", &out.to_string_lossy())
+            })
+            .collect();
+        let result = run_command(&argv, &cwd, Duration::from_secs(command.timeout_secs));
+        let summary = command
+            .summary
+            .as_ref()
+            .and_then(|file| std::fs::read_to_string(out.join(file)).ok())
+            .unwrap_or_default();
+        let blocked = first_match(&summary, &command.fail_when).unwrap_or(None);
+        let (passed, how) = match (&result.verdict, blocked) {
+            (Verdict::Passed, None) => (true, "passed".to_string()),
+            (Verdict::Passed, Some(line)) => (
+                false,
+                format!("showed a result that must not pass (`{}`)", line.trim()),
+            ),
+            (Verdict::Failed { code }, _) => (
+                false,
+                format!(
+                    "failed (exit code {})",
+                    code.map_or("none".to_string(), |code| code.to_string())
+                ),
+            ),
+            (Verdict::TimedOut, _) => (
+                false,
+                format!(
+                    "was still running after {} seconds and was killed",
+                    command.timeout_secs
+                ),
+            ),
+            (Verdict::CouldNotRun(reason), _) => (false, format!("could not be run: {reason}")),
+        };
+        let text = if summary.trim().is_empty() {
+            tail(&result.output, 60)
+        } else {
+            truncate(summary.trim_end(), 4000)
+        };
+        self.log(
+            goal,
+            "stop_check.ran",
+            json!({ "command": name, "commit": commit, "passed": passed, "how": how,
+                    "secs": result.duration.as_secs() }),
+        );
+        goal.stop_check = Some(StopCheck {
+            command: shown,
+            commit,
+            passed,
+            how,
+            text,
+        });
+    }
+
     /// A checkout for an agent to read, kept apart from the owner's own
     /// checkout and from every pipeline's worktree: the default branch for
     /// the director, a sub-goal's branch for its foreman.
@@ -4598,6 +4780,7 @@ impl Supervisor {
         let journal_path = self.dir(id).join("journal.md");
         let journal = std::fs::read_to_string(&journal_path).unwrap_or_default();
         let memory = std::fs::read_to_string(self.memory_path(&goal.project)).unwrap_or_default();
+        self.run_stop_check(&mut goal, &definition, &project);
         let brief = wake_brief(&definition, &goal, &tracker, &journal, &memory);
 
         let done = goal.absorbed();
@@ -4781,8 +4964,16 @@ impl Supervisor {
         }
         if result.get("complete").and_then(Value::as_bool) == Some(true) {
             let evidence = strings(&result, "evidence").to_string();
+            let checked = match goal.stop_check.as_ref().filter(|check| check.passed) {
+                Some(check) => format!(
+                    "\nThe goal's stop check (`{}`) passes on `{}`.",
+                    escape(&check.command),
+                    &check.commit[..check.commit.len().min(10)]
+                ),
+                None => String::new(),
+            };
             let text = format!(
-                ":checkered_flag: {} *The director says the stop condition is met.*\n{}\nPress *Accept* to mark the goal complete, or reply with what is still missing.",
+                ":checkered_flag: {} *The director says the stop condition is met.*\n{}{checked}\nPress *Accept* to mark the goal complete, or reply with what is still missing.",
                 self.mentions(),
                 quote(&truncate(&evidence, 2500))
             );
@@ -6542,6 +6733,61 @@ mod tests {
             blockers: Vec::new(),
         };
         vec![bead("toy-1", true), bead("toy-2", false)]
+    }
+
+    #[test]
+    fn a_goal_with_a_stop_check_is_complete_only_while_its_command_passes() {
+        let mut d = definition(1, "allow");
+        d.stop_check = Some("conformance".to_string());
+        let done = json!({"complete": true, "evidence": "All of it."});
+        let mut goal = goal();
+        assert_eq!(
+            problems(&d, &goal, done.clone()),
+            [
+                "`complete`: the command that decides this goal's stop condition has not been run, so the goal cannot be proposed as complete"
+            ]
+        );
+        goal.stop_check = Some(StopCheck {
+            command: "the suite".to_string(),
+            commit: "0123456789abcdef".to_string(),
+            passed: false,
+            how: "failed (exit code 1)".to_string(),
+            text: "passing 2, failing 1, not written 4\n".to_string(),
+        });
+        assert_eq!(
+            problems(&d, &goal, done.clone()),
+            [
+                "`complete`: the command that decides this goal's stop condition (`the suite`) failed (exit code 1), so the goal is not complete. Your brief has what it said: decide the work that is still missing, and leave `complete` false"
+            ]
+        );
+        // Anything else it decides is still its to decide.
+        assert_eq!(
+            problems(
+                &d,
+                &goal,
+                json!({"ask_owner": "The suite fails. Shall I plan the rest?"})
+            ),
+            Vec::<String>::new()
+        );
+        let brief = wake_brief(&d, &goal, &[], "", "");
+        assert!(
+            brief.contains(
+                "## The stop check\n\nA command decides this goal's stop condition, and the factory runs it: `the suite`. It failed (exit code 1) on commit `0123456789` of the default branch.\n\n```\npassing 2, failing 1, not written 4\n```\n\nWhile it does not pass the goal is not complete, and the factory refuses `complete`."
+            ),
+            "{brief}"
+        );
+        if let Some(check) = goal.stop_check.as_mut() {
+            check.passed = true;
+            check.how = "passed".to_string();
+        }
+        assert_eq!(problems(&d, &goal, done.clone()), Vec::<String>::new());
+        assert!(
+            wake_brief(&d, &goal, &[], "", "").contains("It passes, so you may propose `complete`")
+        );
+        // A definition that names no command shows nothing and asks nothing.
+        let plain = definition(1, "allow");
+        assert!(!wake_brief(&plain, &goal, &[], "", "").contains("## The stop check"));
+        assert_eq!(problems(&plain, &self::goal(), done), Vec::<String>::new());
     }
 
     #[test]

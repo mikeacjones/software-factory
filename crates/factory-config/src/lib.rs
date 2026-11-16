@@ -618,6 +618,12 @@ pub struct GoalDefinition {
     /// without saying more.
     pub objective: Option<String>,
     pub stop_when: Option<String>,
+    /// A command of the project that decides the stop condition. The
+    /// factory runs it on the default branch whenever that has moved, shows
+    /// the director what it said, and refuses the director's proposal that
+    /// the goal is complete while it fails. Without it the stop condition
+    /// is the director's to judge and the owner's to accept.
+    pub stop_check: Option<String>,
     pub director: Tier,
     /// The agent that runs each sub-goal: it starts the sub-goal's beads,
     /// rules on their findings and reports to the director. Without it the

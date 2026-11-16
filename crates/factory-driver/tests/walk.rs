@@ -4178,6 +4178,173 @@ fn a_new_test_that_passes_without_the_change_goes_back_to_the_builder_before_the
     }
 }
 
+/// A goal whose definition names a stop check is complete when the command
+/// says so, not when its director does.
+#[test]
+fn a_goal_is_not_proposed_as_complete_while_its_stop_check_fails() {
+    use factory_driver::goal::{Phase, Supervisor};
+    use factory_slack::socket::Incoming;
+
+    let world = World::new("stop-check", "true");
+    // The project's conformance command passes once the default branch has
+    // the file that says so.
+    let project = world.path("config/projects/toy.toml");
+    let text = std::fs::read_to_string(&project).unwrap();
+    std::fs::write(
+        &project,
+        format!(
+            "{text}\n[commands.conformance]\nargv = [\"sh\", \"-c\", \"if [ -f conformance.ok ]; then echo passing 3, failing 0, not written 0; else echo passing 2, failing 1, not written 0; exit 1; fi\"]\ntimeout_secs = 30\nshown = \"the conformance suite\"\n"
+        ),
+    )
+    .unwrap();
+    std::fs::create_dir_all(world.path("config/goals/toy")).unwrap();
+    let definition = world.path("config/goals/toy/main.toml");
+    let body = "[director]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\n";
+    // A stop check that is not a command of the project is refused.
+    std::fs::write(
+        &definition,
+        format!("id = \"main\"\nstop_check = \"no-such\"\n{body}"),
+    )
+    .unwrap();
+    let refused = factory_driver::goal::check_definitions(&world.config()).unwrap_err();
+    assert!(
+        refused
+            .to_string()
+            .contains("its stop_check `no-such` is not a command of the project"),
+        "{refused}"
+    );
+    std::fs::write(
+        &definition,
+        format!("id = \"main\"\nstop_check = \"conformance\"\n{body}"),
+    )
+    .unwrap();
+    factory_driver::goal::check_definitions(&world.config()).unwrap();
+
+    let say = |role: &str, n: u32, json: serde_json::Value| {
+        std::fs::create_dir_all(world.path("bin/state")).unwrap();
+        std::fs::write(
+            world.path(&format!("bin/state/{role}-{n}.json")),
+            json.to_string(),
+        )
+        .unwrap();
+    };
+    let direct = |fields: serde_json::Value| {
+        let mut result = serde_json::json!({
+            "summary": "Decided.", "start": [], "file": [], "edit": [], "dropped_findings": [],
+            "ask_owner": "", "complete": false, "evidence": "", "journal_entry": "", "project_memory": ""
+        });
+        for (key, value) in fields.as_object().unwrap() {
+            result[key] = value.clone();
+        }
+        result
+    };
+    say(
+        "intake",
+        1,
+        serde_json::json!({"reply": "Here is the charter.", "ready": true, "objective": "Match the suite.", "stop_when": "Every feature of the suite passes.", "plan": "As the suite shows.", "edits": []}),
+    );
+    // The director says it is done; told that the command fails, it asks.
+    say(
+        "director",
+        1,
+        direct(serde_json::json!({"complete": true, "evidence": "It all looks done."})),
+    );
+    say(
+        "director",
+        2,
+        direct(serde_json::json!({"ask_owner": "One feature still fails. Shall I plan it?"})),
+    );
+    // Once the default branch passes, the same proposal stands.
+    say(
+        "director",
+        3,
+        direct(serde_json::json!({"complete": true, "evidence": "The suite passes."})),
+    );
+
+    let mut sup = Supervisor::new(world.config(), None, vec!["OWNER".to_string()], false).unwrap();
+    let id = sup.open_directly("toy", "Match the suite").unwrap();
+    sup.incoming(Incoming::Action {
+        channel: String::new(),
+        user: "OWNER".to_string(),
+        action_id: "goal_start".to_string(),
+        value: id.clone(),
+        message_ts: String::new(),
+    })
+    .unwrap();
+    let brief =
+        |n: usize| std::fs::read_to_string(world.path(&format!("bin/state/brief-{n}.md"))).unwrap();
+    let directors = |world: &World| -> Vec<usize> {
+        world
+            .calls()
+            .iter()
+            .enumerate()
+            .filter(|(_, call)| call[0] == "director")
+            .map(|(at, _)| at + 1)
+            .collect()
+    };
+    let goal = sup.goals().next().unwrap().clone();
+    assert_eq!(goal.phase, Phase::Running, "the proposal was refused");
+    let check = goal.stop_check.clone().unwrap();
+    assert!(!check.passed);
+    assert_eq!(check.how, "failed (exit code 1)");
+    assert_eq!(check.text.trim(), "passing 2, failing 1, not written 0");
+    let turns = directors(&world);
+    assert_eq!(
+        turns.len(),
+        2,
+        "the refused proposal went back to the same session"
+    );
+    let first = brief(turns[0]);
+    assert!(
+        first.contains("## The stop check\n\nA command decides this goal's stop condition, and the factory runs it: `the conformance suite`. It failed (exit code 1) on commit `"),
+        "{first}"
+    );
+    assert!(
+        first.contains("passing 2, failing 1, not written 0"),
+        "{first}"
+    );
+    let second = brief(turns[1]);
+    assert!(
+        second.contains(
+            "(`the conformance suite`) failed (exit code 1), so the goal is not complete"
+        ),
+        "{second}"
+    );
+
+    // The default branch comes to pass. The owner answers, the director is
+    // woken, the command runs again on the new commit, and the proposal is
+    // put to the owner with what the command said.
+    let toy = world.path("toy");
+    std::fs::write(toy.join("conformance.ok"), "").unwrap();
+    run(&toy, "git", &["add", "--all"]);
+    run(&toy, "git", &["commit", "--quiet", "-m", "pass the suite"]);
+    run(&toy, "git", &["push", "--quiet", "origin", "main"]);
+    sup.incoming(Incoming::Message {
+        channel: goal.channel.clone(),
+        user: "OWNER".to_string(),
+        text: "It landed. Look again.".to_string(),
+        ts: "99.0".to_string(),
+        thread_ts: Some(goal.thread_ts.clone()),
+    })
+    .unwrap();
+    let goal = sup.goals().next().unwrap().clone();
+    let check = goal.stop_check.clone().unwrap();
+    assert!(check.passed, "{check:?}");
+    assert_ne!(check.commit, "");
+    assert_eq!(goal.phase, Phase::ProposedComplete);
+    let turns = directors(&world);
+    assert_eq!(turns.len(), 3);
+    let third = brief(turns[2]);
+    assert!(third.contains("It passed on commit `"), "{third}");
+    assert!(
+        third.contains("passing 3, failing 0, not written 0"),
+        "{third}"
+    );
+    let events =
+        std::fs::read_to_string(world.path(&format!("state/goals/{id}/events.jsonl"))).unwrap();
+    assert_eq!(events.matches("\"stop_check.ran\"").count(), 2, "{events}");
+}
+
 /// A second goal on a project waits for the first, and starts by itself.
 #[test]
 fn a_goal_started_while_another_runs_is_queued_and_starts_when_that_ends() {
