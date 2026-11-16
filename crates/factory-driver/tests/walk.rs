@@ -4690,6 +4690,212 @@ fn a_scheduled_definition_is_run_when_due_and_its_agent_only_files_beads() {
     );
 }
 
+/// While the default branch's own CI is red, nothing ships on the project:
+/// the director is told, the owner is told once, a ship is refused, and a
+/// sub-goal the director ships as the fix goes ahead.
+#[test]
+fn nothing_ships_while_the_default_branch_is_red_unless_it_is_the_fix() {
+    use factory_driver::goal::Supervisor;
+    use factory_slack::socket::Incoming;
+    use std::time::{Duration, Instant};
+
+    let world = World::new("default-red", "true");
+    world.with_github("green");
+    std::fs::create_dir_all(world.path("config/goals/toy")).unwrap();
+    std::fs::write(
+        world.path("config/goals/toy/main.toml"),
+        "id = \"main\"\nflow = \"zig-sdk-bead\"\nship_flow = \"zig-sdk-ship\"\n[director]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\n[foreman]\nmodel = \"claude-opus-5-5\"\neffort = \"medium\"\n",
+    )
+    .unwrap();
+    let say = |role: &str, n: u32, json: serde_json::Value| {
+        std::fs::create_dir_all(world.path("bin/state")).unwrap();
+        std::fs::write(
+            world.path(&format!("bin/state/{role}-{n}.json")),
+            json.to_string(),
+        )
+        .unwrap();
+    };
+    let with = |mut result: serde_json::Value, fields: serde_json::Value| {
+        for (key, value) in fields.as_object().unwrap() {
+            result[key] = value.clone();
+        }
+        result
+    };
+    let direct = |fields: serde_json::Value| {
+        with(
+            serde_json::json!({
+                "summary": "Decided.", "start": [], "file": [], "edit": [], "dropped_findings": [],
+                "open_subgoals": [], "ship": [], "ship_on_red": "", "tell_foreman": [], "design": [],
+                "ask_owner": "", "complete": false, "evidence": "", "journal_entry": "", "project_memory": ""
+            }),
+            fields,
+        )
+    };
+    let foreman = |fields: serde_json::Value| {
+        with(
+            serde_json::json!({
+                "summary": "Decided.", "start": [], "file": [], "dropped_findings": [],
+                "report": "working", "message": "", "journal_entry": ""
+            }),
+            fields,
+        )
+    };
+    say(
+        "intake",
+        1,
+        serde_json::json!({"reply": "Here is the charter.", "ready": true, "objective": "Ship the feature.", "stop_when": "toy-1 has landed.", "plan": "One sub-goal.", "edits": []}),
+    );
+    say(
+        "director",
+        1,
+        direct(
+            serde_json::json!({"open_subgoals": [{"id": "feature", "title": "The feature", "objective": "It works.", "beads": ["toy-1"], "paths": []}]}),
+        ),
+    );
+    say(
+        "foreman",
+        1,
+        foreman(serde_json::json!({"start": [{"bead": "toy-1", "reason": "the only one"}]})),
+    );
+    say(
+        "foreman",
+        2,
+        foreman(serde_json::json!({"report": "ready", "message": "toy-1 is absorbed."})),
+    );
+    // The director ships as if nothing were wrong, is refused, and then
+    // ships the sub-goal as the fix.
+    say(
+        "director",
+        2,
+        direct(serde_json::json!({"ship": ["feature"]})),
+    );
+    say(
+        "director",
+        3,
+        direct(
+            serde_json::json!({"ship": ["feature"], "ship_on_red": "The last landing dropped a line of feature.txt, and toy-1 puts it back."}),
+        ),
+    );
+    say(
+        "director",
+        4,
+        direct(serde_json::json!({"ask_owner": "Is that all?"})),
+    );
+
+    // The default branch's own CI has failed on its tip, and passes again
+    // on whatever lands next.
+    let tip = run(
+        &world.path("remote.git"),
+        "git",
+        &["rev-parse", "refs/heads/main"],
+    )
+    .trim()
+    .to_string();
+    std::fs::write(
+        world.path("bin/state-gh/branch-ci"),
+        format!("failure {tip}\n"),
+    )
+    .unwrap();
+
+    let mut sup = Supervisor::new(world.config(), None, vec!["OWNER".to_string()], false).unwrap();
+    let id = sup.open_directly("toy", "Ship the feature").unwrap();
+    sup.incoming(Incoming::Action {
+        channel: String::new(),
+        user: "OWNER".to_string(),
+        action_id: "goal_start".to_string(),
+        value: id.clone(),
+        message_ts: String::new(),
+    })
+    .unwrap();
+    let goal = |sup: &Supervisor| sup.goals().next().unwrap().clone();
+    let brief = |role: &str, n: usize| {
+        let calls = world.calls();
+        let index = (0..calls.len())
+            .filter(|&i| calls[i][0] == role)
+            .nth(n - 1)
+            .unwrap_or_else(|| panic!("no call {n} of the {role}"));
+        std::fs::read_to_string(world.path(&format!("bin/state/brief-{}.md", index + 1))).unwrap()
+    };
+    let deadline = Instant::now() + Duration::from_secs(180);
+    while goal(&sup).units.iter().any(|unit| unit.state == "running")
+        || goal(&sup).subgoals.iter().any(|sub| sub.state != "landed")
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the sub-goal did not land: {:?}",
+            goal(&sup).subgoals
+        );
+        sup.pump(Duration::from_millis(200)).unwrap();
+    }
+
+    // The director was told at its first wake, when it could still open
+    // sub-goals and have beads built.
+    let first = brief("director", 1);
+    assert!(
+        first.contains(&format!(
+            "## The default branch's own CI is red\n\nThe last CI run on `main` failed, on `{}`. Every sub-goal that ships takes that in.\n\n- `ci`: https://github.com/me/toy/actions/runs/55\n",
+            &tip[..10]
+        )) && first.contains("the factory refuses `ship`"),
+        "{first}"
+    );
+    // Its ship was refused, and the refusal went back to the same session.
+    let refused = brief("director", 3);
+    assert!(
+        refused.contains(&format!(
+            "ship: the default branch's own CI is red on `{}`, and nothing ships on this project until it passes",
+            &tip[..10]
+        )),
+        "{refused}"
+    );
+    let directors: Vec<Vec<String>> = world
+        .calls()
+        .into_iter()
+        .filter(|call| call[0] == "director")
+        .collect();
+    assert_eq!(directors[1][1], directors[2][1], "{directors:?}");
+    // The owner was told once, in the project's channel, however often a
+    // director was woken while the same commit was red.
+    let channel =
+        std::fs::read_to_string(world.path("state/projects/toy/executive/events.jsonl")).unwrap();
+    assert_eq!(
+        channel
+            .matches(":red_circle: *The default branch of `toy` is red.*")
+            .count(),
+        1,
+        "{channel}"
+    );
+    assert!(
+        channel.contains("https://github.com/me/toy/actions/runs/55"),
+        "{channel}"
+    );
+    assert!(directors.len() >= 3, "{directors:?}");
+    // Shipped as the fix, it went ahead, and the goal's thread says why.
+    let events =
+        std::fs::read_to_string(world.path(&format!("state/goals/{id}/events.jsonl"))).unwrap();
+    assert!(
+        events.contains("\"ship.on_red\"")
+            && events.contains(
+                "Shipping `feature` although the default branch's CI is red, as the fix for it"
+            )
+            && events.contains("toy-1 puts it back."),
+        "{events}"
+    );
+    let ended = goal(&sup);
+    assert_eq!(ended.subgoals[0].state, "landed", "{:?}", ended.subgoals);
+    assert!(
+        ended
+            .units
+            .iter()
+            .any(|unit| unit.ship && unit.state == "landed"),
+        "{:?}",
+        ended.units
+    );
+    // With the fix landed the default branch passes, and the director woken
+    // by the landing is told nothing of it.
+    assert_eq!(ended.default_red, None);
+    assert!(!brief("director", directors.len()).contains("CI is red"));
+}
+
 /// A goal whose definition names a stop check is complete when the command
 /// says so, not when its director does.
 #[test]

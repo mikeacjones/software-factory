@@ -357,6 +357,11 @@ pub struct Goal {
     /// when the goal's definition names one.
     #[serde(default)]
     pub stop_check: Option<StopCheck>,
+    /// The failure of the default branch's own CI, as it stood when the
+    /// director was last woken. `None` while that CI is not red, or cannot
+    /// be read, and for a goal that ships no sub-goals.
+    #[serde(default)]
+    pub default_red: Option<DefaultRed>,
     pub wakes: u32,
     pub failures: u32,
     pub retry_at: Option<u64>,
@@ -926,6 +931,7 @@ pub fn wake_schema() -> Value {
             "subgoal": text_schema("The ID of an open sub-goal."),
             "text": text_schema("What you tell its foreman."),
         }))},
+        "ship_on_red": text_schema("Empty, unless your brief says the default branch's own CI is red and a sub-goal you ship in this result is the fix for it. Then: what broke the default branch and how that sub-goal mends it, in a sentence or two. The owner is shown it."),
         "design": { "type": "array", "description": "Rulings on the designs of sub-goals that wait for you. Always empty when none waits.", "items": object_schema(json!({
             "subgoal": text_schema("The ID of an open sub-goal whose design waits for you."),
             "accept": { "type": "boolean", "description": "True to accept the design: every agent that works on the sub-goal is then held to it, and its beads may start. False to send it back to the designer." },
@@ -1536,6 +1542,26 @@ pub fn design_brief(
     out
 }
 
+/// The default branch's own CI, when it has failed.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DefaultRed {
+    /// The commit the failed runs are on.
+    pub commit: String,
+    /// What failed, as a reader is told it.
+    pub text: String,
+}
+
+impl DefaultRed {
+    /// What a director is told of it.
+    fn brief(&self) -> String {
+        format!(
+            "## The default branch's own CI is red\n\n{}\nWhatever ships now takes that failure in, and its pull request cannot land while it is red for the same reason. So while this stands the factory refuses `ship`, and the owner has been told. Do not have every sub-goal mend it in its own pull request. If the fix is yours to make, give it to one sub-goal, and ship that sub-goal with `ship_on_red` saying what broke and how it is mended. Opening sub-goals, and starting and continuing beads, go on as before.\n\n",
+            self.text
+        )
+    }
+}
+
 /// One run of the command that decides a goal's stop condition.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StopCheck {
@@ -1969,6 +1995,14 @@ pub fn decision_problems(
     if !continuing.is_empty() && !ships.is_empty() {
         problems
             .push("ship: a sub-goal ships when nothing else is running or starting".to_string());
+    }
+    if let Some(red) = goal.default_red.as_ref().filter(|_| !ships.is_empty())
+        && strings(result, "ship_on_red").trim().is_empty()
+    {
+        problems.push(format!(
+            "ship: the default branch's own CI is red on `{}`, and nothing ships on this project until it passes: whatever ships takes the failure in. If a sub-goal you ship is the fix, say in `ship_on_red` what broke and how it is mended; otherwise leave `ship` empty, and go on with what does not ship or ask the owner",
+            &red.commit[..red.commit.len().min(10)]
+        ));
     }
     let going = starting.len() + continuing.len();
     let in_flight = goal.running() + going + ships.len() + moving;
@@ -2875,6 +2909,9 @@ pub fn wake_brief(
         .filter(|_| definition.stop_check.is_some())
     {
         out.push_str(&check.brief());
+    }
+    if let Some(red) = &goal.default_red {
+        out.push_str(&red.brief());
     }
     out.push_str("## What happened since you last ran\n\n");
     out.push_str(&told(&goal.inbox));
@@ -4056,6 +4093,7 @@ impl Supervisor {
             prompt: None,
             evidence: None,
             stop_check: None,
+            default_red: None,
             wakes: 0,
             failures: 0,
             retry_at: None,
@@ -4960,6 +4998,49 @@ impl Supervisor {
             .unwrap_or_else(|| model.to_string())
     }
 
+    /// The failure of the default branch's own CI, for a goal that ships
+    /// sub-goals: `None` while it is not red or cannot be read. The owner
+    /// is told of a failure once for each commit it is on, in the project's
+    /// channel, whichever goal's director is woken first.
+    fn default_red(&self, definition: &GoalDefinition, project: &Project) -> Option<DefaultRed> {
+        let settings = project
+            .github
+            .as_ref()
+            .filter(|_| definition.ship_flow.is_some())?;
+        let runs = crate::github_client(&self.factory, settings)
+            .branch_runs(&project.repo, &settings.repo, &project.default_branch)
+            .ok()?;
+        let ci = factory_github::branch_ci(&runs);
+        let factory_github::BranchCi::Red { commit, .. } = &ci else {
+            return None;
+        };
+        let text = default_ci_text(&project.default_branch, commit, &ci);
+        let seat = self.executive_seat(project.id.as_str());
+        let told = seat.dir.with_file_name("default-ci.json");
+        let before = std::fs::read_to_string(&told)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .map(|record| strings(&record, "told").to_string())
+            .unwrap_or_default();
+        if &before != commit {
+            let _ = std::fs::create_dir_all(&seat.dir);
+            self.tell_channel(
+                project,
+                &seat,
+                &format!(
+                    ":red_circle: *The default branch of `{}` is red.* {}Nothing ships on this project until it passes, unless a director ships a sub-goal as the fix for it.",
+                    project.id,
+                    escape(&text)
+                ),
+            );
+            let _ = std::fs::write(&told, json!({ "told": commit }).to_string());
+        }
+        Some(DefaultRed {
+            commit: commit.clone(),
+            text,
+        })
+    }
+
     /// Run a command of a project outside any pipeline, in a checkout at
     /// `commit`, which stands for `{base}`. Returns how it went and what its
     /// summary file holds, if it names one.
@@ -5593,6 +5674,7 @@ impl Supervisor {
         let journal = std::fs::read_to_string(&journal_path).unwrap_or_default();
         let memory = std::fs::read_to_string(self.memory_path(&goal.project)).unwrap_or_default();
         self.run_stop_check(&mut goal, &definition, &project);
+        goal.default_red = self.default_red(&definition, &project);
         let brief = wake_brief(&definition, &goal, &tracker, &journal, &memory);
 
         let done = goal.absorbed();
@@ -5989,6 +6071,24 @@ impl Supervisor {
         }
         for stopped in items(&result, "continue") {
             self.continue_bead(&mut goal, &definition, None, stopped);
+        }
+        if let Some(red) = goal.default_red.as_ref().filter(|_| !ships.is_empty()) {
+            // Allowed only as the fix, which its own pull request's CI
+            // then has to bear out before it can land.
+            let why = strings(&result, "ship_on_red").trim();
+            self.log(
+                &goal,
+                "ship.on_red",
+                json!({ "subgoals": ships, "commit": red.commit, "why": why }),
+            );
+            self.say(
+                &goal,
+                &format!(
+                    ":warning: Shipping `{}` although the default branch's CI is red, as the fix for it:\n{}",
+                    ships.join("`, `"),
+                    quote(&truncate(why, 800))
+                ),
+            );
         }
         for sub in &ships {
             self.ship(&mut goal, &definition, &source, sub)?;
@@ -8599,6 +8699,37 @@ mod tests {
         assert_eq!(idle.len(), 1, "{idle:?}");
         assert!(idle[0].contains("answer the foreman with `tell_foreman`"));
         assert!(problems(&d, &waiting, json!({"ship": true})).is_empty());
+        // While the default branch's own CI is red nothing ships, unless
+        // the director says the sub-goal is the fix. All else goes on.
+        let mut red = waiting.clone();
+        red.default_red = Some(DefaultRed {
+            commit: "aaaaaaaaaaaaaaaa".to_string(),
+            text: "The last CI run on `main` failed, on `aaaaaaaaaa`.\n".to_string(),
+        });
+        let refused = problems(&d, &red, json!({"ship": true}));
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert!(
+            refused[0].starts_with("ship: the default branch's own CI is red on `aaaaaaaaaa`, and nothing ships on this project until it passes"),
+            "{refused:?}"
+        );
+        assert_eq!(
+            problems(&d, &red, json!({"ship": true, "ship_on_red": " "})).len(),
+            1
+        );
+        assert!(problems(
+            &d,
+            &red,
+            json!({"ship": true, "ship_on_red": "toy-1 restores the import the last landing dropped."})
+        )
+        .is_empty());
+        assert!(problems(&d, &red, json!({"tell_foreman": "Run toy-2 too."})).is_empty());
+        let shown = wake_brief(&d, &red, &[], "", "");
+        assert!(
+            shown.contains("## The default branch's own CI is red\n\nThe last CI run on `main` failed, on `aaaaaaaaaa`.\n")
+                && shown.contains("the factory refuses `ship`"),
+            "{shown}"
+        );
+        assert!(!wake_brief(&d, &waiting, &[], "", "").contains("CI is red"));
         assert!(problems(&d, &waiting, json!({"tell_foreman": "Run toy-2 too."})).is_empty());
         assert!(problems(&d, &waiting, json!({"ask_owner": "Ship without toy-2?"})).is_empty());
         assert_eq!(

@@ -149,3 +149,11 @@ bead = "sf-gl5.8"
 claim = "A branch's own CI is judged by the workflow runs on the newest commit it ran on: one failure is red whatever else is running, an older commit's failure says nothing, and runs that were only cancelled or skipped are neither a pass nor a failure."
 command = ["cargo", "test", "--locked", "--offline", "--package", "factory-github", "--lib", "--", "a_branch_is_judged_by_the_runs"]
 timeout_secs = 900
+
+[[check]]
+id = "red-default-branch"
+tier = "hermetic"
+bead = "sf-gl5.8"
+claim = "While the default branch's own CI has failed on its newest commit, a director's brief says so with the run, the owner is told once for that commit in the project's channel, and code refuses a ship; a ship the director declares as the fix goes ahead, is logged with the reason, and once it lands and the branch passes nothing more is said or refused."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-driver", "--", "nothing_ships_while_the_default_branch_is_red", "a_director_with_foremen_opens_answers_and_ships"]
+timeout_secs = 900
