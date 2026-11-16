@@ -239,6 +239,15 @@ async fn a_bead_that_may_not_be_launched_ends_its_pipeline_at_once_and_says_why(
     assert!(reason.contains("may not be launched"), "{reason}");
     assert!(reason.contains("it is claimed by `someone`"), "{reason}");
     assert_eq!(standing.unit, "");
+    // A turn that asks for a pipeline the server has, running or over,
+    // is not made to ask for it again: only the other one is started.
+    let asked = vec![
+        serde_json::json!({"id": "pipeline-engine-refused", "bead": "toy-2"}),
+        serde_json::json!({"id": "pipeline-engine-never", "bead": "toy-3"}),
+    ];
+    let wanted = factory_engine::steps::not_yet_there(&client, asked).await;
+    assert_eq!(wanted.len(), 1, "{wanted:?}");
+    assert_eq!(wanted[0]["bead"], "toy-3");
     // The driver was asked once.
     let json = handle
         .fetch_history(WorkflowFetchHistoryOptions::default())
@@ -885,6 +894,17 @@ async fn a_goal_runs_from_its_opening_to_its_end_with_its_tiers_on_the_engine() 
     }
     assert!(assert_described(&client, &project_id("toy")).await > 8);
     assert_eq!(assert_described(&client, INTAKE_ID).await, 3);
+    // Nothing in what the project did stands as failed.
+    let json = client
+        .get_workflow_handle::<Project>(project_id("toy"))
+        .fetch_history(WorkflowFetchHistoryOptions::default())
+        .to_json()
+        .await
+        .unwrap();
+    let history = String::from_utf8_lossy(&json).into_owned();
+    for red in ["Failed", "TimedOut"] {
+        assert!(!history.contains(red), "{red} in:\n{history}");
+    }
 
     // Asked to stop at a safe point, the worker leaves by itself: the
     // listener and the watcher, which never end otherwise, do not hold it.

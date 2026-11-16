@@ -461,8 +461,9 @@ impl Project {
                         launch.flow_name.as_deref(),
                     ))
                     .build();
-                // One that exists under that name is the one asked for:
-                // the name is made from the goal's record of it.
+                // The turn left out those the server already has. One
+                // started under the name since then is the one asked
+                // for all the same, so a refusal here is no trouble.
                 let _ = ctx
                     .start_child_workflow(Pipeline::run, pipeline, options)
                     .await;

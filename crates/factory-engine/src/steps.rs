@@ -294,6 +294,36 @@ impl Drop for Busy {
     }
 }
 
+/// The pipelines among those a turn asked for that the server has no
+/// workflow for yet. One that is there under the name is the one asked
+/// for, since the name is made from the goal's record of it: a project
+/// whose workflow starts afresh asks again for every pipeline its goals
+/// have running. Asking the server to start it a second time would only
+/// be refused, and stand in the project's history as a failure that is
+/// none. The watcher tells the project what becomes of it either way.
+pub async fn not_yet_there(
+    client: &temporalio_client::Client,
+    launches: Vec<serde_json::Value>,
+) -> Vec<serde_json::Value> {
+    let mut wanted = Vec::with_capacity(launches.len());
+    for launch in launches {
+        let there = match launch["id"].as_str() {
+            Some(name) => client
+                .get_workflow_handle::<Pipeline>(name.to_string())
+                .describe(WorkflowDescribeOptions::default())
+                .await
+                .is_ok(),
+            None => false,
+        };
+        // When the server could not be asked the pipeline is asked for
+        // all the same: at worst that is refused, as it was before.
+        if !there {
+            wanted.push(launch);
+        }
+    }
+    wanted
+}
+
 /// Sets a flag when it goes, however the code that holds it is left.
 struct SetOnDrop(Arc<AtomicBool>);
 
@@ -570,7 +600,11 @@ impl Steps {
             tokio::select! {
                 done = &mut work => {
                     return match done {
-                        Ok(Ok(turned)) => Ok(turned),
+                        Ok(Ok(mut turned)) => {
+                            turned.launches =
+                                not_yet_there(&ctx.client(), turned.launches).await;
+                            Ok(turned)
+                        }
                         // The tiers could not be asked at all. Whoever
                         // handed the event in decides what becomes of it.
                         Ok(Err(reason)) => Ok(Turned {
