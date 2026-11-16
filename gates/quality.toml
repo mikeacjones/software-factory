@@ -135,6 +135,62 @@ command = ["sh", "-c", "cargo run --quiet --locked --offline --package factory-c
 timeout_secs = 900
 
 [[check]]
+id = "maintenance-build-contract"
+tier = "hermetic"
+bead = "sf-gl5.9"
+claim = "A maintenance run's mark to build is refused when its schedule names no definition to build under and while the goal of an earlier run is still building, and filing alone is always allowed; a bead to build cannot be deferred, a bead named to build must be one an earlier run filed that still waits, the paths must be plain, and the goal's director must be given a plan."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-driver", "--lib", "--", "a_maintenance_run_has_beads_built_only_when"]
+timeout_secs = 900
+
+[[check]]
+id = "maintenance-builds"
+tier = "hermetic"
+bead = "sf-gl5.9"
+claim = "With a scripted maintainer and director and a real pipeline: a schedule that builds under a scheduled or unknown definition is refused; a bead a run filed and did not build is shown to the next run, which has it built; the factory opens one goal under the named definition whose charter names the bead, the plan and the paths, with no opening conversation and no Start, and its director is woken at once and told how the goal came to be; while that goal builds, a run that marks a bead is refused and may file; and when the bead has landed and is closed the goal is complete with no director run and no owner action, after which a run may build again."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-driver", "--test", "walk", "--", "a_maintenance_run_builds_what_it_marks"]
+timeout_secs = 900
+
+[[check]]
+id = "class-calls-a-run"
+tier = "hermetic"
+bead = "sf-gl5.10"
+claim = "A class of defect that has broken as many beads as the schedule says since a run was last shown it makes a run due at once, the run's brief names the class, and what the run was shown is kept so that the class calls no second run until it has broken that many beads more."
+command = ["sh", "-c", "cargo test --locked --offline --package factory-driver --lib -- a_class_calls_a_run && cargo test --locked --offline --package factory-driver --test walk -- a_maintenance_run_builds_what_it_marks"]
+timeout_secs = 900
+
+[[check]]
+id = "maintenance-builds-configured"
+tier = "hermetic"
+bead = "sf-gl5.9"
+claim = "The Zig project's scheduled definition builds what its runs mark under the project's goal definition, is called by a class of defect that keeps breaking beads, and its maintainer's role says to build tools that every later change runs."
+command = ["sh", "-c", "cargo run --quiet --locked --offline --package factory-cli -- goal check --config config | grep -q 'temporal-sdk-zig/upkeep: scheduled, .* builds what it marks under `parity`, called at once when a class of defect breaks 3 more' && grep -q 'a tool to a sentence' config/roles/maintainer.md"]
+timeout_secs = 900
+
+[[check]]
+id = "class-closed-by-check"
+tier = "hermetic"
+bead = "sf-gl5.11"
+claim = "A filed bead may name the class of defect its check closes, and a name that is not a class key is refused. While the bead is open the class has a check being built, a second bead does not take its place, and builders are still told of the class; when the bead lands the class is recorded as checked at the count of beads it had broken and is no longer in a builder's brief; when it breaks another bead it is told again and a new bead may answer it."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-driver", "--lib", "--", "a_class_leaves_the_builders_brief", "a_maintenance_run_has_beads_built_only_when"]
+timeout_secs = 900
+
+[[check]]
+id = "class-check-recorded"
+tier = "hermetic"
+bead = "sf-gl5.11"
+claim = "With a real pipeline: a bead a maintenance run files with the class it closes is kept as that class's check; the next run's measures show the class with the check being built; when the bead's pull request lands the class is recorded as checked, and the run after is shown that."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-driver", "--test", "walk", "--", "a_maintenance_run_builds_what_it_marks"]
+timeout_secs = 900
+
+[[check]]
+id = "class-check-roles"
+tier = "hermetic"
+bead = "sf-gl5.11"
+claim = "The maintainer's, the director's and the foreman's roles say to file the tool that catches a kind of mistake with the class it closes, and `factory findings` prints each class with its check."
+command = ["sh", "-c", "grep -q 'closes_class' config/roles/maintainer.md && grep -q 'closes_class' config/roles/director.md && grep -q 'closes_class' config/roles/foreman.md && grep -q 'check.words(count.beads)' crates/factory-cli/src/main.rs"]
+timeout_secs = 30
+
+[[check]]
 id = "schedule-found-at-start"
 tier = "host"
 bead = "sf-gl5.6"

@@ -1,9 +1,11 @@
-# Upkeep of the Zig SDK: a run the factory starts by the clock, with no
-# message from the owner. It is not a goal. One agent, the maintainer, is
-# given the charter below and what the factory's records show since its last
-# run, reads the default branch, and files beads. It starts, continues,
-# ships and closes nothing, and code refuses a result that tries: whether a
-# bead it files is built is for the project's goals and the owner.
+# Upkeep of the Zig SDK: a run the factory starts by itself, with no
+# message from the owner. One agent, the maintainer, is given the charter
+# below and what the factory's records show since its last run, reads the
+# default branch, and files beads. The ones it marks to build are built
+# without anyone being asked: the factory opens a goal for them under the
+# definition named in `build_under`, starts it, and ends it when they are
+# closed. Owner's decision, 2026-11-16: the loop from what testers find to
+# the check that stops it must close without the owner in it.
 id = "upkeep"
 
 # The agent of each run. A scheduled definition has no director; this table
@@ -19,6 +21,13 @@ timeout_secs = 2700
 # woken; pipelines carry on.
 hour_utc = 10
 every_days = 7
+# And at once, whenever a class of defect has broken three beads more than
+# a run was last shown. Code counts them from the units' records.
+when_class_breaks = 3
+# What a run marks to build is built by a goal under this definition: its
+# director, designer, foreman and pipelines, one pull request, CI. One such
+# goal at a time; while it builds, a run only files.
+build_under = "parity"
 # The most beads one run may file. What it leaves out goes in its journal
 # for the next run.
 max_beads = 3
@@ -30,9 +39,11 @@ reports = []
 charter = """
 Keep the quality of the Zig SDK from slipping between goals. Three things, \
 in this order. First, what the pipelines keep getting wrong: where a class \
-of defect has broken several beads, find what would have stopped every \
-case (a check in `zig build`, a test helper, a rule in AGENTS.md or \
-CONTRIBUTING.md, a change of structure) and file that, not the cases. \
+of defect has broken several beads, find the tool that would have stopped \
+every case and have it built: a lint rule, a check in `zig build`, a test \
+helper, a fuzz or property test, in a place every bead's pipeline already \
+runs. Not the cases, and not a sentence in AGENTS.md or CONTRIBUTING.md \
+unless no tool can see the mistake. \
 Second, checks that cannot be trusted: one that fails and then passes on \
 the same commit, or a pull request whose CI went red after the pipeline's \
 own checks passed, means something differs between the two; say what. \

@@ -345,6 +345,142 @@ pub fn finding_classes(state_dir: &Path, project: &str) -> Vec<ClassCount> {
     counts
 }
 
+/// The check that answers a class of defect: a bead that builds a tool
+/// which every later change runs, so that the class need not be carried
+/// as words in a brief.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ClassCheck {
+    /// The bead that builds the check.
+    pub bead: String,
+    /// How many beads the class had broken when that bead landed. `None`
+    /// while it has not landed.
+    pub landed_at: Option<usize>,
+}
+
+impl ClassCheck {
+    /// Whether the check has landed and the class has broken no bead since.
+    pub fn holds(&self, beads: usize) -> bool {
+        self.landed_at.is_some_and(|at| beads <= at)
+    }
+
+    /// How the check stands for a class that has broken `beads` beads, as
+    /// a few words.
+    pub fn words(&self, beads: usize) -> String {
+        match self.landed_at {
+            None => format!("check being built by `{}`", self.bead),
+            Some(at) if beads <= at => format!("checked since `{}` landed", self.bead),
+            Some(at) => format!(
+                "check from `{}` landed and {} bead(s) broke after it",
+                self.bead,
+                beads - at
+            ),
+        }
+    }
+}
+
+fn class_checks_path(state_dir: &Path, project: &str) -> PathBuf {
+    state_dir.join("projects").join(project).join("checks.json")
+}
+
+/// The check that answers each class of defect of a project, by the
+/// class's key. A record that cannot be read is no record.
+pub fn class_checks(state_dir: &Path, project: &str) -> BTreeMap<String, ClassCheck> {
+    std::fs::read_to_string(class_checks_path(state_dir, project))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+fn save_class_checks(
+    state_dir: &Path,
+    project: &str,
+    checks: &BTreeMap<String, ClassCheck>,
+) -> Result<(), DriverError> {
+    let path = class_checks_path(state_dir, project);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(io(parent))?;
+    }
+    let text = serde_json::to_string_pretty(checks).map_err(|source| DriverError::Json {
+        path: path.clone(),
+        source,
+    })?;
+    let temp = path.with_extension("json.tmp");
+    std::fs::write(&temp, text).map_err(io(&temp))?;
+    std::fs::rename(&temp, &path).map_err(io(&path))
+}
+
+/// Record that a bead builds the check for a class of defect. A check
+/// that is still being built keeps the class; one that landed and has
+/// leaked since gives it up to the new bead.
+pub fn answer_class(
+    state_dir: &Path,
+    project: &str,
+    class: &str,
+    bead: &str,
+) -> Result<bool, DriverError> {
+    let mut checks = class_checks(state_dir, project);
+    if checks
+        .get(class)
+        .is_some_and(|check| check.landed_at.is_none())
+    {
+        return Ok(false);
+    }
+    checks.insert(
+        class.to_string(),
+        ClassCheck {
+            bead: bead.to_string(),
+            landed_at: None,
+        },
+    );
+    save_class_checks(state_dir, project, &checks)?;
+    Ok(true)
+}
+
+/// A bead has landed: every class whose check it builds is checked from
+/// now, at the count of beads the class has broken so far. Returns those
+/// classes.
+pub fn check_landed(
+    state_dir: &Path,
+    project: &str,
+    bead: &str,
+) -> Result<Vec<String>, DriverError> {
+    let mut checks = class_checks(state_dir, project);
+    let counts = finding_classes(state_dir, project);
+    let mut landed = Vec::new();
+    for (class, check) in checks.iter_mut() {
+        if check.bead == bead && check.landed_at.is_none() {
+            check.landed_at = Some(
+                counts
+                    .iter()
+                    .find(|count| &count.class == class)
+                    .map_or(0, |count| count.beads),
+            );
+            landed.push(class.clone());
+        }
+    }
+    if !landed.is_empty() {
+        save_class_checks(state_dir, project, &checks)?;
+    }
+    Ok(landed)
+}
+
+/// The classes a builder still has to keep in mind: the ones no landed
+/// check answers, and the ones that have broken a bead since theirs landed.
+pub fn classes_unchecked(
+    classes: Vec<ClassCount>,
+    checks: &BTreeMap<String, ClassCheck>,
+) -> Vec<ClassCount> {
+    classes
+        .into_iter()
+        .filter(|count| {
+            !checks
+                .get(&count.class)
+                .is_some_and(|check| check.holds(count.beads))
+        })
+        .collect()
+}
+
 /// The findings of a tester's result that must come with a regression test.
 fn serious(result: &Value) -> Vec<&Value> {
     result
@@ -1910,7 +2046,13 @@ impl Driver {
         if !continuing && matches!(contract, Contract::Change | Contract::Probe) {
             let classes = finding_classes(&self.factory.state_dir, self.unit.project.as_str());
             let note = match contract {
-                Contract::Change => classes_for_builder(&classes),
+                // A class whose check has landed is no longer the builder's
+                // to remember: the check runs on its change. It is told
+                // again only if the class has broken a bead since.
+                Contract::Change => classes_for_builder(&classes_unchecked(
+                    classes,
+                    &class_checks(&self.factory.state_dir, self.unit.project.as_str()),
+                )),
                 _ => classes_for_tester(&classes),
             };
             notes.extend(note);
@@ -3344,6 +3486,16 @@ impl Driver {
                 &self.project.bead_actor,
             )?;
             self.event("bead.closed", Some(&step.id), json!({ "bead": bead }))?;
+            // A bead that builds the check for a class of defect: the
+            // class is checked from here on.
+            let classes = check_landed(&self.factory.state_dir, self.project.id.as_str(), bead)?;
+            if !classes.is_empty() {
+                self.event(
+                    "check.landed",
+                    Some(&step.id),
+                    json!({ "bead": bead, "classes": classes }),
+                )?;
+            }
         }
 
         // Tidying up. A failure here leaves litter, not a wrong result.
@@ -4410,6 +4562,80 @@ fn preflight(factory: &Factory, project: &Project) -> Result<(), DriverError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_class_leaves_the_builders_brief_when_its_check_lands_and_returns_if_it_breaks_again() {
+        let state = std::env::temp_dir().join(format!("factory-checks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state);
+        let broke = |bead: &str, class: &str| {
+            let dir = state.join("units").join(format!("{bead}-1"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("unit.json"),
+                json!({"project": "toy", "bead": bead, "regressions": [{"category": class}]})
+                    .to_string(),
+            )
+            .unwrap();
+        };
+        broke("toy-1", "error-path-cleanup");
+        broke("toy-2", "error-path-cleanup");
+        broke("toy-3", "double-call");
+        let listed = || -> Vec<String> {
+            classes_unchecked(finding_classes(&state, "toy"), &class_checks(&state, "toy"))
+                .into_iter()
+                .map(|count| count.class)
+                .collect()
+        };
+        let words = |class: &str| {
+            let beads = finding_classes(&state, "toy")
+                .into_iter()
+                .find(|count| count.class == class)
+                .map_or(0, |count| count.beads);
+            class_checks(&state, "toy")[class].words(beads)
+        };
+        // With no check, a builder is told every class.
+        assert!(class_checks(&state, "toy").is_empty());
+        assert_eq!(listed(), ["error-path-cleanup", "double-call"]);
+
+        // A bead that builds the check is filed: the class is still told,
+        // and a second bead for it does not take its place.
+        assert!(answer_class(&state, "toy", "error-path-cleanup", "toy-20").unwrap());
+        assert!(!answer_class(&state, "toy", "error-path-cleanup", "toy-21").unwrap());
+        assert_eq!(listed(), ["error-path-cleanup", "double-call"]);
+        assert_eq!(words("error-path-cleanup"), "check being built by `toy-20`");
+        // Another bead landing changes nothing.
+        assert_eq!(
+            check_landed(&state, "toy", "toy-21").unwrap(),
+            Vec::<String>::new()
+        );
+
+        // It lands: the check runs on every change from here, and the
+        // class is no longer something a builder is asked to remember.
+        assert_eq!(
+            check_landed(&state, "toy", "toy-20").unwrap(),
+            ["error-path-cleanup"]
+        );
+        assert_eq!(listed(), ["double-call"]);
+        assert_eq!(words("error-path-cleanup"), "checked since `toy-20` landed");
+        assert_eq!(
+            check_landed(&state, "toy", "toy-20").unwrap(),
+            Vec::<String>::new()
+        );
+
+        // The class breaks another bead all the same: the check leaked,
+        // builders are told again, and a new bead may answer it.
+        broke("toy-4", "error-path-cleanup");
+        assert_eq!(listed(), ["error-path-cleanup", "double-call"]);
+        assert_eq!(
+            words("error-path-cleanup"),
+            "check from `toy-20` landed and 1 bead(s) broke after it"
+        );
+        assert!(answer_class(&state, "toy", "error-path-cleanup", "toy-30").unwrap());
+        assert_eq!(words("error-path-cleanup"), "check being built by `toy-30`");
+        // Another project's classes are its own.
+        assert!(class_checks(&state, "other").is_empty());
+        let _ = std::fs::remove_dir_all(&state);
+    }
 
     #[test]
     fn an_account_can_take_its_token_from_a_file_of_variables_and_from_nowhere_else() {

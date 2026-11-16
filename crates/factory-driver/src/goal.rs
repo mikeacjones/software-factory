@@ -374,6 +374,21 @@ pub struct Goal {
     /// note to the director, and what was said before.
     #[serde(default)]
     pub handoff: Option<String>,
+    /// Set on a goal the factory opened for a maintenance run, to build the
+    /// beads that run marked. Such a goal has no opening conversation and no
+    /// Start: its charter is written by code, and it is complete, with no
+    /// agent and no Accept, when every one of its beads is closed.
+    #[serde(default)]
+    pub maintenance: Option<Maintained>,
+}
+
+/// What a goal opened for a maintenance run is there to build.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Maintained {
+    /// The scheduled definition whose run opened it.
+    pub schedule: String,
+    /// The beads it lands. When none of them is open any more, it is done.
+    pub beads: Vec<String>,
 }
 
 /// The factory's record of a project's executive: the agent the owner
@@ -449,6 +464,11 @@ struct Seat {
 }
 
 impl Goal {
+    /// Whether the goal is over: complete, or stopped.
+    pub fn ended(&self) -> bool {
+        matches!(self.phase, Phase::Complete | Phase::Stopped)
+    }
+
     /// The first sub-goal that has not landed yet, if there is one. A goal
     /// whose director has one slot never has a second.
     pub fn current(&self) -> Option<&SubGoal> {
@@ -869,6 +889,11 @@ fn continue_schema() -> Value {
 
 /// A new bead to file. A foreman's may also join its sub-goal.
 fn file_schema(foreman: bool) -> Value {
+    file_schema_for(foreman, false)
+}
+
+/// As [`file_schema`]; a maintenance run's bead may also be marked to build.
+fn file_schema_for(foreman: bool, maintainer: bool) -> Value {
     let mut properties = json!({
         "title": text_schema("What the bead is, as a short title."),
         "type": { "enum": BEAD_TYPES },
@@ -878,9 +903,13 @@ fn file_schema(foreman: bool) -> Value {
         "parent": text_schema("The epic it belongs under, or empty."),
         "discovered_from": text_schema("The bead whose work turned this up, or empty."),
         "deferred": { "type": "boolean", "description": "True to file it into the icebox: kept, but not ready work." },
+        "closes_class": text_schema("Empty, or the key of the class of defect this bead's check stops from coming back, when the bead builds a tool that every later change runs: a lint rule, a check in the build, a test helper. The factory then stops telling builders about the class in words once the bead has landed."),
     });
     if foreman {
         properties["run_here"] = json!({ "type": "boolean", "description": "True when this sub-goal should not ship without it: it joins the sub-goal, and you are woken again at once to start it. False for work that can land later by itself." });
+    }
+    if maintainer {
+        properties["build"] = json!({ "type": "boolean", "description": "True to have the factory build it now: it opens a goal for the beads this run marks, with no word from the owner. Only when the brief says this run may build. A bead to build cannot be deferred. False to file it and leave it." });
     }
     json!({ "type": "array", "description": "New beads to file.", "items": object_schema(properties) })
 }
@@ -999,6 +1028,30 @@ pub struct Scheduled {
     /// What the agent of the last run wanted the next one to know.
     pub journal: String,
     pub usage: Usage,
+    /// Beads that runs filed and that no goal has been opened to build.
+    /// One that is no longer open leaves the list at the next run.
+    pub backlog: Vec<String>,
+    /// The goal the factory last opened to build a run's beads. While it
+    /// has not ended, no run may have more built.
+    pub goal: Option<String>,
+    /// How many beads each class of defect had broken when a run was last
+    /// shown it: what a class has to exceed to call a run by itself.
+    pub seen: BTreeMap<String, usize>,
+}
+
+/// The classes of defect that call a maintenance run at once: each has
+/// broken `step` beads or more since a run was last shown it. Decided from
+/// the records alone.
+pub fn classes_calling(
+    classes: &[factory_brief::ClassCount],
+    seen: &BTreeMap<String, usize>,
+    step: u32,
+) -> Vec<String> {
+    classes
+        .iter()
+        .filter(|class| class.beads >= seen.get(&class.class).copied().unwrap_or(0) + step as usize)
+        .map(|class| class.class.clone())
+        .collect()
 }
 
 /// The first time a schedule is due after `since`: its hour of the day,
@@ -1040,6 +1093,8 @@ fn date_utc(unix: u64) -> String {
 pub struct Measures {
     /// Classes of defect that have broken three beads or more, ever.
     pub classes: Vec<factory_brief::ClassCount>,
+    /// The check that answers a class, for the classes that have one.
+    pub checks: BTreeMap<String, crate::ClassCheck>,
     /// A check that failed and then passed on the same commit: the
     /// command, the commit and the unit.
     pub flaky: Vec<(String, String, String)>,
@@ -1059,6 +1114,7 @@ pub fn measures(state_dir: &Path, project: &str, from: u64) -> Measures {
             .into_iter()
             .filter(|class| class.beads >= 3)
             .collect(),
+        checks: crate::class_checks(state_dir, project),
         ..Measures::default()
     };
     let mut units: Vec<PathBuf> = std::fs::read_dir(state_dir.join("units"))
@@ -1159,8 +1215,13 @@ impl Measures {
                 .iter()
                 .map(|class| {
                     format!(
-                        "`{}`: {} findings on {} beads",
-                        class.class, class.findings, class.beads
+                        "`{}`: {} findings on {} beads; {}",
+                        class.class,
+                        class.findings,
+                        class.beads,
+                        self.checks
+                            .get(&class.class)
+                            .map_or("no check".to_string(), |check| check.words(class.beads))
                     )
                 })
                 .collect(),
@@ -1212,15 +1273,52 @@ impl Measures {
 pub fn maintenance_schema() -> Value {
     object_schema(json!({
         "summary": text_schema("What you looked at and concluded, in a few plain sentences."),
-        "file": file_schema(false),
+        "file": file_schema_for(false, true),
+        "build": { "type": "array", "items": { "type": "string" }, "description": "Beads an earlier run filed and nothing has built, by ID, to have built now with the ones this run marks. Only IDs the brief lists as waiting. Empty when this run may not build." },
+        "build_plan": text_schema("For the director of the goal that builds them, who has not seen this run: the order to build the beads in and why, what each rests on, and what the work must hold to. Empty when nothing is to be built."),
+        "paths": { "type": "array", "items": { "type": "string" }, "description": "The files and directories the beads to build will change, as plain paths with no patterns. With them the goal may run beside another whose paths do not overlap; without them it waits for the project's running goals to end." },
         "digest": text_schema("For the owner, who reads it in the project's channel: what you found, then one line for each bead you filed and why it is worth doing. If nothing was worth a bead, say so and say what you looked at."),
         "journal": text_schema("What the next run should know: what you looked at, what you chose not to file and why, what to look at next. You start fresh each time; this is all that is kept."),
     }))
 }
 
+/// The beads a maintenance run wants built: the ones it files and marks,
+/// by title, and the ones an earlier run filed, by ID.
+fn builds_of(result: &Value) -> (Vec<&str>, Vec<&str>) {
+    let marked = items(result, "file")
+        .iter()
+        .filter(|file| file.get("build").and_then(Value::as_bool) == Some(true))
+        .map(|file| strings(file, "title"))
+        .collect();
+    let waiting = items(result, "build")
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .collect();
+    (marked, waiting)
+}
+
+/// Whether a maintenance run may have beads built, and if not, why.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MayBuild {
+    Yes,
+    /// The schedule names no definition to build under.
+    FilesOnly,
+    /// The goal an earlier run opened has not ended.
+    Building(String),
+}
+
 /// What is wrong with what a maintenance run returned. It files beads and
-/// does nothing else.
-pub fn maintenance_problems(schedule: &Schedule, result: &Value) -> Vec<String> {
+/// may mark some to be built; it starts, ships and closes nothing itself.
+/// `backlog` is the beads earlier runs filed that are still open and that
+/// no goal was opened for.
+pub fn maintenance_problems(
+    schedule: &Schedule,
+    may_build: &MayBuild,
+    backlog: &[String],
+    result: &Value,
+) -> Vec<String> {
     let mut problems = Vec::new();
     for key in ["summary", "digest"] {
         if strings(result, key).trim().is_empty() {
@@ -1248,9 +1346,51 @@ pub fn maintenance_problems(schedule: &Schedule, result: &Value) -> Vec<String> 
     ] {
         if result.get(key).is_some_and(|value| !empty(value)) {
             problems.push(format!(
-                "`{key}`: a maintenance run files beads and does nothing else"
+                "`{key}`: a maintenance run files beads and marks which to build; it does nothing else"
             ));
         }
+    }
+    let (marked, waiting) = builds_of(result);
+    if !marked.is_empty() || !waiting.is_empty() {
+        match may_build {
+            MayBuild::Yes => {}
+            MayBuild::FilesOnly => problems.push(
+                "build: this schedule only files beads; nothing it files is built by the factory. Leave `build` false and empty".to_string(),
+            ),
+            MayBuild::Building(goal) => problems.push(format!(
+                "build: the goal `{goal}`, opened for an earlier run, is still building, and one such goal runs at a time. File what is worth filing with `build` false; a later run may have it built"
+            )),
+        }
+    }
+    for file in items(result, "file") {
+        if file.get("build").and_then(Value::as_bool) == Some(true)
+            && file.get("deferred").and_then(Value::as_bool) == Some(true)
+        {
+            problems.push(format!(
+                "file: `{}` is to be built and is deferred: a deferred bead is not ready work. Choose one",
+                strings(file, "title")
+            ));
+        }
+    }
+    for id in &waiting {
+        if !backlog.iter().any(|bead| bead == id) {
+            problems.push(format!(
+                "build: `{id}` is not a bead an earlier run filed that is still waiting to be built"
+            ));
+        }
+    }
+    let paths = paths_of(result);
+    if let Some(path) = paths.iter().find(|path| !plain_path(path)) {
+        problems.push(format!(
+            "paths: `{path}` is not a plain path of a file or directory inside the repository"
+        ));
+    }
+    if (!marked.is_empty() || !waiting.is_empty())
+        && strings(result, "build_plan").trim().is_empty()
+    {
+        problems.push(
+            "`build_plan` is empty: the director of the goal that builds these beads has not seen this run. Say the order and what the work must hold to".to_string(),
+        );
     }
     let files = items(result, "file");
     if files.len() > schedule.max_beads as usize {
@@ -1317,7 +1457,9 @@ pub fn default_ci_text(branch: &str, tip: &str, ci: &factory_github::BranchCi) -
 /// the default branch since the last run, each with its net lines, and
 /// `span` says between which commits. `ci` is what the default branch's own
 /// CI says, and `reports` what the schedule's report commands printed, each
-/// with what the command is called.
+/// with what the command is called. `may_build` says whether this run may
+/// have beads built, and `called` names the classes of defect that called
+/// it ahead of its time, if any did.
 #[allow(clippy::too_many_arguments)]
 pub fn maintenance_brief(
     project: &str,
@@ -1330,15 +1472,48 @@ pub fn maintenance_brief(
     ci: &str,
     reports: &[(String, String)],
     tracker: &[Summary],
+    may_build: &MayBuild,
+    called: &[String],
 ) -> String {
+    let building = match may_build {
+        MayBuild::Yes => format!(
+            "You may also have beads built. Mark a bead you file with `build`, or name in `build` a bead listed below as waiting, and the factory opens a goal for them under the definition `{}`: a director, and under it the project's usual pipelines, take them to one pull request and land it, with no word from the owner. Nothing else you could return starts work. Build what stops a class of defect from coming back: a check, a lint rule, a test helper that every later bead then runs. In `build_plan`, tell that goal's director the order and what the work must hold to, and in `paths` the files and directories it will change. What should wait for the owner's judgement, file with `build` false.",
+            schedule.build_under.as_deref().unwrap_or("")
+        ),
+        MayBuild::FilesOnly => "You start nothing, continue nothing, ship nothing and close nothing: what you file is taken up by the project's goals, or by the owner.".to_string(),
+        MayBuild::Building(goal) => format!(
+            "The goal `{goal}`, which the factory opened for an earlier run, is still building, and one such goal runs at a time: this run files only. What it files and should be built, a later run may have built."
+        ),
+    };
     let mut out = format!(
-        "# Maintenance of project `{project}`, run {}\n\n## What these runs are for\n\n{}\n\n## What you may do\n\nFile beads: at most {} in this run, each with a type, a priority, acceptance criteria and the evidence for it in its description, and deferred unless it should be worked on soon. You start nothing, continue nothing, ship nothing and close nothing: what you file is taken up by the project's goals, or by the owner. Your working directory is a checkout of the default branch: read it and run what only reads.\n\n## What the factory's records show since {}\n\n{}",
+        "# Maintenance of project `{project}`, run {}\n\n## What these runs are for\n\n{}\n\n## What you may do\n\nFile beads: at most {} in this run, each with a type, a priority, acceptance criteria and the evidence for it in its description, and deferred unless it should be worked on soon. {building} Your working directory is a checkout of the default branch: read it and run what only reads.\n\n",
         record.runs + 1,
         schedule.charter.trim(),
         schedule.max_beads,
+    );
+    if !called.is_empty() {
+        out.push_str(&format!(
+            "## Why this run is now\n\nIt was not due by the clock. The factory called it because {} broken more beads since a run last looked: `{}`. Start there.\n\n",
+            if called.len() == 1 { "a class of defect has" } else { "classes of defect have" },
+            called.join("`, `")
+        ));
+    }
+    let waiting: Vec<&Summary> = tracker
+        .iter()
+        .filter(|bead| record.backlog.contains(&bead.id))
+        .collect();
+    if !waiting.is_empty() {
+        out.push_str("## Beads earlier runs filed that nothing has built\n\n");
+        for bead in waiting {
+            out.push_str(&format!("- `{}`: {}\n", bead.id, bead.title));
+        }
+        out.push('\n');
+    }
+    out.push_str(&format!(
+        "## What the factory's records show since {}\n\n{}",
         date_utc(from),
         measures.text(),
-    );
+    ));
     out.push_str(&format!(
         "### Files that grew most on the default branch ({span})\n\n"
     ));
@@ -2111,6 +2286,12 @@ fn file_problems(files: &[Value], launchable: &dyn Fn(&str) -> Vec<String>) -> V
         let priority = file.get("priority").and_then(Value::as_i64).unwrap_or(-1);
         if !(0..=4).contains(&priority) {
             problems.push(format!("file: `{title}` needs a priority from 0 to 4"));
+        }
+        let class = strings(file, "closes_class").trim();
+        if !class.is_empty() && !factory_brief::is_class_key(class) {
+            problems.push(format!(
+                "file: `{title}` closes the class `{class}`, which is not written as a key: lowercase words joined by dashes, as the brief lists them"
+            ));
         }
         let from = strings(file, "discovered_from");
         if !from.is_empty() && launchable(from) == ["unknown"] {
@@ -2894,8 +3075,15 @@ pub fn wake_brief(
     memory: &str,
 ) -> String {
     let charter = goal.charter.clone().unwrap_or_default();
+    // A goal the factory opened for a maintenance run was agreed with
+    // nobody: its plan is that run's, and how it came to be is said.
+    let plan = if goal.maintenance.is_some() {
+        "The plan of the maintenance run that opened this goal"
+    } else {
+        "The plan the owner agreed to"
+    };
     let mut out = format!(
-        "# Goal `{}` on project `{}`, wake {}\n\n## Objective\n\n{}\n\n## Stop when\n\n{}\n\n## The plan the owner agreed to\n\n{}\n\n",
+        "# Goal `{}` on project `{}`, wake {}\n\n## Objective\n\n{}\n\n## Stop when\n\n{}\n\n## {plan}\n\n{}\n\n",
         goal.id,
         goal.project,
         goal.wakes + 1,
@@ -2903,6 +3091,12 @@ pub fn wake_brief(
         charter.stop_when,
         charter.plan
     );
+    if let (Some(_), Some(handoff)) = (&goal.maintenance, &goal.handoff) {
+        out.push_str(&format!(
+            "## How this goal came to be\n\n{}\n\n",
+            handoff.trim()
+        ));
+    }
     if let Some(check) = goal
         .stop_check
         .as_ref()
@@ -3498,8 +3692,36 @@ pub fn check_definitions(config: &ConfigDir) -> Result<Vec<String>, DriverError>
                         "its schedule's report `{name}` is not a command of the project"
                     )));
                 }
+                let mut builds = String::new();
+                if let Some(under) = &schedule.build_under {
+                    // What a run marks to build is built by a goal under
+                    // a definition that can run one.
+                    let found = config
+                        .goal_definitions(&id)?
+                        .into_iter()
+                        .find(|other| &other.id == under);
+                    match found {
+                        Some(other) if other.schedule.is_none() => {}
+                        Some(_) => {
+                            return Err(refuse(format!(
+                                "its schedule builds under `{under}`, which has a schedule itself and so runs no goal"
+                            )));
+                        }
+                        None => {
+                            return Err(refuse(format!(
+                                "its schedule builds under `{under}`, which is not a goal definition of the project"
+                            )));
+                        }
+                    }
+                    builds = format!(", and builds what it marks under `{under}`");
+                }
+                if let Some(step) = schedule.when_class_breaks {
+                    builds.push_str(&format!(
+                        ", called at once when a class of defect breaks {step} more bead(s)"
+                    ));
+                }
                 lines.push(format!(
-                    "{id}/{}: scheduled, maintainer {} ({}), every {} day(s) at {:02}:00 UTC, at most {} bead(s) a run",
+                    "{id}/{}: scheduled, maintainer {} ({}), every {} day(s) at {:02}:00 UTC, at most {} bead(s) a run{builds}",
                     definition.id,
                     definition.director.model,
                     definition.director.effort,
@@ -4101,6 +4323,7 @@ impl Supervisor {
             started_at: now_unix(),
             queued_at: None,
             handoff,
+            maintenance: None,
         };
         let id = goal.id.clone();
         self.save(goal.clone())?;
@@ -4749,7 +4972,11 @@ impl Supervisor {
             return Ok(());
         };
         goal.phase = Phase::Running;
-        goal.inbox.insert(0, Happening::Started);
+        // One the factory opened for a maintenance run already holds what
+        // its director is told first.
+        if goal.maintenance.is_none() {
+            goal.inbox.insert(0, Happening::Started);
+        }
         self.log(
             &goal,
             "goal.unqueued",
@@ -4854,6 +5081,63 @@ impl Supervisor {
         }
     }
 
+    /// Take a goal whose charter stands from its opening into the project's
+    /// work: running at once if the project has a place free, else in line.
+    /// `started` is what its director is told first.
+    fn enter(&mut self, mut goal: Goal, started: Happening) -> Result<(), DriverError> {
+        let project = self.config.project(&goal.project)?;
+        let id = goal.id.clone();
+        // A project runs only so many goals at once. Beyond that the goal
+        // waits its turn, and starts by itself.
+        let ahead: Vec<String> = self
+            .active(&goal.project)
+            .iter()
+            .filter(|other| other.id != id)
+            .map(|other| format!("`{}`", other.id))
+            .collect();
+        let limit = goal_limit(&project);
+        let full = ahead.len() >= limit;
+        // With room left and another goal running, whether this one may
+        // run beside it is the executive's to judge.
+        let judged = !full && !ahead.is_empty() && project.executive.is_some();
+        if full || judged {
+            goal.phase = Phase::Queued;
+            goal.queued_at = Some(now_unix());
+            // Kept for the director, who reads it when the goal starts.
+            if !matches!(started, Happening::Started) {
+                goal.inbox.push(started);
+            }
+            self.log(
+                &goal,
+                "goal.queued",
+                json!({ "behind": ahead, "judged": judged }),
+            );
+            self.say(&goal, &if judged {
+                format!(
+                    ":hourglass_flowing_sand: *Goal waiting.* {} is running. The project's executive is deciding whether this one can safely run beside it; if not, it starts by itself when that ends. What you write here meanwhile is kept for its director; `stop` takes it out of the line.",
+                    ahead.join(", ")
+                )
+            } else {
+                format!(
+                    ":hourglass_flowing_sand: *Goal queued.* This project runs {limit} goal(s) at a time, and {} is running. This one starts by itself when that ends. What you write here meanwhile is kept for its director; `stop` takes it out of the queue.",
+                    ahead.join(", ")
+                )
+            });
+            let project = goal.project.clone();
+            self.save(goal)?;
+            return if judged {
+                self.schedule(&project)
+            } else {
+                Ok(())
+            };
+        }
+        goal.phase = Phase::Running;
+        goal.inbox.push(started);
+        self.say(&goal, ":rocket: *Goal started.* It now moves on events: a pipeline ending, or a message from you here. `stop` ends it.");
+        self.save(goal)?;
+        self.wake(&id)
+    }
+
     /// A deterministic act by the owner: a button, or its word. No agent runs
     /// to decide any of these.
     fn act(&mut self, id: &str, action: &str, who: &str) -> Result<(), DriverError> {
@@ -4879,50 +5163,7 @@ impl Supervisor {
                     self.log(&goal, "bead.changed", json!({ "edit": edit }));
                 }
                 self.settle_prompt(&mut goal, &format!("Started by {who}."));
-                // A project runs only so many goals at once. Beyond that
-                // the goal waits its turn, and starts by itself.
-                let ahead: Vec<String> = self
-                    .active(&goal.project)
-                    .iter()
-                    .map(|other| format!("`{}`", other.id))
-                    .collect();
-                let limit = goal_limit(&project);
-                let full = ahead.len() >= limit;
-                // With room left and another goal running, whether this one
-                // may run beside it is the executive's to judge.
-                let judged = !full && !ahead.is_empty() && project.executive.is_some();
-                if full || judged {
-                    goal.phase = Phase::Queued;
-                    goal.queued_at = Some(now_unix());
-                    self.log(
-                        &goal,
-                        "goal.queued",
-                        json!({ "behind": ahead, "judged": judged }),
-                    );
-                    self.say(&goal, &if judged {
-                        format!(
-                            ":hourglass_flowing_sand: *Goal waiting.* {} is running. The project's executive is deciding whether this one can safely run beside it; if not, it starts by itself when that ends. What you write here meanwhile is kept for its director; `stop` takes it out of the line.",
-                            ahead.join(", ")
-                        )
-                    } else {
-                        format!(
-                            ":hourglass_flowing_sand: *Goal queued.* This project runs {limit} goal(s) at a time, and {} is running. This one starts by itself when that ends. What you write here meanwhile is kept for its director; `stop` takes it out of the queue.",
-                            ahead.join(", ")
-                        )
-                    });
-                    let project = goal.project.clone();
-                    self.save(goal)?;
-                    return if judged {
-                        self.schedule(&project)
-                    } else {
-                        Ok(())
-                    };
-                }
-                goal.phase = Phase::Running;
-                goal.inbox.push(Happening::Started);
-                self.say(&goal, ":rocket: *Goal started.* It now moves on events: a pipeline ending, or a message from you here. `stop` ends it.");
-                self.save(goal)?;
-                self.wake(id)
+                self.enter(goal, Happening::Started)
             }
             ("goal_accept", Phase::ProposedComplete) => {
                 self.settle_prompt(&mut goal, &format!("Accepted by {who}."));
@@ -5584,6 +5825,28 @@ impl Supervisor {
                     "bead.filed",
                     json!({ "bead": bead.id, "request": file }),
                 );
+                // A bead that builds the check for a class of defect.
+                let class = strings(file, "closes_class").trim();
+                if factory_brief::is_class_key(class) {
+                    match crate::answer_class(
+                        &self.factory.state_dir,
+                        project.id.as_str(),
+                        class,
+                        &bead.id,
+                    ) {
+                        Ok(true) => self.log_at(
+                            seat,
+                            "check.filed",
+                            json!({ "bead": bead.id, "class": class }),
+                        ),
+                        Ok(false) => {}
+                        Err(err) => self.log_at(
+                            seat,
+                            "check.failed",
+                            json!({ "bead": bead.id, "class": class, "error": err.to_string() }),
+                        ),
+                    }
+                }
                 let line = format!(
                     "filed `{}` ({}, P{}{}): {}",
                     bead.id,
@@ -5663,6 +5926,11 @@ impl Supervisor {
         // While the service is stopping, what an agent is owed stays in its
         // inbox: it is woken by the service that starts next.
         if self.draining || goal.phase != Phase::Running || goal.inbox.is_empty() {
+            return Ok(());
+        }
+        // A goal the factory opened for a maintenance run ends by itself
+        // when its beads are closed: no director is woken to say so.
+        if goal.maintenance.is_some() && self.settle_maintenance(id)? {
             return Ok(());
         }
         goal.retry_at = None;
@@ -6187,12 +6455,33 @@ impl Supervisor {
                 record
             }
         };
+        // The goal an earlier run opened, while it has not ended.
+        let building = record
+            .goal
+            .clone()
+            .filter(|id| self.goals.get(id).is_some_and(|goal| !goal.ended()));
+        // A class of defect that keeps breaking beads calls a run at once,
+        // unless a goal is already building what the last run found.
+        let called = match schedule.when_class_breaks {
+            Some(step) if building.is_none() && record.retry_at.is_none() => classes_calling(
+                &crate::finding_classes(&self.factory.state_dir, project.id.as_str()),
+                &record.seen,
+                step,
+            ),
+            _ => Vec::new(),
+        };
         let due = record
             .retry_at
             .unwrap_or_else(|| schedule_due(schedule, record.since));
-        if self.draining || due > now_unix() {
+        if self.draining || (due > now_unix() && called.is_empty()) {
             return Ok(false);
         }
+        let called = if due > now_unix() { called } else { Vec::new() };
+        let may_build = match (&schedule.build_under, &building) {
+            (None, _) => MayBuild::FilesOnly,
+            (Some(_), Some(goal)) => MayBuild::Building(goal.clone()),
+            (Some(_), None) => MayBuild::Yes,
+        };
         // The first run looks back two weeks; later ones, to the run before.
         let from = if record.runs == 0 {
             record.since.saturating_sub(14 * 86_400)
@@ -6201,6 +6490,11 @@ impl Supervisor {
         };
         let source = bead_source(project);
         let tracker = source.list_open()?;
+        // What earlier runs filed and is still open, with nothing building it.
+        record
+            .backlog
+            .retain(|id| tracker.iter().any(|bead| &bead.id == id));
+        let backlog = record.backlog.clone();
         let found = measures(&self.factory.state_dir, project.id.as_str(), from);
         // The default branch as it is now, and what grew on it.
         let cwd = self.checkout(&seat.dir, project, &None)?;
@@ -6297,8 +6591,10 @@ impl Supervisor {
             &ci,
             &reports,
             &tracker,
+            &may_build,
+            &called,
         );
-        let check = |result: &Value| maintenance_problems(schedule, result);
+        let check = |result: &Value| maintenance_problems(schedule, &may_build, &backlog, result);
         // Where the run's transcript goes. A record put there by hand has
         // no such directory beside it.
         std::fs::create_dir_all(seat.dir.join("runs")).map_err(crate::io(&seat.dir))?;
@@ -6347,11 +6643,35 @@ impl Supervisor {
             }
         };
         let mut filed: Vec<String> = Vec::new();
+        // The beads to build, each with its title: the ones this run marks,
+        // and the ones it names of what earlier runs filed.
+        let mut build: Vec<(String, String)> = Vec::new();
         for file in items(&result, "file")
             .iter()
             .take(schedule.max_beads as usize)
         {
-            filed.push(self.file_bead_at(&seat, &source, project, file).1);
+            let (id, line) = self.file_bead_at(&seat, &source, project, file);
+            filed.push(line);
+            let Some(id) = id else {
+                continue;
+            };
+            if may_build == MayBuild::Yes
+                && file.get("build").and_then(Value::as_bool) == Some(true)
+            {
+                build.push((id, strings(file, "title").to_string()));
+            } else {
+                record.backlog.push(id);
+            }
+        }
+        if may_build == MayBuild::Yes {
+            for id in builds_of(&result).1 {
+                if let Some(bead) = tracker.iter().find(|bead| bead.id == id)
+                    && !build.iter().any(|(other, _)| other == id)
+                {
+                    build.push((bead.id.clone(), bead.title.clone()));
+                    record.backlog.retain(|other| other != id);
+                }
+            }
         }
         record.runs += 1;
         record.failures = 0;
@@ -6359,13 +6679,38 @@ impl Supervisor {
         record.since = now_unix();
         record.commit = tip.clone();
         record.journal = strings(&result, "journal").trim().to_string();
+        // What this run was shown of each class is what a class has to
+        // exceed to call the next one.
+        for class in crate::finding_classes(&self.factory.state_dir, project.id.as_str()) {
+            record.seen.insert(class.class, class.beads);
+        }
         self.log_at(
             &seat,
             "schedule.ran",
             json!({ "definition": definition.id, "run": record.runs, "commit": tip, "filed": filed,
-                    "summary": strings(&result, "summary") }),
+                    "build": build.iter().map(|(id, _)| id).collect::<Vec<_>>(),
+                    "called_by": called, "summary": strings(&result, "summary") }),
         );
-        self.tell_channel(
+        let mut lines: Vec<String> = if filed.is_empty() {
+            vec!["It filed nothing.".to_string()]
+        } else {
+            filed
+                .iter()
+                .map(|line| format!("• {}", escape(line)))
+                .collect()
+        };
+        if !build.is_empty() {
+            lines.push(format!(
+                ":hammer_and_wrench: The factory is building {} of them now, in this thread: `{}`. `stop` here ends it.",
+                build.len(),
+                build
+                    .iter()
+                    .map(|(id, _)| id.as_str())
+                    .collect::<Vec<_>>()
+                    .join("`, `")
+            ));
+        }
+        let posted = self.tell_channel(
             project,
             &seat,
             &format!(
@@ -6374,33 +6719,170 @@ impl Supervisor {
                 record.runs,
                 project.id,
                 quote(&truncate(strings(&result, "digest").trim(), 2500)),
-                if filed.is_empty() {
-                    "It filed nothing.".to_string()
-                } else {
-                    filed
-                        .iter()
-                        .map(|line| format!("• {}", escape(line)))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                }
+                lines.join("\n")
             ),
         );
+        // Saved before the goal is opened: a run that has filed must not
+        // run again because what came after it failed.
         self.save_schedule(&seat, &record)?;
+        if let (Some(under), false) = (&schedule.build_under, build.is_empty()) {
+            let goal = self.open_maintenance(
+                project,
+                &definition.id,
+                under,
+                record.runs,
+                &build,
+                &result,
+                posted,
+            )?;
+            self.log_at(
+                &seat,
+                "schedule.building",
+                json!({ "goal": goal, "beads": build.iter().map(|(id, _)| id).collect::<Vec<_>>() }),
+            );
+            record.goal = Some(goal);
+            self.save_schedule(&seat, &record)?;
+        }
+        Ok(true)
+    }
+
+    /// Open the goal that builds what a maintenance run marked, and start
+    /// it as the owner's Start would: at once if the project has a place
+    /// free, else in line. Its charter is written here, from the run's
+    /// result, and nobody is asked to agree it: the schedule's definition,
+    /// which the owner wrote, is what allows it. `posted` is the run's
+    /// message in the project's channel, whose thread the goal takes.
+    #[allow(clippy::too_many_arguments)]
+    fn open_maintenance(
+        &mut self,
+        project: &Project,
+        schedule: &str,
+        under: &str,
+        run: u32,
+        build: &[(String, String)],
+        result: &Value,
+        posted: Option<(String, String)>,
+    ) -> Result<String, DriverError> {
+        let (channel, ts) = posted.unwrap_or_else(|| (String::new(), now_unix().to_string()));
+        let beads: Vec<String> = build.iter().map(|(id, _)| id.clone()).collect();
+        let listed = build
+            .iter()
+            .map(|(id, title)| format!("- `{id}`: {title}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let handoff = format!(
+            "The factory opened this goal by itself, for run {run} of the scheduled definition `{schedule}`: nobody asked for it in the channel, and the owner has not read its charter. That run's maintainer looked at what the factory's records show of the project and filed these beads to be built now. What it concluded:\n\n{}\n\nThe goal is complete when every one of its beads is closed, and code decides that: you do not propose `complete` for it. If a bead turns out not to be worth building, or cannot be built, say so to the owner in the thread and leave the rest to them.",
+            quote_plain(strings(result, "summary").trim())
+        );
+        let id = self.create_goal(
+            project.id.as_str(),
+            &channel,
+            &ts,
+            "",
+            under,
+            &format!("maintenance: run {run} of {schedule}"),
+            Some(handoff),
+        )?;
+        let mut goal = self.goals[&id].clone();
+        goal.charter = Some(Charter {
+            objective: format!(
+                "Build and land what maintenance run {run} of `{schedule}` filed, so that what it found is stopped by a check and not by someone remembering it:\n{listed}"
+            ),
+            stop_when: format!(
+                "Every one of these beads is closed: `{}`. The factory checks this itself and ends the goal when it holds.",
+                beads.join("`, `")
+            ),
+            plan: strings(result, "build_plan").trim().to_string(),
+            paths: paths_of(result),
+        });
+        goal.maintenance = Some(Maintained {
+            schedule: schedule.to_string(),
+            beads,
+        });
+        self.save(goal.clone())?;
+        self.enter(
+            goal,
+            Happening::Note {
+                text: format!(
+                    "The factory started this goal for maintenance run {run} of `{schedule}`. Nobody pressed Start."
+                ),
+            },
+        )?;
+        Ok(id)
+    }
+
+    /// End a goal opened for a maintenance run once every bead it was to
+    /// build is closed, with no agent and no Accept: its stop condition is
+    /// one code can decide. Returns whether it ended.
+    fn settle_maintenance(&mut self, id: &str) -> Result<bool, DriverError> {
+        let Some(goal) = self.goals.get(id).cloned() else {
+            return Ok(false);
+        };
+        let Some(built) = goal.maintenance.clone() else {
+            return Ok(false);
+        };
+        if goal.ended()
+            || goal.phase == Phase::Intake
+            || goal.units.iter().any(|unit| unit.state == "running")
+        {
+            return Ok(false);
+        }
+        let project = self.config.project(&goal.project)?;
+        let open = bead_source(&project).list_open()?;
+        if built
+            .beads
+            .iter()
+            .any(|bead| open.iter().any(|other| &other.id == bead))
+        {
+            return Ok(false);
+        }
+        let mut goal = goal;
+        self.settle_prompt(
+            &mut goal,
+            "Complete: every bead it was opened for is closed.",
+        );
+        goal.phase = Phase::Complete;
+        goal.inbox.clear();
+        let evidence = format!(
+            "Every bead maintenance run of `{}` marked to build is closed: {}.",
+            built.schedule,
+            built.beads.join(", ")
+        );
+        goal.evidence = Some(evidence.clone());
+        self.log(
+            &goal,
+            "goal.complete",
+            json!({ "evidence": evidence, "by": "code" }),
+        );
+        self.say(
+            &goal,
+            &format!(
+                ":checkered_flag: *Goal complete.* Every bead it was opened to build has landed and is closed: `{}`. No one was asked: this goal's stop condition is one the factory checks itself.",
+                built.beads.join("`, `")
+            ),
+        );
+        let project = goal.project.clone();
+        self.save(goal)?;
+        self.start_queued(&project)?;
         Ok(true)
     }
 
     /// Say something in a project's channel, outside any goal's thread.
-    fn tell_channel(&self, project: &Project, seat: &Seat, text: &str) {
+    /// Returns the channel and the message, when it was posted.
+    fn tell_channel(&self, project: &Project, seat: &Seat, text: &str) -> Option<(String, String)> {
         self.log_at(seat, "slack.say", json!({ "text": text }));
         let channel = self
             .channels
             .iter()
             .find(|(_, id)| id.as_str() == project.id.as_str())
             .map(|(channel, _)| channel.clone());
-        if let (Some(slack), Some(channel)) = (&self.slack, channel)
-            && let Err(err) = slack.post(&channel, None, text)
-        {
-            self.log_at(seat, "slack.failed", json!({ "error": err.to_string() }));
+        let (slack, channel) = (self.slack.as_ref()?, channel?);
+        match slack.post(&channel, None, text) {
+            Ok(ts) => Some((channel, ts)),
+            Err(err) => {
+                self.log_at(seat, "slack.failed", json!({ "error": err.to_string() }));
+                None
+            }
         }
     }
 
@@ -7549,6 +8031,25 @@ impl Supervisor {
                 let Some(record) = self.schedule_record(&project, &definition.id) else {
                     return Some(now_unix());
                 };
+                // A class of defect that has broken enough beads since
+                // a run last looked makes one due now, unless a goal is
+                // still building what the last run found.
+                let building = record
+                    .goal
+                    .as_ref()
+                    .is_some_and(|id| self.goals.get(id).is_some_and(|goal| !goal.ended()));
+                if let Some(step) = schedule.when_class_breaks
+                    && !building
+                    && record.retry_at.is_none()
+                    && !classes_calling(
+                        &crate::finding_classes(&self.factory.state_dir, project.id.as_str()),
+                        &record.seen,
+                        step,
+                    )
+                    .is_empty()
+                {
+                    return Some(now_unix());
+                }
                 Some(
                     record
                         .retry_at
@@ -9936,6 +10437,8 @@ mod tests {
             charter: "Keep quality from slipping.".to_string(),
             max_beads: 2,
             reports: Vec::new(),
+            build_under: None,
+            when_class_breaks: None,
         }
     }
 
@@ -9972,7 +10475,7 @@ mod tests {
             for (key, value) in fields.as_object().unwrap() {
                 result[key] = value.clone();
             }
-            maintenance_problems(&schedule(7), &result)
+            maintenance_problems(&schedule(7), &MayBuild::FilesOnly, &[], &result)
         };
         // Filing nothing is a good run, and so is filing up to the limit.
         assert_eq!(run(json!({})), Vec::<String>::new());
@@ -10005,7 +10508,7 @@ mod tests {
             assert_eq!(
                 run(fields),
                 [format!(
-                    "`{key}`: a maintenance run files beads and does nothing else"
+                    "`{key}`: a maintenance run files beads and marks which to build; it does nothing else"
                 )]
             );
         }
@@ -10031,6 +10534,101 @@ mod tests {
             ]
         );
         assert_eq!(run(json!({ "digest": " " })), ["`digest` is empty"]);
+    }
+
+    #[test]
+    fn a_maintenance_run_has_beads_built_only_when_its_schedule_allows_and_nothing_is_building() {
+        let bead = |title: &str, build: bool, deferred: bool| {
+            json!({ "title": title, "type": "task", "priority": 2, "description": "Why and what.",
+                    "acceptance_criteria": "A check fails on it.", "parent": "", "discovered_from": "",
+                    "deferred": deferred, "build": build })
+        };
+        let run = |may: MayBuild, fields: Value| {
+            let mut result =
+                json!({ "summary": "Looked.", "file": [], "digest": "One check.", "journal": "" });
+            for (key, value) in fields.as_object().unwrap() {
+                result[key] = value.clone();
+            }
+            maintenance_problems(&schedule(7), &may, &["toy-4".to_string()], &result)
+        };
+        let marked = json!({ "file": [bead("A lint rule for cleanup", true, false)],
+            "build": ["toy-4"], "build_plan": "The rule first; toy-4 uses it.", "paths": ["tools/lint"] });
+        assert_eq!(run(MayBuild::Yes, marked.clone()), Vec::<String>::new());
+        // Filing without building is always allowed.
+        for may in [
+            MayBuild::Yes,
+            MayBuild::FilesOnly,
+            MayBuild::Building("toy-g1".to_string()),
+        ] {
+            assert_eq!(
+                run(may, json!({ "file": [bead("Later", false, true)] })),
+                Vec::<String>::new()
+            );
+        }
+        let only = run(MayBuild::FilesOnly, marked.clone());
+        assert_eq!(only.len(), 1, "{only:?}");
+        assert!(
+            only[0].starts_with("build: this schedule only files beads"),
+            "{only:?}"
+        );
+        let busy = run(MayBuild::Building("toy-g1".to_string()), marked);
+        assert_eq!(busy.len(), 1, "{busy:?}");
+        assert!(
+            busy[0].starts_with(
+                "build: the goal `toy-g1`, opened for an earlier run, is still building"
+            ),
+            "{busy:?}"
+        );
+        // What is to be built is ready work, is known, has a plan, and
+        // declares plain paths.
+        assert_eq!(
+            run(
+                MayBuild::Yes,
+                json!({ "file": [bead("Both", true, true)], "build": ["toy-9"], "paths": ["src/*.zig"] })
+            ),
+            [
+                "file: `Both` is to be built and is deferred: a deferred bead is not ready work. Choose one",
+                "build: `toy-9` is not a bead an earlier run filed that is still waiting to be built",
+                "paths: `src/*.zig` is not a plain path of a file or directory inside the repository",
+                "`build_plan` is empty: the director of the goal that builds these beads has not seen this run. Say the order and what the work must hold to",
+            ]
+        );
+        // The class a bead's check closes is named by its key.
+        let mut named = bead("A rule", false, false);
+        named["closes_class"] = json!("error-path-cleanup");
+        assert_eq!(
+            run(MayBuild::Yes, json!({ "file": [named.clone()] })),
+            Vec::<String>::new()
+        );
+        named["closes_class"] = json!("Error paths!");
+        assert_eq!(
+            run(MayBuild::Yes, json!({ "file": [named] })),
+            [
+                "file: `A rule` closes the class `Error paths!`, which is not written as a key: lowercase words joined by dashes, as the brief lists them"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_class_calls_a_run_when_it_has_broken_enough_beads_since_one_last_looked() {
+        let count = |class: &str, beads: usize| factory_brief::ClassCount {
+            class: class.to_string(),
+            findings: beads + 1,
+            beads,
+        };
+        let classes = [count("error-path-cleanup", 3), count("double-call", 2)];
+        let mut seen = BTreeMap::new();
+        assert_eq!(classes_calling(&classes, &seen, 3), ["error-path-cleanup"]);
+        assert_eq!(
+            classes_calling(&classes, &seen, 2),
+            ["error-path-cleanup", "double-call"]
+        );
+        // A run that was shown it is not called by it again until it has
+        // broken that many beads more.
+        seen.insert("error-path-cleanup".to_string(), 3);
+        assert_eq!(classes_calling(&classes, &seen, 3), Vec::<String>::new());
+        let more = [count("error-path-cleanup", 6)];
+        assert_eq!(classes_calling(&more, &seen, 3), ["error-path-cleanup"]);
     }
 
     #[test]
@@ -10127,6 +10725,7 @@ mod tests {
                     findings: 3,
                     beads: 3
                 }],
+                checks: BTreeMap::new(),
                 flaky: vec![(
                     "test".to_string(),
                     "aaaaaaaaaaaaaaaa".to_string(),
@@ -10207,10 +10806,12 @@ mod tests {
                 "(it exited with code 1)\nsrc/a.zig:10-40 = src/b.zig:5-35\n".to_string(),
             )],
             &tracker,
+            &MayBuild::FilesOnly,
+            &[],
         );
         for part in [
             "# Maintenance of project `toy`, run 5\n\n## What these runs are for\n\nKeep quality from slipping.\n\n## What you may do\n\nFile beads: at most 2 in this run",
-            "## What the factory's records show since 1970-01-01 00:01 UTC\n\n### Classes of defect that have broken three beads or more\n\n- `error-path-cleanup`: 3 findings on 3 beads\n",
+            "## What the factory's records show since 1970-01-01 00:01 UTC\n\n### Classes of defect that have broken three beads or more\n\n- `error-path-cleanup`: 3 findings on 3 beads; no check\n",
             "### Checks that failed and then passed on the same commit\n\n- `test` on `aaaaaaaaaa`, in unit `toy-1-100`\n",
             "### Pull requests whose CI went red\n\n- unit `toy-1-100`\n",
             "### Beads that took three rounds of fixing or more\n\n- unit `toy-1-100`: 3 rounds\n",
@@ -10234,6 +10835,8 @@ mod tests {
             &[],
             "No CI run that finished was found on `main`.\n",
             &[],
+            &[],
+            &MayBuild::FilesOnly,
             &[],
         );
         assert_eq!(quiet.matches("None.\n").count(), 6, "{quiet}");

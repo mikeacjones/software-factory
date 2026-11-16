@@ -665,6 +665,17 @@ pub struct Schedule {
     /// command that fails is shown too, and holds nothing up.
     #[serde(default)]
     pub reports: Vec<String>,
+    /// The definition of the project that a run's beads are built under.
+    /// With it a run may mark beads to build: the factory opens a goal
+    /// under that definition for them, starts it with no word from the
+    /// owner, and marks it complete when every one of them is closed.
+    /// Without it a run only files, and what it files waits for a goal
+    /// the owner opens.
+    pub build_under: Option<String>,
+    /// A run is also due, at once, when a class of defect has broken this
+    /// many beads more than a run was last shown. Without it runs come by
+    /// the clock only.
+    pub when_class_breaks: Option<u32>,
 }
 
 fn default_every_days() -> u32 {
@@ -983,6 +994,11 @@ impl ConfigDir {
                 if schedule.charter.trim().is_empty() || !(1..=10).contains(&schedule.max_beads) {
                     return Err(invalid(
                         "schedule: it needs a charter, and max_beads from 1 to 10".to_string(),
+                    ));
+                }
+                if schedule.when_class_breaks == Some(0) {
+                    return Err(invalid(
+                        "schedule: when_class_breaks is at least 1".to_string(),
                     ));
                 }
             }

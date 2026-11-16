@@ -124,7 +124,7 @@ The proof of a milestone: a manifest of checks, each a command with a tier, a ti
 
 ## finding class
 
-The kind of mistake a tester's finding is, as a short key such as `error-path-cleanup`. Every critical or major finding has one. They are counted across a project's units, and the most frequent are told to the next builder.
+The kind of mistake a tester's finding is, as a short key such as `error-path-cleanup`. Every critical or major finding has one. They are counted across a project's units, and the most frequent are told to the next builder. A class that has broken enough beads since a scheduled run last looked calls one at once. A bead may name the class its check closes: once that bead has landed, builders are no longer told of the class, unless it breaks a bead again.
 
 ## test proof
 
@@ -136,11 +136,15 @@ A command of the project that a goal definition names to decide the goal's stop 
 
 ## schedule
 
-The times a goal definition is run at by the factory itself: an hour of the day, every so many days. A definition with one is not a goal. Each run is one agent, which files beads and starts nothing.
+When a goal definition is run by the factory itself: at an hour of the day, every so many days, and, if it says so, as soon as a *finding class* has broken so many beads more. A definition with one is not a goal the owner opens. Each run is one agent, which files beads; a schedule that names a definition to build under lets a run mark beads the factory then builds.
 
 ## maintainer
 
-The agent of a scheduled run. It is given the run's charter and the measures, reads the default branch, and files beads up to the definition's limit. Code refuses anything else it asks for.
+The agent of a scheduled run. It is given the run's charter and the measures, reads the default branch, files beads up to the definition's limit, and marks which of them the factory is to build. Code refuses anything else it asks for.
+
+## maintenance goal
+
+A goal the factory opens for the beads a scheduled run marked to build, under the definition the *schedule* names. Nobody agrees its charter or presses Start: code writes the charter from the run's result. It is run like any goal, and it is complete, with no agent and no Accept, when every one of its beads is closed. A schedule has one at a time.
 
 ## measures
 

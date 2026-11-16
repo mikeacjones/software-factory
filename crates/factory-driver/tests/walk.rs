@@ -4488,6 +4488,298 @@ fn a_sub_goal_is_designed_and_the_design_accepted_before_any_bead_of_it_is_built
     assert!(at("design.proposed") < at("design.accepted"));
 }
 
+/// A schedule that names a definition to build under closes the loop with
+/// nobody in it: a class of defect that keeps breaking beads calls a run,
+/// the run marks beads to build, and the factory opens a goal for them,
+/// starts it and ends it when they are closed.
+#[test]
+fn a_maintenance_run_builds_what_it_marks_in_a_goal_the_factory_opens_and_ends() {
+    use factory_driver::goal::{Phase, Scheduled, Supervisor, check_definitions};
+    use std::time::{Duration, Instant};
+
+    let world = World::new("maintbuild", "true");
+    world.with_github("green");
+    std::fs::create_dir_all(world.path("config/goals/toy")).unwrap();
+    let tier = "[director]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\n";
+    std::fs::write(
+        world.path("config/goals/toy/main.toml"),
+        format!("id = \"main\"\ndefault = true\n{tier}"),
+    )
+    .unwrap();
+    let upkeep = world.path("config/goals/toy/upkeep.toml");
+    let timed = |under: &str| {
+        format!(
+            "id = \"upkeep\"\n{tier}[schedule]\nhour_utc = 4\nevery_days = 7\nmax_beads = 2\ncharter = \"Turn what keeps breaking into checks.\"\nbuild_under = \"{under}\"\nwhen_class_breaks = 3\n"
+        )
+    };
+    // What a run marks is built under a definition that can run a goal.
+    for (under, why) in [
+        (
+            "upkeep",
+            "its schedule builds under `upkeep`, which has a schedule itself and so runs no goal",
+        ),
+        (
+            "nightly",
+            "its schedule builds under `nightly`, which is not a goal definition of the project",
+        ),
+    ] {
+        std::fs::write(&upkeep, timed(under)).unwrap();
+        let refused = check_definitions(&world.config()).unwrap_err().to_string();
+        assert!(refused.contains(why), "{refused}");
+    }
+    std::fs::write(&upkeep, timed("main")).unwrap();
+    let lines = check_definitions(&world.config()).unwrap().join("\n");
+    assert!(
+        lines.contains("at most 2 bead(s) a run, and builds what it marks under `main`, called at once when a class of defect breaks 3 more bead(s)"),
+        "{lines}"
+    );
+
+    let say = |role: &str, n: u32, json: serde_json::Value| {
+        std::fs::create_dir_all(world.path("bin/state")).unwrap();
+        std::fs::write(
+            world.path(&format!("bin/state/{role}-{n}.json")),
+            json.to_string(),
+        )
+        .unwrap();
+    };
+    let check = |build: bool| {
+        serde_json::json!({"title": "A lint rule for cleanup on error paths", "type": "task", "priority": 2,
+            "description": "Three beads leaked on an error path: toy-7, toy-8, toy-9.",
+            "acceptance_criteria": "- the rule fails on each of the three cases",
+            "parent": "", "discovered_from": "", "deferred": false, "build": build,
+            "closes_class": "error-path-cleanup"})
+    };
+    let mut sup = Supervisor::new(world.config(), None, vec!["OWNER".to_string()], false).unwrap();
+    let record_path = world.path("state/projects/toy/schedules/upkeep/scheduled.json");
+    let record = || -> Scheduled {
+        serde_json::from_str(&std::fs::read_to_string(&record_path).unwrap()).unwrap()
+    };
+    let now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    };
+    let count = |role: &str| world.calls().iter().filter(|call| call[0] == role).count();
+    // The brief of a role's Nth call.
+    let brief = |role: &str, nth: usize| {
+        let line = world
+            .calls()
+            .iter()
+            .enumerate()
+            .filter(|(_, call)| call[0] == role)
+            .nth(nth - 1)
+            .map(|(index, _)| index + 1)
+            .unwrap();
+        std::fs::read_to_string(world.path(&format!("bin/state/brief-{line}.md"))).unwrap()
+    };
+    let events = || {
+        std::fs::read_to_string(world.path("state/projects/toy/schedules/upkeep/events.jsonl"))
+            .unwrap()
+    };
+
+    // Nothing is due by the clock, and nothing has broken: no run.
+    assert!(!sup.pump(Duration::ZERO).unwrap());
+    assert!(world.calls().is_empty());
+    assert!(sup.next_due().unwrap() > now());
+
+    // A class of defect breaks a third bead: a run is due at once.
+    for bead in ["toy-7", "toy-8", "toy-9"] {
+        let dir = world.path(&format!("state/units/{bead}-1"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("unit.json"),
+            serde_json::json!({"project": "toy", "bead": bead, "regressions": [{"category": "error-path-cleanup"}]}).to_string(),
+        )
+        .unwrap();
+    }
+    assert!(sup.next_due().unwrap() <= now());
+    // This run files the check and leaves it.
+    say(
+        "maintainer",
+        1,
+        serde_json::json!({"summary": "Error paths keep leaking.", "digest": "One bead: a lint rule.",
+            "journal": "Filed the rule; not built yet.", "file": [check(false)], "build": [], "build_plan": "", "paths": []}),
+    );
+    assert!(sup.pump(Duration::ZERO).unwrap());
+    assert_eq!(count("maintainer"), 1);
+    let shown = brief("maintainer", 1);
+    assert!(
+        shown.contains("## Why this run is now\n\nIt was not due by the clock. The factory called it because a class of defect has broken more beads since a run last looked: `error-path-cleanup`.")
+            && shown.contains("You may also have beads built.")
+            && shown.contains("under the definition `main`"),
+        "{shown}"
+    );
+    let first = record();
+    assert_eq!(first.backlog.len(), 1, "{first:?}");
+    assert_eq!(first.seen.get("error-path-cleanup"), Some(&3));
+    assert!(first.goal.is_none());
+    assert_eq!(sup.goals().count(), 0, "filing alone opens no goal");
+    let filed = first.backlog[0].clone();
+    // The bead says which class of defect its check closes, and the
+    // factory keeps that: the class has a check being built.
+    let checks = || {
+        std::fs::read_to_string(world.path("state/projects/toy/checks.json")).unwrap_or_default()
+    };
+    let kept: serde_json::Value = serde_json::from_str(&checks()).unwrap();
+    assert_eq!(
+        kept["error-path-cleanup"],
+        serde_json::json!({"bead": filed, "landed_at": null}),
+        "{kept}"
+    );
+    assert!(events().contains("\"check.filed\""), "{}", events());
+    // The class has broken nothing more: it calls no second run.
+    assert!(!sup.pump(Duration::ZERO).unwrap());
+    assert!(sup.next_due().unwrap() > now());
+    assert_eq!(count("maintainer"), 1);
+
+    // The next run, at its time, is shown the bead that waits and has it
+    // built. The goal's director starts it; nobody pressed anything.
+    let overdue = |record: Scheduled| {
+        let back = Scheduled {
+            since: now() - 8 * 86_400,
+            ..record
+        };
+        std::fs::write(&record_path, serde_json::to_string(&back).unwrap()).unwrap();
+    };
+    say(
+        "maintainer",
+        2,
+        serde_json::json!({"summary": "The rule is still the thing to build.", "digest": "Building the lint rule.",
+            "journal": "Had the rule built.", "file": [], "build": [filed],
+            "build_plan": "One bead. The rule fails on each of the three cases.", "paths": ["tools"]}),
+    );
+    say(
+        "director",
+        1,
+        serde_json::json!({"summary": "Starting the rule.", "start": [{"bead": filed, "reason": "the only bead"}],
+            "file": [], "edit": [], "dropped_findings": [], "ask_owner": "", "complete": false,
+            "evidence": "", "journal_entry": "", "project_memory": ""}),
+    );
+    overdue(first);
+    assert!(sup.pump(Duration::ZERO).unwrap());
+    assert_eq!(count("maintainer"), 2);
+    let shown = brief("maintainer", 2);
+    assert!(
+        shown.contains(&format!(
+            "## Beads earlier runs filed that nothing has built\n\n- `{filed}`: A lint rule for cleanup on error paths\n"
+        )) && !shown.contains("## Why this run is now")
+            && shown.contains(&format!(
+                "- `error-path-cleanup`: 3 findings on 3 beads; check being built by `{filed}`\n"
+            )),
+        "{shown}"
+    );
+    assert_eq!(sup.goals().count(), 1);
+    let goal = sup.goals().next().unwrap().clone();
+    let built = goal.maintenance.clone().unwrap();
+    assert_eq!(
+        (built.schedule.as_str(), &built.beads),
+        ("upkeep", &vec![filed.clone()])
+    );
+    assert_eq!(goal.definition, "main");
+    let charter = goal.charter.clone().unwrap();
+    assert!(
+        charter.objective.contains(&format!(
+            "- `{filed}`: A lint rule for cleanup on error paths"
+        )) && charter
+            .stop_when
+            .contains(&format!("Every one of these beads is closed: `{filed}`."))
+            && charter.plan == "One bead. The rule fails on each of the three cases."
+            && charter.paths == ["tools"],
+        "{charter:?}"
+    );
+    assert_eq!(count("director"), 1, "its director was woken at once");
+    assert_eq!(count("intake"), 0, "there is no opening conversation");
+    let told = brief("director", 1);
+    assert!(
+        told.contains(
+            "The factory started this goal for maintenance run 2 of `upkeep`. Nobody pressed Start."
+        ) && told.contains("The factory opened this goal by itself")
+            && told.contains("> The rule is still the thing to build."),
+        "{told}"
+    );
+    let second = record();
+    assert_eq!(second.goal.as_deref(), Some(goal.id.as_str()));
+    assert!(second.backlog.is_empty(), "{second:?}");
+    assert!(events().contains("\"schedule.building\""), "{}", events());
+
+    // While that goal builds, a run may file and may not have more built.
+    say(
+        "maintainer",
+        3,
+        serde_json::json!({"summary": "More.", "digest": "Another.", "journal": "",
+            "file": [check(true)], "build": [], "build_plan": "Build it.", "paths": []}),
+    );
+    say(
+        "maintainer",
+        4,
+        serde_json::json!({"summary": "Nothing more.", "digest": "Nothing was worth a bead.", "journal": "",
+            "file": [], "build": [], "build_plan": "", "paths": []}),
+    );
+    overdue(second);
+    assert!(sup.pump(Duration::ZERO).unwrap());
+    assert_eq!(count("maintainer"), 4);
+    assert!(
+        brief("maintainer", 3).contains(&format!(
+            "The goal `{}`, which the factory opened for an earlier run, is still building",
+            goal.id
+        )) && brief("maintainer", 4).contains(&format!(
+            "build: the goal `{}`, opened for an earlier run, is still building",
+            goal.id
+        )),
+        "the run was told, and its build was refused"
+    );
+    assert_eq!(sup.goals().count(), 1, "one such goal at a time");
+
+    // The bead lands and is closed: the goal is complete, and no agent and
+    // no owner said so.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while sup.goals().next().unwrap().phase != Phase::Complete {
+        assert!(Instant::now() < deadline, "the goal never completed");
+        sup.pump(Duration::from_millis(200)).unwrap();
+    }
+    let text = std::fs::read_to_string(world.path(&format!("beads/{filed}.json"))).unwrap();
+    assert!(text.contains("\"closed\""), "{text}");
+    assert_eq!(
+        count("director"),
+        1,
+        "the pipeline's end woke no director: code ended the goal"
+    );
+    let log = std::fs::read_to_string(world.path(&format!("state/goals/{}/events.jsonl", goal.id)))
+        .unwrap();
+    assert!(
+        log.contains("\"goal.complete\"")
+            && log.contains("\"by\":\"code\"")
+            && !log.contains("goal_accept"),
+        "{log}"
+    );
+    // The check has landed: the class is checked from here on, at the
+    // count of beads it had broken, and the run after is told so.
+    let kept: serde_json::Value = serde_json::from_str(&checks()).unwrap();
+    assert_eq!(
+        kept["error-path-cleanup"],
+        serde_json::json!({"bead": filed, "landed_at": 3}),
+        "{kept}"
+    );
+    // With that goal over, a later run may build again.
+    say(
+        "maintainer",
+        5,
+        serde_json::json!({"summary": "Quiet.", "digest": "Nothing was worth a bead.", "journal": "",
+            "file": [], "build": [], "build_plan": "", "paths": []}),
+    );
+    overdue(record());
+    assert!(sup.pump(Duration::ZERO).unwrap());
+    let last = brief("maintainer", 5);
+    assert!(
+        last.contains("You may also have beads built.")
+            && last.contains(&format!(
+                "- `error-path-cleanup`: 3 findings on 3 beads; checked since `{filed}` landed\n"
+            )),
+        "{last}"
+    );
+}
+
 /// A definition with a schedule is run by the factory at its times: one
 /// agent, shown what the records say, which files beads and starts nothing.
 #[test]
@@ -4670,8 +4962,9 @@ fn a_scheduled_definition_is_run_when_due_and_its_agent_only_files_beads() {
     );
     let sent_back = brief(2);
     assert!(
-        sent_back.contains("`start`: a maintenance run files beads and does nothing else")
-            && sent_back.contains("file: 3 beads, and one run may file 2."),
+        sent_back.contains(
+            "`start`: a maintenance run files beads and marks which to build; it does nothing else"
+        ) && sent_back.contains("file: 3 beads, and one run may file 2."),
         "{sent_back}"
     );
     // One bead is in the tracker, deferred, and nothing was started.

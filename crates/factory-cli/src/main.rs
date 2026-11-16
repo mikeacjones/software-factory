@@ -639,10 +639,16 @@ fn run(args: &[String]) -> Result<u8, String> {
             if classes.is_empty() {
                 println!("no classed findings are recorded for {}", project.id);
             }
+            let checks = factory_driver::class_checks(&factory.state_dir, project.id.as_str());
             for count in classes {
                 println!(
-                    "{:<40} {:>3} finding(s) on {:>3} bead(s)",
-                    count.class, count.findings, count.beads
+                    "{:<40} {:>3} finding(s) on {:>3} bead(s)  {}",
+                    count.class,
+                    count.findings,
+                    count.beads,
+                    checks
+                        .get(&count.class)
+                        .map_or("no check".to_string(), |check| check.words(count.beads))
                 );
             }
             Ok(0)
