@@ -124,9 +124,12 @@ on.already_done = { to = "checks", max = 2 }
 id = "describe"
 kind = "agent"
 role = "publisher"
-model = "claude-opus-5-5"
+# A fresh session, not the builder's: the text is written from the commits
+# and the diff, which a smaller model does well, and a session continued
+# under another model would be read again in full at that model's price.
+model = "claude-sonnet-5-5"
 effort = "medium"
-session = "continue:build"
+session = "fresh"
 on.ready = "absorb"
 
 # One commit onto the sub-goal's branch. Nothing is pushed, and the bead
