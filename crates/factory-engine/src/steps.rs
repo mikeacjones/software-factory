@@ -163,8 +163,26 @@ pub struct PumpCall {
 
 /// How long a pipeline a goal's record says is running may be unknown to
 /// the server before its goal is told it never started, in seconds. The
-/// record is written a moment before the pipeline is started.
+/// record is written in the turn that decides to start it, and the
+/// pipeline is started when that turn is over. A turn in which an agent
+/// runs can take far longer than this, so what the watcher says here can
+/// be out of date by the time the project hears it: see
+/// `said_never_started`.
 const NEVER_STARTED_SECS: u64 = 120;
+
+/// What the watcher says of a pipeline the server does not know.
+const NEVER_STARTED: &str = "The engine has no pipeline for it: it was never started.";
+
+/// The pipeline an event says was never started, when that is what the
+/// event says.
+fn said_never_started(event: &Event) -> Option<&str> {
+    match event {
+        Event::Ended {
+            word, rest, name, ..
+        } if word == "failed" && rest == NEVER_STARTED => Some(name),
+        _ => None,
+    }
+}
 
 /// How long the watcher takes a project to have heard what it told it,
 /// before it tells it again, in seconds.
@@ -638,7 +656,25 @@ impl Steps {
         let _busy = self.gate.enter();
         let runner = self.runner.clone();
         let every = Duration::from_secs(call.beat_secs.max(1));
-        let mut work = tokio::task::spawn_blocking(move || runner.turn(&call.project, &call.event));
+        // The watcher says a pipeline never started when the server has not
+        // known it for a while. The project hears that only when its turn
+        // comes, and the turn before it may be the one that started the
+        // pipeline. One the server knows by now did start: its goal is not
+        // told otherwise, the records are only looked at, and the watcher
+        // tells the project how the pipeline really ends.
+        let mut event = call.event;
+        if let Some(name) = said_never_started(&event) {
+            let there = ctx
+                .client()
+                .get_workflow_handle::<Pipeline>(name.to_string())
+                .describe(WorkflowDescribeOptions::default())
+                .await
+                .is_ok();
+            if there {
+                event = Event::Tick;
+            }
+        }
+        let mut work = tokio::task::spawn_blocking(move || runner.turn(&call.project, &event));
         let mut beat = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
         loop {
             tokio::select! {
@@ -791,12 +827,7 @@ impl Steps {
                             .entry(pipeline.name.clone())
                             .or_insert_with(Instant::now);
                         if since.elapsed() >= Duration::from_secs(NEVER_STARTED_SECS) {
-                            let event = ended(
-                                None,
-                                "failed",
-                                "The engine has no pipeline for it: it was never started."
-                                    .to_string(),
-                            );
+                            let event = ended(None, "failed", NEVER_STARTED.to_string());
                             self.report(&client, &call.reach, &mut told, &pipeline.project, event)
                                 .await;
                         }
@@ -991,5 +1022,41 @@ impl StepRunner for ExecRunner {
             .find_map(|line| line.strip_prefix("accounts "))
             .ok_or("the command did not say what the accounts have left")?;
         serde_json::from_str(picture).map_err(|err| format!("the accounts' picture: {err}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ended(word: &str, rest: &str) -> Event {
+        Event::Ended {
+            goal: "g1".to_string(),
+            bead: "testing-envs".to_string(),
+            ship: true,
+            unit: None,
+            word: word.to_string(),
+            rest: rest.to_string(),
+            name: "pipeline-g1-testing-envs-1-0".to_string(),
+        }
+    }
+
+    #[test]
+    fn only_the_watchers_own_report_is_checked_against_the_server() {
+        // What the watcher says of a pipeline the server does not know
+        // names the pipeline to ask the server about.
+        assert_eq!(
+            said_never_started(&ended("failed", NEVER_STARTED)),
+            Some("pipeline-g1-testing-envs-1-0")
+        );
+        // A pipeline that failed for a reason of its own did run, and one
+        // that ended or was refused says so itself: none is asked about.
+        assert_eq!(
+            said_never_started(&ended("failed", "the worker was lost")),
+            None
+        );
+        assert_eq!(said_never_started(&ended("end", NEVER_STARTED)), None);
+        assert_eq!(said_never_started(&ended("refused", "no criteria")), None);
+        assert_eq!(said_never_started(&Event::Tick), None);
     }
 }
