@@ -1524,6 +1524,62 @@ impl Driver {
         Ok(self.log.append(kind, step.as_ref(), data)?)
     }
 
+    /// Have the classifier say what kind of failure `output` shows, and
+    /// keep what it said in the unit's log. It is a shadow: nothing is
+    /// routed by it, and a key that is missing, a refusal or a reading
+    /// that is late is recorded and holds nothing up. Without a `[judge]`
+    /// table in the factory's settings nothing is sent anywhere.
+    fn judge(&self, step: &str, what: Value, preface: &str, output: &str, patterns: &[String]) {
+        let Some(settings) = &self.factory.judge else {
+            return;
+        };
+        let mut data = what;
+        let failed = |why: String| json!({ "why": why });
+        let key = factory_config::read_env_file(&settings.env_file)
+            .map_err(|error| error.to_string())
+            .and_then(|env| {
+                env.get(&settings.key_env)
+                    .filter(|key| !key.trim().is_empty())
+                    .cloned()
+                    .ok_or_else(|| {
+                        format!(
+                            "{} has no {}",
+                            settings.env_file.display(),
+                            settings.key_env
+                        )
+                    })
+            });
+        let home = std::env::var("HOME").ok();
+        let reading = key.and_then(|key| {
+            let excerpt = factory_checks::judge::failure_excerpt(output, patterns, home.as_deref());
+            factory_checks::judge::Judge::new(
+                &settings.url,
+                &settings.model,
+                key,
+                Duration::from_secs(settings.timeout_secs),
+            )
+            .kind(preface, &excerpt)
+            .map_err(|error| error.to_string())
+        });
+        let (kind, said) = match reading {
+            Ok(judged) => (
+                "failure.judged",
+                json!({
+                    "kind": judged.kind, "confidence": judged.confidence,
+                    "probabilities": judged.probabilities.into_iter().collect::<BTreeMap<String, f64>>(),
+                    "model": judged.model, "millis": judged.millis,
+                }),
+            ),
+            Err(why) => ("failure.judge_failed", failed(why)),
+        };
+        if let (Some(data), Some(said)) = (data.as_object_mut(), said.as_object()) {
+            data.extend(said.clone());
+        }
+        // The log is where it goes; if that cannot be written the step
+        // will say so itself.
+        let _ = self.event(kind, Some(step), data);
+    }
+
     fn save(&mut self) -> Result<(), DriverError> {
         self.unit.thread = self.thread.state().cloned().or(self.unit.thread.take());
         let path = self.dir.join("unit.json");
@@ -3497,6 +3553,17 @@ impl Driver {
             Verdict::Failed { code } => code,
             _ => None,
         };
+        self.judge(
+            &step.id,
+            json!({ "command": name, "output": failed.output }),
+            if matches!(failed.result.verdict, Verdict::TimedOut) {
+                "The command was stopped because it reached its time limit."
+            } else {
+                ""
+            },
+            &failed.result.output,
+            &command.failure_lines,
+        );
         if let Some(why) = host_fault(
             &failed.result.output,
             code,
@@ -4055,6 +4122,39 @@ impl Driver {
                         .take(3)
                         .collect();
                     let log = logs.first().cloned();
+                    if let Some((_, text)) = &log {
+                        // GitHub puts the job, the step and the time before
+                        // every line; the classifier is sent the line.
+                        let plain: Vec<&str> = text
+                            .lines()
+                            .map(|line| {
+                                let line = line.rsplit('\t').next().unwrap_or(line);
+                                match line.split_once(' ') {
+                                    Some((stamp, rest))
+                                        if stamp.ends_with('Z')
+                                            && stamp.starts_with(|c: char| c.is_ascii_digit()) =>
+                                    {
+                                        rest
+                                    }
+                                    _ => line,
+                                }
+                            })
+                            .collect();
+                        self.judge(
+                            &step.id,
+                            json!({ "ci": failed.iter().map(|check| check.name.clone()).collect::<Vec<_>>() }),
+                            &format!(
+                                "Failed CI jobs: {}.",
+                                failed
+                                    .iter()
+                                    .map(|check| check.name.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ),
+                            &plain.join("\n"),
+                            &settings.ci_failure_lines,
+                        );
+                    }
                     let mut feedback = format!(
                         "GitHub CI failed on the pull request, on commit `{short}`. The factory's own checks passed on this machine, so look for what differs there: the platform, the optimisation mode, timing.\n\nFailed checks:\n{}\n",
                         names.join("\n")

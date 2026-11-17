@@ -1,0 +1,54 @@
+# Work runs side by side unless one piece depends on another, a tier's brief
+# costs less to read, and a classifier's reading of a failure is recorded.
+# Each check is an acceptance line of a bead in epic sf-c5g.
+id = "side-by-side"
+title = "Work runs side by side unless one piece depends on another, and the tiers cost less to wake"
+bead = "sf-c5g"
+
+[[check]]
+id = "design-edges"
+tier = "hermetic"
+bead = "sf-c5g.1"
+claim = "A design says for each bead the beads of the sub-goal it comes after; one that names a bead outside the sub-goal, the bead itself or a bead the order lists later is refused, so the edges hold no circle; the design's text says each bead's edges; and a design recorded before designs said so has none, which is not the same as saying nothing comes after anything."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-driver", "--lib", "--", "a_design_orders_every_bead_of_its_sub_goal_once_or_says_the_split_is_wrong", "a_design_says_what_each_bead_comes_after_and_only_beads_listed_before_it"]
+timeout_secs = 900
+
+[[check]]
+id = "beads-by-dependency"
+tier = "hermetic"
+bead = "sf-c5g.1"
+claim = "In a sub-goal with an accepted design that names edges, beads with nothing between them start side by side on the same file and with no paths declared; a bead whose design names one not yet absorbed is refused, however far apart their paths, and starts once that one is absorbed; a declared path is still a plain path. In a sub-goal with no design, with a design from before designs named edges, or with a design not yet accepted, the paths rule stands as before."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-driver", "--lib", "--", "in_a_designed_sub_goal_a_bead_waits_for_what_it_comes_after_and_for_nothing_else", "beads_run_side_by_side_only_on_declared_paths_that_do_not_overlap", "shared_files_never_count_as_overlap_and_an_open_sub_goal_can_be_given_paths"]
+timeout_secs = 900
+
+[[check]]
+id = "sub-goals-and-goals-by-dependency"
+tier = "hermetic"
+bead = "sf-c5g.1"
+claim = "Sub-goals are open side by side up to the director's slots whatever their paths, overlapping or none; one declared to come after a sub-goal that has not landed, that opens with it, that is itself or that the goal does not have is refused, and it opens once that one has landed. A waiting goal may be started beside a running one whatever either charter's paths, up to the project's slots, and the executive's brief says a dependency keeps a goal waiting and a shared file does not."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-driver", "--lib", "--", "sub_goals_are_worked_on_side_by_side_unless_one_comes_after_another", "goals_run_side_by_side_whatever_their_charters_paths"]
+timeout_secs = 900
+
+[[check]]
+id = "roles-say-so"
+tier = "hermetic"
+bead = "sf-c5g.1"
+claim = "The designer is told that `after` is what the factory acts on and to name a bead there only for what truly builds on it; the director, the foreman and the executive are each told that a dependency keeps work apart and a file two pieces both change does not; and the architecture records the owner's decision."
+command = ["sh", "-c", "grep -q '`after` is what the factory acts on' config/roles/designer.md && grep -q 'What keeps two sub-goals apart is a dependency, never a file both change' config/roles/director.md && grep -q 'do not hold one back for a file they share' config/roles/foreman.md && grep -q 'That both change the same files is no reason to hold one back' config/roles/executive.md && grep -q 'A dependency keeps work apart, and a file two pieces both change does not' docs/architecture.md"]
+timeout_secs = 60
+
+[[check]]
+id = "journal-is-bounded"
+tier = "hermetic"
+bead = "sf-c5g.2"
+claim = "A tier's brief holds the newest entries of its journal in full up to the limit, says how many older ones were left out and names the file that holds them all; a journal within the limit is shown as it is; and the director and the foreman are told that an entry carries forward what still matters."
+command = ["sh", "-c", "cargo test --locked --offline --package factory-driver --lib -- a_brief_holds_the_newest_journal_entries_and_says_where_the_rest_are && grep -q 'recent_journal(&journal, JOURNAL_KEPT, &journal_path)' crates/factory-driver/src/goal.rs && grep -q 'each entry carries forward whatever still matters' config/roles/director.md && grep -q 'each entry carries forward whatever still matters' config/roles/foreman.md"]
+timeout_secs = 900
+
+[[check]]
+id = "failure-kind-shadow"
+tier = "hermetic"
+bead = "sf-c5g.3"
+claim = "With a [judge] table a failed check's lines are sent once to the configured endpoint with the key from its file, and the kind, its probabilities, the model and the time taken are kept in the unit's log; the unit ends as it would have, though the classifier called the failure something else; an endpoint that cannot be reached and a key that is not in the file are each recorded and hold nothing up, the second with nothing sent; and without the table nothing is sent or recorded. The lines sent are the ones that say what failed, cut down, with the home directory written `~`; only the kind is asked; and the key is never printed."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-checks", "--package", "factory-driver", "--", "a_failed_check_is_put_to_the_classifier_and_nothing_is_routed_by_what_it_says", "a_failures_lines_are_picked_out_cut_down_and_cleared_of_the_home_directory", "the_question_has_fixed_answers_in_a_fixed_order", "the_classifier_is_asked_once_and_its_answer_is_read", "a_refusal_an_unknown_kind_and_a_dead_server_are_errors_and_nothing_more"]
+timeout_secs = 900

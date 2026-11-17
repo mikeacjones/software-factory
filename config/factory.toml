@@ -74,3 +74,18 @@ usage_refresh = true
 env_file = "~/.config/software-factory/slack.env"
 poll_secs = 10
 answer_wait_secs = 43200
+
+# The classifier that is asked what kind of failure a failed check shows
+# (host, timeout, crash, compile, policy, assertion): TypeSafe's Jev. It is a
+# shadow: its reading is kept in the unit's log (`failure.judged`) beside
+# what the factory's own checks found, and nothing is routed by it. The
+# failure's lines leave this machine for TypeSafe's API, so it runs
+# only while this table is here: take the table out to turn it off. A missing key, a refusal or a late answer is
+# recorded (`failure.judge_failed`) and holds nothing up.
+#
+# On since 2026-11-17, with a test key the owner means to revoke: when it is,
+# every reading is recorded as failed until a new key is in the file.
+[judge]
+env_file = "~/.config/software-factory/judge.env"   # TYPESAFE_API_KEY=...
+model = "jev-1.13.0"                                # a fixed version, never an alias
+timeout_secs = 5

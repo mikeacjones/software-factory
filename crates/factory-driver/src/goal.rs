@@ -71,8 +71,9 @@ pub struct Charter {
     pub stop_when: String,
     pub plan: String,
     /// The files and directories the goal's work will change, when its
-    /// director could bound them. With them the goal may run beside another
-    /// whose paths do not overlap; without them it runs alone.
+    /// director could bound them. Its sub-goals keep inside them. They do
+    /// not decide whether the goal may run beside another: that is the
+    /// executive's judgment of whether one builds on the other.
     #[serde(default)]
     pub paths: Vec<String>,
 }
@@ -186,6 +187,12 @@ pub struct Design {
     pub state: String,
     /// The design as the designer last wrote it.
     pub text: String,
+    /// For each bead of the sub-goal, the beads of it that must be absorbed
+    /// before it starts, as the designer last said. `None` for a design
+    /// written before designs said so: the paths rule then decides what
+    /// runs side by side, as in a sub-goal with no design.
+    #[serde(default)]
+    pub after: Option<Vec<(String, Vec<String>)>>,
     /// What the designer said is wrong with the split, when it disputes it.
     pub dispute: String,
     /// What the director said when it last sent the design back.
@@ -206,6 +213,40 @@ impl Design {
     fn waits(&self) -> bool {
         matches!(self.state.as_str(), "proposed" | "disputed" | "failed")
     }
+}
+
+/// How many of a tier's newest journal entries its brief holds in full.
+/// A director's brief on its 47th wake was 390,000 characters, 300,000 of
+/// them every entry it had ever written, read again on each turn of each
+/// wake (owner's decision, 2026-11-17).
+const JOURNAL_KEPT: usize = 4;
+
+/// A tier's journal as its brief shows it: the newest entries in full,
+/// and for the older ones how many there are and where the file is. An
+/// entry begins at a line `## Wake <n>`.
+pub fn recent_journal(journal: &str, keep: usize, path: &Path) -> String {
+    let mut starts: Vec<usize> = Vec::new();
+    let mut at = 0;
+    for line in journal.split_inclusive('\n') {
+        if line.starts_with("## Wake ") {
+            starts.push(at);
+        }
+        at += line.len();
+    }
+    if starts.len() <= keep {
+        return journal.to_string();
+    }
+    let left_out = starts.len() - keep;
+    format!(
+        "(The {left_out} older {} left out. The whole journal is the file `{}`: read it when you need what an earlier wake wrote.)\n\n{}",
+        if left_out == 1 {
+            "entry is"
+        } else {
+            "entries are"
+        },
+        path.display(),
+        &journal[starts[left_out]..]
+    )
 }
 
 /// How many times a director may send one design back before it must
@@ -882,7 +923,7 @@ pub fn intake_schema() -> Value {
         "objective": text_schema("The goal, in a sentence or two the owner would recognise as theirs. Empty until ready."),
         "stop_when": text_schema("The condition that ends the goal, checkable against the tracker and the repository. Empty until ready."),
         "plan": text_schema("How you intend to go about it: the first beads in order and why, what you will file or ask about. Empty until ready."),
-        "paths": { "type": "array", "items": { "type": "string" }, "description": "The files and directories this goal's work will change, relative to the repository, when you can bound them with confidence. A goal with paths may run at the same time as another goal whose paths do not overlap; a goal without them runs alone. Empty until ready, and empty for a goal that may touch anything." },
+        "paths": { "type": "array", "items": { "type": "string" }, "description": "The files and directories this goal's work will change, relative to the repository, when you can bound them with confidence. Its sub-goals keep inside them. They do not decide whether it runs beside another goal: that turns on whether one builds on the other. Empty until ready, and empty for a goal that may touch anything." },
         "edits": { "type": "array", "items": edit_schema(), "description": "Changes to existing beads the owner agreed to in this conversation, such as acceptance criteria. They are shown in the charter and applied when the owner starts the goal." },
     }))
 }
@@ -893,7 +934,7 @@ fn start_schema(foreman: bool) -> Value {
         "reason": text_schema("Why this one next."),
     });
     if foreman {
-        properties["paths"] = json!({ "type": "array", "items": { "type": "string" }, "description": "The files and directories this bead will change, relative to the repository, such as `src/worker` or `docs/timers.md`. Give them whenever you can bound them: a bead running without paths keeps every other from starting beside it. No two beads' paths may overlap. The shared files the brief names never count and need not be listed." });
+        properties["paths"] = json!({ "type": "array", "items": { "type": "string" }, "description": "The files and directories this bead will change, relative to the repository, such as `src/worker` or `docs/timers.md`. Give them whenever you can bound them: its builder is told them. In a sub-goal whose design says what each bead comes after, they do not decide what runs side by side. In one without, a bead running without paths keeps every other from starting beside it, and no two beads' paths may overlap. The shared files the brief names never count and need not be listed." });
     }
     json!({ "type": "array", "description": "Pipelines to start now.", "items": object_schema(properties) })
 }
@@ -951,7 +992,7 @@ pub fn foreman_schema() -> Value {
         "dropped_findings": dropped_schema(),
         "report": { "enum": ["working", "ready", "escalate"], "description": "`working` while a pipeline of this sub-goal is running or being started. `ready` when everything meant for it is absorbed and the director should ship it. `escalate` when you need the director: a bead that cannot run, a question, work that does not belong." },
         "message": text_schema("To the director, when `report` is `ready` or `escalate`: what the sub-goal holds and what they should know, or what you need from them. Otherwise empty."),
-        "journal_entry": text_schema("What you want to remember at the next wake of this sub-goal. You start fresh each time; this is all that carries over."),
+        "journal_entry": text_schema("What you want to remember at the next wake of this sub-goal. You start fresh each time; this is all that carries over. The brief shows only your newest entries, so carry forward here whatever still matters from the older ones."),
     }))
 }
 
@@ -969,9 +1010,10 @@ pub fn wake_schema() -> Value {
             "title": text_schema("What the sub-goal delivers, as the title its one pull request could carry."),
             "objective": text_schema("What will be true when it has landed."),
             "beads": { "type": "array", "items": { "type": "string" }, "description": "The beads you mean it to hold, in the order you would run them." },
-            "paths": { "type": "array", "items": { "type": "string" }, "description": "The files and directories its beads will change, relative to the repository. Give them whenever you can bound them, also for a sub-goal opened alone: one without paths keeps every other from opening until it lands. No two sub-goals' paths may overlap. The shared files the brief names never count and need not be listed. Empty only for a sub-goal that may change anything." },
+            "paths": { "type": "array", "items": { "type": "string" }, "description": "The files and directories its beads will change, relative to the repository, when you can bound them: its foreman's beads keep inside them. They may overlap another sub-goal's: what both change is merged when the second ships. The shared files the brief names need not be listed. Empty for a sub-goal that may change anything." },
+            "after": { "type": "array", "items": { "type": "string" }, "description": "The IDs of sub-goals of this goal that must have landed before this one opens, because its beads build on what they deliver: an interface, a type, a file's new shape. Code refuses to open it while one of them has not landed. Empty when it builds on none: it is then worked on beside whatever else is open, also when both change the same files. Name a sub-goal here for what this one truly builds on, never because the two touch the same file." },
         }))},
-        "subgoal_paths": { "type": "array", "description": "Paths for sub-goals that are already open: to give one opened without paths its own, so that another may be opened beside it, or to change them when its foreman needs a file outside them. Usually empty.", "items": object_schema(json!({
+        "subgoal_paths": { "type": "array", "description": "Paths for sub-goals that are already open: to change them when its foreman needs a file outside them. Usually empty.", "items": object_schema(json!({
             "subgoal": text_schema("The ID of an open sub-goal."),
             "paths": { "type": "array", "items": { "type": "string" }, "description": "The files and directories its beads change, relative to the repository: those already absorbed, those running and those still planned." },
         }))},
@@ -990,7 +1032,7 @@ pub fn wake_schema() -> Value {
         "ask_owner": text_schema("One question only the owner can answer, or empty."),
         "complete": { "type": "boolean", "description": "True to propose that the stop condition is met. The owner decides." },
         "evidence": text_schema("When complete: how the stop condition is met, point by point, with what you checked. Otherwise empty."),
-        "journal_entry": text_schema("What you want to remember at the next wake of this goal: decisions made, what you are waiting on, what you would do next. You start fresh each time; this is all that carries over."),
+        "journal_entry": text_schema("What you want to remember at the next wake of this goal: decisions made, what you are waiting on, what you would do next. You start fresh each time; this is all that carries over. The brief shows only your newest entries, so carry forward here whatever still matters from the older ones: what is settled and not to be raised again, what you are waiting on."),
         "project_memory": text_schema("The whole new text of this project's memory, which every goal on the project reads, or empty to leave it as it is. Keep only durable facts about the project."),
     }))
 }
@@ -1336,7 +1378,7 @@ pub fn maintenance_schema() -> Value {
         "file": file_schema_for(false, true),
         "build": { "type": "array", "items": { "type": "string" }, "description": "Beads an earlier run filed and nothing has built, by ID, to have built now with the ones this run marks. Only IDs the brief lists as waiting. Empty when this run may not build." },
         "build_plan": text_schema("For the director of the goal that builds them, who has not seen this run: the order to build the beads in and why, what each rests on, and what the work must hold to. Empty when nothing is to be built."),
-        "paths": { "type": "array", "items": { "type": "string" }, "description": "The files and directories the beads to build will change, as plain paths with no patterns. With them the goal may run beside another whose paths do not overlap; without them it waits for the project's running goals to end." },
+        "paths": { "type": "array", "items": { "type": "string" }, "description": "The files and directories the beads to build will change, as plain paths with no patterns. Its sub-goals keep inside them." },
         "digest": text_schema("For the owner, who reads it in the project's channel: what you found, then one line for each bead you filed and why it is worth doing. If nothing was worth a bead, say so and say what you looked at."),
         "journal": text_schema("What the next run should know: what you looked at, what you chose not to file and why, what to look at next. You start fresh each time; this is all that is kept."),
     }))
@@ -1635,6 +1677,7 @@ pub fn design_schema() -> Value {
         "order": { "type": "array", "description": "Every bead of the sub-goal, once, in the order they should be built. Empty when the verdict is split_wrong.", "items": object_schema(json!({
             "bead": text_schema("A bead of the sub-goal."),
             "reason": text_schema("Why it comes at this place: what it settles that later beads build on, or what it needs from earlier ones."),
+            "after": { "type": "array", "items": { "type": "string" }, "description": "The beads of this sub-goal, listed earlier in the order, that must be built and absorbed before this one starts, because it uses what they add: a type, a function, a file's new shape. Empty when it needs none of them. Code refuses to start a bead before these are absorbed, and starts beads with nothing between them side by side, also when they change the same files: what both changed is merged when the second is absorbed. So name a bead here for what this one truly builds on, never because the two touch the same file. A dependency left out costs the later bead its work; one that is not real makes the sub-goal wait for nothing." },
         }))},
         "open_questions": text_schema("What the repository and the beads did not settle, and what you assumed for each. Empty if nothing."),
         "split": text_schema("When the verdict is split_wrong: what is wrong with the split and what would be right, naming beads. Otherwise empty."),
@@ -1684,12 +1727,52 @@ pub fn design_problems(planned: &[String], result: &Value) -> Vec<String> {
                     ));
                 }
             }
+            // A bead comes after beads listed before it, which also keeps
+            // the dependencies free of circles.
+            for (at, (bead, after)) in design_after(result).iter().enumerate() {
+                for earlier in after {
+                    if earlier == bead {
+                        problems.push(format!("order: `{bead}` cannot come after itself"));
+                    } else if !planned.iter().any(|own| own == earlier) {
+                        problems.push(format!(
+                            "order: `{bead}` is said to come after `{earlier}`, which is not a bead of this sub-goal. What it needs from outside the sub-goal belongs in `open_questions`"
+                        ));
+                    } else if !ordered[..at].contains(&earlier.as_str()) {
+                        problems.push(format!(
+                            "order: `{bead}` is said to come after `{earlier}`, which the order lists later: a bead comes after beads listed before it"
+                        ));
+                    }
+                }
+            }
         }
         other => problems.push(format!(
             "`verdict` is `{other}`; it must be designed or split_wrong"
         )),
     }
     problems
+}
+
+/// What a designer's result says each bead comes after: every bead of the
+/// order with the beads that must be absorbed before it starts.
+pub fn design_after(result: &Value) -> Vec<(String, Vec<String>)> {
+    items(result, "order")
+        .iter()
+        .map(|entry| {
+            let after = entry
+                .get("after")
+                .and_then(Value::as_array)
+                .map(|after| {
+                    after
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(|bead| bead.trim().to_string())
+                        .filter(|bead| !bead.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
+            (strings(entry, "bead").trim().to_string(), after)
+        })
+        .collect()
 }
 
 /// A designer's result as the text everyone after it reads.
@@ -1700,12 +1783,22 @@ pub fn design_text(result: &Value) -> String {
         strings(result, "errors_and_invariants").trim(),
         strings(result, "layout").trim(),
     );
+    let after = design_after(result);
     for (at, entry) in items(result, "order").iter().enumerate() {
+        let needs = after
+            .get(at)
+            .map(|(_, needs)| needs.as_slice())
+            .unwrap_or_default();
         out.push_str(&format!(
-            "{}. `{}`: {}\n",
+            "{}. `{}`: {} {}\n",
             at + 1,
             strings(entry, "bead").trim(),
-            strings(entry, "reason").trim()
+            strings(entry, "reason").trim(),
+            if needs.is_empty() {
+                "(Needs no other bead of the sub-goal.)".to_string()
+            } else {
+                format!("(After `{}`.)", needs.join("`, `"))
+            }
         ));
     }
     let open = strings(result, "open_questions").trim();
@@ -1960,12 +2053,6 @@ pub fn decision_problems(
             }
         }
     }
-    let paths_now = |sub: &SubGoal| {
-        bounds.iter().find(|(id, _)| id == &sub.id).map_or_else(
-            || (sub.paths.clone(), true),
-            |(_, paths)| (paths.clone(), false),
-        )
-    };
     if !openings.is_empty() {
         let waiting: Vec<String> = flight.iter().map(|sub| format!("`{}`", sub.id)).collect();
         if !batched {
@@ -1987,40 +2074,43 @@ pub fn decision_problems(
                 ),
             });
         } else {
-            // Within the limit: may these be worked on beside each other?
-            let mut claims: Vec<(String, Vec<String>, bool)> = flight
+            // Within the limit. Sub-goals whose paths overlap may be
+            // worked on side by side: what they both changed is folded
+            // together when the second ships. What holds one back is a
+            // sub-goal it builds on that has not landed.
+            let claims: Vec<(String, Vec<String>, bool)> = openings
                 .iter()
-                .map(|sub| {
-                    let (paths, old) = paths_now(sub);
-                    (sub.id.clone(), paths, old)
-                })
+                .map(|sub| (strings(sub, "id").trim().to_string(), paths_of(sub), false))
                 .collect();
-            claims.extend(
-                openings
-                    .iter()
-                    .map(|sub| (strings(sub, "id").trim().to_string(), paths_of(sub), false)),
-            );
-            problems.extend(claim_problems(
-                &SUBGOAL_CLAIMS,
-                &claims,
-                &definition.shared_paths,
-            ));
+            problems.extend(shape_problems("open_subgoal", &claims));
+            for sub in &openings {
+                let id = strings(sub, "id").trim();
+                for earlier in after_of(sub) {
+                    let known = goal.subgoals.iter().find(|known| known.id == earlier);
+                    if earlier == id {
+                        problems.push(format!("open_subgoal: `{id}` cannot come after itself"));
+                    } else if claims.iter().any(|(opening, _, _)| opening == &earlier) {
+                        problems.push(format!(
+                            "open_subgoal: `{id}` comes after `{earlier}`, which opens with it: a sub-goal that builds on another opens once that one has landed"
+                        ));
+                    } else if known.is_none() {
+                        problems.push(format!(
+                            "open_subgoal: `{id}` is said to come after `{earlier}`, which is not a sub-goal of this goal"
+                        ));
+                    } else if known.is_some_and(|known| known.state != "landed") {
+                        problems.push(format!(
+                            "open_subgoal: `{id}` comes after `{earlier}`, which has not landed: open it when that one has"
+                        ));
+                    }
+                }
+            }
         }
     } else if !bounds.is_empty() {
-        // Nothing opens, but what is open is given new paths: they may
-        // not run into each other either.
-        let claims: Vec<(String, Vec<String>, bool)> = flight
+        let claims: Vec<(String, Vec<String>, bool)> = bounds
             .iter()
-            .map(|sub| {
-                let (paths, old) = paths_now(sub);
-                (sub.id.clone(), paths, old)
-            })
+            .map(|(id, paths)| (id.clone(), paths.clone(), false))
             .collect();
-        problems.extend(claim_problems(
-            &SUBGOAL_CLAIMS,
-            &claims,
-            &definition.shared_paths,
-        ));
+        problems.extend(shape_problems("subgoal_paths", &claims));
     }
     let absorbed = goal.absorbed();
     // Whether the sub-goal in question is run by a foreman: the open one as
@@ -2363,6 +2453,21 @@ fn file_problems(files: &[Value], launchable: &dyn Fn(&str) -> Vec<String>) -> V
 }
 
 /// The paths declared for a piece of work, tidied.
+/// The work a piece of work is declared to come after, by ID.
+fn after_of(work: &Value) -> Vec<String> {
+    work.get("after")
+        .and_then(Value::as_array)
+        .map(|after| {
+            after
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|id| id.trim().to_string())
+                .filter(|id| !id.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn paths_of(work: &Value) -> Vec<String> {
     items(work, "paths")
         .iter()
@@ -2387,7 +2492,7 @@ fn shared_words(shared: &[String]) -> String {
         return String::new();
     }
     format!(
-        " These are shared and never count: nearly all work adds to them, so do not list them, and do not hold work back because two pieces both change one: `{}`. What both changed there is folded together when the second is absorbed or shipped.",
+        " These are shared: nearly all work adds to them, so do not list them in any `paths`, and never hold work back because two pieces both change one: `{}`. What both changed there is folded together when the second is absorbed or shipped.",
         shared.join("`, `")
     )
 }
@@ -2409,20 +2514,6 @@ const BEAD_CLAIMS: Claims = Claims {
     undeclared_new: "would run beside another bead, so it needs `paths`: the files and directories it will change",
     undeclared_old: "is running with no paths declared, so nothing may start beside it: wait for it to end",
     overlap: "beads whose paths overlap run one after the other",
-};
-
-const SUBGOAL_CLAIMS: Claims = Claims {
-    field: "open_subgoal",
-    undeclared_new: "would be worked on beside another sub-goal, so it needs `paths`: the files and directories its beads will change",
-    undeclared_old: "has not landed and has no paths declared, so nothing may open beside it: wait for it to land",
-    overlap: "sub-goals whose paths overlap are worked on one after the other",
-};
-
-const GOAL_CLAIMS: Claims = Claims {
-    field: "start",
-    undeclared_new: "would run beside another goal, and its charter names no paths, so it runs alone: leave it waiting",
-    undeclared_old: "is running with no paths in its charter, so nothing may start beside it",
-    overlap: "goals whose paths overlap run one after the other",
 };
 
 fn close_schema() -> Value {
@@ -2514,7 +2605,7 @@ pub fn schedule_schema() -> Value {
         "summary": text_schema("What you decided and why, for the owner, in a sentence or two."),
         "start": { "type": "array", "description": "Waiting goals to start now, beside what is running. Empty to leave them waiting.", "items": object_schema(json!({
             "goal": text_schema("The ID of a waiting goal."),
-            "reason": text_schema("Why it is safe to run beside what is running."),
+            "reason": text_schema("Why it may run beside what is running: what tells you it builds on nothing a running goal has still to land."),
         }))},
     }))
 }
@@ -2531,16 +2622,6 @@ pub fn schedule_problems(
     if strings(result, "summary").trim().is_empty() {
         problems.push("`summary` is empty".to_string());
     }
-    let paths = |goal: &Goal| {
-        goal.charter
-            .as_ref()
-            .map(|charter| charter.paths.clone())
-            .unwrap_or_default()
-    };
-    let mut claims: Vec<(String, Vec<String>, bool)> = running
-        .iter()
-        .map(|goal| (goal.id.clone(), paths(goal), true))
-        .collect();
     let mut starting: Vec<&str> = Vec::new();
     for start in items(result, "start") {
         let id = strings(start, "goal").trim();
@@ -2550,7 +2631,7 @@ pub fn schedule_problems(
         }
         starting.push(id);
         match waiting.iter().find(|goal| goal.id == id) {
-            Some(goal) => claims.push((goal.id.clone(), paths(goal), false)),
+            Some(_) => {}
             None => problems.push(format!("start: `{id}` is not a goal that is waiting")),
         }
     }
@@ -2559,16 +2640,33 @@ pub fn schedule_problems(
             "start: that would make {} goals running at once, and this project may run {slots}",
             running.len() + starting.len()
         ));
-    } else if !starting.is_empty() {
-        problems.extend(claim_problems(&GOAL_CLAIMS, &claims, &[]));
     }
     problems
 }
 
-/// Why pieces of work may not go on at the same time. Work runs side by
+/// What is wrong with the paths newly declared for pieces of work, whatever
+/// else runs: each names a file or a directory inside the repository.
+fn shape_problems(field: &str, claims: &[(String, Vec<String>, bool)]) -> Vec<String> {
+    let mut problems = Vec::new();
+    for (name, paths, old) in claims {
+        for path in paths.iter().filter(|_| !old) {
+            if !plain_path(path) {
+                problems.push(format!(
+                    "{field}: `{path}`, declared for `{name}`, is not a plain path inside the repository: name files and directories, with no patterns"
+                ));
+            }
+        }
+    }
+    problems
+}
+
+/// Why beads may not go on at the same time where nobody has said what
+/// builds on what: a sub-goal with no design. There work runs side by
 /// side only when each piece has declared the paths it will change and no
 /// two declarations overlap: that is what makes it safe before any of it
-/// runs. Each claim is a name, its paths, and whether it is already going;
+/// runs. Where a design names what each bead comes after, and for
+/// sub-goals and goals, a declared dependency decides and this does not
+/// (owner's decision, 2026-11-17). Each claim is a name, its paths, and whether it is already going;
 /// `starting` says whether anything new is among them.
 ///
 /// `shared` are the files nearly all work adds to. They never make two
@@ -2579,17 +2677,8 @@ fn claim_problems(
     claims: &[(String, Vec<String>, bool)],
     shared: &[String],
 ) -> Vec<String> {
-    let mut problems = Vec::new();
     let field = words.field;
-    for (name, paths, old) in claims {
-        for path in paths.iter().filter(|_| !old) {
-            if !plain_path(path) {
-                problems.push(format!(
-                    "{field}: `{path}`, declared for `{name}`, is not a plain path inside the repository: name files and directories, with no patterns"
-                ));
-            }
-        }
-    }
+    let mut problems = shape_problems(field, claims);
     if claims.len() < 2 || claims.iter().all(|(_, _, old)| *old) {
         return problems;
     }
@@ -2671,8 +2760,38 @@ fn path_problems(
             claims.push((bead.to_string(), unit.paths.clone(), false));
         }
     }
-    if !starts.is_empty() || !continuing.is_empty() {
+    if starts.is_empty() && continuing.is_empty() {
+        return problems;
+    }
+    // A design that says what each bead comes after decides what runs side
+    // by side. Without one, nobody has said what builds on what, and the
+    // declared paths decide as they always did.
+    let Some(after) = sub
+        .design
+        .as_ref()
+        .filter(|design| design.accepted())
+        .and_then(|design| design.after.as_ref())
+    else {
         problems.extend(claim_problems(&BEAD_CLAIMS, &claims, shared));
+        return problems;
+    };
+    problems.extend(shape_problems(BEAD_CLAIMS.field, &claims));
+    for (bead, _, old) in &claims {
+        if *old {
+            continue;
+        }
+        let needs = after
+            .iter()
+            .find(|(named, _)| named == bead)
+            .map(|(_, needs)| needs.as_slice())
+            .unwrap_or_default();
+        for earlier in needs {
+            if !sub.absorbed.iter().any(|(done, _)| done == earlier) {
+                problems.push(format!(
+                    "start: `{bead}` comes after `{earlier}` in this sub-goal's design, and `{earlier}` is not absorbed yet: beads with nothing between them run side by side, a bead that builds on another waits for it"
+                ));
+            }
+        }
     }
     problems
 }
@@ -3016,7 +3135,7 @@ fn permission_text(definition: &GoalDefinition) -> String {
             "- Sub-goals: each is a part of the goal that lands as one pull request. {} Opening one (`open_subgoals`) hands it to its foreman, a separate agent that starts its beads through the light pipeline, rules on their findings, and reports to you when the sub-goal is ready to ship or when it needs you. You do not start beads: `start` is refused.\n- Answering a foreman: `tell_foreman` reaches the foreman of an open sub-goal, and wakes it.\n- Shipping: yours to decide, by naming the sub-goal in `ship` once nothing is running in it. It runs the whole verification once, opens one pull request for all of it and lands it, which closes its beads. Sub-goals ship one at a time, in the order you name them, and each takes in what landed before it first.\n- Filing a new bead {}.\n- Changing a bead that exists (criteria, priority, deferral) {}.\n- Ending the goal: you propose, the owner decides.",
             if slots > 1 {
                 format!(
-                    "Up to {slots} may be waiting to land at once, and parts of the goal that change different code are meant to be worked on side by side. Each sub-goal has `paths`, the files and directories its beads will change, and code checks before anything opens that no two overlap.{} Whenever a place is free, open the next part of the plan that needs nothing an unlanded sub-goal will deliver and changes other code than it. Give every sub-goal its paths when you open it, also one opened alone: a sub-goal without paths keeps every other from opening until it lands, unless you give it paths with `subgoal_paths`. Landing stays one at a time: each sub-goal's shipping first takes in what landed before it, a conflict there is resolved on its branch, and the whole verification runs on the result before its pull request opens.",
+                    "Up to {slots} may be waiting to land at once, and parts of the goal are meant to be worked on side by side unless one builds on another. What holds a sub-goal back is a dependency, never a shared file: name in its `after` the sub-goals whose work its beads build on, and code refuses to open it until they have landed. Two sub-goals with nothing between them may change the same files; what both changed is merged when the second ships, and a conflict there is resolved by a builder on its branch.{} Whenever a place is free, open the next part of the plan that builds on nothing an unlanded sub-goal will deliver. A dependency you leave out costs the later sub-goal its work, so say what each one needs; one that is not real makes the goal wait for nothing. Give a sub-goal `paths` when you can bound what it changes: its foreman keeps its beads inside them. Landing stays one at a time: each sub-goal's shipping first takes in what landed before it, and the whole verification runs on the result before its pull request opens.",
                     shared_words(&definition.shared_paths)
                 )
             } else {
@@ -3436,7 +3555,7 @@ pub fn foreman_brief(
         "\n## What you may decide\n\n- Starting a pipeline: carried out at once, on a launchable bead of this sub-goal, up to {slots} at a time. A bead blocked only by beads this sub-goal has absorbed is launchable.{}\n- Continuing a pipeline that parked or failed: `continue`, from the step you name, with a note for that step. It goes on in its own worktree with everything it built, and its used-up rounds are open again. A pipeline may be continued {MAX_CONTINUES} times; after that it goes to the director.\n- Filing a new bead: {}\n- Reporting: `working` while a pipeline runs; `ready` hands the sub-goal to the director to ship; `escalate` asks the director, and you are woken with the answer.\n- Not yours: shipping, changing a bead that exists, and talking to the owner. Those are the director's; escalate.\n\nReturn the structured result. Code checks every decision against the tracker before carrying it out, and sends back what it refuses.\n",
         if slots > 1 {
             format!(
-                "\n- Side by side: beads may run at the same time when each has `paths`, the files and directories it will change, and no two declarations overlap. Code checks that before anything starts.{} The count above is a maximum, not a target: start beads together when you have read the code each will touch, neither needs the other's result, and they change different code; one after the other when one builds on the other. Each is built from the branch as it is now; the one absorbed second has the first merged into it and its checks run again, and a conflict goes back to its builder and through the whole pipeline.",
+                "\n- Side by side: where this sub-goal has a design, its order says what each bead comes after, and code refuses to start a bead before those are absorbed. Beads with nothing between them are meant to run at the same time, also when they change the same files: start them together whenever places are free. Where there is no design, or it was written before designs said what comes after what, beads run at the same time only when each has `paths`, the files and directories it will change, and no two declarations overlap; then start beads together when you have read the code each will touch and neither needs the other's result.{} Give a bead its `paths` when you can: its builder is told them. Each bead is built from the branch as it is now; the one absorbed second has the first merged into it and its checks run again, and a conflict goes back to its builder and through the whole pipeline.",
                 shared_words(&definition.shared_paths)
             )
         } else {
@@ -3487,7 +3606,7 @@ fn goal_line(goal: &Goal) -> String {
             truncate(&charter.objective.replace('\n', " "), 400)
         },
         if charter.paths.is_empty() {
-            "none declared, so it runs alone".to_string()
+            "none declared: it may change anything".to_string()
         } else {
             charter.paths.join(", ")
         },
@@ -3597,7 +3716,7 @@ pub fn desk_brief(
 /// The same inputs give the same text.
 pub fn schedule_brief(project: &str, slots: usize, running: &[&Goal], waiting: &[&Goal]) -> String {
     let mut out = format!(
-        "# Goals are waiting to run on project `{project}`\n\nThis project may have {slots} goals running at once. That is a limit, not a target. A waiting goal may start beside a running one only when both have paths in their charters and none overlap, which code checks, and only when you judge that they cannot collide.\n\n## Running\n\n"
+        "# Goals are waiting to run on project `{project}`\n\nThis project may have {slots} goals running at once. That is a limit, not a target. What keeps a waiting goal from starting beside a running one is a dependency, never a shared file: leave it waiting when it builds on something a running goal has still to land, and start it otherwise. Two goals may change the same files; every sub-goal takes in the default branch before it ships, so what both changed is merged there, one pull request at a time.\n\n## Running\n\n"
     );
     for goal in running {
         out.push_str(&goal_line(goal));
@@ -6057,13 +6176,14 @@ impl Supervisor {
         let tracker = source.list_open()?;
         let journal_path = self.dir(id).join("journal.md");
         let journal = std::fs::read_to_string(&journal_path).unwrap_or_default();
+        let shown = recent_journal(&journal, JOURNAL_KEPT, &journal_path);
         let memory = std::fs::read_to_string(self.memory_path(&goal.project)).unwrap_or_default();
         self.run_stop_check(&mut goal, &definition, &project);
         goal.default_red = self.default_red(&definition, &project);
         // The log is the record of what this goal's agents filed, also for
         // a goal that began before its record kept them.
         goal.filed = filed_in(&self.dir(id));
-        let brief = wake_brief(&definition, &goal, &tracker, &journal, &memory);
+        let brief = wake_brief(&definition, &goal, &tracker, &shown, &memory);
 
         let done = goal.absorbed();
         let launchable = |bead: &str| match source.read(bead) {
@@ -7138,6 +7258,7 @@ impl Supervisor {
             design.state = "proposed".to_string();
             design.dispute.clear();
             design.text = design_text(&result);
+            design.after = Some(design_after(&result));
             let path = self.dir(id).join(format!("design-{sub_id}.md"));
             let _ = std::fs::write(&path, &design.text);
             goal.inbox.push(Happening::Note {
@@ -7403,6 +7524,7 @@ impl Supervisor {
         let tracker = source.list_open()?;
         let journal_path = self.dir(id).join(format!("foreman-{sub_id}.md"));
         let journal = std::fs::read_to_string(&journal_path).unwrap_or_default();
+        let shown = recent_journal(&journal, JOURNAL_KEPT, &journal_path);
         let memory = std::fs::read_to_string(self.memory_path(&goal.project)).unwrap_or_default();
         let steps = self.bead_steps(&definition, &project);
         let records = self.factory.state_dir.join("units");
@@ -7415,7 +7537,7 @@ impl Supervisor {
                 steps: &steps,
                 records: &records,
             },
-            &journal,
+            &shown,
             &memory,
         );
 
@@ -8908,7 +9030,7 @@ mod tests {
             "interface": "`pub const Options = struct { retries: u32 = 3 };`",
             "errors_and_invariants": "`error.Timeout` when the deadline passes. The caller owns the buffer.",
             "layout": "`src/options.zig`, new.",
-            "order": [{"bead": "toy-1", "reason": "it adds the type"}, {"bead": "toy-2", "reason": "it uses it"}],
+            "order": [{"bead": "toy-1", "reason": "it adds the type", "after": []}, {"bead": "toy-2", "reason": "it uses it", "after": ["toy-1"]}],
             "open_questions": "", "split": ""
         })
     }
@@ -8950,8 +9072,172 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.ends_with("### The order of the beads\n\n1. `toy-1`: it adds the type\n2. `toy-2`: it uses it\n"),
+            text.ends_with("### The order of the beads\n\n1. `toy-1`: it adds the type (Needs no other bead of the sub-goal.)\n2. `toy-2`: it uses it (After `toy-1`.)\n"),
             "{text}"
+        );
+    }
+
+    #[test]
+    fn a_brief_holds_the_newest_journal_entries_and_says_where_the_rest_are() {
+        let path = Path::new("/state/goals/g/journal.md");
+        let entry =
+            |wake: usize| format!("## Wake {wake}\n\nWhat wake {wake} decided.\n## not an entry\n");
+        let journal: String = (1..=6).map(entry).collect::<Vec<_>>().join("\n");
+        // Few enough: all of it, as it is.
+        let short: String = (1..=4).map(entry).collect::<Vec<_>>().join("\n");
+        assert_eq!(recent_journal(&short, 4, path), short);
+        assert_eq!(recent_journal("", 4, path), "");
+        // More: the newest four in full, and word of the two left out.
+        let shown = recent_journal(&journal, 4, path);
+        assert!(
+            shown.starts_with("(The 2 older entries are left out. The whole journal is the file `/state/goals/g/journal.md`: read it when you need what an earlier wake wrote.)\n\n## Wake 3\n"),
+            "{shown}"
+        );
+        assert!(shown.ends_with(&entry(6)), "{shown}");
+        for wake in 3..=6 {
+            assert!(shown.contains(&format!("What wake {wake} decided.")));
+        }
+        assert!(!shown.contains("What wake 2 decided."));
+        assert!(recent_journal(&journal, 5, path).starts_with("(The 1 older entry is left out."));
+        // The same journal gives the same text.
+        assert_eq!(shown, recent_journal(&journal, 4, path));
+    }
+
+    #[test]
+    fn a_design_says_what_each_bead_comes_after_and_only_beads_listed_before_it() {
+        let planned = ["toy-1".to_string(), "toy-2".to_string()];
+        assert_eq!(
+            design_after(&designed()),
+            [
+                ("toy-1".to_string(), Vec::<String>::new()),
+                ("toy-2".to_string(), vec!["toy-1".to_string()])
+            ]
+        );
+        // A design from before designs said so has none, which is not the
+        // same as saying nothing comes after anything.
+        let old: Design = serde_json::from_value(json!({
+            "state": "accepted", "text": "t", "dispute": "", "note": "",
+            "rounds": 1, "failures": 0, "retry_at": null
+        }))
+        .unwrap();
+        assert_eq!(old.after, None);
+        let mut wrong = designed();
+        wrong["order"] = json!([
+            {"bead": "toy-1", "reason": "r", "after": ["toy-2", "toy-1", "toy-9"]},
+            {"bead": "toy-2", "reason": "r", "after": []},
+        ]);
+        assert_eq!(
+            design_problems(&planned, &wrong),
+            [
+                "order: `toy-1` is said to come after `toy-2`, which the order lists later: a bead comes after beads listed before it",
+                "order: `toy-1` cannot come after itself",
+                "order: `toy-1` is said to come after `toy-9`, which is not a bead of this sub-goal. What it needs from outside the sub-goal belongs in `open_questions`",
+            ]
+        );
+        // Two beads with nothing between them are a design like any other.
+        let mut apart = designed();
+        apart["order"][1]["after"] = json!([]);
+        assert_eq!(design_problems(&planned, &apart), Vec::<String>::new());
+    }
+
+    #[test]
+    fn in_a_designed_sub_goal_a_bead_waits_for_what_it_comes_after_and_for_nothing_else() {
+        let d: GoalDefinition = toml::from_str(
+            "id = \"d\"\nflow = \"bead\"\nship_flow = \"ship\"\nmax_pipelines = 2\n[director]\nmodel = \"m\"\neffort = \"high\"\n[foreman]\nmodel = \"f\"\neffort = \"high\"\nslots = 2\n",
+        )
+        .unwrap();
+        let designed = |after: Option<Vec<(String, Vec<String>)>>, absorbed: &[&str]| {
+            let mut goal = with_foreman(absorbed, None);
+            goal.subgoals[0].planned = vec!["toy-1".into(), "toy-3".into()];
+            goal.subgoals[0].design = Some(Design {
+                state: "accepted".into(),
+                text: "The design.".into(),
+                after,
+                ..Design::default()
+            });
+            goal
+        };
+        let both = |goal: &Goal, first: Value, second: Value| {
+            let result = json!({
+                "summary": "Decided.", "file": [], "dropped_findings": [],
+                "report": "working", "message": "", "journal_entry": "",
+                "start": [
+                    {"bead": "toy-1", "reason": "", "paths": first},
+                    {"bead": "toy-3", "reason": "", "paths": second},
+                ],
+            });
+            let mut tracker = tracker();
+            tracker.push(Summary {
+                id: "toy-3".into(),
+                ..tracker[0].clone()
+            });
+            foreman_problems(
+                &d,
+                goal,
+                &goal.subgoals[0],
+                &tracker,
+                &|_| Vec::new(),
+                &steps(),
+                &result,
+            )
+        };
+        let edges = |needs: &[&str]| {
+            Some(vec![
+                ("toy-1".to_string(), Vec::new()),
+                (
+                    "toy-3".to_string(),
+                    needs.iter().map(|bead| bead.to_string()).collect(),
+                ),
+            ])
+        };
+        // Nothing between them: side by side on the same file, and with
+        // no paths at all.
+        let apart = designed(edges(&[]), &[]);
+        assert_eq!(
+            both(&apart, json!(["src/worker.zig"]), json!(["src/worker.zig"])),
+            Vec::<String>::new()
+        );
+        assert_eq!(both(&apart, json!([]), json!([])), Vec::<String>::new());
+        // One builds on the other: it waits, however far apart their paths.
+        let chained = designed(edges(&["toy-1"]), &[]);
+        assert_eq!(
+            both(&chained, json!(["src/a"]), json!(["docs"])),
+            [
+                "start: `toy-3` comes after `toy-1` in this sub-goal's design, and `toy-1` is not absorbed yet: beads with nothing between them run side by side, a bead that builds on another waits for it"
+            ]
+        );
+        // Once that one is absorbed it starts.
+        let done = designed(edges(&["toy-1"]), &["toy-1"]);
+        assert_eq!(
+            foreman_says(
+                &d,
+                &done,
+                json!({"start": [{"bead": "toy-2", "reason": "", "paths": []}]})
+            )
+            .iter()
+            .filter(|problem| problem.contains("comes after"))
+            .count(),
+            0
+        );
+        // A declared path is still a plain path.
+        assert!(both(&apart, json!(["src/**"]), json!([]))[0].contains("is not a plain path"),);
+        // A design written before designs said what comes after what: the
+        // paths decide, as in a sub-goal with no design.
+        let old = designed(None, &[]);
+        assert!(
+            both(&old, json!(["src/worker.zig"]), json!(["src/worker.zig"]))[0]
+                .contains("would change the same files")
+        );
+        // And one that is not accepted yet decides nothing.
+        let mut proposed = designed(edges(&[]), &[]);
+        proposed.subgoals[0].design.as_mut().unwrap().state = "proposed".into();
+        assert!(
+            !both(
+                &proposed,
+                json!(["src/worker.zig"]),
+                json!(["src/worker.zig"])
+            )
+            .is_empty()
         );
     }
 
@@ -9691,7 +9977,7 @@ mod tests {
     }
 
     #[test]
-    fn sub_goals_are_worked_on_side_by_side_only_on_paths_that_do_not_overlap() {
+    fn sub_goals_are_worked_on_side_by_side_unless_one_comes_after_another() {
         // A director with two slots, each sub-goal run by a foreman.
         let d: GoalDefinition = toml::from_str(
             "id = \"d\"\nflow = \"bead\"\nship_flow = \"ship\"\nmax_pipelines = 2\n[director]\nmodel = \"m\"\neffort = \"high\"\nslots = 2\n[foreman]\nmodel = \"f\"\neffort = \"high\"\n",
@@ -9712,7 +9998,7 @@ mod tests {
             )
             .is_empty()
         );
-        // One alone needs none.
+        // One alone needs none, and neither does one beside another.
         assert!(problems(&d, &goal(), open(vec![sub("left", json!([]))])).is_empty());
         assert_eq!(
             problems(
@@ -9720,10 +10006,10 @@ mod tests {
                 &goal(),
                 open(vec![sub("left", json!(["src/a"])), sub("right", json!([]))])
             ),
-            [
-                "open_subgoal: `right` would be worked on beside another sub-goal, so it needs `paths`: the files and directories its beads will change"
-            ]
+            Vec::<String>::new()
         );
+        // Paths that overlap keep nothing apart: what both changed is
+        // merged when the second ships.
         assert_eq!(
             problems(
                 &d,
@@ -9733,9 +10019,63 @@ mod tests {
                     sub("right", json!(["src/b"]))
                 ])
             ),
+            Vec::<String>::new()
+        );
+        // A path is still a plain one.
+        assert!(
+            problems(&d, &goal(), open(vec![sub("left", json!(["src/**"]))]))[0]
+                .contains("is not a plain path")
+        );
+        // What keeps a sub-goal from opening is one it builds on that
+        // has not landed.
+        let after = |id: &str, after: Value| {
+            let mut sub = sub(id, json!([]));
+            sub["after"] = after;
+            sub
+        };
+        assert_eq!(
+            problems(
+                &d,
+                &goal(),
+                open(vec![
+                    sub("left", json!([])),
+                    after("right", json!(["left"]))
+                ])
+            ),
             [
-                "open_subgoal: `left` (`src`) and `right` (`src/b`) would change the same files: sub-goals whose paths overlap are worked on one after the other"
+                "open_subgoal: `right` comes after `left`, which opens with it: a sub-goal that builds on another opens once that one has landed"
             ]
+        );
+        assert_eq!(
+            problems(
+                &d,
+                &goal(),
+                open(vec![after("right", json!(["right", "nowhere"]))])
+            ),
+            [
+                "open_subgoal: `right` cannot come after itself",
+                "open_subgoal: `right` is said to come after `nowhere`, which is not a sub-goal of this goal"
+            ]
+        );
+        let mut built_on = with_foreman(&[], None);
+        assert_eq!(
+            problems(
+                &d,
+                &built_on,
+                open(vec![after("right", json!(["signals"]))])
+            ),
+            [
+                "open_subgoal: `right` comes after `signals`, which has not landed: open it when that one has"
+            ]
+        );
+        built_on.subgoals[0].state = "landed".into();
+        assert_eq!(
+            problems(
+                &d,
+                &built_on,
+                open(vec![after("right", json!(["signals"]))])
+            ),
+            Vec::<String>::new()
         );
         assert_eq!(
             problems(
@@ -9760,20 +10100,12 @@ mod tests {
                 "open_subgoal: that would make 3 sub-goals that have not landed, and this goal's director may have 2"
             ]
         );
-        // One already there counts, by its paths or by having none.
+        // One already there keeps nothing out, with paths or without,
+        // on the same files or on others.
         let mut one = with_foreman(&[], None);
-        assert_eq!(
-            problems(&d, &one, open(vec![sub("right", json!(["src/b"]))])),
-            [
-                "open_subgoal: `signals` has not landed and has no paths declared, so nothing may open beside it: wait for it to land"
-            ]
-        );
-        one.subgoals[0].paths = vec!["src/a".into()];
         assert!(problems(&d, &one, open(vec![sub("right", json!(["src/b"]))])).is_empty());
-        assert!(
-            problems(&d, &one, open(vec![sub("right", json!(["src/a/x.zig"]))]))[0]
-                .contains("would change the same files")
-        );
+        one.subgoals[0].paths = vec!["src/a".into()];
+        assert!(problems(&d, &one, open(vec![sub("right", json!(["src/a/x.zig"]))])).is_empty());
         let full = problems(
             &d,
             &one,
@@ -9867,8 +10199,8 @@ mod tests {
             ),
             Vec::<String>::new()
         );
-        // Code that both change keeps them apart as before, and it is the
-        // code that is named.
+        // So are two that change the same code: that keeps no sub-goals
+        // apart any more.
         assert_eq!(
             problems(
                 &d,
@@ -9878,44 +10210,19 @@ mod tests {
                     sub("right", json!(["README.md", "src/a/x.zig"]))
                 ])
             ),
-            [
-                "open_subgoal: `left` (`src/a`) and `right` (`src/a/x.zig`) would change the same files: sub-goals whose paths overlap are worked on one after the other"
-            ]
-        );
-        // A file is shared by its own name, not by one that begins like it.
-        assert_eq!(
-            problems(
-                &d,
-                &goal(),
-                open(vec![
-                    sub("left", json!(["README.md.in"])),
-                    sub("right", json!(["README.md.in"]))
-                ])
-            )
-            .len(),
-            1
+            Vec::<String>::new()
         );
 
-        // A sub-goal that is open without paths keeps every other out,
-        // until the director gives it paths in the same decision.
+        // A sub-goal that is open without paths keeps none out, and may
+        // be given paths in the same decision, also ones the new
+        // sub-goal's lie under.
         let mut one = with_foreman(&[], None);
         let mut beside = open(vec![sub("right", json!(["src/b", "README.md"]))]);
-        assert_eq!(
-            problems(&d, &one, beside.clone()),
-            [
-                "open_subgoal: `signals` has not landed and has no paths declared, so nothing may open beside it: wait for it to land"
-            ]
-        );
+        assert_eq!(problems(&d, &one, beside.clone()), Vec::<String>::new());
         beside["subgoal_paths"] = json!([{"subgoal": "signals", "paths": ["src/a", "README.md"]}]);
         assert_eq!(problems(&d, &one, beside.clone()), Vec::<String>::new());
-        // The paths it is given may not run into the new one's.
         beside["subgoal_paths"] = json!([{"subgoal": "signals", "paths": ["src"]}]);
-        assert_eq!(
-            problems(&d, &one, beside),
-            [
-                "open_subgoal: `signals` (`src`) and `right` (`src/b`) would change the same files: sub-goals whose paths overlap are worked on one after the other"
-            ]
-        );
+        assert_eq!(problems(&d, &one, beside), Vec::<String>::new());
         // Paths go to a sub-goal that is open, and there have to be some.
         let give =
             |id: &str, paths: Value| json!({"subgoal_paths": [{"subgoal": id, "paths": paths}]});
@@ -9957,7 +10264,7 @@ mod tests {
             ),
             Vec::<String>::new()
         );
-        // Two that are open are given paths that do not overlap.
+        // Two that are open are given paths, which may overlap.
         let mut two = with_foreman(&[], None);
         let mut second = two.subgoals[0].clone();
         second.id = "timers".into();
@@ -9970,13 +10277,17 @@ mod tests {
             problems(&d, &two, bounds(json!(["src/a"]), json!(["src/b"]))),
             Vec::<String>::new()
         );
+        assert_eq!(
+            problems(&d, &two, bounds(json!(["src/a"]), json!(["src/a/x.zig"]))),
+            Vec::<String>::new()
+        );
         assert!(
-            problems(&d, &two, bounds(json!(["src/a"]), json!(["src/a/x.zig"])))[0]
-                .contains("would change the same files")
+            problems(&d, &two, bounds(json!(["src/a"]), json!(["../b"])))[0]
+                .contains("is not a plain path")
         );
 
-        // Beads: two of a sub-goal that both add to the shared files run
-        // side by side, and a shared file is no step outside a sub-goal's
+        // Beads, in a sub-goal with no design, where the paths still
+        // decide: two that both add to the shared files run side by side, and a shared file is no step outside a sub-goal's
         // own paths.
         let mut fenced = with_foreman(&[], None);
         fenced.subgoals[0].planned = vec!["toy-1".into()];
@@ -10019,7 +10330,7 @@ mod tests {
     }
 
     #[test]
-    fn goals_run_side_by_side_only_on_charters_whose_paths_do_not_overlap() {
+    fn goals_run_side_by_side_whatever_their_charters_paths() {
         let with_paths = |id: &str, phase: Phase, paths: &[&str]| {
             let mut goal = goal();
             goal.id = id.into();
@@ -10049,26 +10360,14 @@ mod tests {
         // always allowed, since they start when a running goal ends.
         assert!(says(2, &[&running], &["toy-g2"]).is_empty());
         assert!(says(2, &[&running], &[]).is_empty());
-        assert_eq!(
-            says(2, &[&running], &["toy-g3"]),
-            [
-                "start: `toy-g1` (`src/worker`) and `toy-g3` (`src/worker/poll.zig`) would change the same files: goals whose paths overlap run one after the other"
-            ]
-        );
-        // A goal that could touch anything runs alone, whichever side it is on.
-        assert_eq!(
-            says(2, &[&running], &["toy-g4"]),
-            [
-                "start: `toy-g4` would run beside another goal, and its charter names no paths, so it runs alone: leave it waiting"
-            ]
-        );
+        // Paths that overlap keep no goals apart: whether one builds on
+        // the other is the executive's to judge, and every sub-goal takes
+        // in the default branch before it ships.
+        assert!(says(2, &[&running], &["toy-g3"]).is_empty());
+        // Nor does a charter with no paths, whichever side it is on.
+        assert!(says(2, &[&running], &["toy-g4"]).is_empty());
         let loose = with_paths("toy-g1", Phase::Running, &[]);
-        assert_eq!(
-            says(2, &[&loose], &["toy-g2"]),
-            [
-                "start: `toy-g1` is running with no paths in its charter, so nothing may start beside it"
-            ]
-        );
+        assert!(says(2, &[&loose], &["toy-g2"]).is_empty());
         // The limit, and goals that are not waiting.
         assert_eq!(
             says(2, &[&running], &["toy-g2", "toy-g4"]),
@@ -10087,7 +10386,8 @@ mod tests {
         for expected in [
             "This project may have 2 goals running at once. That is a limit, not a target.",
             "- `toy-g1` (running): Ship it\n  Paths: src/worker.",
-            "- `toy-g4` (waiting to run): Ship it\n  Paths: none declared, so it runs alone.",
+            "- `toy-g4` (waiting to run): Ship it\n  Paths: none declared: it may change anything.",
+            "What keeps a waiting goal from starting beside a running one is a dependency, never a shared file",
             "  Its plan: toy-1 first",
         ] {
             assert!(

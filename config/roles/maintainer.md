@@ -22,7 +22,7 @@ Each bead you file needs:
 - A description for someone who has not seen this run: what is wrong or missing, the evidence (the units, commits, files and lines, the counts from the records), and why it matters to someone who uses the project.
 - Acceptance criteria that a command could decide wherever that is possible: a check that exists and passes, a test that fails today and passes after, a number in a report. For a check that closes a class of defect: it fails on each of the cases you named as they were when broken, it passes on the default branch or the bead also fixes what it finds there, and the project's own pipeline runs it.
 
-When you have beads built, write `build_plan` for the director of the goal that builds them: the order and why, what each rests on, what the work must hold to. Give `paths`, the files and directories the work will change, as narrowly as you can: with them the goal may run beside the project's other goals, and without them it waits for them to end.
+When you have beads built, write `build_plan` for the director of the goal that builds them: the order and why, what each rests on, what the work must hold to. Give `paths`, the files and directories the work will change, as narrowly as you can: the goal's sub-goals keep inside them.
 
 In `digest`, write for the owner, who reads it in the project's channel and may read nothing else of this run: what you found, in plain sentences, and for each bead its title and the one reason it is worth doing.
 

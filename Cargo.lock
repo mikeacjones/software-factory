@@ -589,7 +589,9 @@ dependencies = [
  "factory-supervise",
  "globset",
  "regex",
+ "serde_json",
  "thiserror",
+ "ureq",
 ]
 
 [[package]]

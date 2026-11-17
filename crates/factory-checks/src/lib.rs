@@ -1,6 +1,8 @@
 //! Deterministic checks on a worker's output: the project's own commands, and
 //! each step's changes against the paths its flow lets it write.
 
+pub mod judge;
+
 use std::path::Path;
 use std::time::Duration;
 

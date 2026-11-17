@@ -4215,17 +4215,13 @@ fn the_owner_talks_to_the_executive_which_opens_goals_and_says_which_run_togethe
     assert_eq!(phase(&sup, &c), Phase::Queued);
     assert_eq!(calls("executive"), 6);
 
-    // One of the two ends. There is room, but the third has no paths: the
-    // executive's wish to start it is refused by code, and it stays in line.
+    // One of the two ends. There is room, and that the third names no
+    // paths keeps it waiting no longer: the executive judges that it builds
+    // on nothing the running goal has still to land, and code starts it.
     say(
         "executive",
         7,
-        json!({"summary": "Start it.", "start": [{"goal": c, "reason": "there is room"}]}),
-    );
-    say(
-        "executive",
-        8,
-        json!({"summary": "It could touch anything, so it waits.", "start": []}),
+        json!({"summary": "Start it.", "start": [{"goal": c, "reason": "it builds on nothing the running goal has still to land"}]}),
     );
     let b_thread = sup
         .goals()
@@ -4235,25 +4231,18 @@ fn the_owner_talks_to_the_executive_which_opens_goals_and_says_which_run_togethe
         .clone();
     write(&mut sup, &b_thread, "stop");
     assert_eq!(phase(&sup, &b), Phase::Stopped);
-    assert_eq!(phase(&sup, &c), Phase::Queued);
-    assert_eq!(calls("executive"), 8);
+    assert_eq!(phase(&sup, &c), Phase::Running);
+    assert_eq!(calls("executive"), 7);
     let log =
         std::fs::read_to_string(world.path("state/projects/toy/executive/events.jsonl")).unwrap();
-    assert!(
-        log.contains("would run beside another goal, and its charter names no paths"),
-        "{log}"
-    );
+    assert!(!log.contains("its charter names no paths"), "{log}");
 
-    // When the last running goal ends, the one in line starts by itself.
+    // When the other running goal ends, nobody is asked anything.
     say("director", 3, asks);
     write(&mut sup, &thread, "stop");
     assert_eq!(phase(&sup, &a), Phase::Stopped);
     assert_eq!(phase(&sup, &c), Phase::Running);
-    assert_eq!(
-        calls("executive"),
-        8,
-        "nothing to judge when nothing else runs"
-    );
+    assert_eq!(calls("executive"), 7, "nothing to judge when nothing waits");
 
     // The executive's record survives a restart.
     drop(sup);
@@ -7348,4 +7337,150 @@ fn walk_names(dir: &Path) -> Vec<String> {
         }
     }
     names
+}
+
+/// A server that takes the place of the classifier: it answers every
+/// request with `body` and keeps what it was sent.
+fn fake_judge(body: &'static str) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/v1/systemone", listener.local_addr().unwrap());
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let kept = seen.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let read = stream.read(&mut chunk).unwrap_or(0);
+                request.extend_from_slice(&chunk[..read]);
+                let text = String::from_utf8_lossy(&request).to_string();
+                let whole = text.find("\r\n\r\n").is_some_and(|head| {
+                    let length = text
+                        .to_ascii_lowercase()
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:").map(str::to_string))
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    request.len() >= head + 4 + length
+                });
+                if whole || read == 0 {
+                    break;
+                }
+            }
+            kept.lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(&request).to_string());
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    (url, seen)
+}
+
+/// A world whose `test` command fails on the change and on the base, with
+/// a `[judge]` table that names `url` and a key file holding `key_line`.
+fn judged_world(name: &str, url: &str, key_line: &str) -> World {
+    let world = triage_world(
+        name,
+        "echo 'error: the server never answers'; exit 1",
+        "triage = { base = true }\n",
+    );
+    let env = world.path("judge.env");
+    std::fs::write(&env, key_line).unwrap();
+    let factory = world.path("config/factory.toml");
+    let text = std::fs::read_to_string(&factory).unwrap();
+    std::fs::write(
+        &factory,
+        format!(
+            "{text}\n[judge]\nenv_file = \"{}\"\nurl = \"{url}\"\ntimeout_secs = 2\n",
+            env.display()
+        ),
+    )
+    .unwrap();
+    world
+}
+
+/// With a `[judge]` table a failed check's lines go to the classifier once,
+/// and what it says is kept in the unit's log. Nothing is routed by it: the
+/// unit ends as it would have, here parked by the run on the base, though
+/// the classifier called the failure something else. A classifier that
+/// cannot be reached, or a key that is not there, is recorded and holds
+/// nothing up. Without the table nothing is sent.
+#[test]
+fn a_failed_check_is_put_to_the_classifier_and_nothing_is_routed_by_what_it_says() {
+    const SAID: &str = r#"{"model":"jev-1.13.0","answers":{"kind":{"type":"choice","choice":"compile","confidence":0.91,"probabilities":{"host":0.02,"timeout":0.03,"crash":0.0,"compile":0.91,"policy":0.0,"assertion":0.04}}},"usage":{"input_tokens":300,"output_tokens":70}}"#;
+    let parks_on_the_base = |world: &World| {
+        let mut driver = Driver::start(world.config(), "toy", "toy-1", &OPTIONS).unwrap();
+        let Status::Parked(reason) = driver.run().unwrap() else {
+            panic!("the unit should park");
+        };
+        assert!(reason.contains("not the change's"), "{reason}");
+        assert_eq!(events_named(world, &driver, "command.base").len(), 1);
+        assert_eq!(builder_runs(world), 1, "{:?}", world.calls());
+        driver
+    };
+
+    let (url, seen) = fake_judge(SAID);
+    let world = judged_world("judge-says", &url, "TYPESAFE_API_KEY=key-for-the-test\n");
+    let driver = parks_on_the_base(&world);
+    let judged = events_named(&world, &driver, "failure.judged");
+    assert_eq!(judged.len(), 1, "{judged:?}");
+    assert_eq!(judged[0]["command"], "test");
+    assert_eq!(judged[0]["kind"], "compile");
+    assert_eq!(judged[0]["model"], "jev-1.13.0");
+    assert_eq!(judged[0]["probabilities"]["compile"], 0.91);
+    assert!(judged[0]["millis"].is_u64(), "{judged:?}");
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1, "asked once: {seen:?}");
+    assert!(seen[0].contains("the server never answers"), "{}", seen[0]);
+    assert!(seen[0].contains("jev-1.13.0"), "{}", seen[0]);
+    assert!(
+        seen[0]
+            .to_ascii_lowercase()
+            .contains("authorization: bearer key-for-the-test"),
+        "{}",
+        seen[0]
+    );
+
+    // Nothing listens at this address.
+    let gone = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}/v1/systemone", listener.local_addr().unwrap())
+    };
+    let world = judged_world("judge-gone", &gone, "TYPESAFE_API_KEY=key\n");
+    let driver = parks_on_the_base(&world);
+    let failed = events_named(&world, &driver, "failure.judge_failed");
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert_eq!(failed[0]["command"], "test");
+    assert!(events_named(&world, &driver, "failure.judged").is_empty());
+
+    // The key is not in the file.
+    let (url, seen) = fake_judge(SAID);
+    let world = judged_world("judge-no-key", &url, "OTHER=1\n");
+    let driver = parks_on_the_base(&world);
+    let failed = events_named(&world, &driver, "failure.judge_failed");
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert!(
+        failed[0]["why"]
+            .as_str()
+            .unwrap()
+            .contains("has no TYPESAFE_API_KEY"),
+        "{failed:?}"
+    );
+    assert!(seen.lock().unwrap().is_empty(), "nothing was sent");
+
+    // No table: nothing is asked and nothing is recorded.
+    let world = triage_world(
+        "judge-off",
+        "echo 'error: the server never answers'; exit 1",
+        "triage = { base = true }\n",
+    );
+    let driver = parks_on_the_base(&world);
+    assert!(events_named(&world, &driver, "failure.judged").is_empty());
+    assert!(events_named(&world, &driver, "failure.judge_failed").is_empty());
 }

@@ -49,6 +49,48 @@ pub struct Factory {
     pub service: ServiceSettings,
     /// The Temporal server the flow engine runs on, if any.
     pub temporal: Option<Temporal>,
+    /// The classifier that is asked what kind of failure a failed check
+    /// shows, if any. Without this table nothing is sent anywhere.
+    pub judge: Option<JudgeSettings>,
+}
+
+/// The classifier a failed check's lines are sent to: a System One model
+/// behind TypeSafe's API. What it says is recorded in the unit's log and
+/// nothing is routed by it.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JudgeSettings {
+    /// A file only the owner can read, holding the API key as a
+    /// KEY=value line.
+    pub env_file: PathBuf,
+    /// The name the key has in that file.
+    #[serde(default = "default_judge_key")]
+    pub key_env: String,
+    #[serde(default = "default_judge_url")]
+    pub url: String,
+    /// A fixed version, never an alias that moves: a new model is a new
+    /// set of readings, to be compared before it is relied on.
+    #[serde(default = "default_judge_model")]
+    pub model: String,
+    /// How long one reading may take before it is given up, in seconds.
+    #[serde(default = "default_judge_timeout")]
+    pub timeout_secs: u64,
+}
+
+fn default_judge_key() -> String {
+    "TYPESAFE_API_KEY".to_string()
+}
+
+fn default_judge_url() -> String {
+    "https://api.typesafe.ai/v1/systemone".to_string()
+}
+
+fn default_judge_model() -> String {
+    "jev-1.13.0".to_string()
+}
+
+fn default_judge_timeout() -> u64 {
+    5
 }
 
 fn default_limit_grace() -> u64 {
@@ -863,6 +905,9 @@ impl ConfigDir {
         }
         if let Some(slack) = &mut factory.slack {
             slack.env_file = expand_home(&slack.env_file);
+        }
+        if let Some(judge) = factory.judge.as_mut() {
+            judge.env_file = expand_home(&judge.env_file);
         }
         if factory.accounts.is_empty() {
             factory.accounts.push(Account {

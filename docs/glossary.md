@@ -100,7 +100,7 @@ One level of the agents that run a goal, defined by a model, an effort, a time l
 
 ## paths
 
-The files and directories a foreman sets aside for a bead that runs beside others of its sub-goal. Beads may run at the same time only when each has paths and no two overlap, which code checks before anything starts. A director does the same for sub-goals. Files a goal definition lists as shared, which nearly every bead adds to, never count as overlap.
+The files and directories a piece of work is declared to change: a bead's, given by its foreman; a sub-goal's, given by its director, inside which its beads keep; a goal's, in its charter, inside which its sub-goals keep. They do not decide what runs side by side where somebody has said what builds on what: a sub-goal's *designer* names the beads each bead comes *after*, a *director* the sub-goals a sub-goal comes after, and code holds work back only for those. In a sub-goal with no design, beads still run at the same time only when each has paths and no two overlap. Files a goal definition lists as shared, which nearly every bead adds to, never count as overlap.
 
 ## release
 
