@@ -375,9 +375,14 @@ impl Supervisor {
                 quote(&truncate(digest, 2500))
             )
         };
-        let channel = self
-            .tell_channel(project, seat, &said)
-            .map(|(channel, _)| channel);
+        // A run that proposes something needs the owner's answer to each
+        // proposal; one that proposes nothing needs nobody.
+        let channel = if made.is_empty() {
+            self.tell_channel(project, seat, &said)
+        } else {
+            self.call_channel(project, seat, &said)
+        }
+        .map(|(channel, _)| channel);
         for proposal in &mut made {
             let text = proposal_text(proposal);
             self.log_at(

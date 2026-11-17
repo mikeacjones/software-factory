@@ -12,7 +12,7 @@ Two rules explain most of the shapes below.
 ```mermaid
 flowchart TB
     owner(["Owner"])
-    slack["Slack<br/>one channel per project, one thread per goal and per run"]
+    slack["Slack<br/>one channel per project, one thread per goal;<br/>a run has a thread only if it asks the owner something"]
 
     subgraph server["Temporal server, namespace software-factory"]
         intake["Intake workflow<br/>id: intake"]
@@ -59,7 +59,7 @@ flowchart TB
     issues --> beads
     issues --> github
     turn -->|"posts and buttons"| slack
-    steps -->|"status in the run's thread"| slack
+    steps -->|"a question for the owner"| slack
 ```
 
 The dashboard (`factory-dash`) is outside this picture on purpose: it only reads the state directory.
@@ -300,8 +300,8 @@ sequenceDiagram
     Note over Sup: Code checks the result. A start, ship or close is refused.<br/>So is a build while a goal is building. Refusals go back to the same session.
     Sup->>Tracker: file the beads, each with a GitHub issue
     Note over Sup: Code keeps which bead answers which class.
-    Sup->>Slack: the digest, in the project's channel
-    Note over Sup: Code opens the maintenance goal in that message's thread,<br/>with a charter written from the result. Nobody presses Start.
+    Sup->>Slack: the digest, in the project's channel<br/>(with quiet set: to the log only)
+    Note over Sup: Code opens the maintenance goal in that message's thread,<br/>with a charter written from the result. Nobody presses Start.<br/>With quiet set it has no thread until it needs the owner.
     Sup->>Dir: the director is woken, and told how the goal came to be
     Dir-->>Sup: open a sub-goal, accept its design, start its beads
     Sup-->>Project: pipelines to start
@@ -310,7 +310,7 @@ sequenceDiagram
     Pipe-->>Project: the ship pipeline finished, signalled by the watcher
     Project->>Sup: activity turn
     Note over Sup: Code: none of the goal's beads is open any more.<br/>The goal is complete. No director is woken and nobody accepts.
-    Sup->>Slack: goal complete, in the thread
+    Sup->>Slack: goal complete, in the thread<br/>(with quiet set: to the log only)
     Note over Sup: From the next bead on, builders are not told of the class.<br/>If it breaks a bead again, they are, and a run is called.
 ```
 

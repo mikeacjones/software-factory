@@ -797,6 +797,214 @@ fn the_owner_steers_and_answers_in_the_runs_thread() {
     assert!(!kinds.iter().any(|kind| kind == "slack.failed"));
 }
 
+/// Set `quiet` in a world that already has Slack.
+fn quiet(world: &World) {
+    let factory = world.path("config/factory.toml");
+    let text = std::fs::read_to_string(&factory).unwrap();
+    std::fs::write(
+        &factory,
+        text.replace(
+            "answer_wait_secs = 20",
+            "answer_wait_secs = 20\nquiet = true",
+        ),
+    )
+    .unwrap();
+}
+
+/// With `quiet` set a pipeline has no thread and says nothing in Slack,
+/// until a step has to ask the owner something: the question starts the
+/// thread, names the owner, and its answer is read there.
+#[test]
+fn a_quiet_pipeline_posts_only_the_question_it_needs_answered() {
+    let world = World::new("quiet-unit", "test -f feature.txt");
+    world.scenario("ask-once");
+    let fake = common::FakeSlack::start_with(
+        true,
+        &[("100.0", "BOT", "root")],
+        Some("Yes, make it shout."),
+    );
+    world.with_slack(&fake.url);
+    quiet(&world);
+
+    let mut driver = Driver::start(world.config(), "toy", "toy-1", &SLACK).unwrap();
+    assert_eq!(driver.run().unwrap(), Status::Ended);
+
+    let posts = fake.requests_to("chat.postMessage");
+    assert_eq!(posts.len(), 1, "{posts:#?}");
+    assert!(
+        posts[0].contains(":factory:")
+            && posts[0].contains("<@OWNER>")
+            && posts[0].contains("Should the feature shout?"),
+        "{}",
+        posts[0]
+    );
+    assert!(
+        fake.requests_to("chat.update").is_empty(),
+        "no status line is kept up to date"
+    );
+    let second = std::fs::read_to_string(world.path("bin/state/brief-2.md")).unwrap();
+    assert!(second.starts_with("# The owner answered your question"));
+    assert!(second.contains("Yes, make it shout."));
+
+    // What it would have said is still in the unit's log.
+    let kinds = world.event_kinds(&driver);
+    assert!(kinds.iter().any(|kind| kind == "slack.say"));
+    assert!(kinds.iter().any(|kind| kind == "slack.status"));
+    assert!(kinds.iter().any(|kind| kind == "owner.answered"));
+    assert!(!kinds.iter().any(|kind| kind == "slack.failed"));
+}
+
+/// With `quiet` set a goal posts what the owner must answer, with the
+/// owner named, and nothing else: not its start, not a director's wake,
+/// not a pipeline starting or ending, and no thread for the pipeline.
+#[test]
+fn a_quiet_goal_posts_only_what_needs_the_owner_and_names_them() {
+    use factory_driver::goal::{Phase, Supervisor};
+    use factory_slack::socket::Incoming;
+    use std::time::{Duration, Instant};
+
+    let world = World::new("quiet-goal", "true");
+    world.with_github("green");
+    let fake = common::FakeSlack::start_with(true, &[("100.0", "BOT", "root")], None);
+    world.with_slack(&fake.url);
+    quiet(&world);
+    std::fs::create_dir_all(world.path("config/goals/toy")).unwrap();
+    std::fs::write(
+        world.path("config/goals/toy/main.toml"),
+        "id = \"main\"\nmax_pipelines = 1\n[director]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\n",
+    )
+    .unwrap();
+    let say = |role: &str, n: u32, json: serde_json::Value| {
+        std::fs::create_dir_all(world.path("bin/state")).unwrap();
+        std::fs::write(
+            world.path(&format!("bin/state/{role}-{n}.json")),
+            json.to_string(),
+        )
+        .unwrap();
+    };
+    let direct = |extra: serde_json::Value| {
+        let mut all = serde_json::json!({
+            "summary": "Decided, at length.", "start": [], "file": [], "edit": [],
+            "dropped_findings": [], "ask_owner": "", "complete": false, "evidence": "",
+            "journal_entry": "", "project_memory": ""
+        });
+        for (key, value) in extra.as_object().unwrap() {
+            all[key] = value.clone();
+        }
+        all
+    };
+    say(
+        "intake",
+        1,
+        serde_json::json!({"reply": "Here is the charter.", "ready": true,
+            "objective": "Ship the feature.", "stop_when": "toy-1 has landed.",
+            "plan": "toy-1.", "edits": []}),
+    );
+    say(
+        "director",
+        1,
+        direct(serde_json::json!({"start": [{"bead": "toy-1", "reason": "first"}]})),
+    );
+    say(
+        "director",
+        2,
+        direct(serde_json::json!({"ask_owner": "Is one bead enough?"})),
+    );
+    say(
+        "director",
+        3,
+        direct(serde_json::json!({"complete": true, "evidence": "toy-1 landed."})),
+    );
+
+    let mut sup = Supervisor::new(
+        world.config(),
+        Some(factory_slack::Slack::with_base_url("xoxb-test", &fake.url)),
+        vec!["OWNER".to_string()],
+        true,
+    )
+    .unwrap();
+    let message = |text: &str, ts: &str, thread: Option<&str>| Incoming::Message {
+        channel: "C0TOY".to_string(),
+        user: "OWNER".to_string(),
+        text: text.to_string(),
+        ts: ts.to_string(),
+        thread_ts: thread.map(str::to_string),
+    };
+    let posts = || fake.requests_to("chat.postMessage");
+
+    // Agreeing the charter is a conversation the owner is in: the Start
+    // prompt is posted, with the owner named.
+    sup.incoming(message("Ship the feature", "50.0", None))
+        .unwrap();
+    let id = sup.goals().next().unwrap().id.clone();
+    let asked = posts();
+    assert_eq!(asked.len(), 1, "{asked:#?}");
+    assert!(
+        asked[0].contains(r#""action_id":"goal_start""#) && asked[0].contains("<@OWNER>"),
+        "{}",
+        asked[0]
+    );
+
+    // Starting it, the director's first wake and the pipeline it starts
+    // post nothing.
+    sup.incoming(Incoming::Action {
+        channel: "C0TOY".to_string(),
+        user: "OWNER".to_string(),
+        action_id: "goal_start".to_string(),
+        value: id.clone(),
+        message_ts: "100.0".to_string(),
+    })
+    .unwrap();
+    assert_eq!(sup.goals().next().unwrap().phase, Phase::Running);
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while sup.goals().next().unwrap().wakes < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "the pipeline never reported back"
+        );
+        sup.pump(Duration::from_millis(200)).unwrap();
+    }
+
+    // The pipeline ended and the director asked the owner something:
+    // that, and only that, was posted, in the goal's thread.
+    let asked = posts();
+    assert_eq!(asked.len(), 2, "{asked:#?}");
+    assert!(
+        asked[1].contains("<@OWNER>")
+            && asked[1].contains("Is one bead enough?")
+            && asked[1].contains(r#""thread_ts":"50.0""#),
+        "{}",
+        asked[1]
+    );
+
+    // The answer wakes the director, which says the goal is done: the
+    // Accept prompt names the owner.
+    sup.incoming(message("Yes.", "60.0", Some("50.0"))).unwrap();
+    assert_eq!(sup.goals().next().unwrap().phase, Phase::ProposedComplete);
+    let asked = posts();
+    assert_eq!(asked.len(), 3, "{asked:#?}");
+    assert!(
+        asked[2].contains(r#""action_id":"goal_accept""#) && asked[2].contains("<@OWNER>"),
+        "{}",
+        asked[2]
+    );
+
+    // Everything that was not posted is in the goal's log, and the
+    // pipeline's in its own.
+    let log =
+        std::fs::read_to_string(world.path(&format!("state/goals/{id}/events.jsonl"))).unwrap();
+    for said in [
+        "Goal started",
+        "*Director* · wake 1",
+        "started (run",
+        "ended:",
+    ] {
+        assert!(log.contains(said), "{said} is not in the goal's log");
+        assert!(!asked.join("\n").contains(said), "{said} was posted");
+    }
+    assert!(log.contains(r#""kind":"slack.need""#));
+}
+
 #[test]
 fn stop_from_the_owner_parks_the_unit() {
     let world = World::new("stop", "true");

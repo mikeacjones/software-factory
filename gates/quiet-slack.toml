@@ -1,0 +1,29 @@
+# Slack is used only for what needs the owner, and the owner is named in it.
+# Each check is an acceptance line of bead sf-5dz.
+id = "quiet-slack"
+title = "Slack is used only for what needs the owner, with the owner named"
+bead = "sf-5dz"
+
+[[check]]
+id = "quiet-pipeline"
+tier = "hermetic"
+bead = "sf-5dz"
+claim = "With `quiet` set in `[slack]` a pipeline opens no thread and posts no update or status line; a step that has to ask the owner something starts the thread with the question, under the run's header and with the owner named, and the answer written there reaches the step. What it would have said is in the unit's log."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-driver", "--test", "walk", "--", "a_quiet_pipeline_posts_only_the_question_it_needs_answered"]
+timeout_secs = 900
+
+[[check]]
+id = "quiet-goal"
+tier = "hermetic"
+bead = "sf-5dz"
+claim = "With `quiet` set a goal posts the Start prompt, a director's question and the Accept prompt, each with the owner named and in the goal's thread, and posts none of: the goal starting, a director's wake, a pipeline starting or ending. Those are in the goal's log."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-driver", "--test", "walk", "--", "a_quiet_goal_posts_only_what_needs_the_owner_and_names_them"]
+timeout_secs = 900
+
+[[check]]
+id = "loud-unchanged"
+tier = "hermetic"
+bead = "sf-5dz"
+claim = "With `quiet` unset a run still has its thread, its updates and its status line, and a goal still says what it does in its thread."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-driver", "--test", "walk", "--", "the_owner_steers_and_answers_in_the_runs_thread", "a_goal_is_agreed_run_on_events_and_ended_by_the_owner"]
+timeout_secs = 900

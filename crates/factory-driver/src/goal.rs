@@ -3998,6 +3998,9 @@ pub struct Supervisor {
     /// The one project this supervisor acts for, when it was made for a
     /// turn of that project. Otherwise it acts for every project.
     scope: Option<String>,
+    /// Only what needs the owner is posted, with the owner named in it.
+    /// Everything else a goal would say is written to its log alone.
+    quiet: bool,
     /// Every project's channel, by project: `channels` loses the other
     /// projects' when the supervisor is made for one project's turn.
     channel_of: BTreeMap<String, String>,
@@ -4097,9 +4100,14 @@ impl Supervisor {
             .iter()
             .map(|(channel, project)| (project.clone(), channel.clone()))
             .collect();
+        let quiet = factory
+            .slack
+            .as_ref()
+            .is_some_and(|settings| settings.quiet);
         Ok(Supervisor {
             config,
             factory,
+            quiet,
             slack,
             owners,
             channels,
@@ -4311,6 +4319,15 @@ impl Supervisor {
         }
     }
 
+    /// Post what the executive did by itself, when nobody is waiting for
+    /// an answer. With `quiet` set it is not posted: it is in the
+    /// executive's log.
+    fn aside(&self, channel: &str, thread: &str, text: &str) {
+        if !self.quiet {
+            self.post(channel, thread, text);
+        }
+    }
+
     fn save(&mut self, goal: Goal) -> Result<(), DriverError> {
         let dir = self.dir(&goal.id);
         std::fs::create_dir_all(dir.join("runs")).map_err(crate::io(&dir))?;
@@ -4326,8 +4343,15 @@ impl Supervisor {
         Ok(())
     }
 
+    /// Say what a goal is doing. This is for the record: with `quiet`
+    /// set it goes to the goal's log and not to Slack. What the owner
+    /// must see is said with `need`, and an answer to something the owner
+    /// just wrote with `reply`.
     fn say(&self, goal: &Goal, text: &str) {
         self.log(goal, "slack.say", json!({ "text": text }));
+        if self.quiet {
+            return;
+        }
         if let Some(slack) = &self.slack
             && let Err(err) = slack.post(&goal.channel, Some(&goal.thread_ts), text)
         {
@@ -4335,8 +4359,92 @@ impl Supervisor {
         }
     }
 
+    /// Answer something the owner just wrote or pressed in the goal's
+    /// thread. Posted whether or not `quiet` is set; a goal nobody opened
+    /// from Slack has no thread to answer in.
+    fn reply(&self, goal: &Goal, text: &str) {
+        self.log(goal, "slack.say", json!({ "text": text }));
+        if goal.channel.is_empty() {
+            return;
+        }
+        if let Some(slack) = &self.slack
+            && let Err(err) = slack.post(&goal.channel, Some(&goal.thread_ts), text)
+        {
+            self.log(goal, "slack.failed", json!({ "error": err.to_string() }));
+        }
+    }
+
+    /// Say something the goal cannot go on without the owner for. Always
+    /// posted, with the owner named. The caller saves the goal: one the
+    /// factory opened by itself is given its thread here.
+    fn need(&self, goal: &mut Goal, text: &str) {
+        let text = self.calling(text);
+        self.log(goal, "slack.need", json!({ "text": text }));
+        self.root(goal);
+        if let Some(slack) = &self.slack
+            && let Err(err) = slack.post(&goal.channel, Some(&goal.thread_ts), &text)
+        {
+            self.log(goal, "slack.failed", json!({ "error": err.to_string() }));
+        }
+    }
+
+    /// `text` with the owner named in it, if it does not name them yet.
+    fn calling(&self, text: &str) -> String {
+        let mentions = self.mentions();
+        if mentions.is_empty() || text.contains(&mentions) {
+            text.to_string()
+        } else {
+            format!("{mentions} {text}")
+        }
+    }
+
+    /// Give a goal that has no thread one, in its project's channel. A
+    /// goal the factory opened by itself while `quiet` was set was never
+    /// announced, so the first thing that needs the owner starts its
+    /// thread, and what the owner replies there reaches the goal.
+    fn root(&self, goal: &mut Goal) {
+        if !goal.channel.is_empty() {
+            return;
+        }
+        let (Some(slack), Some(channel)) = (&self.slack, self.channel_of.get(&goal.project)) else {
+            return;
+        };
+        let objective = goal
+            .charter
+            .as_ref()
+            .map(|charter| charter.objective.lines().next().unwrap_or("").to_string())
+            .unwrap_or_default();
+        let text = format!(
+            ":dart: *Goal* `{}` of `{}`\n{}\n_The factory opened this goal by itself. Reply here to steer it; `stop` ends it._",
+            goal.id,
+            goal.project,
+            quote(&truncate(&objective, 600))
+        );
+        match slack.post(channel, None, &text) {
+            Ok(ts) => {
+                goal.channel = channel.clone();
+                goal.thread_ts = ts;
+                self.log(
+                    goal,
+                    "slack.thread_opened",
+                    json!({ "channel": goal.channel, "ts": goal.thread_ts }),
+                );
+            }
+            Err(err) => self.log(goal, "slack.failed", json!({ "error": err.to_string() })),
+        }
+    }
+
     /// Post a message the owner answers with a button, and remember it.
     fn prompt(&self, goal: &mut Goal, text: &str, buttons: &[Button<'_>]) {
+        let named = if self.quiet {
+            self.calling(text)
+        } else {
+            text.to_string()
+        };
+        let text = named.as_str();
+        if self.quiet {
+            self.root(goal);
+        }
         self.log(
             goal,
             "slack.prompt",
@@ -4988,7 +5096,7 @@ impl Supervisor {
         let happened = !due.is_empty();
         for closure in due {
             let did = self.close_bead(&seat, &project, &closure);
-            self.post(
+            self.aside(
                 &closure.channel,
                 &closure.thread,
                 &format!(
@@ -5104,7 +5212,7 @@ impl Supervisor {
         for line in &did {
             text.push_str(&format!("\n• {}", escape(line)));
         }
-        self.post(&place.0, &place.1, &text);
+        self.aside(&place.0, &place.1, &text);
         for reply in items(&result, "replies") {
             let id = strings(reply, "goal").trim().to_string();
             if let Some(mut goal) = self.goals.get(&id).cloned() {
@@ -5301,14 +5409,14 @@ impl Supervisor {
                 goal.inbox.push(Happening::OwnerSaid {
                     text: text.to_string(),
                 });
-                self.say(
+                self.reply(
                     &goal,
                     "Noted. The director reads this when the goal starts.",
                 );
                 self.save(goal)
             }
             Phase::Complete | Phase::Stopped => {
-                self.say(
+                self.reply(
                     &goal,
                     "This goal has ended. Start a new one with a new message in the channel.",
                 );
@@ -5348,7 +5456,7 @@ impl Supervisor {
                 "goal.queued",
                 json!({ "behind": ahead, "judged": judged }),
             );
-            self.say(&goal, &if judged {
+            self.reply(&goal, &if judged {
                 format!(
                     ":hourglass_flowing_sand: *Goal waiting.* {} is running. The project's executive is deciding whether this one can safely run beside it; if not, it starts by itself when that ends. What you write here meanwhile is kept for its director; `stop` takes it out of the line.",
                     ahead.join(", ")
@@ -5386,8 +5494,8 @@ impl Supervisor {
                 for edit in goal.charter_edits.clone() {
                     if let Err(err) = source.change(&edit.bead, &edit.change(), &project.bead_actor)
                     {
-                        self.say(
-                            &goal,
+                        self.need(
+                            &mut goal,
                             &format!(
                                 ":x: Could not change `{}`: {}. The goal has not started.",
                                 escape(&edit.bead),
@@ -5457,7 +5565,7 @@ impl Supervisor {
             ("goal_stop", _) => {
                 self.settle_prompt(&mut goal, "The goal was stopped.");
                 goal.phase = Phase::Stopped;
-                self.say(&goal, ":octagonal_sign: *Goal stopped.* A pipeline already running finishes by itself; nothing new starts.");
+                self.reply(&goal, ":octagonal_sign: *Goal stopped.* A pipeline already running finishes by itself; nothing new starts.");
                 let project = goal.project.clone();
                 self.save(goal)?;
                 self.start_queued(&project)
@@ -5501,7 +5609,7 @@ impl Supervisor {
             .unwrap_or_default();
         if &before != commit {
             let _ = std::fs::create_dir_all(&seat.dir);
-            self.tell_channel(
+            self.call_channel(
                 project,
                 &seat,
                 &format!(
@@ -5808,7 +5916,7 @@ impl Supervisor {
         );
         if goal.failures >= 5 {
             goal.phase = Phase::Stopped;
-            self.say(&goal, &format!(":x: {} *Goal stopped*: the director failed five times in a row. The last reason: {}", self.mentions(), escape(reason)));
+            self.need(&mut goal, &format!(":x: {} *Goal stopped*: the director failed five times in a row. The last reason: {}", self.mentions(), escape(reason)));
         } else {
             let retry = goal
                 .retry_at
@@ -5919,7 +6027,7 @@ impl Supervisor {
         let (result, session) = match result {
             Ok(done) => done,
             Err(reason) => {
-                self.say(
+                self.reply(
                     &goal,
                     &format!(
                         ":warning: I could not answer ({}). Reply again to retry.",
@@ -5988,7 +6096,7 @@ impl Supervisor {
         } else {
             goal.charter = None;
             goal.charter_edits.clear();
-            self.say(&goal, &escape(strings(&result, "reply")));
+            self.reply(&goal, &escape(strings(&result, "reply")));
         }
         self.save(goal)
     }
@@ -6365,8 +6473,8 @@ impl Supervisor {
         }
         let question = strings(&result, "ask_owner").trim();
         if !question.is_empty() {
-            self.say(
-                &goal,
+            self.need(
+                &mut goal,
                 &format!(
                     ":question: {} The director needs an answer:\n{}\n_Reply in this thread._",
                     self.mentions(),
@@ -6700,7 +6808,7 @@ impl Supervisor {
                 record.failures = 0;
                 record.retry_at = None;
                 record.since = now_unix();
-                self.tell_channel(project, seat, &format!(
+                self.call_channel(project, seat, &format!(
                     ":warning: The scheduled run `{}` of `{}` could not be run three times and is put off to its next time. The last reason: {}",
                     definition.id,
                     project.id,
@@ -7137,7 +7245,31 @@ impl Supervisor {
     /// Say something in a project's channel, outside any goal's thread.
     /// Returns the channel and the message, when it was posted.
     fn tell_channel(&self, project: &Project, seat: &Seat, text: &str) -> Option<(String, String)> {
-        self.log_at(seat, "slack.say", json!({ "text": text }));
+        if self.quiet {
+            self.log_at(seat, "slack.say", json!({ "text": text }));
+            return None;
+        }
+        self.post_channel(project, seat, "slack.say", text)
+    }
+
+    /// Say something in a project's channel that needs the owner, with
+    /// the owner named when `quiet` is set. Always posted.
+    fn call_channel(&self, project: &Project, seat: &Seat, text: &str) -> Option<(String, String)> {
+        if self.quiet {
+            self.post_channel(project, seat, "slack.need", &self.calling(text))
+        } else {
+            self.post_channel(project, seat, "slack.say", text)
+        }
+    }
+
+    fn post_channel(
+        &self,
+        project: &Project,
+        seat: &Seat,
+        kind: &str,
+        text: &str,
+    ) -> Option<(String, String)> {
+        self.log_at(seat, kind, json!({ "text": text }));
         let channel = self
             .channels
             .iter()

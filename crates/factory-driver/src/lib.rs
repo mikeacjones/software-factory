@@ -1513,6 +1513,16 @@ impl Driver {
             Some(url) => Slack::with_base_url(token.clone(), url.clone()),
             None => Slack::new(token.clone()),
         };
+        if settings.quiet {
+            return Thread::quiet(
+                slack,
+                channel,
+                saved,
+                owners,
+                self.header(),
+                self.log.clone(),
+            );
+        }
         match saved {
             Some(state) => Thread::resume(slack, state, owners, self.header(), self.log.clone()),
             None => Thread::open(slack, channel, owners, self.header(), self.log.clone()),
@@ -2055,13 +2065,18 @@ impl Driver {
         if !self.thread.live() {
             return Ok(None);
         }
-        self.thread.say(&format!(
+        if !self.thread.ask(&format!(
             ":question: {} step *{step}* needs an answer before it can go on:\n{}\n_Reply in this thread._",
             self.thread.owner_mentions(),
             quote(&question)
-        ));
+        )) {
+            return Ok(None);
+        }
         self.thread
             .status(&format!(":question: *{step}* is waiting for your answer"));
+        // A thread started by the question is kept, so that a restart
+        // while it waits finds the same one.
+        self.save()?;
         let settings = self.factory.slack.clone();
         let poll = Duration::from_secs(settings.as_ref().map_or(10, |s| s.poll_secs).max(1));
         let limit = Duration::from_secs(settings.as_ref().map_or(43_200, |s| s.answer_wait_secs));

@@ -74,6 +74,12 @@ usage_refresh = true
 env_file = "~/.config/software-factory/slack.env"
 poll_secs = 10
 answer_wait_secs = 43200
+# Post only what needs the owner, with the owner named: a question, a prompt
+# with a button, a goal that stopped by itself, a red default branch, a
+# proposal. A pipeline opens no thread unless a step asks the owner
+# something, and what a director, a foreman or a pipeline would say as it
+# goes is in its log, which the dashboard reads.
+quiet = true
 
 # The classifier that is asked what kind of failure a failed check shows
 # (host, timeout, crash, compile, policy, assertion): TypeSafe's Jev. It is a

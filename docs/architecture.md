@@ -41,7 +41,7 @@ Owner's decision, 2026-11-14. Every agent runs in bypass mode as the owner's acc
 | Git adapter | Worktrees, checkpoints, branches, pushes, with timeouts | `factory-git` |
 | GitHub adapter | Pull requests, CI watching, the serial lander, issue sync, behind a write allowlist | `factory-github` |
 | Checks | Project commands in a slot, diff policy, the weakened-tests detector, result validation | `factory-checks` |
-| Slack | Questions, alerts, the digest and owner commands | `factory-slack` |
+| Slack | Questions, prompts and alerts that need the owner, and owner commands. With `quiet` set in `[slack]` nothing else is posted: what a goal or a pipeline is doing is in its log and on the dashboard, and each post names the owner | `factory-slack` |
 | Tasks | Scheduled and manual tasks that run beside the flow | `factory-tasks` |
 | Briefings | The brief for each agent step, and the role prompts | `factory-brief` |
 | Driver | The reconciler: observe, step every unit, act, land at most one, dispatch | `factory-driver` |

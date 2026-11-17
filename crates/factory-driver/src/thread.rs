@@ -25,6 +25,12 @@ pub struct Thread {
     /// The fixed first lines of the root message.
     header: String,
     log: EventLog,
+    /// Set when only what needs the owner is posted: `say` and `status`
+    /// then write to the log alone, and `ask` is what posts.
+    quiet: bool,
+    /// The channel a quiet thread is started in, the first time the owner
+    /// is asked something.
+    channel_name: Option<String>,
 }
 
 impl Thread {
@@ -36,6 +42,30 @@ impl Thread {
             owners: Vec::new(),
             header: String::new(),
             log,
+            quiet: false,
+            channel_name: None,
+        }
+    }
+
+    /// A thread that posts only what needs the owner. Nothing is posted
+    /// until `ask` is called: the thread is started then, by the question
+    /// itself. `state` is the thread an earlier process started, if one did.
+    pub fn quiet(
+        slack: Slack,
+        channel_name: &str,
+        state: Option<ThreadState>,
+        owners: Vec<String>,
+        header: String,
+        log: EventLog,
+    ) -> Thread {
+        Thread {
+            slack: Some(slack),
+            state,
+            owners,
+            header,
+            log,
+            quiet: true,
+            channel_name: Some(channel_name.to_string()),
         }
     }
 
@@ -54,6 +84,8 @@ impl Thread {
             owners,
             header,
             log,
+            quiet: false,
+            channel_name: None,
         };
         let opened = slack
             .ensure_channel(channel_name, &thread.owners)
@@ -97,6 +129,8 @@ impl Thread {
             owners,
             header,
             log,
+            quiet: false,
+            channel_name: None,
         }
     }
 
@@ -106,7 +140,7 @@ impl Thread {
 
     /// Whether the owner can be reached through this thread.
     pub fn live(&self) -> bool {
-        self.slack.is_some() && self.state.is_some()
+        self.slack.is_some() && (self.state.is_some() || self.quiet)
     }
 
     /// `<@U123>` for each owner, to draw their attention.
@@ -123,9 +157,60 @@ impl Thread {
         let _ = self.log.append(kind, None, data);
     }
 
-    /// Post an update in the thread.
+    /// Put something to the owner, by name. A quiet thread that has not
+    /// been started is started by this message, under the run's header, so
+    /// that the owner's reply to it is read as the answer. Returns whether
+    /// the owner can have seen it.
+    pub fn ask(&mut self, text: &str) -> bool {
+        self.record("slack.ask", json!({ "text": text }));
+        let Some(slack) = &self.slack else {
+            return false;
+        };
+        let posted = match &self.state {
+            Some(state) => slack
+                .post(&state.channel, Some(&state.root_ts), text)
+                .map(|_| None),
+            None => {
+                let name = self.channel_name.clone().unwrap_or_default();
+                slack
+                    .ensure_channel(&name, &self.owners)
+                    .and_then(|channel| {
+                        let root = format!("{}\n{text}", self.header);
+                        let ts = slack.post(&channel, None, &root)?;
+                        Ok(Some((channel, ts)))
+                    })
+            }
+        };
+        match posted {
+            Ok(Some((channel, root_ts))) => {
+                self.record(
+                    "slack.thread_opened",
+                    json!({ "channel": channel, "ts": root_ts }),
+                );
+                self.state = Some(ThreadState {
+                    channel,
+                    last_seen: root_ts.clone(),
+                    root_ts,
+                });
+                true
+            }
+            Ok(None) => true,
+            Err(err) => {
+                self.record(
+                    "slack.failed",
+                    json!({ "doing": "ask", "error": err.to_string() }),
+                );
+                false
+            }
+        }
+    }
+
+    /// Post an update in the thread. A quiet thread keeps it to the log.
     pub fn say(&mut self, text: &str) {
         self.record("slack.say", json!({ "text": text }));
+        if self.quiet {
+            return;
+        }
         if let (Some(slack), Some(state)) = (&self.slack, &self.state)
             && let Err(err) = slack.post(&state.channel, Some(&state.root_ts), text)
         {
@@ -139,6 +224,9 @@ impl Thread {
     /// Replace the status line of the thread's root message.
     pub fn status(&mut self, line: &str) {
         self.record("slack.status", json!({ "text": line }));
+        if self.quiet {
+            return;
+        }
         if let (Some(slack), Some(state)) = (&self.slack, &self.state) {
             let text = format!("{}\n{line}", self.header);
             if let Err(err) = slack.update(&state.channel, &state.root_ts, &text) {

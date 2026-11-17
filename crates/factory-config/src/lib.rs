@@ -273,6 +273,13 @@ pub struct SlackSettings {
     /// How long a question waits for the owner before the unit is parked.
     #[serde(default = "default_answer_wait")]
     pub answer_wait_secs: u64,
+    /// Post only what needs the owner, and name the owner in it: a
+    /// question, something to approve, a goal that stopped by itself.
+    /// What a pipeline, a director or a foreman would otherwise say as it
+    /// goes is written to its log, where the dashboard reads it, and a
+    /// pipeline opens a thread only to ask the owner something.
+    #[serde(default)]
+    pub quiet: bool,
 }
 
 fn default_poll() -> u64 {
