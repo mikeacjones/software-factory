@@ -20,7 +20,7 @@ A file that says what a bead goes through in one project, from being chosen to b
 
 ## step
 
-One stage of a flow. There are four kinds: an agent step (a model run in a role), a command step (a named project command with no model), a group (steps with no order among them, joined when all finish) and a factory action (push, open pull request, await CI, land, close bead).
+One stage of a flow. There are four kinds: an agent step (a model run in a role), a command step (a named project command with no model), a group of commands (`kind = "commands"`: the project's commands run at the same time, joined when all finish, passing only if every one passed) and a factory action (push, open pull request, await CI, land, close bead).
 
 ## role
 

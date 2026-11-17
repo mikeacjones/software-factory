@@ -18,56 +18,32 @@ model = "claude-opus-5-5"
 effort = "medium"
 session = "fresh"
 writes = ["code"]
-on.done = "fmt"
+on.done = "checks"
 on.already_done = "park"
 on.needs_owner = { to = "ask", max = 3 }
 
+# The quick checks, all at the same time. Every one runs to its end, and a
+# builder sent back is given every one that failed, not only the first. The
+# index is regenerated first and alone (the project marks it `edits`), so no
+# other check reads the file while it is rewritten.
 [[step]]
-id = "fmt"
-kind = "command"
-command = "fmt"
-on.pass = "index"
+id = "checks"
+kind = "commands"
+commands = ["fmt", "samples-index", "readme", "changelog"]
+on.pass = "tests"
 on.fail = { to = "fix", max = 2 }
 
+# The tests, at the same time. The project requires the optimized run for
+# changes to the workflow runtime, the fibers and the bridge, where code has
+# failed only under optimization. It runs here when the bead touches them,
+# while the builder's session is still at hand; every sub-goal gets it once
+# more when it ships.
 [[step]]
-id = "index"
-kind = "command"
-command = "samples-index"
-on.pass = "readme"
-on.fail = { to = "fix", max = 2 }
-
-[[step]]
-id = "readme"
-kind = "command"
-command = "readme"
-on.pass = "changelog"
-on.fail = { to = "fix", max = 2 }
-
-[[step]]
-id = "changelog"
-kind = "command"
-command = "changelog"
-on.pass = "test"
-on.fail = { to = "fix", max = 2 }
-
-[[step]]
-id = "test"
-kind = "command"
-command = "test"
-on.pass = "test-safe"
-on.fail = { to = "fix", max = 3 }
-
-# The project requires the optimized test run for changes to the workflow
-# runtime, the fibers and the bridge, where code has failed only under
-# optimization. It runs here when the bead touches them, while the builder's
-# session is still at hand; every sub-goal gets it once more when it ships.
-[[step]]
-id = "test-safe"
-kind = "command"
-command = "test-releasesafe"
-when_changed = ["runtime"]
+id = "tests"
+kind = "commands"
+commands = ["test", { command = "test-releasesafe", when_changed = ["runtime"] }]
 on.pass = "reports"
-on.fail = { to = "fix", max = 2 }
+on.fail = { to = "fix", max = 3 }
 
 # The review reports, about this bead's change only: its base is the
 # sub-goal's tip when the bead started.
@@ -137,10 +113,10 @@ session = "continue:build"
 # attempt has not held.
 effort_by_round = ["medium", "high"]
 writes = ["code"]
-on.done = { to = "fmt", max = 8 }
+on.done = { to = "checks", max = 8 }
 on.needs_owner = { to = "ask", max = 2 }
 # Nothing in the branch needed changing: every check runs again.
-on.already_done = { to = "fmt", max = 2 }
+on.already_done = { to = "checks", max = 2 }
 
 # The bead's commit message. The pull-request text it also writes is not
 # used here: the sub-goal's pull request is written when it ships.
@@ -166,52 +142,24 @@ on.failed = { to = "describe", max = 2 }
 # this one's and nothing is absorbed yet. A clean merge has the checks run
 # again on the two together; a conflict goes back to this bead's builder,
 # and from there through the whole pipeline again.
-on.moved = "recheck-fmt"
+on.moved = "recheck-checks"
 on.conflict = { to = "fix", max = 3 }
 
 # The checks again, after another bead's work was merged in cleanly. No agent
 # runs: this bead's own change is what the tester and the reviewer already
 # passed, and the two beads are reviewed together when the sub-goal ships.
 [[step]]
-id = "recheck-fmt"
-kind = "command"
-command = "fmt"
-on.pass = "recheck-index"
+id = "recheck-checks"
+kind = "commands"
+commands = ["fmt", "samples-index", "readme", "changelog"]
+on.pass = "recheck-tests"
 on.fail = { to = "fix", max = 2 }
 
+# Back to the absorb when they pass. If yet another bead got there first,
+# round again.
 [[step]]
-id = "recheck-index"
-kind = "command"
-command = "samples-index"
-on.pass = "recheck-readme"
-on.fail = { to = "fix", max = 2 }
-
-[[step]]
-id = "recheck-readme"
-kind = "command"
-command = "readme"
-on.pass = "recheck-changelog"
-on.fail = { to = "fix", max = 2 }
-
-[[step]]
-id = "recheck-changelog"
-kind = "command"
-command = "changelog"
-on.pass = "recheck-test"
-on.fail = { to = "fix", max = 2 }
-
-[[step]]
-id = "recheck-test"
-kind = "command"
-command = "test"
-on.pass = "recheck-test-safe"
-on.fail = { to = "fix", max = 2 }
-
-[[step]]
-id = "recheck-test-safe"
-kind = "command"
-command = "test-releasesafe"
-when_changed = ["runtime"]
-# Back to the absorb. If yet another bead got there first, round again.
+id = "recheck-tests"
+kind = "commands"
+commands = ["test", { command = "test-releasesafe", when_changed = ["runtime"] }]
 on.pass = { to = "absorb", max = 6 }
 on.fail = { to = "fix", max = 2 }

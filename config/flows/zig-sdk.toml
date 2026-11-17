@@ -5,9 +5,10 @@
 # proves the default branch is green, so a later failure is the change's
 # fault, and it builds the Rust core once so the builder's own runs are fast.
 #
-# After the builder: formatting, the generated samples index, README examples,
-# changelog fragments, the unit tests in both modes, and every sample against a
-# dev server. Then the project's review reports are written, and a fresh
+# After the builder, two groups of checks, each run all at the same time:
+# formatting, the generated samples index, README examples and changelog
+# fragments; then the unit tests in both modes, on this machine and on Linux,
+# and every sample against a dev server. Then the project's review reports are written, and a fresh
 # adversarial tester tries to break the change by running it and a fresh
 # reviewer reads it, both starting from those reports. The builder's session is continued for every fix
 # and for the publication text. The factory commits, pushes and opens the pull
@@ -30,68 +31,32 @@ model = "claude-opus-5-5"
 effort = "medium"
 session = "fresh"
 writes = ["code"]
-on.done = "fmt"
+on.done = "checks"
 on.already_done = "park"
 on.needs_owner = { to = "ask", max = 3 }
 
+# The quick checks, all at the same time: formatting, the generated samples
+# index (samples/dispatch.zig must be current), README examples and changelog
+# fragments. Every one runs to its end, and a builder sent back is given every
+# one that failed, not only the first. The index is regenerated first and
+# alone (the project marks it `edits`), so no other check reads the file
+# while it is rewritten.
 [[step]]
-id = "fmt"
-kind = "command"
-command = "fmt"
-on.pass = "index"
+id = "checks"
+kind = "commands"
+commands = ["fmt", "samples-index", "readme", "changelog"]
+on.pass = "tests"
 on.fail = { to = "fix", max = 2 }
 
-# samples/dispatch.zig is generated from the samples; it must be current.
+# The tests, all at the same time: the unit tests in Debug and in ReleaseSafe
+# (fiber and bridge code has failed only under optimization before), every
+# sample against a dev server (a finished sample stays in the suite: breaking
+# one is a regression), and the unit tests on Linux. CI also tests Linux, and
+# what fails only there is found here first, before anything is pushed.
 [[step]]
-id = "index"
-kind = "command"
-command = "samples-index"
-on.pass = "readme"
-on.fail = { to = "fix", max = 2 }
-
-[[step]]
-id = "readme"
-kind = "command"
-command = "readme"
-on.pass = "changelog"
-on.fail = { to = "fix", max = 2 }
-
-[[step]]
-id = "changelog"
-kind = "command"
-command = "changelog"
-on.pass = "test"
-on.fail = { to = "fix", max = 2 }
-
-[[step]]
-id = "test"
-kind = "command"
-command = "test"
-on.pass = "test-safe"
-on.fail = { to = "fix", max = 3 }
-
-# Fiber and bridge code has failed only under optimization before.
-[[step]]
-id = "test-safe"
-kind = "command"
-command = "test-releasesafe"
-on.pass = "samples"
-on.fail = { to = "fix", max = 2 }
-
-# A finished sample stays in the suite: breaking one is a regression.
-[[step]]
-id = "samples"
-kind = "command"
-command = "samples-test"
-on.pass = "test-linux"
-on.fail = { to = "fix", max = 2 }
-
-# Everything above ran on this machine's own platform. CI also tests Linux,
-# and what fails only there is found here first, before anything is pushed.
-[[step]]
-id = "test-linux"
-kind = "command"
-command = "test-linux"
+id = "tests"
+kind = "commands"
+commands = ["test", "test-releasesafe", "samples-test", "test-linux"]
 on.pass = "reports"
 on.fail = { to = "fix", max = 3 }
 
@@ -170,10 +135,10 @@ session = "continue:build"
 # attempt has not held.
 effort_by_round = ["medium", "high"]
 writes = ["code"]
-on.done = { to = "fmt", max = 8 }
+on.done = { to = "checks", max = 8 }
 on.needs_owner = { to = "ask", max = 2 }
 # Nothing in the branch needed changing: every check runs again.
-on.already_done = { to = "fmt", max = 2 }
+on.already_done = { to = "checks", max = 2 }
 
 [[step]]
 id = "describe"

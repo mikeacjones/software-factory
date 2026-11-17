@@ -560,6 +560,12 @@ pub struct CommandSpec {
     /// sent to fix it.
     #[serde(default)]
     pub triage: Triage,
+    /// The command changes files in the worktree as it runs, such as one
+    /// that regenerates a file and then compares it. In a group of commands
+    /// it runs before the others start, and alone, so that none of them
+    /// reads a file it is in the middle of writing.
+    #[serde(default)]
+    pub edits: bool,
 }
 
 /// Runs the factory makes of a command that failed, to tell a failure of the

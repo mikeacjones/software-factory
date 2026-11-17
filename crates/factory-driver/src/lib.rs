@@ -764,6 +764,16 @@ pub fn load_flow(
                     )));
                 }
             }
+            StepKind::Commands { members } => {
+                for member in members {
+                    if project.commands[&member.command].wants_out() {
+                        return Err(DriverError::Preflight(format!(
+                            "the command `{}` writes to `{{out}}`, so it needs a step of its own to say what it produces, not a place in the group `{}`",
+                            member.command, step.id
+                        )));
+                    }
+                }
+            }
             StepKind::Action { .. } => {}
         }
     }
@@ -788,8 +798,33 @@ pub fn bead_source(project: &Project) -> Source {
     }
 }
 
+/// One command a step runs, as the factory judges it: a command step's
+/// own, or one of a group's.
+struct Check<'a> {
+    step: &'a Step,
+    /// What its notes, its failures and its output files are kept under,
+    /// and what the thread calls it: the step's ID for a command step, and
+    /// `<step>.<command>` for a command of a group.
+    key: String,
+    name: &'a str,
+    policy: ExitPolicy,
+    produces: Option<&'a String>,
+    when_changed: &'a [String],
+}
+
+/// A command of a group, while the group runs.
+struct GroupRun {
+    key: String,
+    name: String,
+    command: factory_config::CommandSpec,
+    argv: Vec<String>,
+    result: Option<CommandResult>,
+}
+
 /// A command step's run that failed, as the factory looks into it.
 struct Failed<'a> {
+    /// What it is kept under: see [`Check::key`].
+    key: &'a str,
     name: &'a str,
     command: &'a factory_config::CommandSpec,
     argv: &'a [String],
@@ -1625,6 +1660,7 @@ impl Driver {
         let end = match &step.kind {
             StepKind::Agent { .. } => self.agent_step(&step)?,
             StepKind::Command { .. } => self.command_step(&step)?,
+            StepKind::Commands { .. } => self.commands_step(&step)?,
             StepKind::Action { action } => match action.as_str() {
                 "await-ci" => self.await_ci_step(&step)?,
                 "land" => self.land_step(&step)?,
@@ -2885,32 +2921,235 @@ impl Driver {
         else {
             return Ok(StepEnd::Park("not a command step".to_string()));
         };
+        let check = Check {
+            step,
+            key: step.id.clone(),
+            name,
+            policy: *policy,
+            produces: step.produces.as_ref(),
+            when_changed: &step.when_changed,
+        };
+        if self.not_needed(&check)? {
+            return Ok(StepEnd::Outcome("pass".to_string()));
+        }
         let command = self.project.commands[name].clone();
-        if !step.when_changed.is_empty() {
-            let globs: Vec<String> = step
-                .when_changed
+        let (argv, out_dir) = self.command_argv(&check, &command)?;
+        self.thread.status(&format!(
+            ":arrows_counterclockwise: *{}* · running `{}`",
+            step.id,
+            escape(&command.display())
+        ));
+        let result = run_command_with_grace(
+            &argv,
+            &self.unit.worktree,
+            Duration::from_secs(command.timeout_secs),
+            Duration::from_secs(command.stop_grace_secs),
+        );
+        self.judge_command(&check, &command, &argv, out_dir.as_ref(), &result)
+    }
+
+    /// Run a group of commands at the same time, wait for every one, and
+    /// judge them together. The step passes when each passed. It parks when
+    /// one of them parks, since no fix round can help with that one, and
+    /// fails otherwise, with every failure in what the builder is given. A
+    /// command that changes the worktree runs first, alone, so that no
+    /// other reads a file it is writing.
+    fn commands_step(&mut self, step: &Step) -> Result<StepEnd, DriverError> {
+        let StepKind::Commands { members } = &step.kind else {
+            return Ok(StepEnd::Park("not a group of commands".to_string()));
+        };
+        let mut runs: Vec<GroupRun> = Vec::new();
+        let mut unrun = 0;
+        for member in members {
+            let check = Check {
+                step,
+                key: format!("{}.{}", step.id, member.command),
+                name: &member.command,
+                policy: ExitPolicy::MustPass,
+                produces: None,
+                when_changed: &member.when_changed,
+            };
+            if self.not_needed(&check)? {
+                unrun += 1;
+                continue;
+            }
+            let command = self.project.commands[&member.command].clone();
+            let (argv, _) = self.command_argv(&check, &command)?;
+            runs.push(GroupRun {
+                key: check.key,
+                name: member.command.clone(),
+                command,
+                argv,
+                result: None,
+            });
+        }
+        let worktree = self.unit.worktree.clone();
+        let run = |one: &GroupRun| {
+            run_command_with_grace(
+                &one.argv,
+                &worktree,
+                Duration::from_secs(one.command.timeout_secs),
+                Duration::from_secs(one.command.stop_grace_secs),
+            )
+        };
+        for one in runs.iter_mut().filter(|one| one.command.edits) {
+            self.thread.status(&format!(
+                ":arrows_counterclockwise: *{}* · running `{}` first and alone: it changes the worktree",
+                step.id,
+                escape(&one.command.display())
+            ));
+            one.result = Some(run(one));
+        }
+        let together: Vec<String> = runs
+            .iter()
+            .filter(|one| one.result.is_none())
+            .map(|one| format!("`{}`", escape(&one.command.display())))
+            .collect();
+        if !together.is_empty() {
+            self.thread.status(&format!(
+                ":arrows_counterclockwise: *{}* · running {} at the same time",
+                step.id,
+                together.join(", ")
+            ));
+        }
+        let results: Vec<(usize, CommandResult)> = std::thread::scope(|scope| {
+            let started = Instant::now();
+            let handles: Vec<_> = runs
                 .iter()
-                .flat_map(|scope| self.project.scopes.get(scope).cloned().unwrap_or_default())
+                .enumerate()
+                .filter(|(_, one)| one.result.is_none())
+                .map(|(index, one)| (index, scope.spawn(move || run(one))))
                 .collect();
-            let changed = factory_git::changed_files(&self.unit.worktree, &self.unit.base, "HEAD")?;
-            let outside = scope_violations(&changed, &globs, &[])?;
-            if outside.len() == changed.len() {
-                self.event(
-                    "command.skipped",
-                    Some(&step.id),
-                    json!({ "command": name, "when_changed": step.when_changed }),
-                )?;
-                self.thread.say(&format!(
-                    ":fast_forward: *{}* · not needed: the change touches nothing in {}",
-                    step.id,
-                    step.when_changed.join(", ")
-                ));
-                return Ok(StepEnd::Outcome("pass".to_string()));
+            handles
+                .into_iter()
+                .map(|(index, handle)| {
+                    let result = handle.join().unwrap_or_else(|_| CommandResult {
+                        verdict: Verdict::CouldNotRun(
+                            "the thread that ran it panicked".to_string(),
+                        ),
+                        output: String::new(),
+                        duration: started.elapsed(),
+                    });
+                    (index, result)
+                })
+                .collect()
+        });
+        for (index, result) in results {
+            runs[index].result = Some(result);
+        }
+        // Each is judged as a step of its own would be, in the order the
+        // flow lists them, and only then are they put together.
+        let mut parked = Vec::new();
+        let mut failed = Vec::new();
+        let mut lines = Vec::new();
+        for one in &runs {
+            let check = Check {
+                step,
+                key: one.key.clone(),
+                name: &one.name,
+                policy: ExitPolicy::MustPass,
+                produces: None,
+                when_changed: &[],
+            };
+            let Some(result) = &one.result else { continue };
+            self.unit.feedback = None;
+            let end = self.judge_command(&check, &one.command, &one.argv, None, result)?;
+            if let Some(note) = self.unit.notes.remove(&one.key) {
+                lines.push(format!("- {}", note.body));
+            }
+            match end {
+                StepEnd::Outcome(outcome) if outcome == "pass" => {}
+                StepEnd::Outcome(_) => {
+                    let text = self.unit.feedback.take().unwrap_or_default();
+                    failed.push((one.name.clone(), text));
+                }
+                StepEnd::Park(reason) => parked.push(reason),
+                other => return Ok(other),
             }
         }
+        if unrun > 0 {
+            lines.push(format!(
+                "- {unrun} more of them did not need to run: the change touches nothing they depend on."
+            ));
+        }
+        self.unit.notes.insert(
+            step.id.clone(),
+            Note {
+                title: format!(
+                    "Checks {}, run at the same time",
+                    members
+                        .iter()
+                        .map(|member| format!("`{}`", member.command))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                body: lines.join("\n"),
+            },
+        );
+        self.unit.feedback = match failed.as_slice() {
+            [] => None,
+            [(_, text)] => Some(text.clone()),
+            all => Some(format!(
+                "{} of the checks the factory ran at the same time failed: {}. Each is below. Fix every one before you return.\n\n{}",
+                all.len(),
+                all.iter()
+                    .map(|(name, _)| format!("`{name}`"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                all.iter()
+                    .map(|(name, text)| format!("## `{name}`\n\n{text}"))
+                    .collect::<Vec<_>>()
+                    .join("\n\n")
+            )),
+        };
+        if !parked.is_empty() {
+            // What failed besides stays in the feedback, for whoever goes on.
+            return Ok(StepEnd::Park(parked.join("\n\n")));
+        }
+        Ok(StepEnd::Outcome(
+            if failed.is_empty() { "pass" } else { "fail" }.to_string(),
+        ))
+    }
+
+    /// Whether a command depends only on paths the change does not touch,
+    /// so that it passes unrun. Says so where people look when it does.
+    fn not_needed(&mut self, check: &Check) -> Result<bool, DriverError> {
+        if check.when_changed.is_empty() {
+            return Ok(false);
+        }
+        let globs: Vec<String> = check
+            .when_changed
+            .iter()
+            .flat_map(|scope| self.project.scopes.get(scope).cloned().unwrap_or_default())
+            .collect();
+        let changed = factory_git::changed_files(&self.unit.worktree, &self.unit.base, "HEAD")?;
+        let outside = scope_violations(&changed, &globs, &[])?;
+        if outside.len() != changed.len() {
+            return Ok(false);
+        }
+        self.event(
+            "command.skipped",
+            Some(&check.step.id),
+            json!({ "command": check.name, "when_changed": check.when_changed }),
+        )?;
+        self.thread.say(&format!(
+            ":fast_forward: *{}* · not needed: the change touches nothing in {}",
+            check.key,
+            check.when_changed.join(", ")
+        ));
+        Ok(true)
+    }
+
+    /// The argv a command runs with, and the directory made for the
+    /// artifact it produces, if it produces one.
+    fn command_argv(
+        &mut self,
+        check: &Check,
+        command: &factory_config::CommandSpec,
+    ) -> Result<(Vec<String>, Option<PathBuf>), DriverError> {
         self.unit.runs += 1;
         // An artifact gets a directory of its own, outside the worktree.
-        let out_dir = match &step.produces {
+        let out_dir = match check.produces {
             Some(artifact) => {
                 let dir = self
                     .dir
@@ -2934,33 +3173,37 @@ impl Driver {
                 }
             })
             .collect();
+        Ok((argv, out_dir))
+    }
+
+    /// Judge a command that ran: keep its output, record what it says,
+    /// look into a failure, and say how the check ended. A failure leaves
+    /// what the builder is to be given in the unit's feedback.
+    fn judge_command(
+        &mut self,
+        check: &Check,
+        command: &factory_config::CommandSpec,
+        argv: &[String],
+        out_dir: Option<&PathBuf>,
+        result: &CommandResult,
+    ) -> Result<StepEnd, DriverError> {
+        let name = check.name;
         // What people are shown: the command as configured, not the long
         // paths. What the builder is given is the command it can run.
         let shown = command.display();
         let runnable = command.runnable(&self.config.0);
-        self.thread.status(&format!(
-            ":arrows_counterclockwise: *{}* · running `{}`",
-            step.id,
-            escape(&shown)
-        ));
-        let result = run_command_with_grace(
-            &argv,
-            &self.unit.worktree,
-            Duration::from_secs(command.timeout_secs),
-            Duration::from_secs(command.stop_grace_secs),
-        );
-        let output_path = self.artifact(&format!("{}-output.txt", step.id), &result.output)?;
+        let output_path = self.artifact(&format!("{}-output.txt", check.key), &result.output)?;
         let secs = result.duration.as_secs();
         self.event(
             "command.ran",
-            Some(&step.id),
+            Some(&check.step.id),
             json!({
                 "command": name, "argv": argv, "verdict": format!("{:?}", result.verdict),
                 "secs": secs, "output": output_path, "commit": self.unit.checkpoint,
             }),
         )?;
 
-        let (passed, how) = match (&result.verdict, policy) {
+        let (passed, how) = match (&result.verdict, &check.policy) {
             (Verdict::CouldNotRun(reason), _) => {
                 // The host's fault, not the code's: no fix round can help.
                 return Ok(StepEnd::Park(format!(
@@ -3000,7 +3243,7 @@ impl Driver {
         };
         let short = self.unit.checkpoint[..self.unit.checkpoint.len().min(10)].to_string();
         let short = short.as_str();
-        if let (Some(artifact), Some(dir), true) = (&step.produces, &out_dir, passed) {
+        if let (Some(artifact), Some(dir), true) = (check.produces, out_dir, passed) {
             let ended = match &result.verdict {
                 Verdict::Passed => "passed".to_string(),
                 Verdict::Failed { code } => format!(
@@ -3014,14 +3257,14 @@ impl Driver {
                 Artifact {
                     path: dir.clone(),
                     commit: self.unit.checkpoint.clone(),
-                    step: step.id.clone(),
+                    step: check.step.id.clone(),
                     command: shown.clone(),
                     ended: ended.clone(),
                 },
             );
             self.event(
                 "artifact.produced",
-                Some(&step.id),
+                Some(&check.step.id),
                 json!({ "artifact": artifact, "path": dir, "commit": self.unit.checkpoint, "ended": ended }),
             )?;
             let summary = command
@@ -3039,12 +3282,12 @@ impl Driver {
                 ));
                 self.event(
                     "report.blocked",
-                    Some(&step.id),
+                    Some(&check.step.id),
                     json!({ "artifact": artifact, "line": line }),
                 )?;
                 self.thread.say(&format!(
                     ":x: *{}* · the reports show a result that must not pass: `{}`",
-                    step.id,
+                    check.key,
                     escape(line.trim())
                 ));
                 self.save()?;
@@ -3052,7 +3295,7 @@ impl Driver {
             }
             self.thread.say(&format!(
                 ":page_facing_up: *{}* · `{artifact}` written on `{short}` ({ended}) · {}\n{}",
-                step.id,
+                check.key,
                 duration_text(secs),
                 if summary.trim().is_empty() {
                     String::new()
@@ -3064,7 +3307,7 @@ impl Driver {
             return Ok(StepEnd::Outcome("pass".to_string()));
         }
         self.unit.notes.insert(
-            step.id.clone(),
+            check.key.clone(),
             Note {
                 title: format!("Check `{name}`"),
                 body: format!(
@@ -3074,28 +3317,29 @@ impl Driver {
             },
         );
         if passed {
-            self.unit.failures.remove(&step.id);
+            self.unit.failures.remove(&check.key);
             self.thread.say(&format!(
                 ":white_check_mark: *{}* · `{}` {how} · {}",
-                step.id,
+                check.key,
                 escape(&shown),
                 duration_text(secs)
             ));
             return Ok(StepEnd::Outcome("pass".to_string()));
         }
         let mut found = Vec::new();
-        if matches!(policy, ExitPolicy::MustPass)
+        if matches!(check.policy, ExitPolicy::MustPass)
             && matches!(result.verdict, Verdict::Failed { .. } | Verdict::TimedOut)
         {
             let failed = Failed {
+                key: &check.key,
                 name,
-                command: &command,
-                argv: &argv,
-                result: &result,
+                command,
+                argv,
+                result,
                 how: &how,
                 output: &output_path,
             };
-            match self.triage(step, &failed)? {
+            match self.triage(check.step, &failed)? {
                 Triaged::End(end) => return Ok(end),
                 Triaged::Found(lines) => found = lines,
             }
@@ -3119,7 +3363,7 @@ impl Driver {
         ));
         self.thread.say(&format!(
             ":x: *{}* · `{}` {how} · {}\n{}",
-            step.id,
+            check.key,
             escape(&shown),
             duration_text(secs),
             code_block(&truncate(&tail(&result.output, 25), 2400))
@@ -3160,7 +3404,7 @@ impl Driver {
         if command.triage.rerun {
             self.thread.status(&format!(
                 ":arrows_counterclockwise: *{}* · `{}` {}: running it once more",
-                step.id,
+                failed.key,
                 escape(&command.display()),
                 failed.how
             ));
@@ -3170,7 +3414,7 @@ impl Driver {
                 Duration::from_secs(command.timeout_secs),
                 Duration::from_secs(command.stop_grace_secs),
             );
-            let path = self.artifact(&format!("{}-rerun-output.txt", step.id), &again.output)?;
+            let path = self.artifact(&format!("{}-rerun-output.txt", failed.key), &again.output)?;
             self.event(
                 "command.rerun",
                 Some(&step.id),
@@ -3185,9 +3429,9 @@ impl Driver {
                     Some(&step.id),
                     json!({ "command": name, "first": failed.output, "rerun": path }),
                 )?;
-                self.unit.failures.remove(&step.id);
+                self.unit.failures.remove(failed.key);
                 self.unit.notes.insert(
-                    step.id.clone(),
+                    failed.key.to_string(),
                     Note {
                         title: format!("Check `{name}`"),
                         body: format!(
@@ -3202,7 +3446,7 @@ impl Driver {
                 );
                 self.thread.say(&format!(
                     ":recycle: *{}* · `{}` {} and then passed when run again: a flake, not the change's, recorded and passed",
-                    step.id,
+                    failed.key,
                     escape(&command.display()),
                     failed.how
                 ));
@@ -3221,7 +3465,7 @@ impl Driver {
             }
         }
         let signature = failure_signature(&failed.result.output, &command.failure_lines)?;
-        if let Some(previous) = self.unit.failures.get(&step.id)
+        if let Some(previous) = self.unit.failures.get(failed.key)
             && previous.signature == signature
         {
             let reason = format!(
@@ -3239,7 +3483,7 @@ impl Driver {
             return Ok(Triaged::End(StepEnd::Park(reason)));
         }
         self.unit.failures.insert(
-            step.id.clone(),
+            failed.key.to_string(),
             Failure {
                 signature,
                 commit: self.unit.checkpoint.clone(),
@@ -3257,7 +3501,7 @@ impl Driver {
         let short_base = short_commit(&base);
         self.thread.status(&format!(
             ":arrows_counterclockwise: *{}* · `{}` {}: running it on the base `{short_base}`",
-            step.id,
+            failed.key,
             escape(&command.display()),
             failed.how
         ));
@@ -3283,7 +3527,7 @@ impl Driver {
         };
         let _ = std::fs::remove_dir_all(&dest);
         let _ = std::fs::remove_file(dest.with_extension("index"));
-        let path = self.artifact(&format!("{}-base-output.txt", step.id), &result.output)?;
+        let path = self.artifact(&format!("{}-base-output.txt", failed.key), &result.output)?;
         self.event(
             "command.base",
             Some(&step.id),
@@ -3848,13 +4092,23 @@ impl Driver {
         // have reached the landing unless each passed on the published code.
         let mut commands: Vec<String> = Vec::new();
         for step in &self.flow.steps {
-            if let StepKind::Command {
-                command,
-                policy: ExitPolicy::MustPass,
-            } = &step.kind
-                && self.unit.usage.contains_key(&step.id)
-                && let Some(spec) = self.project.commands.get(command)
-            {
+            if !self.unit.usage.contains_key(&step.id) {
+                continue;
+            }
+            let named: Vec<&String> = match &step.kind {
+                StepKind::Command {
+                    command,
+                    policy: ExitPolicy::MustPass,
+                } => vec![command],
+                StepKind::Commands { members } => {
+                    members.iter().map(|member| &member.command).collect()
+                }
+                _ => Vec::new(),
+            };
+            for command in named {
+                let Some(spec) = self.project.commands.get(command) else {
+                    continue;
+                };
                 let shown = spec
                     .display()
                     .replace("{base}", &self.project.default_branch);

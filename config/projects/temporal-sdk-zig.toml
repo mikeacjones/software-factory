@@ -116,9 +116,12 @@ timeout_secs = 900
 argv = ["zig", "build", "fmt"]
 timeout_secs = 900
 
+# It regenerates samples/dispatch.zig and then compares it, so in a group of
+# checks it runs first and alone.
 [commands.samples-index]
 argv = ["sh", "-c", "zig build samples-index && git diff --exit-code samples/dispatch.zig"]
 timeout_secs = 900
+edits = true
 
 [commands.readme]
 argv = ["zig", "build", "readme-check"]

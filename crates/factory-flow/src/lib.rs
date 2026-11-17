@@ -3,8 +3,9 @@
 //! and walks a unit through it one outcome at a time. It does no I/O beyond
 //! parsing text.
 //!
-//! This is the thin first cut: steps run one at a time (no groups), and the
-//! only factory action is `publish`.
+//! Steps run one at a time. The one exception is a group of commands (`kind =
+//! "commands"`), whose commands the factory runs at the same time and judges
+//! together, as one step.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -144,9 +145,43 @@ pub enum StepKind {
         command: String,
         policy: ExitPolicy,
     },
+    /// The project's commands, run at the same time as one step. It passes
+    /// when every one of them passes, and fails when any fails, once all
+    /// have ended. Each must pass: a report or a command that must fail
+    /// stays a step of its own.
+    Commands {
+        members: Vec<Member>,
+    },
     Action {
         action: String,
     },
+}
+
+/// One command of a group.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Member {
+    /// A named command from the project record.
+    pub command: String,
+    /// Path scopes: the command runs only when the unit's change touches
+    /// one of them, and passes unrun otherwise.
+    pub when_changed: Vec<String>,
+}
+
+/// A command of a group as a flow file writes it: its name alone, or a
+/// table with the name and what it depends on.
+#[derive(Clone, Deserialize)]
+#[serde(untagged)]
+enum RawMember {
+    Name(String),
+    Table(RawMemberTable),
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawMemberTable {
+    command: String,
+    #[serde(default)]
+    when_changed: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -197,6 +232,7 @@ struct RawStep {
     workspace: Option<Workspace>,
     writes: Option<Vec<String>>,
     command: Option<String>,
+    commands: Option<Vec<RawMember>>,
     policy: Option<ExitPolicy>,
     action: Option<String>,
     produces: Option<String>,
@@ -386,6 +422,41 @@ impl Flow {
                     for scope in &step.when_changed {
                         if !registry.scopes.contains(scope) {
                             problems.push(format!("step `{id}`: unknown path scope `{scope}`"));
+                        }
+                    }
+                    for outcome in ["pass", "fail"] {
+                        if !step.on.contains_key(outcome) {
+                            problems.push(format!(
+                                "step `{id}`: a command step must route `{outcome}`"
+                            ));
+                        }
+                    }
+                    for outcome in step.on.keys() {
+                        if !matches!(outcome.as_str(), "pass" | "fail") {
+                            problems.push(format!(
+                                "step `{id}`: a command step cannot end with `{outcome}`"
+                            ));
+                        }
+                    }
+                }
+                StepKind::Commands { members } => {
+                    let mut named = BTreeSet::new();
+                    for member in members {
+                        let command = &member.command;
+                        if !named.insert(command.as_str()) {
+                            problems.push(format!(
+                                "step `{id}`: the command `{command}` is in the group twice"
+                            ));
+                        }
+                        if !registry.commands.contains(command) {
+                            problems.push(format!("step `{id}`: unknown command `{command}`"));
+                        }
+                        for scope in &member.when_changed {
+                            if !registry.scopes.contains(scope) {
+                                problems.push(format!(
+                                    "step `{id}`: unknown path scope `{scope}` for `{command}`"
+                                ));
+                            }
                         }
                     }
                     for outcome in ["pass", "fail"] {
@@ -666,7 +737,7 @@ impl Flow {
     }
 }
 
-fn convert(raw: RawStep) -> Result<Step, String> {
+fn convert(mut raw: RawStep) -> Result<Step, String> {
     let id = raw.id.clone();
     let unused = |fields: &[(&str, bool)]| -> Result<(), String> {
         for (name, present) in fields {
@@ -688,6 +759,7 @@ fn convert(raw: RawStep) -> Result<Step, String> {
         "agent" => {
             unused(&[
                 ("command", raw.command.is_some()),
+                ("commands", raw.commands.is_some()),
                 ("policy", raw.policy.is_some()),
                 ("action", raw.action.is_some()),
             ])?;
@@ -719,6 +791,7 @@ fn convert(raw: RawStep) -> Result<Step, String> {
                 ("session", raw.session.is_some()),
                 ("workspace", raw.workspace.is_some()),
                 ("writes", raw.writes.is_some()),
+                ("commands", raw.commands.is_some()),
                 ("action", raw.action.is_some()),
             ])?;
             StepKind::Command {
@@ -735,11 +808,60 @@ fn convert(raw: RawStep) -> Result<Step, String> {
                 ("workspace", raw.workspace.is_some()),
                 ("writes", raw.writes.is_some()),
                 ("command", raw.command.is_some()),
+                ("commands", raw.commands.is_some()),
                 ("policy", raw.policy.is_some()),
             ])?;
             StepKind::Action {
                 action: need("action", &raw.action)?,
             }
+        }
+        "commands" => {
+            unused(&[
+                ("role", raw.role.is_some()),
+                ("model", raw.model.is_some()),
+                ("effort", raw.effort.is_some()),
+                ("session", raw.session.is_some()),
+                ("workspace", raw.workspace.is_some()),
+                ("writes", raw.writes.is_some()),
+                ("command", raw.command.is_some()),
+                ("policy", raw.policy.is_some()),
+                ("action", raw.action.is_some()),
+            ])?;
+            if raw.produces.is_some() {
+                return Err(format!(
+                    "step `{id}`: a group of commands cannot produce an artifact; give the command that does a step of its own"
+                ));
+            }
+            if raw.when_changed.is_some() {
+                return Err(format!(
+                    "step `{id}`: in a group of commands, `when_changed` goes on each command that has one"
+                ));
+            }
+            let members: Vec<Member> = raw
+                .commands
+                .take()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|member| match member {
+                    RawMember::Name(command) => Member {
+                        command,
+                        when_changed: Vec::new(),
+                    },
+                    RawMember::Table(RawMemberTable {
+                        command,
+                        when_changed,
+                    }) => Member {
+                        command,
+                        when_changed,
+                    },
+                })
+                .collect();
+            if members.is_empty() {
+                return Err(format!(
+                    "step `{id}`: a group of commands needs `commands`, with at least one"
+                ));
+            }
+            StepKind::Commands { members }
         }
         other => return Err(format!("step `{id}`: unknown kind `{other}`")),
     };
@@ -968,7 +1090,7 @@ on.failed = "park"
         Registry {
             roles,
             models: set(&["m"]),
-            commands: set(&["test"]),
+            commands: set(&["test", "fmt", "vet"]),
             scopes: set(&["code"]),
         }
     }
@@ -1216,6 +1338,83 @@ on.merged = "end"
         assert_eq!(
             problems(&misplaced),
             ["step `test`: only an agent step has an effort"]
+        );
+    }
+
+    /// The flow's test step as a group of three commands.
+    fn grouped(members: &str) -> String {
+        FLOW.replace(
+            "kind = \"command\"\ncommand = \"test\"",
+            &format!("kind = \"commands\"\ncommands = {members}"),
+        )
+    }
+
+    #[test]
+    fn a_group_of_commands_is_one_step_and_each_may_depend_on_what_changed() {
+        let text = grouped(r#"["fmt", { command = "test", when_changed = ["code"] }, "vet"]"#);
+        let flow = Flow::parse(&text).unwrap();
+        flow.check(&registry()).unwrap();
+        let StepKind::Commands { members } = &flow.step("test").unwrap().kind else {
+            panic!("expected a group");
+        };
+        let named: Vec<&str> = members.iter().map(|m| m.command.as_str()).collect();
+        assert_eq!(named, ["fmt", "test", "vet"]);
+        assert_eq!(members[1].when_changed, ["code"]);
+        assert!(members[0].when_changed.is_empty());
+        assert_eq!(flow.outcomes("test").unwrap(), ["fail", "pass"]);
+    }
+
+    #[test]
+    fn a_group_that_cannot_be_run_as_one_is_refused() {
+        assert_eq!(
+            problems(&grouped(r#"["fmt", "fmt", "nope"]"#)),
+            [
+                "step `test`: the command `fmt` is in the group twice",
+                "step `test`: unknown command `nope`",
+            ]
+        );
+        assert_eq!(
+            problems(&grouped(
+                r#"[{ command = "fmt", when_changed = ["docs"] }]"#
+            )),
+            ["step `test`: unknown path scope `docs` for `fmt`"]
+        );
+        let refused = |text: &str| match Flow::parse(text) {
+            Err(FlowError::Invalid { problems, .. }) => problems,
+            other => panic!("expected the flow to be refused, got {other:?}"),
+        };
+        assert_eq!(
+            refused(&grouped("[]")),
+            ["step `test`: a group of commands needs `commands`, with at least one"]
+        );
+        assert_eq!(
+            refused(&grouped("[\"fmt\"]\nwhen_changed = [\"code\"]")),
+            [
+                "step `test`: in a group of commands, `when_changed` goes on each command that has one"
+            ]
+        );
+        assert_eq!(
+            refused(&grouped("[\"fmt\"]\nproduces = \"x\"")),
+            [
+                "step `test`: a group of commands cannot produce an artifact; give the command that does a step of its own"
+            ]
+        );
+        assert_eq!(
+            refused(&grouped("[\"fmt\"]\npolicy = \"report-only\"")),
+            ["step `test`: `policy` does not apply to a commands step"]
+        );
+        // A member's table takes only what a member can have.
+        assert!(matches!(
+            Flow::parse(&grouped(r#"[{ command = "fmt", policy = "must-fail" }]"#)),
+            Err(FlowError::Parse(_))
+        ));
+        // And a single command step cannot have a list.
+        assert_eq!(
+            refused(&FLOW.replace(
+                "command = \"test\"\non.pass",
+                "command = \"test\"\ncommands = [\"fmt\"]\non.pass"
+            )),
+            ["step `test`: `commands` does not apply to a command step"]
         );
     }
 

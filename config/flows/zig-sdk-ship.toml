@@ -24,65 +24,28 @@ start = "sync"
 id = "sync"
 kind = "action"
 action = "sync"
-on.current = "fmt"
-on.moved = "fmt"
+on.current = "checks"
+on.moved = "checks"
 on.conflict = "fix"
 
+# The fast checks, all at the same time. Every one runs to its end, and the
+# builder sent back is given every one that failed, not only the first. The
+# index is regenerated first and alone (the project marks it `edits`), so no
+# other check reads the file while it is rewritten.
 [[step]]
-id = "fmt"
-kind = "command"
-command = "fmt"
-on.pass = "index"
+id = "checks"
+kind = "commands"
+commands = ["fmt", "samples-index", "readme", "changelog"]
+on.pass = "tests"
 on.fail = { to = "fix", max = 2 }
 
+# The tests, all at the same time: the unit tests in both modes, every sample
+# against a dev server, and the unit tests on Linux. CI also tests Linux, and
+# what fails only there is found here first, before anything is pushed.
 [[step]]
-id = "index"
-kind = "command"
-command = "samples-index"
-on.pass = "readme"
-on.fail = { to = "fix", max = 2 }
-
-[[step]]
-id = "readme"
-kind = "command"
-command = "readme"
-on.pass = "changelog"
-on.fail = { to = "fix", max = 2 }
-
-[[step]]
-id = "changelog"
-kind = "command"
-command = "changelog"
-on.pass = "test"
-on.fail = { to = "fix", max = 2 }
-
-[[step]]
-id = "test"
-kind = "command"
-command = "test"
-on.pass = "test-safe"
-on.fail = { to = "fix", max = 3 }
-
-[[step]]
-id = "test-safe"
-kind = "command"
-command = "test-releasesafe"
-on.pass = "samples"
-on.fail = { to = "fix", max = 3 }
-
-[[step]]
-id = "samples"
-kind = "command"
-command = "samples-test"
-on.pass = "test-linux"
-on.fail = { to = "fix", max = 3 }
-
-# Everything above ran on this machine's own platform. CI also tests Linux,
-# and what fails only there is found here first, before anything is pushed.
-[[step]]
-id = "test-linux"
-kind = "command"
-command = "test-linux"
+id = "tests"
+kind = "commands"
+commands = ["test", "test-releasesafe", "samples-test", "test-linux"]
 on.pass = "reports"
 on.fail = { to = "fix", max = 3 }
 
@@ -123,7 +86,7 @@ session = "fresh"
 # attempt has not held.
 effort_by_round = ["medium", "high"]
 writes = ["code"]
-on.done = { to = "fmt", max = 6 }
+on.done = { to = "checks", max = 6 }
 on.needs_owner = { to = "ask", max = 2 }
 # Nothing in the branch needed changing: the failure it was sent for is
 # not the branch's, or is fixed on the default branch. The ship takes the

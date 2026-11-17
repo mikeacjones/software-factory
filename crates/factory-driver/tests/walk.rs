@@ -42,15 +42,11 @@ fn a_unit_is_built_broken_fixed_reviewed_and_published() {
         steps,
         [
             "build:done",
-            "fmt:pass",
-            "readme:pass",
-            "changelog:pass",
+            "checks:pass",
             "test:pass",
             "break:broken",
             "fix:done",
-            "fmt:pass",
-            "readme:pass",
-            "changelog:pass",
+            "checks:pass",
             "test:pass",
             "break:held",
             "review:approve",
@@ -1073,14 +1069,8 @@ fn a_red_check_goes_back_to_the_builder_and_green_is_merged_without_asking_anyon
             "publish:done",
             "ci:red",
             "fix:done",
-            "fmt:pass",
-            "index:pass",
-            "readme:pass",
-            "changelog:pass",
-            "test:pass",
-            "test-safe:pass",
-            "samples:pass",
-            "test-linux:pass",
+            "checks:pass",
+            "tests:pass",
             "reports:pass",
             "proof:pass",
             "break:held",
@@ -2106,8 +2096,8 @@ fn a_sub_goal_absorbs_its_beads_and_ships_as_one_pull_request() {
         std::fs::read_to_string(world.path(&format!("state/units/{ship_unit}/events.jsonl")))
             .unwrap();
     for present in [
-        "\"step\":\"test-safe\"",
-        "\"step\":\"samples\"",
+        "\"command\":\"test-releasesafe\"",
+        "\"command\":\"samples-test\"",
         "\"kind\":\"ci.green\"",
         "\"kind\":\"landed\"",
     ] {
@@ -2916,16 +2906,7 @@ fn two_beads_built_side_by_side_are_absorbed_one_onto_the_other() {
         .collect();
     assert_eq!(
         after,
-        [
-            "absorb",
-            "recheck-fmt",
-            "recheck-index",
-            "recheck-readme",
-            "recheck-changelog",
-            "recheck-test",
-            "recheck-test-safe",
-            "absorb"
-        ]
+        ["absorb", "recheck-checks", "recheck-tests", "absorb"]
     );
     // The sub-goal's branch holds one commit for each, in a line, with both
     // beads' files.
@@ -3041,7 +3022,7 @@ fn two_beads_that_collide_are_merged_by_the_builder_of_the_second() {
         .filter(|line| line.contains("\"kind\":\"step.ended\""))
         .filter_map(|line| line.split("\"step\":\"").nth(1)?.split('"').next())
         .collect();
-    for step in ["fix", "test", "break", "review", "describe", "absorb"] {
+    for step in ["fix", "tests", "break", "review", "describe", "absorb"] {
         assert!(after.contains(&step), "{step} did not run again: {after:?}");
     }
 
@@ -3298,8 +3279,8 @@ fn two_sub_goals_worked_on_side_by_side_land_one_after_the_other() {
         .filter(|line| line.contains("\"kind\":\"step.ended\""))
         .filter_map(|line| line.split("\"step\":\"").nth(1)?.split('"').next())
         .collect();
-    assert_eq!(&steps[..3], ["sync", "fmt", "index"], "{steps:?}");
-    for step in ["test", "test-safe", "samples", "ci", "land"] {
+    assert_eq!(&steps[..3], ["sync", "checks", "tests"], "{steps:?}");
+    for step in ["ci", "land"] {
         assert!(steps.contains(&step), "{step} did not run after the sync");
     }
 
@@ -3817,7 +3798,7 @@ fn a_parked_pipeline_is_continued_by_a_foreman_that_takes_over_the_sub_goal() {
         "- You are taking over this sub-goal part-way.".to_string(),
         "- `toy-1`: parked Parked:".to_string(),
         format!("units/{unit}/events.jsonl"),
-        "The bead pipeline's steps, in order: build, fmt, index,".to_string(),
+        "The bead pipeline's steps, in order: build, checks, tests,".to_string(),
     ] {
         assert!(
             taken_over.contains(&expected),
@@ -6456,7 +6437,7 @@ fn a_fix_that_finds_nothing_to_change_goes_on_through_the_checks() {
         .position(|k| k == "fix:already_done")
         .unwrap_or_else(|| panic!("no fix ended already_done: {ended:?}"));
     assert_eq!(ended[at - 1], "test:fail", "{ended:?}");
-    assert_eq!(ended[at + 1], "fmt:pass", "{ended:?}");
+    assert_eq!(ended[at + 1], "checks:pass", "{ended:?}");
     assert!(
         events_named(&world, &driver, "result.rejected").is_empty(),
         "an already_done fix is accepted as it is"
@@ -6595,4 +6576,123 @@ fn a_parked_ship_shipped_again_starts_from_its_sync() {
         !log.contains("\"step\":\"fix\""),
         "no builder was sent to the ship"
     );
+}
+
+/// A group of checks runs its commands at the same time and waits for them
+/// all: each of two checks waits for the other to have started, which only
+/// works if they run together. The one that changes the worktree runs
+/// before them. Both fail the first time, and the one fix round is given
+/// both failures, not only the first.
+#[test]
+fn a_group_of_checks_runs_together_and_the_builder_is_given_every_failure() {
+    let world = World::new("group", "true");
+    let root = world.path("").display().to_string();
+    // One of a pair of checks: it says it started, waits for the other, and
+    // fails once, with its own message.
+    let check = |me: &str, other: &str| {
+        format!(
+            "[ -f {root}/edited ] || {{ echo \"error: {me} ran before the edit\"; exit 1; }}; \
+             touch {root}/{me}-started; i=0; \
+             while [ ! -f {root}/{other}-started ]; do sleep 0.1; i=$((i+1)); \
+             [ $i -gt 100 ] && {{ echo \"error: {other} never ran beside {me}\"; exit 1; }}; done; \
+             if [ ! -f {root}/{me}-failed ]; then touch {root}/{me}-failed; \
+             echo \"error: {me} says the change is wrong\"; exit 1; fi"
+        )
+    };
+    let project = world.path("config/projects/toy.toml");
+    let text = std::fs::read_to_string(&project).unwrap();
+    let old = "[commands.fmt]\nargv = [\"true\"]\ntimeout_secs = 30\n\n[commands.readme]\nargv = [\"true\"]\ntimeout_secs = 30\n\n[commands.changelog]\nargv = [\"true\"]\ntimeout_secs = 30\n";
+    assert!(text.contains(old), "{text}");
+    let new = format!(
+        "[commands.fmt]\nargv = [\"sh\", \"-c\", '{}']\ntimeout_secs = 30\n\n\
+         [commands.readme]\nargv = [\"sh\", \"-c\", '{}']\ntimeout_secs = 30\n\n\
+         [commands.changelog]\nargv = [\"sh\", \"-c\", 'sleep 1; touch {root}/edited']\ntimeout_secs = 30\nedits = true\n",
+        check("fmt", "readme"),
+        check("readme", "fmt"),
+    );
+    std::fs::write(&project, text.replace(old, &new)).unwrap();
+
+    let mut driver = Driver::start(world.config(), "toy", "toy-1", &OPTIONS).unwrap();
+    assert_eq!(driver.run().unwrap(), Status::Ended);
+    let ended: Vec<String> = world
+        .event_kinds(&driver)
+        .into_iter()
+        .filter(|k| k.contains(':'))
+        .collect();
+    assert_eq!(
+        &ended[..4],
+        ["build:done", "checks:fail", "fix:done", "checks:pass"],
+        "{ended:?}"
+    );
+    // Every command ran each time the group did: none was cut short by
+    // another's failure.
+    let ran: Vec<String> = events_named(&world, &driver, "command.ran")
+        .iter()
+        .map(|data| data["command"].as_str().unwrap_or("").to_string())
+        .filter(|name| name != "test")
+        .collect();
+    let groups = ended.iter().filter(|k| k.starts_with("checks:")).count();
+    for name in ["fmt", "readme", "changelog"] {
+        assert_eq!(
+            ran.iter().filter(|ran| *ran == name).count(),
+            groups,
+            "{ran:?}"
+        );
+    }
+    // Each kept its own output.
+    let unit_dir = world.path(&format!("state/units/{}", driver.unit().id));
+    let files: Vec<String> = walk_names(&unit_dir);
+    for name in ["checks.fmt-output.txt", "checks.readme-output.txt"] {
+        assert!(files.iter().any(|file| file.ends_with(name)), "{files:?}");
+    }
+    // The one fix round was told about both failures.
+    let calls = world.calls();
+    let fix = (0..calls.len())
+        .filter(|&i| calls[i][0] == "builder")
+        .nth(1)
+        .unwrap();
+    let brief =
+        std::fs::read_to_string(world.path(&format!("bin/state/brief-{}.md", fix + 1))).unwrap();
+    for expected in [
+        "2 of the checks the factory ran at the same time failed: `fmt`, `readme`",
+        "error: fmt says the change is wrong",
+        "error: readme says the change is wrong",
+    ] {
+        assert!(
+            brief.contains(expected),
+            "missing {expected:?} in:\n{brief}"
+        );
+    }
+    // Neither ran before the edit, and neither ran alone: the first time,
+    // each failed with nothing but its own message.
+    for name in ["fmt", "readme"] {
+        let first = files
+            .iter()
+            .filter(|file| file.ends_with(&format!("checks.{name}-output.txt")))
+            .min()
+            .unwrap();
+        let output = std::fs::read_to_string(unit_dir.join("artifacts").join(first)).unwrap();
+        assert_eq!(
+            output.trim(),
+            format!("error: {name} says the change is wrong"),
+            "{first}"
+        );
+    }
+}
+
+/// The names of every file under a directory.
+fn walk_names(dir: &Path) -> Vec<String> {
+    let mut names = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return names;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            names.extend(walk_names(&path));
+        } else {
+            names.push(entry.file_name().to_string_lossy().to_string());
+        }
+    }
+    names
 }

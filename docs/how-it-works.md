@@ -120,36 +120,32 @@ sequenceDiagram
 
 ## 3. One bead's pipeline
 
-This is `config/flows/zig-sdk-bead.toml`. A flow is data. The pipeline workflow walks it one step at a time, and each step is an activity.
+This is `config/flows/zig-sdk-bead.toml`. A flow is data. The pipeline workflow walks it one step at a time, and each step is an activity. A group of commands is one step: its commands run at the same time, and the step decides once every one has ended.
 
 ```mermaid
 flowchart TD
     start(["A foreman or director starts the bead"]) --> prepare["Code prepares the unit<br/>claim the bead, worktree and branch from the sub-goal's tip, setup"]
     prepare --> build["build · agent · builder<br/>fresh session"]
-    build -->|"done"| fmt
+    build -->|"done"| checks
     build -->|"already_done"| park
 
     subgraph commands["Command steps: code runs the project's commands, no model"]
         direction TB
-        fmt["fmt"] --> index["samples-index"]
-        index --> readme["readme"]
-        readme --> changelog["changelog"]
-        changelog --> test["test"]
-        test --> testsafe["test-releasesafe<br/>only when the runtime's paths changed"]
-        testsafe --> reports["reports<br/>writes the review reports, fails only on results named in fail_when"]
+        checks["checks · group, all at once<br/>samples-index first and alone (it edits), then fmt, readme, changelog together"] --> tests["tests · group, all at once<br/>test, and test-releasesafe only when the runtime's paths changed"]
+        tests --> reports["reports<br/>writes the review reports, fails only on results named in fail_when"]
         reports --> proof["test-proof<br/>each test the change adds must fail on the code as it was"]
     end
 
     proof -->|"pass"| break
-    commands -->|"any of them fails, 2 or 3 times each"| fix
+    commands -->|"any fails, 2 or 3 times each step; a group gives the builder every failure"| fix
     break["break · agent · tester<br/>fresh session, scratch worktree"] -->|"held"| review
     break -->|"broken, up to 3 times"| fix
     review["review · agent · reviewer<br/>fresh session, scratch worktree"] -->|"approve"| describe
     review -->|"rework, up to 2 times"| fix
-    fix["fix · agent · builder<br/>continues the build session, more effort from round 2"] -->|"done, up to 8 times"| fmt
+    fix["fix · agent · builder<br/>continues the build session, more effort from round 2"] -->|"done, up to 8 times"| checks
     describe["describe · agent · publisher<br/>continues the build session"] -->|"ready"| absorb
     absorb["absorb · action<br/>one commit onto the sub-goal's branch"] -->|"done"| finished(["Absorbed: nothing is pushed as a pull request, and the bead stays open"])
-    absorb -->|"moved: another bead got there first and merged cleanly"| recheck["The command steps again on the two together, no agent"]
+    absorb -->|"moved: another bead got there first and merged cleanly"| recheck["The two groups again on the two together, no agent"]
     recheck -->|"pass, up to 6 times"| absorb
     recheck -->|"fail"| fix
     absorb -->|"conflict, up to 3 times"| fix
@@ -170,26 +166,20 @@ This is `config/flows/zig-sdk-ship.toml`. It runs once on the sub-goal's branch,
 ```mermaid
 flowchart TD
     start(["The director ships the sub-goal, and it is its turn in the project's line"]) --> sync["sync · action<br/>fetch and merge the default branch"]
-    sync -->|"current or moved"| fmt
+    sync -->|"current or moved"| checks
     sync -->|"conflict"| fix
 
     subgraph commands["Command steps: the whole repository, no model"]
         direction TB
-        fmt["fmt"] --> index["samples-index"]
-        index --> readme["readme"]
-        readme --> changelog["changelog"]
-        changelog --> test["test"]
-        test --> testsafe["test-releasesafe"]
-        testsafe --> samples["samples-test<br/>every sample against a dev server"]
-        samples --> linux["test-linux<br/>Linux arm64 in containers"]
-        linux --> reports["reports"]
+        checks["checks · group, all at once<br/>samples-index first and alone, then fmt, readme, changelog together"] --> tests["tests · group, all at once<br/>test, test-releasesafe, samples-test against a dev server, test-linux in containers"]
+        tests --> reports["reports"]
     end
 
     reports -->|"pass"| review
-    commands -->|"any of them fails, 2 or 3 times each"| fix
+    commands -->|"any fails, 2 or 3 times each step; a group gives the builder every failure"| fix
     review["review · agent · reviewer<br/>the beads read together"] -->|"approve"| describe
     review -->|"rework, up to 2 times"| fix
-    fix["fix · agent · builder<br/>fresh session on the sub-goal's branch"] -->|"done, up to 6 times"| fmt
+    fix["fix · agent · builder<br/>fresh session on the sub-goal's branch"] -->|"done, up to 6 times"| checks
     describe["describe · agent · publisher<br/>the commit message and the pull-request text"] -->|"ready"| publish
     publish["publish · action<br/>push, open one pull request"] -->|"done"| ci
     publish -->|"failed, up to 2 times"| describe

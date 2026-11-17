@@ -100,6 +100,16 @@ pub fn step_kind(step: &Step) -> String {
             };
             format!("the project's `{command}` command ({rule})")
         }
+        StepKind::Commands { members } => {
+            let named: Vec<String> = members
+                .iter()
+                .map(|member| format!("`{}`", member.command))
+                .collect();
+            format!(
+                "the project's commands {}, at the same time (each must pass)",
+                named.join(", ")
+            )
+        }
         StepKind::Action { action } => format!("the factory's own `{action}`"),
     }
 }

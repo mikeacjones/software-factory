@@ -19,28 +19,16 @@ model = "claude-opus-5-5"
 effort = "medium"
 session = "fresh"
 writes = ["code"]
-on.done = "fmt"
+on.done = "checks"
 on.already_done = "park"
 on.needs_owner = { to = "ask", max = 3 }
 
+# The quick checks, all at the same time. Every one runs to its end, and a
+# builder sent back is given every one that failed, not only the first.
 [[step]]
-id = "fmt"
-kind = "command"
-command = "fmt"
-on.pass = "readme"
-on.fail = { to = "fix", max = 2 }
-
-[[step]]
-id = "readme"
-kind = "command"
-command = "readme"
-on.pass = "changelog"
-on.fail = { to = "fix", max = 2 }
-
-[[step]]
-id = "changelog"
-kind = "command"
-command = "changelog"
+id = "checks"
+kind = "commands"
+commands = ["fmt", "readme", "changelog"]
 on.pass = "test"
 on.fail = { to = "fix", max = 2 }
 
@@ -92,10 +80,10 @@ effort = "medium"
 session = "continue:build"
 effort_by_round = ["medium", "high"]
 writes = ["code"]
-on.done = { to = "fmt", max = 8 }
+on.done = { to = "checks", max = 8 }
 on.needs_owner = { to = "ask", max = 2 }
 # Nothing in the branch needed changing: every check runs again.
-on.already_done = { to = "fmt", max = 2 }
+on.already_done = { to = "checks", max = 2 }
 
 [[step]]
 id = "describe"
