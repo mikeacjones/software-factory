@@ -36,10 +36,11 @@ use factory_claude::{Outcome, RunSpec, Session, Usage};
 use factory_config::{BeadSource, ConfigDir, Factory, Project, read_env_file};
 use factory_core::{EventLog, ProjectId, StepId, UnitId, now_unix};
 use factory_flow::{
-    ExitPolicy, Flow, Next, Position, Registry, SessionRule, Step, StepKind, Workspace,
+    ExitPolicy, Flow, Next, Position, Registry, SessionRule, Step, StepKind, Target, Workspace,
 };
 use factory_github::{
-    CiVerdict, GitHub, MergeMethod, MergeRequest, ci_verdict, publication_problems,
+    CiVerdict, GitHub, MergeMethod, MergeRequest, ci_verdict, publication_problems, runs_to_rerun,
+    without_replaced,
 };
 use factory_slack::{Slack, code_block, escape, link, quote, truncate};
 use factory_supervise::{Control, tail};
@@ -220,8 +221,107 @@ pub struct Unit {
     /// likely to go as the last one did.
     #[serde(default)]
     pub failures: BTreeMap<String, Failure>,
+    /// Checks that failed on a commit and passed when run again on it. The
+    /// change did not cause them, so no builder was sent, but something in
+    /// the project or its tests did: whoever started the pipeline is handed
+    /// each one when it ends, to file or to drop, as it is a finding.
+    #[serde(default)]
+    pub flakes: Vec<Flake>,
+    /// Where the watch of the pull request's CI stands on the commit it
+    /// last looked at: how often failed jobs were run again, and whether
+    /// the failure was handed on.
+    #[serde(default)]
+    pub ci: Option<CiWatch>,
     pub runs: u32,
     pub started_at: u64,
+}
+
+/// A check that failed and then passed on the same commit.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Flake {
+    /// The step it happened in.
+    pub step: String,
+    /// What failed: a command of the project, or the CI checks by name.
+    pub check: String,
+    /// The commit it failed and passed on.
+    pub commit: String,
+    /// The failing lines, made comparable as a failure's signature is.
+    pub signature: String,
+    /// Where the failing output is kept.
+    pub output: Option<PathBuf>,
+}
+
+impl Flake {
+    /// The flake as a finding for whoever started the pipeline, in the
+    /// shape a tester's or reviewer's has.
+    pub fn finding(&self) -> Value {
+        json!({
+            "step": self.step,
+            "severity": "flake",
+            "category": "flaky-check",
+            "title": format!(
+                "`{}` failed on commit `{}` and passed when run again on it: the change did not cause it, so something in the project or its tests did. What failed: {}",
+                self.check,
+                short_commit(&self.commit),
+                truncate(&self.signature.replace('\n', " | "), 400)
+            ),
+            "location": self
+                .output
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
+        })
+    }
+}
+
+/// What a pipeline left for whoever started it to rule on: what its tester
+/// and reviewer found that was not fixed, and the checks that failed for a
+/// reason that was not the change's.
+pub fn unit_findings(unit: &Unit) -> Vec<Value> {
+    unit.results
+        .iter()
+        .flat_map(|(step, result)| {
+            result
+                .get("findings")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+                .iter()
+                .map(move |finding| {
+                    let mut finding = finding.clone();
+                    finding["step"] = json!(step);
+                    finding
+                })
+        })
+        .chain(unit.flakes.iter().map(Flake::finding))
+        .collect()
+}
+
+/// The watch of a pull request's CI on one commit.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CiWatch {
+    pub commit: String,
+    /// How often the failed jobs have been run again on it.
+    pub reruns: u32,
+    /// One more than the project allows, for each time the flow came back
+    /// to the watch with no new commit: nothing changed, so looking at the
+    /// same failure again would tell nobody anything.
+    #[serde(default)]
+    pub granted: u32,
+    /// The failed checks that were replaced by running them again, by URL.
+    #[serde(default)]
+    pub replaced: Vec<String>,
+    /// The checks that failed before the jobs were last run again.
+    #[serde(default)]
+    pub failed: Vec<String>,
+    /// The failing lines of that failure, and where its log is kept.
+    #[serde(default)]
+    pub signature: String,
+    #[serde(default)]
+    pub log: Option<PathBuf>,
+    /// Whether the failure on this commit was handed on as red.
+    #[serde(default)]
+    pub reported: bool,
 }
 
 /// A command step's failure, made comparable with its next one.
@@ -1099,6 +1199,8 @@ impl Driver {
                 trespassed: BTreeMap::new(),
                 rulings: Vec::new(),
                 failures: BTreeMap::new(),
+                flakes: Vec::new(),
+                ci: None,
                 conflicts: Vec::new(),
                 runs: 0,
                 started_at,
@@ -2447,6 +2549,18 @@ impl Driver {
                         // A fix is not done while a regression test still fails.
                         problems.extend(self.check_regressions(&cwd)?);
                     }
+                    if problems.is_empty()
+                        && contract == Contract::Change
+                        && verdict == "done"
+                        && *workspace == Workspace::Unit
+                        && self.unit.ship
+                    {
+                        // A sub-goal's commits are published as they are.
+                        // One this builder made that the project's check on
+                        // commits refuses can still be reworded by it now;
+                        // at the publish step nobody can.
+                        problems.extend(self.check_ship_commits(step, &cwd)?);
+                    }
                     if contract == Contract::Publication
                         && self.unit.absorb_into.is_none()
                         && self
@@ -3429,6 +3543,15 @@ impl Driver {
                     Some(&step.id),
                     json!({ "command": name, "first": failed.output, "rerun": path }),
                 )?;
+                // Not the change's, and still somebody's: whoever started
+                // the pipeline is handed it when the pipeline ends.
+                self.unit.flakes.push(Flake {
+                    step: step.id.clone(),
+                    check: name.to_string(),
+                    commit: self.unit.checkpoint.clone(),
+                    signature: failure_signature(&failed.result.output, &command.failure_lines)?,
+                    output: Some(failed.output.to_path_buf()),
+                });
                 self.unit.failures.remove(failed.key);
                 self.unit.notes.insert(
                     failed.key.to_string(),
@@ -3613,6 +3736,133 @@ impl Driver {
         })
     }
 
+    /// Run the project's publish checks on a sub-goal's branch as a fix
+    /// left it. Those checks read commits, and a ship publishes its commits
+    /// unchanged, so what they refuse is said to the builder that made the
+    /// commit, in the session that made it. A check that cannot run says
+    /// nothing here: the publish step runs it again and parks on that.
+    fn check_ship_commits(&mut self, step: &Step, cwd: &Path) -> Result<Vec<String>, DriverError> {
+        let mut problems = Vec::new();
+        for name in self.project.publish_checks.clone() {
+            let Some(command) = self.project.commands.get(&name).cloned() else {
+                continue;
+            };
+            let result = run_command(
+                &command.argv,
+                cwd,
+                Duration::from_secs(command.timeout_secs),
+            );
+            self.event(
+                "publish.check",
+                Some(&step.id),
+                json!({
+                    "command": name, "verdict": format!("{:?}", result.verdict),
+                    "when": "before the fix is accepted",
+                }),
+            )?;
+            if matches!(result.verdict, Verdict::Failed { .. } | Verdict::TimedOut) {
+                problems.push(format!(
+                    "the project's check on what is published, `{name}` (`{}`), fails on this branch as you left it. The commits of this branch are published as they are, so a commit you made in this run has to pass it, and no later step can reword one. The end of its output:\n\n```\n{}\n```\n\nPut it right in the commits you made in this run: reword the last one with `git commit --amend`, or an earlier one of yours with a rebase over your own commits only. Leave every commit that was on the branch before you started exactly as it is, and change no file for this",
+                    command.argv.join(" "),
+                    tail(&result.output, 40)
+                ));
+            }
+        }
+        Ok(problems)
+    }
+
+    /// Whether the failed jobs of a red CI would be run again: the project
+    /// allows it, they have not been run again that often on this commit,
+    /// and each failure is a job of a workflow run, which is all that can
+    /// be run again.
+    fn may_rerun_ci(
+        &self,
+        settings: &factory_config::GitHub,
+        failed: &[factory_github::Check],
+        watch: &CiWatch,
+    ) -> bool {
+        settings.ci_reruns > 0
+            && watch.reruns < settings.ci_reruns + watch.granted
+            && runs_to_rerun(failed).is_some()
+    }
+
+    /// Have the failed jobs of a red CI run again on the same commit, if the
+    /// project allows it and they have not been run again that often yet.
+    /// No model is asked whether the failure looks like the change's: jobs
+    /// that pass on the same commit answer that. True when they are running
+    /// again, and the watch goes on.
+    fn rerun_ci(
+        &mut self,
+        step: &Step,
+        github: &GitHub,
+        settings: &factory_config::GitHub,
+        failed: &[factory_github::Check],
+        watch: &mut CiWatch,
+    ) -> Result<bool, DriverError> {
+        if !self.may_rerun_ci(settings, failed, watch) {
+            return Ok(false);
+        }
+        let Some(runs) = runs_to_rerun(failed) else {
+            return Ok(false);
+        };
+        let repo_dir = self.project.repo.clone();
+        let names: Vec<String> = failed.iter().map(|check| check.name.clone()).collect();
+        // The failing log first: once the jobs run again it is the old
+        // attempt's, and it is the evidence if they pass.
+        let log = failed
+            .iter()
+            .find_map(|check| github.failed_log(&repo_dir, &settings.repo, check));
+        let mut log_path = watch.log.clone();
+        let mut signature = watch.signature.clone();
+        if let Some(log) = &log {
+            self.unit.runs += 1;
+            log_path = Some(self.artifact(&format!("{}-failed-before-rerun.log", step.id), log)?);
+            signature = failure_signature(log, &settings.ci_failure_lines)?;
+        }
+        for run in &runs {
+            if let Err(err) = github.rerun_failed(&repo_dir, &settings.repo, run) {
+                // The failure stands as it is, and goes where it always went.
+                self.event(
+                    "ci.rerun_refused",
+                    Some(&step.id),
+                    json!({ "run": run, "error": err.to_string() }),
+                )?;
+                return Ok(false);
+            }
+        }
+        watch.reruns += 1;
+        watch.replaced = failed
+            .iter()
+            .filter_map(|check| check.url.clone())
+            .collect();
+        for name in &names {
+            if !watch.failed.contains(name) {
+                watch.failed.push(name.clone());
+            }
+        }
+        watch.signature = signature;
+        watch.log = log_path.clone();
+        self.unit.ci = Some(watch.clone());
+        self.event(
+            "ci.rerun",
+            Some(&step.id),
+            json!({
+                "failed": names, "runs": runs, "times": watch.reruns,
+                "commit": watch.commit, "log": log_path,
+            }),
+        )?;
+        self.thread.say(&format!(
+            ":arrows_counterclockwise: *{}* · {} failed on `{}`: running the failed jobs again on the same commit ({} of {}), before any builder is sent. A pass makes it a flake, which is recorded and filed; another failure goes to the builder.",
+            step.id,
+            escape(&names.join(", ")),
+            short_commit(&watch.commit),
+            watch.reruns,
+            settings.ci_reruns + watch.granted
+        ));
+        self.save()?;
+        Ok(true)
+    }
+
     /// The `await-ci` action: watch the pull request's checks by polling, with
     /// no model involved. A failed check ends the wait as `red` once the
     /// checks still running have finished, or have been waited for long
@@ -3635,12 +3885,37 @@ impl Driver {
         let timeout = Duration::from_secs(settings.ci_timeout_secs);
         let red_wait = Duration::from_secs(settings.ci_red_wait_secs);
         let started = Instant::now();
+        // What the time limit is counted from: the start, or the last time
+        // failed jobs were run again, since those have to run in full.
+        let mut clock = started;
         let mut red_since: Option<Instant> = None;
         let mut green_since: Option<Instant> = None;
         let mut last_status: Option<Instant> = None;
         let mut unreadable = 0;
         let mut waiting_on: Vec<String> = Vec::new();
         let short = self.unit.checkpoint[..self.unit.checkpoint.len().min(10)].to_string();
+        // Where the watch stands on this commit: kept in the unit's record,
+        // so that a watch taken up again after a restart does not run the
+        // jobs again as if for the first time.
+        let mut watch = self
+            .unit
+            .ci
+            .clone()
+            .filter(|watch| watch.commit == self.unit.checkpoint)
+            .unwrap_or_else(|| CiWatch {
+                commit: self.unit.checkpoint.clone(),
+                ..CiWatch::default()
+            });
+        if settings.ci_reruns > 0 && watch.reported {
+            // The failure on this commit was handed on, and the flow is
+            // back with no new commit: a fix that found nothing of the
+            // branch's to change, or someone who continued the unit from
+            // here. The same failure is not news, so the jobs run again.
+            watch.reported = false;
+            watch.granted += 1;
+            self.unit.ci = Some(watch.clone());
+            self.save()?;
+        }
         self.thread.say(&format!(
             ":eyes: *{}* · watching GitHub CI on `{short}`. No model runs while it waits: a failure goes back to the builder once the checks still running have finished, all green goes on.",
             step.id
@@ -3693,19 +3968,27 @@ impl Driver {
                 )));
             }
 
-            match ci_verdict(&status.checks, &settings.required_checks) {
+            // A failed job that was run again is waited for until GitHub
+            // shows the job that replaced it.
+            let checks = without_replaced(&status.checks, &watch.replaced);
+            match ci_verdict(&checks, &settings.required_checks) {
                 CiVerdict::Red { failed }
-                    if !factory_github::red_is_final(
-                        &status.checks,
-                        red_since.map_or(Duration::ZERO, |since| since.elapsed()),
-                        red_wait,
-                    ) && started.elapsed() < timeout =>
+                    if clock.elapsed() < timeout
+                        && (!factory_github::red_is_final(
+                            &checks,
+                            red_since.map_or(Duration::ZERO, |since| since.elapsed()),
+                            red_wait,
+                        ) || (self.may_rerun_ci(&settings, &failed, &watch)
+                            && checks.iter().any(|check| {
+                                check.state == factory_github::CheckState::Pending
+                            }))) =>
                 {
                     // Red already, with checks still running. Another may
                     // fail for another reason: the builder is handed all
-                    // of it at once.
-                    let running: Vec<String> = status
-                        .checks
+                    // of it at once. And a run's failed jobs can only be
+                    // run again once the run has ended, so while that is
+                    // what comes next the wait is not cut short.
+                    let running: Vec<String> = checks
                         .iter()
                         .filter(|check| check.state == factory_github::CheckState::Pending)
                         .map(|check| check.name.clone())
@@ -3741,6 +4024,16 @@ impl Driver {
                             waiting_on.len()
                         ));
                     }
+                }
+                CiVerdict::Red { failed }
+                    if self.rerun_ci(step, &github, &settings, &failed, &mut watch)? =>
+                {
+                    // The failed jobs are running again on the same commit:
+                    // the watch starts over for them.
+                    clock = Instant::now();
+                    red_since = None;
+                    green_since = None;
+                    last_status = None;
                 }
                 CiVerdict::Red { failed } => {
                     let names: Vec<String> = failed
@@ -3796,14 +4089,37 @@ impl Driver {
                                 .replace("{config}", &self.config.0.to_string_lossy())
                         ));
                     }
+                    if watch.reruns > 0 {
+                        feedback.push_str(&format!(
+                            "\nWhat the factory found out before sending you:\n\n- The failed jobs were run again on this commit, {} time(s), and failed each time.\n",
+                            watch.reruns
+                        ));
+                    }
                     feedback.push_str("\nReproduce the failure if you can, fix its cause, and run the project's commands before you return.");
+                    // Where the step this goes to may say so, a failure that
+                    // is not the branch's is not mended in the branch and
+                    // not put to the owner.
+                    let may_leave = step
+                        .on
+                        .get("red")
+                        .and_then(|route| match &route.to {
+                            Target::Step(id) => self.flow.outcomes(id).ok(),
+                            _ => None,
+                        })
+                        .is_some_and(|outcomes| outcomes.iter().any(|o| o == "already_done"));
+                    if may_leave && settings.ci_reruns > 0 {
+                        feedback.push_str(" If what failed is not this branch's doing (a test the branch does not touch, which also fails now and then on the default branch or on another pull request), change nothing and return `already_done` with what you found: the factory runs the failed jobs again by itself, and the defect goes to whoever runs the goal, to be filed and fixed at its cause. Do not make a commit only to start CI again, and do not ask the owner whether to run it again.");
+                    }
                     self.unit.feedback = Some(feedback);
+                    watch.reported = true;
+                    self.unit.ci = Some(watch.clone());
                     self.event(
                         "ci.red",
                         Some(&step.id),
                         json!({
                             "failed": failed.iter().map(|check| check.name.clone()).collect::<Vec<_>>(),
                             "log": log_path, "secs": started.elapsed().as_secs(),
+                            "reruns": watch.reruns,
                         }),
                     )?;
                     let shown = log
@@ -3822,6 +4138,36 @@ impl Driver {
                 CiVerdict::Green { passed } => match green_since {
                     // Seen green twice, far enough apart: no check appeared late.
                     Some(since) if since.elapsed() >= settle => {
+                        if watch.reruns > 0 && !watch.failed.is_empty() {
+                            // Failed and then passed on one commit: not
+                            // the change's, and still somebody's. Whoever
+                            // started the pipeline is handed it when the
+                            // pipeline ends.
+                            let check = format!("CI: {}", watch.failed.join(", "));
+                            self.event(
+                                "ci.flaky",
+                                Some(&step.id),
+                                json!({
+                                    "failed": watch.failed, "reruns": watch.reruns,
+                                    "commit": watch.commit, "log": watch.log,
+                                }),
+                            )?;
+                            self.thread.say(&format!(
+                                ":recycle: *{}* · {} failed on `{short}` and passed when run again: a flake, not the change's. It is recorded, and goes to whoever runs this work to be filed.",
+                                step.id,
+                                escape(&watch.failed.join(", "))
+                            ));
+                            self.unit.flakes.push(Flake {
+                                step: step.id.clone(),
+                                check,
+                                commit: watch.commit.clone(),
+                                signature: watch.signature.clone(),
+                                output: watch.log.clone(),
+                            });
+                            watch.failed.clear();
+                            self.unit.ci = Some(watch.clone());
+                            self.save()?;
+                        }
                         self.event(
                             "ci.green",
                             Some(&step.id),
@@ -3859,7 +4205,7 @@ impl Driver {
                     }
                 }
             }
-            if started.elapsed() >= timeout {
+            if clock.elapsed() >= timeout {
                 return Ok(StepEnd::Park(format!(
                     "CI had not finished after {}; still waiting on: {}",
                     duration_text(timeout.as_secs()),
@@ -4731,14 +5077,29 @@ impl Driver {
                     )));
                 }
                 Verdict::Failed { .. } | Verdict::TimedOut => {
-                    let reason = format!(
-                        "The final commit did not pass the project's publish check `{name}` (`{shown}`), so nothing was pushed. The check reads the commit the factory makes from your commit message.\n\nThe end of its output:\n\n```\n{}\n```\n\nWrite the commit message and pull-request text again so that the check passes.",
-                        tail(&result.output, 60)
-                    );
+                    let reason = if self.unit.ship {
+                        // A sub-goal's commits are published as they are:
+                        // no text a publisher writes changes one of them.
+                        // What the check refuses is put right in the branch.
+                        format!(
+                            "The commits of this branch are published as they are, and the project's publish check `{name}` (`{shown}`) refuses them, so nothing was pushed.\n\nThe end of its output:\n\n```\n{}\n```\n\nPut right what it names, and nothing else. Where it is a commit's message, reword that commit and change no file: `git commit --amend` for the last one; for an earlier one, rebase from its parent and reword that one alone. Every other commit keeps its message, and the files end exactly as they are now (`git diff` between the old and the new tip must show nothing). This is the one case in which you rewrite commits; the factory pushes the branch itself, so do not push. Where the check wants something added, such as a changelog entry, add it in a new commit. This is yours to do: do not ask the owner to do it.",
+                            tail(&result.output, 60)
+                        )
+                    } else {
+                        format!(
+                            "The final commit did not pass the project's publish check `{name}` (`{shown}`), so nothing was pushed. The check reads the commit the factory makes from your commit message.\n\nThe end of its output:\n\n```\n{}\n```\n\nWrite the commit message and pull-request text again so that the check passes.",
+                            tail(&result.output, 60)
+                        )
+                    };
                     self.unit.feedback = Some(reason.clone());
                     self.thread.say(&format!(
-                        ":x: *{}* · the final commit failed `{}`; nothing was pushed\n{}",
+                        ":x: *{}* · {} failed `{}`; nothing was pushed\n{}",
                         step.id,
+                        if self.unit.ship {
+                            "the branch's commits"
+                        } else {
+                            "the final commit"
+                        },
                         escape(&shown),
                         code_block(&truncate(&tail(&result.output, 15), 2000))
                     ));

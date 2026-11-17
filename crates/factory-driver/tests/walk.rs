@@ -986,6 +986,249 @@ fn a_failing_ci_run_is_waited_out_and_every_failure_goes_back_together() {
     assert!(brief.contains(&note), "missing {note:?} in:\n{brief}");
 }
 
+/// Let the toy project have the failed jobs of its CI run again.
+fn rerun_ci(world: &World, times: u32) {
+    let project = world.path("config/projects/toy.toml");
+    let text = std::fs::read_to_string(&project).unwrap();
+    assert!(text.contains("\nci_poll_secs = 1\n"), "{text}");
+    std::fs::write(
+        &project,
+        text.replace(
+            "\nci_poll_secs = 1\n",
+            &format!("\nci_poll_secs = 1\nci_reruns = {times}\nci_failure_lines = ['^unit\\s+test\\s+error: ']\n"),
+        ),
+    )
+    .unwrap();
+}
+
+fn gh_calls(world: &World, start: &str) -> usize {
+    std::fs::read_to_string(world.path("bin/state-gh/calls"))
+        .unwrap()
+        .lines()
+        .filter(|call| call.starts_with(start))
+        .count()
+}
+
+/// CI fails on a pull request and passes when its failed jobs are run again
+/// on the same commit. Code runs them again, with no builder asked what it
+/// thinks and no owner asked to press the button, and the pull request
+/// lands. The flake is kept as a finding for whoever started the pipeline.
+#[test]
+fn ci_that_passes_when_its_failed_jobs_run_again_lands_and_the_flake_is_a_finding() {
+    let world = World::new("ci-rerun", "true");
+    world.with_github("pending red green");
+    rerun_ci(&world, 2);
+    let mut driver = Driver::start(world.config(), "toy", "toy-1", &OPTIONS).unwrap();
+    assert_eq!(driver.run().unwrap(), Status::Ended);
+    let unit = driver.unit().id.to_string();
+    let events = events_of(&world, &unit);
+
+    let reruns = events_named(&world, &driver, "ci.rerun");
+    assert_eq!(reruns.len(), 1, "{reruns:?}");
+    assert_eq!(reruns[0]["failed"], serde_json::json!(["unit"]));
+    assert_eq!(reruns[0]["runs"], serde_json::json!(["55"]));
+    assert_eq!(gh_calls(&world, "run rerun 55 --repo me/toy --failed"), 1);
+    assert!(
+        events_named(&world, &driver, "ci.red").is_empty(),
+        "nothing was handed to a builder"
+    );
+    let at = events
+        .iter()
+        .position(|(kind, _, _)| kind == "ci.rerun")
+        .unwrap();
+    assert!(
+        !events[at..]
+            .iter()
+            .any(|(kind, step, _)| kind == "step.started" && step == "fix"),
+        "no builder is sent for a failure that passes when run again"
+    );
+    let ended: Vec<String> = world
+        .event_kinds(&driver)
+        .into_iter()
+        .filter(|k| k.starts_with("ci:") || k.starts_with("land:"))
+        .collect();
+    assert_eq!(ended, ["ci:green", "land:done"]);
+
+    // The flake: what failed, on which commit, and the lines that say how,
+    // from the log as it was before the jobs ran again.
+    let flaky = events_named(&world, &driver, "ci.flaky");
+    assert_eq!(flaky.len(), 1, "{events:?}");
+    let flakes = &driver.unit().flakes;
+    assert_eq!(flakes.len(), 1);
+    assert_eq!(flakes[0].step, "ci");
+    assert_eq!(flakes[0].check, "CI: unit");
+    assert_eq!(flakes[0].commit, driver.unit().checkpoint);
+    assert!(
+        flakes[0].signature.contains("error: expected #, found #"),
+        "{:?}",
+        flakes[0]
+    );
+    let log = std::fs::read_to_string(flakes[0].output.as_ref().unwrap()).unwrap();
+    assert!(log.contains("1 test failed on linux"), "{log}");
+
+    // It is among what the pipeline leaves for whoever started it.
+    let findings = factory_driver::unit_findings(driver.unit());
+    let finding = findings
+        .iter()
+        .find(|finding| finding["severity"] == "flake")
+        .unwrap_or_else(|| panic!("no flake among {findings:?}"));
+    assert_eq!(finding["step"], "ci");
+    let title = finding["title"].as_str().unwrap();
+    assert!(title.contains("`CI: unit` failed on commit"), "{title}");
+    assert!(title.contains("passed when run again"), "{title}");
+}
+
+/// CI that fails again when its failed jobs are run again is the builder's
+/// to look at, and the builder is told what was already tried. A project
+/// that has not asked for it has nothing run again.
+#[test]
+fn ci_that_fails_again_goes_to_the_builder_with_what_was_tried() {
+    let world = World::new("ci-rerun-red", "true");
+    world.with_github("red red green");
+    rerun_ci(&world, 1);
+    let mut driver = Driver::start(world.config(), "toy", "toy-1", &OPTIONS).unwrap();
+    assert_eq!(driver.run().unwrap(), Status::Ended);
+    assert_eq!(events_named(&world, &driver, "ci.rerun").len(), 1);
+    let red = events_named(&world, &driver, "ci.red");
+    assert_eq!(red.len(), 1, "{red:?}");
+    assert_eq!(red[0]["reruns"], 1);
+    assert!(
+        driver.unit().flakes.is_empty(),
+        "it never passed on that commit"
+    );
+    let calls = world.calls();
+    let fix = (0..calls.len())
+        .rfind(|&i| calls[i][0] == "builder")
+        .expect("the builder was not run for the fix");
+    let brief =
+        std::fs::read_to_string(world.path(&format!("bin/state/brief-{}.md", fix + 1))).unwrap();
+    for expected in [
+        "The failed jobs were run again on this commit, 1 time(s), and failed each time.",
+        "return `already_done`",
+        "do not ask the owner whether to run it again",
+    ] {
+        assert!(
+            brief.contains(expected),
+            "missing {expected:?} in:\n{brief}"
+        );
+    }
+
+    // Without `ci_reruns`, the first red goes to the builder as before.
+    let world = World::new("ci-no-rerun", "true");
+    world.with_github("red green");
+    let mut driver = Driver::start(world.config(), "toy", "toy-1", &OPTIONS).unwrap();
+    assert_eq!(driver.run().unwrap(), Status::Ended);
+    assert!(events_named(&world, &driver, "ci.rerun").is_empty());
+    assert_eq!(gh_calls(&world, "run rerun"), 0);
+    assert_eq!(events_named(&world, &driver, "ci.red").len(), 1);
+    let calls = world.calls();
+    let fix = (0..calls.len())
+        .rfind(|&i| calls[i][0] == "builder")
+        .unwrap();
+    let brief =
+        std::fs::read_to_string(world.path(&format!("bin/state/brief-{}.md", fix + 1))).unwrap();
+    assert!(
+        !brief.contains("already_done` with what you found"),
+        "{brief}"
+    );
+}
+
+/// The builder sent to a red CI finds that the failure is not its branch's
+/// and changes nothing. The flow comes back to the watch with the same
+/// commit, where the old failure is not news: the failed jobs run once
+/// more, pass, and the pull request lands. Nobody was asked for a rerun.
+#[test]
+fn a_fix_that_says_the_ci_failure_is_not_the_branchs_has_the_jobs_run_again() {
+    let world = World::new("ci-not-ours", "true");
+    // Red, red again after the one rerun the project allows; then, when
+    // the flow is back from the fix, red as it was left and green after
+    // the rerun that return is granted.
+    world.with_github("red red red green");
+    rerun_ci(&world, 1);
+    world.scenario("ci-not-ours");
+    let mut driver = Driver::start(world.config(), "toy", "toy-1", &OPTIONS).unwrap();
+    assert_eq!(driver.run().unwrap(), Status::Ended);
+    let ended: Vec<String> = world
+        .event_kinds(&driver)
+        .into_iter()
+        .filter(|k| k.starts_with("ci:") || k.starts_with("fix:") || k.starts_with("land:"))
+        .collect();
+    // The fix before the first watch is the one the tester's break asked for.
+    assert_eq!(
+        ended,
+        [
+            "fix:done",
+            "ci:red",
+            "fix:already_done",
+            "ci:green",
+            "land:done"
+        ]
+    );
+    assert_eq!(events_named(&world, &driver, "ci.rerun").len(), 2);
+    assert_eq!(gh_calls(&world, "run rerun"), 2);
+    assert_eq!(events_named(&world, &driver, "ci.red").len(), 1);
+    assert_eq!(driver.unit().flakes.len(), 1, "{:?}", driver.unit().flakes);
+    assert!(
+        events_named(&world, &driver, "question.asked").is_empty(),
+        "the owner is not asked to run CI again"
+    );
+}
+
+/// A run's failed jobs can only be run again once the run has ended. While
+/// a rerun is what comes next, the wait for the checks still running is
+/// not cut short at the time a builder would otherwise be sent.
+#[test]
+fn failed_jobs_are_run_again_only_once_nothing_is_still_running() {
+    let world = World::new("ci-rerun-wait", "true");
+    // One check has failed and the other is still running, twice over;
+    // then both have failed; after the rerun everything passes.
+    world.with_github("failing failing red-both green");
+    rerun_ci(&world, 1);
+    // A builder would be sent at once, were no rerun to come.
+    let project = world.path("config/projects/toy.toml");
+    let text = std::fs::read_to_string(&project).unwrap();
+    std::fs::write(
+        &project,
+        text.replace(
+            "\nci_reruns = 1\n",
+            "\nci_reruns = 1\nci_red_wait_secs = 0\n",
+        ),
+    )
+    .unwrap();
+    let mut driver = Driver::start(world.config(), "toy", "toy-1", &OPTIONS).unwrap();
+    assert_eq!(driver.run().unwrap(), Status::Ended);
+    let reruns = events_named(&world, &driver, "ci.rerun");
+    assert_eq!(reruns.len(), 1, "{reruns:?}");
+    assert_eq!(reruns[0]["failed"], serde_json::json!(["fmt", "unit"]));
+    assert!(events_named(&world, &driver, "ci.rerun_refused").is_empty());
+    assert!(events_named(&world, &driver, "ci.red").is_empty());
+    assert_eq!(driver.unit().flakes.len(), 1);
+}
+
+/// GitHub refuses to run the jobs again: the failure goes where it always
+/// went, and the refusal is in the unit's record.
+#[test]
+fn a_rerun_github_refuses_leaves_the_failure_to_the_builder() {
+    let world = World::new("ci-rerun-refused", "true");
+    world.with_github("red green");
+    rerun_ci(&world, 2);
+    std::fs::write(world.path("bin/state-gh/no-rerun"), "").unwrap();
+    let mut driver = Driver::start(world.config(), "toy", "toy-1", &OPTIONS).unwrap();
+    assert_eq!(driver.run().unwrap(), Status::Ended);
+    let refused = events_named(&world, &driver, "ci.rerun_refused");
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert!(
+        refused[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("cannot be rerun"),
+        "{refused:?}"
+    );
+    assert!(events_named(&world, &driver, "ci.rerun").is_empty());
+    assert_eq!(events_named(&world, &driver, "ci.red").len(), 1);
+    assert!(driver.unit().flakes.is_empty());
+}
+
 /// A project command may be a tool the factory keeps for the project in its
 /// own config directory. It is run from there, people are shown the name
 /// the project gives it, and a builder it fails for is given the command as
@@ -1772,6 +2015,399 @@ fn a_goal_is_agreed_run_on_events_and_ended_by_the_owner() {
         .filter(|post| !post.contains(r#""thread_ts":"50.0""#))
         .count();
     assert_eq!(off_thread, 0);
+}
+
+/// A goal whose one sub-goal, `feature`, holds toy-1 and is shipped, on a
+/// project whose check on what is published refuses a `Changelog: none`
+/// trailer with no reason, in the sub-goal's worktree. Runs until the
+/// director has been woken for the ship's end, and returns the ship's log.
+fn ship_with_a_check_on_trailers(world: &World, ci: &str) -> String {
+    use factory_driver::goal::{Phase, Supervisor};
+    use factory_slack::socket::Incoming;
+    use std::time::{Duration, Instant};
+
+    world.with_github(ci);
+    let project = world.path("config/projects/toy.toml");
+    let text = std::fs::read_to_string(&project).unwrap();
+    assert!(text.contains("\nflow = "), "{text}");
+    std::fs::write(
+        &project,
+        format!(
+            "{}\n[commands.trailers]\nargv = [\"sh\", \"-c\", \"case $PWD in *feature*) if git log --format=%B origin/main..HEAD | grep -q '^Changelog: none$'; then echo 'a commit has a Changelog trailer with no reason'; exit 1; fi ;; esac\"]\ntimeout_secs = 30\n",
+            text.replacen("\nflow = ", "\npublish_checks = [\"trailers\"]\nflow = ", 1)
+        ),
+    )
+    .unwrap();
+    std::fs::create_dir_all(world.path("config/goals/toy")).unwrap();
+    std::fs::write(
+        world.path("config/goals/toy/main.toml"),
+        "id = \"main\"\nflow = \"zig-sdk-bead\"\nship_flow = \"zig-sdk-ship\"\n[director]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\n",
+    )
+    .unwrap();
+    let say = |role: &str, n: u32, extra: serde_json::Value| {
+        let mut result = serde_json::json!({
+            "summary": "Decided.", "start": [], "file": [], "edit": [], "dropped_findings": [],
+            "open_subgoal": {"id": "", "title": "", "objective": "", "beads": []}, "ship": false,
+            "ask_owner": "", "complete": false, "evidence": "", "journal_entry": "", "project_memory": ""
+        });
+        if role == "intake" {
+            result = serde_json::json!({});
+        }
+        for (key, value) in extra.as_object().unwrap() {
+            result[key] = value.clone();
+        }
+        std::fs::create_dir_all(world.path("bin/state")).unwrap();
+        std::fs::write(
+            world.path(&format!("bin/state/{role}-{n}.json")),
+            result.to_string(),
+        )
+        .unwrap();
+    };
+    say(
+        "intake",
+        1,
+        serde_json::json!({
+            "reply": "Here is the charter.", "ready": true, "objective": "Ship the feature.",
+            "stop_when": "It has landed.", "plan": "One sub-goal: toy-1.", "edits": []
+        }),
+    );
+    say(
+        "director",
+        1,
+        serde_json::json!({
+            "open_subgoal": {"id": "feature", "title": "The feature", "objective": "It works.", "beads": ["toy-1"]},
+            "start": [{"bead": "toy-1", "reason": "first"}]
+        }),
+    );
+    say("director", 2, serde_json::json!({"ship": true}));
+    say(
+        "director",
+        3,
+        serde_json::json!({"complete": true, "evidence": "It landed."}),
+    );
+
+    let mut sup = Supervisor::new(world.config(), None, vec!["OWNER".to_string()], false).unwrap();
+    let id = sup.open_directly("toy", "Ship the feature").unwrap();
+    sup.incoming(Incoming::Action {
+        channel: String::new(),
+        user: "OWNER".to_string(),
+        action_id: "goal_start".to_string(),
+        value: id,
+        message_ts: String::new(),
+    })
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(150);
+    while sup.goals().next().unwrap().wakes < 3 {
+        assert!(Instant::now() < deadline, "the ship never ended");
+        sup.pump(Duration::from_millis(200)).unwrap();
+    }
+    let goal = sup.goals().next().unwrap().clone();
+    let ship = goal
+        .units
+        .iter()
+        .find(|unit| unit.ship)
+        .and_then(|unit| unit.unit.clone())
+        .expect("the ship has a unit");
+    let log =
+        std::fs::read_to_string(world.path(&format!("state/units/{ship}/events.jsonl"))).unwrap();
+    assert_eq!(goal.subgoals[0].state, "landed", "{log}");
+    assert_eq!(goal.phase, Phase::ProposedComplete);
+    log
+}
+
+/// A log's step ends, as `step:outcome`, and its events of `kind`.
+fn log_ends(log: &str) -> Vec<String> {
+    log.lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|event| event["kind"] == "step.ended")
+        .map(|event| {
+            format!(
+                "{}:{}",
+                event["step"].as_str().unwrap(),
+                event["data"]["outcome"].as_str().unwrap()
+            )
+        })
+        .collect()
+}
+
+fn log_events(log: &str, kind: &str) -> Vec<serde_json::Value> {
+    log.lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|event| event["kind"] == kind)
+        .collect()
+}
+
+/// What landed on the default branch, message by message.
+fn landed_messages(world: &World) -> String {
+    run(
+        &world.path("remote.git"),
+        "git",
+        &["log", "--format=%B", "main"],
+    )
+}
+
+/// A sub-goal's commits are published as they are. A builder sent to mend
+/// a red CI on a ship commits its fix under a message the project's check
+/// on what is published refuses. That is found when its result is checked,
+/// while it is the builder's own commit and it is there to reword it: not
+/// at the publish step, where the ship used to stop for the owner to amend
+/// the commit by hand.
+#[test]
+fn a_ship_fix_whose_commit_the_publish_check_refuses_is_reworded_by_its_builder() {
+    let world = World::new("ship-commit", "true");
+    world.scenario("bare-fix-commit");
+    let log = ship_with_a_check_on_trailers(&world, "red green");
+    let ends = log_ends(&log);
+    assert!(ends.contains(&"ci:red".to_string()), "{ends:?}");
+    assert!(
+        !ends.contains(&"publish:failed".to_string()),
+        "the commit never reached the publish step as it was: {ends:?}"
+    );
+    let rejected = log_events(&log, "result.rejected");
+    assert_eq!(rejected.len(), 1, "{rejected:?}");
+    assert_eq!(rejected[0]["step"], "fix");
+    let problem = rejected[0]["data"]["problems"][0].as_str().unwrap();
+    for expected in [
+        "the project's check on what is published, `trailers`",
+        "a commit has a Changelog trailer with no reason",
+        "Put it right in the commits you made in this run",
+    ] {
+        assert!(
+            problem.contains(expected),
+            "missing {expected:?} in {problem}"
+        );
+    }
+    // The same builder, in the same session, reworded its commit.
+    let calls = world.calls();
+    let builders: Vec<&Vec<String>> = calls
+        .iter()
+        .filter(|call| call[0] == "builder" && call[2].contains("feature"))
+        .collect();
+    assert_eq!(builders.len(), 2, "{builders:?}");
+    assert_eq!(builders[0][1], builders[1][1]);
+    let landed = landed_messages(&world);
+    assert!(landed.contains("Changelog: none (reworded)"), "{landed}");
+    assert!(
+        !landed.lines().any(|line| line == "Changelog: none"),
+        "{landed}"
+    );
+}
+
+/// A ship whose branch already holds a commit the check refuses, however
+/// it came to: the publish step sends it to the builder, who rewords the
+/// commit, and not to the publisher, whose text changes no commit of a
+/// ship. Everything runs again and the sub-goal lands.
+#[test]
+fn a_ship_whose_commits_the_publish_check_refuses_goes_to_the_builder_and_lands() {
+    let world = World::new("ship-refused", "true");
+    world.scenario("bare-trailer");
+    let log = ship_with_a_check_on_trailers(&world, "green");
+    let ends: Vec<String> = log_ends(&log)
+        .into_iter()
+        .filter(|end| {
+            end.starts_with("publish:") || end.starts_with("fix:") || end.starts_with("describe:")
+        })
+        .collect();
+    assert_eq!(
+        ends,
+        [
+            "describe:ready",
+            "publish:failed",
+            "fix:done",
+            "describe:ready",
+            "publish:done"
+        ]
+    );
+    let calls = world.calls();
+    let fix = (0..calls.len())
+        .rfind(|&i| calls[i][0] == "builder")
+        .expect("no builder was sent");
+    let brief =
+        std::fs::read_to_string(world.path(&format!("bin/state/brief-{}.md", fix + 1))).unwrap();
+    for expected in [
+        "The commits of this branch are published as they are, and the project's publish check `trailers`",
+        "a commit has a Changelog trailer with no reason",
+        "do not ask the owner to do it",
+    ] {
+        assert!(
+            brief.contains(expected),
+            "missing {expected:?} in:\n{brief}"
+        );
+    }
+    let landed = landed_messages(&world);
+    assert!(landed.contains("Changelog: none (reworded)"), "{landed}");
+    assert!(
+        !landed.lines().any(|line| line == "Changelog: none"),
+        "{landed}"
+    );
+}
+
+/// What stopped the factory one night, with the owner out of it. CI fails
+/// on a pull request for a reason that is not the change's: code runs the
+/// failed jobs again and the pull request lands. The director is handed
+/// the flake as a finding and files the bug. Later it raises that bug's
+/// priority: the bead is the goal's own, so that is done at once, while a
+/// change to a bead the owner wrote is still put to the owner.
+#[test]
+fn a_flaky_ci_is_run_again_filed_as_a_bug_and_raised_with_nobody_asked() {
+    use factory_driver::goal::{Phase, Supervisor};
+    use factory_slack::socket::Incoming;
+    use std::time::{Duration, Instant};
+
+    let world = World::new("goal-flake", "true");
+    world.with_github("red green");
+    rerun_ci(&world, 1);
+    let fake = common::FakeSlack::start_with(true, &[("100.0", "BOT", "root")], None);
+    world.with_slack(&fake.url);
+    std::fs::create_dir_all(world.path("config/goals/toy")).unwrap();
+    std::fs::write(
+        world.path("config/goals/toy/main.toml"),
+        "id = \"main\"\nmax_pipelines = 1\n[director]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\n[permissions]\nfile_beads = \"allow\"\nedit_beads = \"own\"\n",
+    )
+    .unwrap();
+    let say = |role: &str, n: u32, json: serde_json::Value| {
+        std::fs::create_dir_all(world.path("bin/state")).unwrap();
+        std::fs::write(
+            world.path(&format!("bin/state/{role}-{n}.json")),
+            json.to_string(),
+        )
+        .unwrap();
+    };
+    let decide = |extra: serde_json::Value| {
+        let mut decision = serde_json::json!({
+            "summary": "Decided.", "start": [], "file": [], "edit": [], "dropped_findings": [],
+            "ask_owner": "", "complete": false, "evidence": "", "journal_entry": "",
+            "project_memory": ""
+        });
+        for (key, value) in extra.as_object().unwrap() {
+            decision[key] = value.clone();
+        }
+        decision
+    };
+    say(
+        "intake",
+        1,
+        serde_json::json!({
+            "reply": "Here is the charter.", "ready": true, "objective": "Ship the feature.",
+            "stop_when": "toy-1 has landed.", "plan": "toy-1.", "edits": []
+        }),
+    );
+    say(
+        "director",
+        1,
+        decide(serde_json::json!({"start": [{"bead": "toy-1", "reason": "first"}]})),
+    );
+    // Handed the flake, it files the bug, and wants a bead of the owner's
+    // changed as well.
+    say(
+        "director",
+        2,
+        decide(serde_json::json!({
+            "file": [{
+                "title": "The unit job fails now and then on a commit it passes on",
+                "type": "bug", "priority": 2,
+                "description": "CI's `unit` failed on toy-1's commit and passed when run again.",
+                "acceptance_criteria": "- the test passes 200 times in a row",
+                "parent": "", "discovered_from": "toy-1", "deferred": false
+            }],
+            "edit": [{"bead": "toy-2", "acceptance_criteria": "", "priority": 0,
+                      "defer": "unchanged", "reason": "it is urgent now"}]
+        })),
+    );
+
+    let supervisor = || {
+        Supervisor::new(
+            world.config(),
+            Some(factory_slack::Slack::with_base_url("xoxb-test", &fake.url)),
+            vec!["OWNER".to_string()],
+            false,
+        )
+        .unwrap()
+    };
+    let press = |action: &str, goal: &str| Incoming::Action {
+        channel: "C0TOY".to_string(),
+        user: "OWNER".to_string(),
+        action_id: action.to_string(),
+        value: goal.to_string(),
+        message_ts: "100.0".to_string(),
+    };
+    let bead = |id: &str| std::fs::read_to_string(world.path(&format!("beads/{id}.json"))).unwrap();
+    let mut sup = supervisor();
+    sup.incoming(Incoming::Message {
+        channel: "C0TOY".to_string(),
+        user: "OWNER".to_string(),
+        text: "Ship the feature".to_string(),
+        ts: "50.0".to_string(),
+        thread_ts: None,
+    })
+    .unwrap();
+    let id = sup.goals().next().unwrap().id.clone();
+    sup.incoming(press("goal_start", &id)).unwrap();
+    assert_eq!(sup.goals().next().unwrap().phase, Phase::Running);
+
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while sup.goals().next().unwrap().wakes < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "the pipeline never reported back"
+        );
+        sup.pump(Duration::from_millis(200)).unwrap();
+    }
+    // The pull request landed on jobs run again, and nobody was asked to.
+    assert!(bead("toy-1").contains("\"closed\""), "{}", bead("toy-1"));
+    assert_eq!(gh_calls(&world, "run rerun 55"), 1);
+    let calls = world.calls();
+    let woke = (0..calls.len())
+        .rfind(|&i| calls[i][0] == "director")
+        .unwrap();
+    let brief =
+        std::fs::read_to_string(world.path(&format!("bin/state/brief-{}.md", woke + 1))).unwrap();
+    for expected in [
+        "The pipeline for `toy-1` ended: **landed**",
+        "F1 (ci, flake): `CI: unit` failed on commit",
+        "A finding marked `flake` is a check that failed and then passed on the same commit.",
+        "Changing a bead that exists (criteria, priority, deferral) is carried out at once on a bead this goal filed",
+    ] {
+        assert!(
+            brief.contains(expected),
+            "missing {expected:?} in:\n{brief}"
+        );
+    }
+
+    // The bug is filed. The owner's bead waits for the owner.
+    let filed = std::fs::read_dir(world.path("beads"))
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .find(|name| name.starts_with("filed-"))
+        .expect("no bead was filed");
+    let filed = filed.trim_end_matches(".json").to_string();
+    assert!(bead(&filed).contains("\"priority\": 2"), "{}", bead(&filed));
+    let request = sup.goals().next().unwrap().request.clone().unwrap();
+    assert_eq!(request.edits.len(), 1);
+    assert_eq!(request.edits[0].bead, "toy-2");
+    assert!(!bead("toy-2").contains("\"priority\": 0"));
+    drop(sup);
+
+    // Woken again, by a service that has started since, it raises the bug
+    // it filed: carried out at once, with nothing put to the owner.
+    say(
+        "director",
+        3,
+        decide(serde_json::json!({
+            "edit": [{"bead": filed, "acceptance_criteria": "", "priority": 1,
+                      "defer": "unchanged", "reason": "it has stopped a pull request"}],
+            "complete": true, "evidence": "toy-1 landed."
+        })),
+    );
+    let mut sup = supervisor();
+    sup.incoming(press("request_approve", &id)).unwrap();
+    assert!(bead("toy-2").contains("\"priority\": 0"));
+    assert!(bead(&filed).contains("\"priority\": 1"), "{}", bead(&filed));
+    let goal = sup.goals().next().unwrap();
+    assert!(goal.request.is_none(), "{:?}", goal.request);
+    assert_eq!(goal.phase, Phase::ProposedComplete);
+    assert_eq!(goal.filed, [filed]);
 }
 
 #[test]
@@ -6361,6 +6997,23 @@ fn a_check_that_passes_when_run_again_is_a_flake_and_no_builder_is_sent() {
         .map(|data| data["text"].as_str().unwrap_or("").to_string())
         .collect();
     assert!(said.iter().any(|t| t.contains("a flake")), "{said:?}");
+    // The flake is left for whoever started the pipeline, as a finding.
+    let flakes = &driver.unit().flakes;
+    assert_eq!(flakes.len(), 1, "{flakes:?}");
+    assert_eq!(flakes[0].check, "test");
+    assert!(
+        flakes[0].signature.contains("connection reset"),
+        "{flakes:?}"
+    );
+    let findings = factory_driver::unit_findings(driver.unit());
+    assert!(
+        findings.iter().any(|finding| finding["severity"] == "flake"
+            && finding["title"]
+                .as_str()
+                .unwrap()
+                .contains("`test` failed on commit")),
+        "{findings:?}"
+    );
 }
 
 /// Output the project names as the host's fault parks the step: no fix

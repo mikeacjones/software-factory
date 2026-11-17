@@ -9,6 +9,9 @@
 #   state/branch-ci   how the one workflow run on a branch's tip ended, when
 #                     it did not pass: `failure`, `cancelled` and so on. A
 #                     second word is the only commit that holds for.
+#   state/reruns      how often a run's failed jobs were run again. Each
+#                     time, the jobs the checks point at are new ones.
+#   state/no-rerun    if it exists, running failed jobs again is refused
 #   state/calls       one line per call
 here=$(cd "$(dirname "$0")" && pwd)
 state="$here/state-gh"
@@ -70,7 +73,8 @@ case "$1 $2" in
     if [ "$(wc -l < "$state/ci")" -gt 1 ]; then
       tail -n +2 "$state/ci" > "$state/ci.next" && mv "$state/ci.next" "$state/ci"
     fi
-    run() { printf '{"__typename":"CheckRun","name":"%s","status":"%s","conclusion":"%s","detailsUrl":"https://github.com/me/toy/actions/runs/55/job/66"}' "$1" "$2" "$3"; }
+    job=$(( 66 + $(cat "$state/reruns" 2>/dev/null || echo 0) ))
+    run() { printf '{"__typename":"CheckRun","name":"%s","status":"%s","conclusion":"%s","detailsUrl":"https://github.com/me/toy/actions/runs/55/job/%s"}' "$1" "$2" "$3" "$job"; }
     case "$word" in
       pending) checks="$(run fmt COMPLETED SUCCESS),$(run unit IN_PROGRESS '')" ;;
       red) checks="$(run fmt COMPLETED SUCCESS),$(run unit COMPLETED FAILURE)" ;;
@@ -92,6 +96,14 @@ case "$1 $2" in
       if [ -z "$only" ] || [ "$only" = "$tip" ]; then conclusion=$word; fi
     fi
     printf '[{"workflowName":"ci","headSha":"%s","status":"completed","conclusion":"%s","url":"https://github.com/me/toy/actions/runs/55"}]\n' "$tip" "$conclusion" ;;
+  "run rerun")
+    # Only the failed jobs are ever run again, never a whole run.
+    case " $* " in
+      *" --failed "*) ;;
+      *) echo "fake gh: a run is only rerun with --failed: $*" >&2; exit 1 ;;
+    esac
+    if [ -f "$state/no-rerun" ]; then echo "run 55 cannot be rerun; its workflow file may be broken" >&2; exit 1; fi
+    echo $(( $(cat "$state/reruns" 2>/dev/null || echo 0) + 1 )) > "$state/reruns" ;;
   "run view")
     echo "unit	test	error: expected 4, found 5"
     echo "unit	test	1 test failed on linux" ;;

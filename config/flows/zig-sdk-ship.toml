@@ -108,7 +108,10 @@ id = "publish"
 kind = "action"
 action = "publish"
 on.done = "ci"
-on.failed = { to = "describe", max = 2 }
+# A check on what is published refused the branch's commits. They are
+# published as they are, so no text the publisher writes can change one:
+# the builder puts the commit right, and everything runs again on it.
+on.failed = { to = "fix", max = 2 }
 # Nothing is pushed while a file still holds a marker from the merge above.
 on.conflict = { to = "fix", max = 2 }
 

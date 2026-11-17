@@ -69,5 +69,8 @@ timeout_secs = 2700
 # New beads, with their type, priority and deferral, are the director's call.
 file_beads = "allow"
 # Changing a bead that exists (its acceptance criteria, its priority, deferring
-# it) is put to the owner. Set to "allow" to let the director decide alone.
-edit_beads = "ask"
+# it): the director decides alone for a bead this goal's own agents filed,
+# such as the bug behind a test that fails now and then, whose priority has
+# to follow what it turns out to cost. A bead the owner wrote is put to the
+# owner. "ask" puts every change to the owner, "allow" none.
+edit_beads = "own"

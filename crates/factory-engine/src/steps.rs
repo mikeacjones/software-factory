@@ -8,8 +8,8 @@
 //! had done is not done again.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use factory_driver::goal::{Event, RunningPipeline, Turned};
@@ -370,10 +370,171 @@ impl Drop for SetOnDrop {
 /// learns it.
 pub type Started = Arc<dyn Fn(&str) + Send + Sync>;
 
+/// How long the result of a step that has ended is kept for an attempt of
+/// the same activity that comes for it late.
+const FLIGHT_KEPT_SECS: u64 = 3600;
+
+/// A step's run as this worker has it: still going, or ended with what it
+/// came to.
+#[derive(Clone)]
+pub struct Flight {
+    /// `None` while the run goes on.
+    done: tokio::sync::watch::Receiver<Option<(Result<StepDone, String>, Instant)>>,
+    /// The session an agent run has said it is. Empty until it has.
+    session: tokio::sync::watch::Receiver<String>,
+}
+
+/// The step runs this worker is in the middle of, by the activity each is
+/// the work of.
+///
+/// A step's work runs on a thread of its own and cannot be called back.
+/// When the server stops hearing from an attempt (the network was down
+/// for a minute, say), it gives the same activity out again, and it may
+/// well come to this same worker while the first attempt's run is still
+/// going. Started afresh, the unit would have two runs at once: two
+/// agents in one session and one worktree, each writing the unit's
+/// record. So an attempt that finds its activity's run here joins it,
+/// and is given what that run comes to. A run that has ended with an
+/// outcome is kept a while for the same reason: the attempt it ended
+/// under may be one the server had already given up on. One that failed
+/// is not kept: the attempt after it is there to do the step again.
+pub struct Flights {
+    running: Mutex<HashMap<String, Flight>>,
+    kept: Duration,
+}
+
+impl Default for Flights {
+    fn default() -> Self {
+        Flights::kept_for(Duration::from_secs(FLIGHT_KEPT_SECS))
+    }
+}
+
+impl Flights {
+    /// Flights whose ended runs are kept for `kept`.
+    pub fn kept_for(kept: Duration) -> Flights {
+        Flights {
+            running: Mutex::new(HashMap::new()),
+            kept,
+        }
+    }
+
+    /// What every attempt of one activity shares, and nothing else does: a
+    /// step that is run again later, in another round or after a usage
+    /// limit, is another activity.
+    pub fn key(workflow: Option<&str>, run: Option<&str>, activity: &str) -> String {
+        format!(
+            "{}/{}/{activity}",
+            workflow.unwrap_or(""),
+            run.unwrap_or("")
+        )
+    }
+
+    /// The run of `key`, joined if this worker has it and started with
+    /// `work` if not. `work` is handed how to say which session it is.
+    /// True when the run was there already.
+    pub fn join_or_start(
+        &self,
+        key: String,
+        work: impl FnOnce(Started) -> Result<StepDone, String> + Send + 'static,
+    ) -> (Flight, bool) {
+        let mut running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
+        let kept = self.kept;
+        running.retain(|_, flight| {
+            flight
+                .done
+                .borrow()
+                .as_ref()
+                .is_none_or(|(_, ended)| ended.elapsed() < kept)
+        });
+        // A run that failed is not an answer to keep: the server gives a
+        // failed activity out again so that it is done again.
+        let failed = |flight: &Flight| matches!(&*flight.done.borrow(), Some((Err(_), _)));
+        if let Some(flight) = running.get(&key).filter(|flight| !failed(flight)) {
+            return (flight.clone(), true);
+        }
+        let (landed, done) = tokio::sync::watch::channel(None);
+        let (said, session) = tokio::sync::watch::channel(String::new());
+        let started: Started = Arc::new(move |id: &str| {
+            said.send_replace(id.to_string());
+        });
+        tokio::spawn(async move {
+            let result = match tokio::task::spawn_blocking(move || work(started)).await {
+                Ok(result) => result,
+                Err(join) => Err(format!("the step's run was lost: {join}")),
+            };
+            // The flight kept in `running` holds a receiver, so this is
+            // there for whoever comes for it.
+            landed.send_replace(Some((result, Instant::now())));
+        });
+        let flight = Flight { done, session };
+        running.insert(key, flight.clone());
+        (flight, false)
+    }
+}
+
+/// What an attempt waiting on a flight does next.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Wait {
+    /// The run has ended, with this.
+    Landed(Result<StepDone, String>),
+    /// Say that the run is alive, and which session it is.
+    Beat(String),
+}
+
+impl Flight {
+    /// Wait for the next thing an attempt has to do for the run: hand on
+    /// what it came to, or say it is alive. `session` is the session the
+    /// run was last known to be, and is kept up to date.
+    ///
+    /// The first heartbeat an activity sends goes to the server at once,
+    /// and the ones after it are held back for a while. So the first one
+    /// must be the one that carries the session: a beat is due as soon as
+    /// the run has said which session it is, and then at every tick.
+    pub async fn wait(&mut self, tick: &mut tokio::time::Interval, session: &mut String) -> Wait {
+        loop {
+            if let Some((result, _)) = self.done.borrow_and_update().clone() {
+                let known = self.session.borrow().clone();
+                if !known.is_empty() {
+                    *session = known;
+                }
+                return Wait::Landed(result.map(|mut done| {
+                    done.session = done
+                        .session
+                        .or_else(|| Some(session.clone()).filter(|id| !id.is_empty()));
+                    done
+                }));
+            }
+            let known = self.session.borrow_and_update().clone();
+            if !known.is_empty() && known != *session {
+                *session = known;
+                return Wait::Beat(session.clone());
+            }
+            tokio::select! {
+                changed = self.done.changed() => {
+                    if changed.is_err() && self.done.borrow().is_none() {
+                        return Wait::Landed(Err("the step's run was lost".to_string()));
+                    }
+                }
+                // Once the run has ended it says no more, and the result
+                // is what comes next.
+                Ok(()) = self.session.changed() => {}
+                _ = tick.tick() => return Wait::Beat(session.clone()),
+            }
+        }
+    }
+}
+
+/// The ticks between an attempt's heartbeats: the first one a whole beat
+/// from now, since the first heartbeat is the session's to send.
+fn beats(every: Duration) -> tokio::time::Interval {
+    tokio::time::interval_at(tokio::time::Instant::now() + every, every)
+}
+
 /// The activities of a worker, over whatever does the work.
 pub struct Steps {
     runner: Arc<dyn StepRunner>,
     gate: Arc<Gate>,
+    flights: Flights,
 }
 
 impl Steps {
@@ -384,7 +545,35 @@ impl Steps {
     /// The activities of a worker that can be stopped at a safe point:
     /// `gate` is how it knows what is in flight.
     pub fn with_gate(runner: Arc<dyn StepRunner>, gate: Arc<Gate>) -> Steps {
-        Steps { runner, gate }
+        Steps {
+            runner,
+            gate,
+            flights: Flights::default(),
+        }
+    }
+
+    /// The run of the step an activity is an attempt of: the one this
+    /// worker already has, or a new one.
+    fn flight(
+        &self,
+        ctx: &ActivityContext,
+        call: &StepCall,
+        work: impl FnOnce(Started) -> Result<StepDone, String> + Send + 'static,
+    ) -> Flight {
+        let info = ctx.info();
+        let key = Flights::key(
+            info.workflow_id.as_deref(),
+            info.workflow_run_id.as_deref(),
+            &info.activity_id,
+        );
+        let (flight, joined) = self.flights.join_or_start(key, work);
+        if joined {
+            eprintln!(
+                "factory-engine: attempt {} of step `{}` of unit `{}` joins the run this worker already has of it",
+                info.attempt, call.step, call.unit
+            );
+        }
+        flight
     }
 
     /// Tell a project of one of its pipelines, unless it was told the
@@ -433,45 +622,21 @@ impl Steps {
             .deserialize::<String>()?
             .filter(|id| !id.is_empty())
             .or_else(|| call.session.clone());
-        let (said, mut heard) = tokio::sync::mpsc::unbounded_channel::<String>();
         let runner = self.runner.clone();
         let (work_call, resume) = (call.clone(), cut_off.clone());
-        let mut work = tokio::task::spawn_blocking(move || {
-            let started: Started = Arc::new(move |id: &str| {
-                let _ = said.send(id.to_string());
-            });
+        // An attempt whose run this worker still has joins it: the server
+        // gives an activity out again when it has not heard from it, and
+        // the run it has not heard from may be alive and well right here.
+        let flight = self.flight(&ctx, &call, move |started| {
             runner.agent(&work_call, resume, started)
         });
+        let mut flight = flight;
         let mut session = cut_off.unwrap_or_default();
-        // The first heartbeat an activity sends goes to the server at once,
-        // and the ones after it are held back for a while. So the first one
-        // must be the one that carries the session: nothing is sent before
-        // the run has said which session it is, or before the first beat is due.
-        let every = Duration::from_secs(call.beat_secs.max(1));
-        let mut beat = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+        let mut tick = beats(Duration::from_secs(call.beat_secs.max(1)));
         loop {
-            tokio::select! {
-                done = &mut work => {
-                    // A session reported just as the run ended.
-                    while let Ok(id) = heard.try_recv() {
-                        session = id;
-                    }
-                    return match done {
-                        Ok(Ok(mut done)) => {
-                            done.session = Some(session).filter(|id| !id.is_empty());
-                            Ok(done)
-                        }
-                        Ok(Err(reason)) => Err(failed(reason)),
-                        Err(join) => Err(failed(format!("the step's run was lost: {join}"))),
-                    };
-                }
-                Some(id) = heard.recv() => {
-                    session = id;
-                    ctx.record_heartbeat(session.clone()).await?;
-                }
-                _ = beat.tick() => {
-                    ctx.record_heartbeat(session.clone()).await?;
-                }
+            match flight.wait(&mut tick, &mut session).await {
+                Wait::Landed(done) => return done.map_err(failed),
+                Wait::Beat(id) => ctx.record_heartbeat(id).await?,
             }
         }
     }
@@ -487,20 +652,16 @@ impl Steps {
         let _busy = self.gate.enter();
         let runner = self.runner.clone();
         let every = Duration::from_secs(call.beat_secs.max(1));
-        let mut work = tokio::task::spawn_blocking(move || runner.plain(&call));
-        let mut beat = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+        let work_call = call.clone();
+        // As for an agent step: a second attempt joins the run in flight,
+        // so no command or watch of CI runs twice on one worktree.
+        let mut flight = self.flight(&ctx, &call, move |_started| runner.plain(&work_call));
+        let mut tick = beats(every);
+        let mut session = String::new();
         loop {
-            tokio::select! {
-                done = &mut work => {
-                    return match done {
-                        Ok(Ok(done)) => Ok(done),
-                        Ok(Err(reason)) => Err(failed(reason)),
-                        Err(join) => Err(failed(format!("the step's run was lost: {join}"))),
-                    };
-                }
-                _ = beat.tick() => {
-                    ctx.record_heartbeat(String::new()).await?;
-                }
+            match flight.wait(&mut tick, &mut session).await {
+                Wait::Landed(done) => return done.map_err(failed),
+                Wait::Beat(_) => ctx.record_heartbeat(String::new()).await?,
             }
         }
     }
@@ -1053,6 +1214,153 @@ impl StepRunner for ExecRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The network drops, the server stops hearing from a step and gives
+    /// the same activity out again, to the worker that is still running it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_second_attempt_of_an_activity_joins_the_run_in_flight_and_nothing_runs_twice() {
+        let flights = Arc::new(Flights::kept_for(Duration::from_secs(60)));
+        let runs = Arc::new(AtomicUsize::new(0));
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let key = Flights::key(Some("pipeline-g1-toy-1"), Some("run-1"), "7");
+
+        let counted = runs.clone();
+        let (first, joined) = flights.join_or_start(key.clone(), move |started| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            started("session-1");
+            wait.recv().map_err(|err| err.to_string())?;
+            Ok(StepDone {
+                outcome: "done".to_string(),
+                ..StepDone::default()
+            })
+        });
+        assert!(!joined);
+
+        // The second attempt, while the first one's run is still going.
+        let counted = runs.clone();
+        let (second, joined) = flights.join_or_start(key.clone(), move |_started| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Err("a second run was started".to_string())
+        });
+        assert!(joined, "the attempt must join the run this worker has");
+
+        // Both wait on the one run, and each says the run's session in the
+        // first heartbeat it sends.
+        let land = |mut flight: Flight, resumed: &str| {
+            let mut session = resumed.to_string();
+            tokio::spawn(async move {
+                let mut tick = beats(Duration::from_secs(600));
+                let mut said = Vec::new();
+                loop {
+                    match flight.wait(&mut tick, &mut session).await {
+                        Wait::Landed(done) => return (done, said),
+                        Wait::Beat(id) => said.push(id),
+                    }
+                }
+            })
+        };
+        // The second attempt was handed the session by the server, from the
+        // first one's last heartbeat; the first learns it from the run.
+        let (first, second) = (land(first, ""), land(second, "session-1"));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        release.send(()).unwrap();
+        let expected = StepDone {
+            outcome: "done".to_string(),
+            session: Some("session-1".to_string()),
+            ..StepDone::default()
+        };
+        let (done, said) = first.await.unwrap();
+        assert_eq!(done, Ok(expected.clone()));
+        assert_eq!(said, ["session-1"], "the session is the first thing said");
+        let (done, said) = second.await.unwrap();
+        assert_eq!(done, Ok(expected.clone()));
+        assert!(said.is_empty(), "it knew the session and has no news of it");
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "the step ran once");
+
+        // An attempt that comes after the run ended, because the one it
+        // ended under had been given up on, is handed what it came to.
+        let counted = runs.clone();
+        let (late, joined) = flights.join_or_start(key, move |_started| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Err("a second run was started".to_string())
+        });
+        assert!(joined);
+        assert_eq!(land(late, "").await.unwrap().0, Ok(expected));
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+
+        // The same step run again later is another activity, and runs.
+        let counted = runs.clone();
+        let again = Flights::key(Some("pipeline-g1-toy-1"), Some("run-1"), "12");
+        let (next, joined) = flights.join_or_start(again, move |_started| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Ok(StepDone {
+                limited_secs: Some(60),
+                ..StepDone::default()
+            })
+        });
+        assert!(!joined);
+        let done = land(next, "").await.unwrap().0;
+        assert_eq!(done.unwrap().limited_secs, Some(60));
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+    }
+
+    /// A run that failed is done again by the attempt that follows it, as
+    /// the server means it to be: only a run still going, or one that came
+    /// to an outcome, is joined.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_run_that_failed_is_done_again_by_the_next_attempt() {
+        let flights = Flights::kept_for(Duration::from_secs(60));
+        let runs = Arc::new(AtomicUsize::new(0));
+        let run = |flights: &Flights| {
+            let counted = runs.clone();
+            flights.join_or_start("w/r/1".to_string(), move |_started| {
+                if counted.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err("the unit's record could not be read".to_string())
+                } else {
+                    Ok(StepDone {
+                        outcome: "pass".to_string(),
+                        ..StepDone::default()
+                    })
+                }
+            })
+        };
+        let mut tick = beats(Duration::from_secs(600));
+        let (mut first, _) = run(&flights);
+        assert_eq!(
+            first.wait(&mut tick, &mut String::new()).await,
+            Wait::Landed(Err("the unit's record could not be read".to_string()))
+        );
+        let (mut second, joined) = run(&flights);
+        assert!(!joined, "a failure is not handed to the attempt after it");
+        let Wait::Landed(Ok(done)) = second.wait(&mut tick, &mut String::new()).await else {
+            panic!("the second attempt did not run the step");
+        };
+        assert_eq!(done.outcome, "pass");
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+    }
+
+    /// What ended is not kept for ever: a result nobody came for goes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_run_that_ended_is_kept_only_for_a_while() {
+        let flights = Flights::kept_for(Duration::from_millis(20));
+        let runs = Arc::new(AtomicUsize::new(0));
+        let run = |flights: &Flights| {
+            let counted = runs.clone();
+            flights.join_or_start("w/r/1".to_string(), move |_started| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                Ok(StepDone::default())
+            })
+        };
+        let (mut first, _) = run(&flights);
+        let mut tick = beats(Duration::from_secs(600));
+        let landed = first.wait(&mut tick, &mut String::new()).await;
+        assert_eq!(landed, Wait::Landed(Ok(StepDone::default())));
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let (mut second, joined) = run(&flights);
+        assert!(!joined, "a result that old is no longer anyone's");
+        second.wait(&mut tick, &mut String::new()).await;
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+    }
 
     fn ended(word: &str, rest: &str) -> Event {
         Event::Ended {

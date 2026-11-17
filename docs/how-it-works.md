@@ -182,10 +182,12 @@ flowchart TD
     fix["fix · agent · builder<br/>fresh session on the sub-goal's branch"] -->|"done, up to 6 times"| checks
     describe["describe · agent · publisher<br/>the commit message and the pull-request text"] -->|"ready"| publish
     publish["publish · action<br/>push, open one pull request"] -->|"done"| ci
-    publish -->|"failed, up to 2 times"| describe
+    publish -->|"a check refuses the branch's commits, up to 2 times:<br/>the builder rewords the commit"| fix
     publish -->|"conflict, up to 2 times"| fix
     ci["ci · action<br/>poll the required checks, no model"] -->|"green"| land
-    ci -->|"red, up to 2 times, with every failure and its log"| fix
+    ci -->|"red: code runs the failed jobs again<br/>on the same commit, up to ci_reruns times"| ci
+    ci -->|"still red, up to 2 times, with every failure and its log"| fix
+    fix -->|"already_done: the failure is not the branch's, up to 2 times"| sync
     land["land · action<br/>squash and merge, confirm the commit is on the default branch"] -->|"done"| landed(["Landed: code closes every bead of the sub-goal and removes the worktree"])
     land -->|"failed"| park(["Park"])
 ```
@@ -311,6 +313,8 @@ sequenceDiagram
     Sup->>Slack: goal complete, in the thread
     Note over Sup: From the next bead on, builders are not told of the class.<br/>If it breaks a bead again, they are, and a run is called.
 ```
+
+Jobs that pass when run again were a flake. No builder is sent, the pull request lands, and the flake goes to the director or foreman as a finding when the pipeline ends, to be filed as a bug or added to the bead that covers it. A fix that comes back `already_done` reaches `ci` again with the commit unchanged, and the failed jobs are run once more. Nobody is asked to run CI again. Before a fix is accepted on this branch, code runs the project's publish checks on it, so a commit the builder made with a message they refuse is reworded by that builder, in the same session.
 
 ## Where each diagram comes from
 

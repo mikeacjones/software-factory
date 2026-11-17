@@ -417,19 +417,26 @@ impl GitHub {
 
     /// The failing part of a check's log, if GitHub will give it.
     pub fn failed_log(&self, cwd: &Path, repo: &str, check: &Check) -> Option<String> {
-        // .../actions/runs/<run>/job/<job>
-        let url = check.url.as_deref()?;
-        let run = url.split("/actions/runs/").nth(1)?.split('/').next()?;
-        if run.is_empty() || !run.chars().all(|c| c.is_ascii_digit()) {
-            return None;
-        }
+        let run = workflow_run(check)?;
         self.gh(
             cwd,
-            &["run", "view", run, "--repo", repo, "--log-failed"],
+            &["run", "view", &run, "--repo", repo, "--log-failed"],
             None,
         )
         .ok()
         .filter(|log| !log.trim().is_empty())
+    }
+
+    /// Have a workflow run's failed jobs run again on the same commit. The
+    /// jobs that passed are left as they are.
+    pub fn rerun_failed(&self, cwd: &Path, repo: &str, run: &str) -> Result<(), GitHubError> {
+        self.check_allowed(repo)?;
+        self.gh(
+            cwd,
+            &["run", "rerun", run, "--repo", repo, "--failed"],
+            None,
+        )
+        .map(|_| ())
     }
 
     /// Merge a pull request, but only if its head is still `head`: nothing
@@ -753,6 +760,58 @@ pub struct PullRequestStatus {
     pub mergeable: String,
     pub merge_commit: Option<String>,
     pub checks: Vec<Check>,
+}
+
+/// The workflow run a check is a job of, from its URL
+/// (`.../actions/runs/<run>/job/<job>`). A commit status, or a check that
+/// some other service made, has none.
+pub fn workflow_run(check: &Check) -> Option<String> {
+    let url = check.url.as_deref()?;
+    let run = url.split("/actions/runs/").nth(1)?.split('/').next()?;
+    (!run.is_empty() && run.chars().all(|c| c.is_ascii_digit())).then(|| run.to_string())
+}
+
+/// The workflow runs to run again for a red verdict: each run that holds a
+/// failed check, once. `None` when a failed check is no job of a workflow
+/// run, since running the others again could not turn the verdict green.
+pub fn runs_to_rerun(failed: &[Check]) -> Option<Vec<String>> {
+    let mut runs: Vec<String> = Vec::new();
+    for check in failed {
+        let run = workflow_run(check)?;
+        if !runs.contains(&run) {
+            runs.push(run);
+        }
+    }
+    (!runs.is_empty()).then_some(runs)
+}
+
+/// The checks as they stand once failed jobs have been asked to run again:
+/// a failed check that is still the run that was replaced, known by its
+/// URL, is waited for like one that is running. GitHub takes a moment to
+/// show the new job, and until it does the old failure is not news. Once
+/// the new job of the same name is there, the old one says nothing more,
+/// whether or not GitHub goes on listing it.
+pub fn without_replaced(checks: &[Check], replaced: &[String]) -> Vec<Check> {
+    let old = |check: &Check| {
+        check.state == CheckState::Failed
+            && check.url.as_ref().is_some_and(|url| replaced.contains(url))
+    };
+    checks
+        .iter()
+        .filter(|check| {
+            !(old(check)
+                && checks
+                    .iter()
+                    .any(|other| other.name == check.name && !old(other)))
+        })
+        .cloned()
+        .map(|mut check| {
+            if old(&check) {
+                check.state = CheckState::Pending;
+            }
+            check
+        })
+        .collect()
 }
 
 /// Read one entry of GitHub's check rollup: a check run or a commit status.
@@ -1255,6 +1314,84 @@ mod tests {
     }
 
     #[test]
+    fn failed_jobs_are_run_again_by_their_workflow_run_and_the_old_failure_is_not_news() {
+        let job = |name: &str, state: CheckState, url: &str| Check {
+            name: name.to_string(),
+            state,
+            url: Some(url.to_string()),
+        };
+        let base = "https://github.com/me/toy/actions/runs";
+        let failed = [
+            job(
+                "unit (macos)",
+                CheckState::Failed,
+                &format!("{base}/55/job/66"),
+            ),
+            job(
+                "unit (linux)",
+                CheckState::Failed,
+                &format!("{base}/55/job/67"),
+            ),
+            job("docs", CheckState::Failed, &format!("{base}/56/job/70")),
+        ];
+        // Each run once, however many of its jobs failed.
+        assert_eq!(
+            runs_to_rerun(&failed),
+            Some(vec!["55".to_string(), "56".to_string()])
+        );
+        // A failure that is no job of a workflow run cannot be run again,
+        // so nothing is.
+        let mut with_status = failed.to_vec();
+        with_status.push(job("coverage", CheckState::Failed, "https://ci.example/7"));
+        assert_eq!(runs_to_rerun(&with_status), None);
+        assert_eq!(runs_to_rerun(&[]), None);
+
+        // Until GitHub shows the new job, the replaced failure is waited for.
+        let replaced = vec![format!("{base}/55/job/66")];
+        let seen = [
+            job(
+                "unit (macos)",
+                CheckState::Failed,
+                &format!("{base}/55/job/66"),
+            ),
+            job("fmt", CheckState::Passed, &format!("{base}/55/job/60")),
+        ];
+        let required = vec!["fmt".to_string(), "unit (macos)".to_string()];
+        assert!(matches!(
+            ci_verdict(&without_replaced(&seen, &replaced), &required),
+            CiVerdict::Pending { .. }
+        ));
+        // A new job listed beside the one it replaced is the answer, and
+        // the old failure is no longer waited for.
+        let both = [
+            seen[0].clone(),
+            job(
+                "unit (macos)",
+                CheckState::Passed,
+                &format!("{base}/55/job/99"),
+            ),
+            seen[1].clone(),
+        ];
+        assert!(matches!(
+            ci_verdict(&without_replaced(&both, &replaced), &required),
+            CiVerdict::Green { .. }
+        ));
+        // The new job has another URL: its failure is the run's answer.
+        let again = [
+            job(
+                "unit (macos)",
+                CheckState::Failed,
+                &format!("{base}/55/job/99"),
+            ),
+            job("fmt", CheckState::Passed, &format!("{base}/55/job/60")),
+        ];
+        assert!(matches!(
+            ci_verdict(&without_replaced(&again, &replaced), &required),
+            CiVerdict::Red { .. }
+        ));
+    }
+
+    #[test]
     fn one_failed_check_is_red_at_once_whatever_else_is_pending() {
         let checks = [
             check("fmt", CheckState::Passed),
@@ -1398,6 +1535,9 @@ mod tests {
             "b",
         );
         assert!(matches!(result, Err(GitHubError::NotAllowed(repo)) if repo == "someone/else"));
+        // Running jobs again is a write too.
+        let rerun = github.rerun_failed(&std::env::temp_dir(), "someone/else", "55");
+        assert!(matches!(rerun, Err(GitHubError::NotAllowed(repo)) if repo == "someone/else"));
     }
 
     /// A stand-in `gh` that keeps pull requests in a file.

@@ -126,6 +126,10 @@ The proof of a milestone: a manifest of checks, each a command with a tier, a ti
 
 The kind of mistake a tester's finding is, as a short key such as `error-path-cleanup`. Every critical or major finding has one. They are counted across a project's units, and the most frequent are told to the next builder. A class that has broken enough beads since a scheduled run last looked calls one at once. A bead may name the class its check closes: once that bead has landed, builders are no longer told of the class, unless it breaks a bead again.
 
+## flake
+
+A check that failed and then passed on the same commit: a command of the project run again by *triage*, or the failed jobs of a pull request's CI run again by code. The change did not cause it, so no builder is sent. It is kept in the unit's record and handed, as a *finding* marked `flake`, to whoever started the pipeline, who files it or adds it to the bead that covers it.
+
 ## test proof
 
 A command step that runs each test a change adds or alters on the code as it was at the unit's base. A test that fails there tests the change; one that passes there goes back to the builder; one that cannot be compiled or reached there is reported as not proved.

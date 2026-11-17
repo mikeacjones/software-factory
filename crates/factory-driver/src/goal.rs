@@ -382,6 +382,11 @@ pub struct Goal {
     /// agent and no Accept, when every one of its beads is closed.
     #[serde(default)]
     pub maintenance: Option<Maintained>,
+    /// The beads this goal's own agents filed, read from its log each time
+    /// its director is woken. Where the goal's definition says the director
+    /// may change its own beads, these are the ones.
+    #[serde(default)]
+    pub filed: Vec<String>,
 }
 
 /// What a goal opened for a maintenance run is there to build.
@@ -466,6 +471,28 @@ struct Seat {
 }
 
 impl Goal {
+    /// Whether a bead is the factory's own within this goal: one its
+    /// agents filed, or one a maintenance run filed for it to build. The
+    /// owner wrote neither, so a definition may let the director change
+    /// them without asking.
+    pub fn owns(&self, bead: &str) -> bool {
+        self.filed.iter().any(|filed| filed == bead)
+            || self
+                .maintenance
+                .as_ref()
+                .is_some_and(|maintained| maintained.beads.iter().any(|built| built == bead))
+    }
+
+    /// Whether changes to beads have to be put to the owner before they
+    /// are made, under a definition's permissions.
+    fn must_ask(&self, permission: Permission, edits: &[BeadEdit]) -> bool {
+        match permission {
+            Permission::Allow => false,
+            Permission::Ask => !edits.is_empty(),
+            Permission::Own => edits.iter().any(|edit| !self.owns(&edit.bead)),
+        }
+    }
+
     /// Whether the goal is over: complete, or stopped.
     pub fn ended(&self) -> bool {
         matches!(self.phase, Phase::Complete | Phase::Stopped)
@@ -547,20 +574,7 @@ fn engine_ended(
         outcome: outcome.to_string(),
         detail,
         pull_request: unit.and_then(|unit| unit.pull_request.clone()),
-        findings: unit
-            .map(|unit| {
-                unit.results
-                    .iter()
-                    .flat_map(|(step, result)| {
-                        items(result, "findings").iter().map(move |finding| {
-                            let mut finding = finding.clone();
-                            finding["step"] = json!(step);
-                            finding
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default(),
+        findings: unit.map(crate::unit_findings).unwrap_or_default(),
         commit: unit.and_then(|unit| unit.absorbed.clone()),
         ship,
         strayed: unit.map(|unit| unit.strayed.clone()).unwrap_or_default(),
@@ -1000,6 +1014,32 @@ fn edits_of(value: &Value, key: &str) -> Vec<BeadEdit> {
         .collect()
 }
 
+/// The beads a goal's agents have filed, from the goal's own log.
+fn filed_in(dir: &Path) -> Vec<String> {
+    let mut filed: Vec<String> = Vec::new();
+    let text = std::fs::read_to_string(dir.join("events.jsonl")).unwrap_or_default();
+    for line in text.lines() {
+        // Most lines are something else: only those that say so are read.
+        if !line.contains("\"bead.filed\"") {
+            continue;
+        }
+        let Ok(event) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let bead = event
+            .pointer("/data/bead")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if strings(&event, "kind") == "bead.filed"
+            && !bead.is_empty()
+            && !filed.iter().any(|known| known == bead)
+        {
+            filed.push(bead.to_string());
+        }
+    }
+    filed
+}
+
 fn edit_problems(edits: &[BeadEdit], tracker: &[Summary]) -> Vec<String> {
     let mut problems = Vec::new();
     for edit in edits {
@@ -1168,6 +1208,18 @@ pub fn measures(state_dir: &Path, project: &str, from: u64) -> Measures {
                         out.flaky.push((run.0, run.1, unit.clone()));
                     }
                 }
+                "ci.flaky" => out.flaky.push((
+                    format!(
+                        "CI ({})",
+                        items(&data, "failed")
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    strings(&data, "commit").to_string(),
+                    unit.clone(),
+                )),
                 "step.ended" if step == "ci" && strings(&data, "outcome") == "red" => {
                     if !out.red.contains(&unit) {
                         out.red.push(unit.clone());
@@ -2263,8 +2315,7 @@ pub fn decision_problems(
     }
     // A goal must never be left with nothing that can move it.
     let asks_owner = !strings(result, "ask_owner").trim().is_empty();
-    let needs_approval = (definition.permissions.edit_beads == Permission::Ask
-        && !edits.is_empty())
+    let needs_approval = goal.must_ask(definition.permissions.edit_beads, &edits)
         || (definition.permissions.file_beads == Permission::Ask
             && !items(result, "file").is_empty());
     if in_flight == 0 && !asks_owner && !complete && !needs_approval {
@@ -2955,6 +3006,9 @@ fn permission_text(definition: &GoalDefinition) -> String {
     let say = |permission: Permission| match permission {
         Permission::Allow => "is carried out at once",
         Permission::Ask => "is put to the owner, who approves or rejects it",
+        Permission::Own => {
+            "is carried out at once on a bead this goal filed, and put to the owner, who approves or rejects it, on any other"
+        }
     };
     if definition.foreman.is_some() {
         let slots = definition.director.slots;
@@ -3057,6 +3111,12 @@ fn told(inbox: &[Happening]) -> String {
                 }
                 if !findings.is_empty() {
                     out.push_str("  Findings its tester and reviewer left unfixed. Decide for each: file a bead (with the right type and priority, deferred if it can wait) or drop it.\n");
+                }
+                if findings
+                    .iter()
+                    .any(|finding| strings(finding, "severity") == "flake")
+                {
+                    out.push_str("  A finding marked `flake` is a check that failed and then passed on the same commit. No builder was sent, since the change did not cause it, but it will fail someone else's pipeline next. It is this goal's to get fixed at its cause, not worked around, with nobody asked: see \"Checks that fail for a reason that is not the change's\" in your instructions.\n");
                 }
                 for finding in findings {
                     label += 1;
@@ -3383,7 +3443,7 @@ pub fn foreman_brief(
             String::new()
         },
         match definition.permissions.file_beads {
-            Permission::Allow =>
+            Permission::Allow | Permission::Own =>
                 "carried out at once. One filed with `run_here` joins this sub-goal, and you are woken again to start it.",
             Permission::Ask =>
                 "not yours on this goal. Describe it in `message` and escalate.",
@@ -4380,6 +4440,7 @@ impl Supervisor {
             queued_at: None,
             handoff,
             maintenance: None,
+            filed: Vec::new(),
         };
         let id = goal.id.clone();
         self.save(goal.clone())?;
@@ -5999,6 +6060,9 @@ impl Supervisor {
         let memory = std::fs::read_to_string(self.memory_path(&goal.project)).unwrap_or_default();
         self.run_stop_check(&mut goal, &definition, &project);
         goal.default_red = self.default_red(&definition, &project);
+        // The log is the record of what this goal's agents filed, also for
+        // a goal that began before its record kept them.
+        goal.filed = filed_in(&self.dir(id));
         let brief = wake_brief(&definition, &goal, &tracker, &journal, &memory);
 
         let done = goal.absorbed();
@@ -6054,14 +6118,24 @@ impl Supervisor {
         let mut request = Request::default();
         for file in items(&result, "file") {
             match definition.permissions.file_beads {
-                Permission::Allow => did.push(self.file_bead(&goal, &source, &project, file).1),
+                Permission::Allow | Permission::Own => {
+                    let (bead, line) = self.file_bead(&goal, &source, &project, file);
+                    goal.filed.extend(bead);
+                    did.push(line);
+                }
                 Permission::Ask => request.files.push(file.clone()),
             }
         }
         for edit in edits_of(&result, "edit") {
-            match definition.permissions.edit_beads {
-                Permission::Allow => did.push(self.edit_bead(&goal, &source, &project, &edit)),
-                Permission::Ask => request.edits.push(edit),
+            // What the goal filed itself it may put right itself, where
+            // its definition says so; the owner's beads are the owner's.
+            if goal.must_ask(
+                definition.permissions.edit_beads,
+                std::slice::from_ref(&edit),
+            ) {
+                request.edits.push(edit);
+            } else {
+                did.push(self.edit_bead(&goal, &source, &project, &edit));
             }
         }
         for dropped in items(&result, "dropped_findings") {
@@ -7950,20 +8024,7 @@ impl Supervisor {
                     detail,
                     pull_request: driver.and_then(|driver| driver.unit().pull_request.clone()),
                     findings: driver
-                        .map(|driver| {
-                            driver
-                                .unit()
-                                .results
-                                .iter()
-                                .flat_map(|(step, result)| {
-                                    items(result, "findings").iter().map(move |finding| {
-                                        let mut finding = finding.clone();
-                                        finding["step"] = json!(step);
-                                        finding
-                                    })
-                                })
-                                .collect()
-                        })
+                        .map(|driver| crate::unit_findings(driver.unit()))
                         .unwrap_or_default(),
                     commit: driver.and_then(|driver| driver.unit().absorbed.clone()),
                     ship,
@@ -10425,6 +10486,65 @@ mod tests {
     }
 
     #[test]
+    fn a_director_may_change_the_beads_its_goal_filed_and_asks_for_any_other() {
+        let d = definition(1, "own");
+        let edit = |bead: &str| json!({"edit": [{"bead": bead, "acceptance_criteria": "- works", "priority": 1, "defer": "unchanged", "reason": "r"}]});
+        // What the goal filed is read from its log, whatever else is there.
+        let dir = std::env::temp_dir().join(format!("factory-own-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("events.jsonl"),
+            concat!(
+                r#"{"time_unix":1,"kind":"goal.woken","data":{"bead":"toy-1"}}"#,
+                "\n",
+                r#"{"time_unix":2,"kind":"bead.filed","data":{"bead":"toy-2","request":{"title":"A \"bead.filed\" bug"}}}"#,
+                "\n",
+                r#"{"time_unix":3,"kind":"bead.filed","data":{"bead":"toy-2","request":{}}}"#,
+                "\nnot json\n",
+                r#"{"time_unix":4,"kind":"note","data":{"bead":"toy-1","text":"\"bead.filed\""}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let mut goal = goal();
+        goal.filed = filed_in(&dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(goal.filed, ["toy-2"]);
+        assert!(goal.owns("toy-2") && !goal.owns("toy-1"));
+
+        // Its own bead: carried out at once, so it is no question to the
+        // owner, and by itself leaves the goal with nothing to move it.
+        assert_eq!(problems(&d, &goal, edit("toy-2")).len(), 1);
+        // Another's: put to the owner, which counts as asking.
+        assert!(problems(&d, &goal, edit("toy-1")).is_empty());
+        // One of each: the owner is asked about the one that is not its.
+        let both = json!({"edit": [edit("toy-2")["edit"][0], edit("toy-1")["edit"][0]]});
+        assert!(problems(&d, &goal, both).is_empty());
+        let own = edits_of(&edit("toy-2"), "edit");
+        let other = edits_of(&edit("toy-1"), "edit");
+        assert!(!goal.must_ask(Permission::Own, &own));
+        assert!(goal.must_ask(Permission::Own, &other));
+        assert!(goal.must_ask(Permission::Ask, &own));
+        assert!(!goal.must_ask(Permission::Allow, &other));
+        assert!(!goal.must_ask(Permission::Ask, &[]));
+
+        // The beads a maintenance run filed for the goal to build are its own.
+        let mut built = self::goal();
+        built.maintenance = Some(
+            serde_json::from_value(json!({"schedule": "upkeep", "beads": ["toy-1"]})).unwrap(),
+        );
+        assert!(built.owns("toy-1"));
+        assert_eq!(problems(&d, &built, edit("toy-1")).len(), 1);
+
+        // The director is told which it is.
+        let text = permission_text(&d);
+        assert!(
+            text.contains("Changing a bead that exists (criteria, priority, deferral) is carried out at once on a bead this goal filed, and put to the owner"),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn completion_needs_evidence_and_no_running_pipeline() {
         let d = definition(1, "ask");
         assert_eq!(
@@ -10778,6 +10898,13 @@ mod tests {
                 event(250, "step.ended", "fix", json!({ "outcome": "done" })),
                 event(260, "step.ended", "fix", json!({ "outcome": "done" })),
                 event(270, "step.ended", "ci", json!({ "outcome": "red" })),
+                // CI's jobs failed and passed on one commit: flaky too.
+                event(
+                    275,
+                    "ci.flaky",
+                    "ci",
+                    json!({ "failed": ["unit", "fmt"], "reruns": 1, "commit": "cccccccccccccccc" }),
+                ),
                 event(280, "step.ended", "ci", json!({ "outcome": "green" })),
                 event(
                     290,
@@ -10822,11 +10949,18 @@ mod tests {
                     beads: 3
                 }],
                 checks: BTreeMap::new(),
-                flaky: vec![(
-                    "test".to_string(),
-                    "aaaaaaaaaaaaaaaa".to_string(),
-                    "toy-1-100".to_string()
-                )],
+                flaky: vec![
+                    (
+                        "test".to_string(),
+                        "aaaaaaaaaaaaaaaa".to_string(),
+                        "toy-1-100".to_string()
+                    ),
+                    (
+                        "CI (unit, fmt)".to_string(),
+                        "cccccccccccccccc".to_string(),
+                        "toy-1-100".to_string()
+                    )
+                ],
                 red: vec!["toy-1-100".to_string()],
                 rounds: vec![("toy-1-100".to_string(), 3)],
                 parked: vec![(

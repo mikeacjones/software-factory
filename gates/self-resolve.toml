@@ -1,0 +1,54 @@
+# A failure that is not the change's is resolved by the factory, down to its
+# cause, with the owner out of it. Each check is an acceptance line of a bead
+# in epic sf-se3.
+id = "self-resolve"
+title = "The factory resolves a failure that is not the change's by itself"
+bead = "sf-se3"
+
+[[check]]
+id = "ci-run-again"
+tier = "hermetic"
+bead = "sf-se3.1"
+claim = "With ci_reruns set, a pull request's failed jobs, and only those (gh run rerun --failed, never a whole run), are run again on the same commit by code: jobs that then pass land the pull request with no fix step; jobs that fail again reach the builder with how often they were run again; a fix that returns already_done has them run once more; a rerun GitHub refuses leaves the failure to the builder with the refusal in the unit's log; and without ci_reruns nothing is run again. Jobs are run again only once no check is still running. A failed check that was replaced by a rerun counts as pending until its new job shows, and a failure that is no job of a workflow run is not run again."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-github", "--package", "factory-driver", "--", "failed_jobs_are_run_again_by_their_workflow_run", "ci_that_passes_when_its_failed_jobs_run_again_lands", "ci_that_fails_again_goes_to_the_builder_with_what_was_tried", "a_fix_that_says_the_ci_failure_is_not_the_branchs_has_the_jobs_run_again", "a_rerun_github_refuses_leaves_the_failure_to_the_builder", "failed_jobs_are_run_again_only_once_nothing_is_still_running"]
+timeout_secs = 900
+
+[[check]]
+id = "flake-is-a-finding"
+tier = "hermetic"
+bead = "sf-se3.2"
+claim = "A check that failed and passed on one commit, a command of the project or the jobs of CI, is kept on the unit with its commit, failing lines and output, and is among the findings the pipeline leaves, marked flake; the director's brief shows it with what to do, a director files the bug for it with nobody asked, and a scheduled run's measures count a CI flake as they count a command's."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-driver", "--", "ci_that_passes_when_its_failed_jobs_run_again_lands", "a_check_that_passes_when_run_again_is_a_flake", "a_flaky_ci_is_run_again_filed_as_a_bug_and_raised_with_nobody_asked", "a_maintenance_run_is_shown_what_the_units_records_say_since_the_last_one"]
+timeout_secs = 900
+
+[[check]]
+id = "own-beads"
+tier = "hermetic"
+bead = "sf-se3.3"
+claim = "With edit_beads = \"own\" a director's change to a bead its goal filed is carried out at once, also by a service started since the bead was filed, and a change to any other bead is put to the owner and not made until approved; the beads a goal filed are read from its log; and file_beads = \"own\" is refused when definitions are loaded."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-config", "--package", "factory-driver", "--", "goal_definitions_load_and_one_is_the_default", "a_director_may_change_the_beads_its_goal_filed_and_asks_for_any_other", "a_flaky_ci_is_run_again_filed_as_a_bug_and_raised_with_nobody_asked"]
+timeout_secs = 900
+
+[[check]]
+id = "ship-commits"
+tier = "hermetic"
+bead = "sf-se3.4"
+claim = "A fix on a sub-goal's branch whose own commit the project's publish checks refuse is rejected once and reworded by the same builder session, and the ship lands without its publish step failing; a ship whose branch already holds such a commit goes from publish to the builder and not to the publisher, and lands; and what lands holds no commit the check refuses. The ship flow routes publish's failed outcome to fix."
+command = ["sh", "-c", "grep -A9 '^id = \"publish\"' config/flows/zig-sdk-ship.toml | grep -q 'on.failed = { to = \"fix\"' && cargo test --locked --offline --package factory-driver --test walk -- a_ship_fix_whose_commit_the_publish_check_refuses_is_reworded_by_its_builder a_ship_whose_commits_the_publish_check_refuses_goes_to_the_builder_and_lands"]
+timeout_secs = 900
+
+[[check]]
+id = "one-run-per-step"
+tier = "hermetic"
+bead = "sf-se3.5"
+claim = "A second attempt of one activity, given out while this worker's first run of it is still going, starts nothing and returns that run's result with its session; an attempt that comes after the run ended is handed the kept result; the same step run later as another activity runs; a run that failed is done again by the next attempt; and a kept result is dropped after its time."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-engine", "--lib", "--", "a_second_attempt_of_an_activity_joins_the_run_in_flight", "a_run_that_ended_is_kept_only_for_a_while", "a_run_that_failed_is_done_again_by_the_next_attempt"]
+timeout_secs = 600
+
+[[check]]
+id = "zig-project-uses-it"
+tier = "hermetic"
+bead = "sf-se3"
+claim = "The Zig project has its CI's failed jobs run again before a builder is sent, its parity goal lets the director change the beads the goal filed, and the director, the foreman and the builder are each told that a failure which is not the change's is not the owner's to run again. The bug behind a flake is to be fixed at its cause: the director and the foreman are told to write the bead so, the builder that a change which only makes the failure rarer is not a fix, and the reviewer to send such a change back."
+command = ["sh", "-c", "grep -q '^ci_reruns = 2' config/projects/temporal-sdk-zig.toml && grep -q '^edit_beads = \"own\"' config/goals/temporal-sdk-zig/parity.toml && grep -q 'never ask the owner to run CI again' config/roles/director.md && grep -q 'Checks that fail for a reason that is not the change' config/roles/foreman.md && grep -q 'never return `needs_owner` to have something run again' config/roles/builder.md && grep -q 'The bug is fixed at its cause' config/roles/director.md && grep -q 'marking it flaky are not fixes' config/roles/foreman.md && grep -q 'A change that only makes the failure rarer or hides it is not a fix' config/roles/builder.md && grep -q 'does the change remove its cause, or only live with it' config/roles/reviewer.md"]
+timeout_secs = 60

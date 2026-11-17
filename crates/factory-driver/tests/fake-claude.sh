@@ -22,6 +22,15 @@
 #                                    told to put it back
 #                      fix-nothing   sent to fix a failed `test` check, the builder changes
 #                                    nothing and returns already_done
+#                      ci-not-ours   sent to fix a failure of GitHub CI, the builder changes
+#                                    nothing and returns already_done
+#                      bare-trailer  the publisher's commit message ends in a `Changelog: none`
+#                                    trailer with no reason
+#                      bare-fix-commit
+#                                    sent to fix a failure of GitHub CI, the builder commits
+#                                    its fix itself, under such a trailer
+#                    Either way, a builder told that the check on what is published
+#                    refuses the branch gives every such trailer a reason.
 #                      limit-default-once
 #                                    the first run without an account token is refused
 #                                    at the five-hour limit
@@ -109,6 +118,7 @@ case "$role" in
     nothing=0
     case "$scenario" in
       *fix-nothing*) case "$brief" in *"The command \`test\`"*) nothing=1 ;; esac ;;
+      *ci-not-ours*) case "$brief" in *"GitHub CI failed on the pull request"*) nothing=1 ;; esac ;;
     esac
     # A builder with nothing to change writes nothing.
     [ "$nothing" = 1 ] || case "$brief" in
@@ -135,6 +145,21 @@ case "$role" in
           *"put it back"*) rm -rf .github ;;
           *) [ -f "$state/trespassed" ] || { touch "$state/trespassed"; mkdir -p .github; echo "on: push" > .github/ci.yml; } ;;
         esac ;;
+    esac
+    # A commit of its own with a trailer the project's check refuses, and
+    # the rewording once it is told so.
+    case "$scenario" in
+      *bare-fix-commit*)
+        case "$brief" in
+          *"GitHub CI failed on the pull request"*)
+            git add -A && git commit --no-verify --quiet -m "wip: mend what CI found" -m "Changelog: none" ;;
+        esac ;;
+    esac
+    case "$brief" in
+      *"check on what is published"*|*"publish check"*)
+        git add -A && { git diff --cached --quiet || git commit --no-verify --quiet -m "wip: a line"; }
+        FILTER_BRANCH_SQUELCH_WARNING=1 git filter-branch -f --msg-filter \
+          'sed "s/^Changelog: none$/Changelog: none (reworded)/"' origin/main..HEAD >/dev/null 2>&1 ;;
     esac
     # It commits what it has, as a builder is told to, and is not done yet.
     case "$scenario" in
@@ -206,6 +231,9 @@ case "$role" in
     trailer=""
     case "$brief" in
       *"publish check"*) trailer='\nChangelog: none (test)\n' ;;
+    esac
+    case "$scenario" in
+      *bare-trailer*) trailer='\nChangelog: none\n' ;;
     esac
     output='{"outcome":"ready","summary":"Wrote the text.",'$common',"commit_message":"Add the feature\n\nIt adds lines to feature.txt.\n'$trailer'","pr_title":"Add the feature","pr_body":"Adds the feature for toy-1. '"$closes"'","merge_summary":"The branch adds feature.txt, which the bead asked for."}'
     ;;

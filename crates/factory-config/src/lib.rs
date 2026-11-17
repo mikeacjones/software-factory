@@ -411,6 +411,19 @@ pub struct GitHub {
     /// together and fixed in one round. Zero hands the first one back at once.
     #[serde(default = "default_ci_red_wait")]
     pub ci_red_wait_secs: u64,
+    /// How often the failed jobs of a pull request's CI are run again on
+    /// the same commit before a builder is sent. Jobs that pass then failed
+    /// for a reason that was not the change's: the step goes on as green,
+    /// and the failure is recorded as a flake for whoever runs the goal to
+    /// file. Jobs that fail every time go to the builder, told so. Zero
+    /// runs nothing again.
+    #[serde(default)]
+    pub ci_reruns: u32,
+    /// Regular expressions for the lines of a failed CI job's log that say
+    /// what failed, as a command's `failure_lines` are for its output. They
+    /// are what a flake is recorded with. Without them, the log's last lines.
+    #[serde(default)]
+    pub ci_failure_lines: Vec<String>,
     /// Keep GitHub issues in step with beads: a bead with no issue gets one
     /// when the factory files it or starts work on it, and a pull request
     /// must close the issue of every bead it lands.
@@ -787,6 +800,10 @@ pub enum Permission {
     Allow,
     #[default]
     Ask,
+    /// For changes to beads only: carried out at once on a bead the goal's
+    /// own agents filed, and put to the owner on any other. What the
+    /// factory wrote down itself it may also put right itself.
+    Own,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -796,7 +813,8 @@ pub struct GoalPermissions {
     #[serde(default = "allow")]
     pub file_beads: Permission,
     /// Changing a bead that already exists: its acceptance criteria, its
-    /// priority, or deferring it.
+    /// priority, or deferring it. `own` lets the director change the beads
+    /// its goal filed and asks the owner about every other.
     #[serde(default)]
     pub edit_beads: Permission,
 }
@@ -1003,6 +1021,12 @@ impl ConfigDir {
             }
             if definition.max_pipelines == 0 {
                 return Err(invalid("max_pipelines must be at least 1".to_string()));
+            }
+            if definition.permissions.file_beads == Permission::Own {
+                return Err(invalid(
+                    "permissions.file_beads is `allow` or `ask`: `own` is for edit_beads, since a bead being filed is nobody's yet"
+                        .to_string(),
+                ));
             }
             for path in &definition.shared_paths {
                 let plain = !path.is_empty()
@@ -1277,15 +1301,23 @@ timeout_secs = 60
             definition("bugs", "[permissions]\nedit_beads = \"allow\""),
         )
         .unwrap();
+        std::fs::write(
+            goals.join("upkeep.toml"),
+            definition("upkeep", "[permissions]\nedit_beads = \"own\""),
+        )
+        .unwrap();
         let loaded = dir.goal_definitions("toy").unwrap();
         assert_eq!(
             loaded.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(),
-            ["bugs", "parity"]
+            ["bugs", "parity", "upkeep"]
         );
         assert_eq!(loaded[1].max_pipelines, 2);
         assert_eq!(loaded[1].permissions.edit_beads, Permission::Ask);
         assert_eq!(loaded[1].permissions.file_beads, Permission::Allow);
         assert_eq!(loaded[0].permissions.edit_beads, Permission::Allow);
+        // The director may change the beads its own goal filed, and no others.
+        assert_eq!(loaded[2].permissions.edit_beads, Permission::Own);
+        std::fs::remove_file(goals.join("upkeep.toml")).unwrap();
         assert_eq!(dir.projects().unwrap(), ["toy"]);
         assert!(dir.goal_definitions("other").unwrap().is_empty());
 

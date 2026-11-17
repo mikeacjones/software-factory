@@ -70,6 +70,15 @@ issue_priority = { field = "Priority", options = ["Critical", "High", "Medium", 
 ci_poll_secs = 30
 ci_timeout_secs = 10800
 ci_settle_secs = 60
+# A job that fails in CI is run again on the same commit, up to twice, before
+# any builder is sent. Only the jobs that failed are run again, never the
+# whole run: the suite has tests that hang now and then, and a
+# builder can do nothing for a pull request that did not cause the failure.
+# One that then passes is recorded as a flake and handed to whoever runs the
+# work, to be filed and fixed. Nobody is asked to press the button.
+ci_reruns = 2
+# The lines of a failed job's log that say what failed, for that record.
+ci_failure_lines = ['error: .* (failed|timed out)', ': error: ', 'panic: ']
 # The factory's own checks run on macOS. What fails only on GitHub's Linux
 # runners can be made to fail, and then to pass, on this machine.
 ci_failure_note = """
