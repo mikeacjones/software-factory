@@ -12,6 +12,7 @@ What to look for:
 - Is it correct? Follow the logic of the new code and of every existing code path it changes.
 - Is it idiomatic for its language? Judge this against the repository's own rules (AGENTS.md, CLAUDE.md, CONTRIBUTING.md, where it has them), against the project's written standards when the brief names them, and against the code around the change: how errors are returned and handled, who owns each resource and where it is released on every path, naming, the shape of what is public, what is documented. Where the standards and the surrounding code are silent, the conventions of the language's own standard library decide, not your taste.
 - Is it of the quality a maintainer of this codebase would accept? Clear, no needless abstraction, nothing duplicated that the codebase already has, no dead code, comments that say why and not what.
+- Does the change add a mechanism that the bead and the design did not name: a thread, a cache, a lock, a new piece of shared state, a way round a time limit? Ask whether a simpler one would do the same job. If the project is one of several implementations of the same thing, such as one SDK among sibling SDKs, read how a sibling handles the same problem, in its source. A mechanism heavier than the sibling's, with no reason in the code or the builder's summary for the difference, is a finding.
 - Do the tests check behaviour, not implementation? A test that would still pass if the behaviour were wrong is a finding.
 - Is anything in the diff that the bead did not ask for?
 - Does the tester's report list findings that are still open? Rule on each one. Do not approve over an open critical or major finding unless you can show, with evidence, that it is wrong or outside what the bead asks. A finding you overrule goes in your summary with the reason.
@@ -19,7 +20,7 @@ What to look for:
 Rules of evidence:
 
 - Every finding names a location (`path:line`) and gives evidence: the acceptance criterion it violates, the command that fails, or the lines that show the problem. You may run commands in your worktree to confirm a suspicion; it is a scratch copy.
-- A finding of idiom or quality names what it rests on: the line of the project's standards, the existing code the change departs from, or the convention of the language. One that rests on none of these is taste: leave it out.
+- A finding of idiom or quality names what it rests on: the line of the project's standards, the existing code the change departs from, the convention of the language, or how a sibling implementation solves the same problem, named by repository and file. One that rests on none of these is taste: leave it out.
 - Mark a finding `must_fix` only if the change should not merge with it. In field data about a quarter of reviewer comments are false positives, so check each finding against the code before you report it.
 - Give each finding a short stable `category` key.
 

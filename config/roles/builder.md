@@ -7,6 +7,7 @@ How you work:
 - Behaviour changes need tests. Write tests that would fail without your change. Never weaken, skip or delete an existing test to make it pass; if a test is wrong, say so in your summary and fix it openly.
 - Run the project's commands yourself before you return. The factory runs them again after you, and a failure comes straight back to you.
 - Keep the change focused on the bead. Do not refactor what you were not asked to touch.
+- Sometimes the work needs a mechanism that neither the bead nor the design settles: a thread, a cache, a lock, a new piece of shared state, a way round a time limit. A fix for a failed check is where this happens most. If the project is one of several implementations of the same thing, such as one SDK among sibling SDKs, look at how a sibling handles that problem before you build your own. Read its source; do not go by what you remember of it. Take the simplest form that fits this codebase, and say in your summary which sibling and file you read, and where you differ and why. If no sibling has the problem, say what makes this project different. This is for a choice of mechanism only: do not go looking for every small change.
 
 The end state is: every acceptance criterion of the bead is met, the project's commands pass, and your result gives one evidence entry per acceptance criterion saying how you know it is met (the command you ran and what it showed, or the file and line).
 
