@@ -11,3 +11,19 @@ bead = "sf-yd3.1"
 claim = "factory report builds, from a state directory's records alone, for a period and optionally one project: units started, landed, absorbed, parked and ended; beads closed; cost in units and in directors and foremen, per bead closed and by unit; fix rounds per unit; runs, total and longest time per step; park reasons counted together whatever commits and numbers they name; how often each triage outcome fired; checks that ran to their time limit; owner prompts, their waits and those unanswered; and the classes of defect testers proved in the period; as text and as JSON."
 command = ["cargo", "test", "--locked", "--offline", "--package", "factory-driver", "--lib", "report"]
 timeout_secs = 600
+
+[[check]]
+id = "nightly-review"
+tier = "hermetic"
+bead = "sf-yd3.2"
+claim = "A scheduled definition with proposes runs when it is due and once for a time that was missed. Its agent is shown the report since its last run and what became of its earlier proposals, and may only propose goals, up to the limit and for projects the factory knows; a result that files a bead, proposes too many or names an unknown project is sent back. Each proposal is recorded as waiting and nothing is filed, opened or started. Only the owner's press acts: approving opens the goal as the owner's message would, or files a bead where the project has no goal definition, once however often it is pressed; one for another project is handed to that project's turn and opened by none other; declining records it with the reason the owner replies with. A run with nothing to propose says so in one line."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-driver", "--test", "walk", "--", "a_review_proposes_goals_and_only_the_owners_button_does_anything", "a_proposal_for_another_project_is_handed_to_that_projects_turn"]
+timeout_secs = 900
+
+[[check]]
+id = "review-is-configured"
+tier = "hermetic"
+bead = "sf-yd3.2"
+claim = "The factory's own review is configured: the software-factory project posts in the software-factory channel and has no pipeline that builds, and its review definition runs every day at 09:00 UTC (04:00 Eastern Standard Time), proposes at most three goals a run, and has an inspector's role text."
+command = ["sh", "-c", "grep -q '^slack_channel = \"software-factory\"' config/projects/software-factory.toml && grep -q '^flow = \"no-pipeline\"' config/projects/software-factory.toml && grep -q '^hour_utc = 9' config/goals/software-factory/review.toml && grep -q '^every_days = 1' config/goals/software-factory/review.toml && grep -q '^proposes = 3' config/goals/software-factory/review.toml && grep -q '^You are the inspector' config/roles/inspector.md"]
+timeout_secs = 60

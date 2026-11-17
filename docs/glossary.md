@@ -146,6 +146,18 @@ One run of a project's Temporal Schedule `issues-<project>`, hourly unless the `
 
 The agent of a scheduled run. It is given the run's charter and the measures, reads the default branch, files beads up to the definition's limit, and marks which of them the factory is to build. Code refuses anything else it asks for.
 
+## inspector
+
+The agent of a *review*. It is given how the factory ran since its last run, made by code from the records, and what became of what it proposed before, and it returns *proposals* up to the definition's limit. Code refuses anything else it asks for.
+
+## review
+
+A *schedule* whose runs look at the factory as a whole and not at one project's code: its table names `proposes`, the most goals one run may propose. Its agent is the *inspector*. It files nothing and starts nothing.
+
+## proposal
+
+A goal a *review* puts to the owner: a project, an objective, a stop condition and the figures that call for it, posted with an approve and a decline button. Approving opens the goal in its project as the owner's own message there would, or files it as a bead where the project has no goal definition the owner can open. Declining records it, with the reason the owner gives under the message. Later runs are shown what became of each.
+
 ## maintenance goal
 
 A goal the factory opens for the beads a scheduled run marked to build, under the definition the *schedule* names. Nobody agrees its charter or presses Start: code writes the charter from the run's result. It is run like any goal, and it is complete, with no agent and no Accept, when every one of its beads is closed. A schedule has one at a time.

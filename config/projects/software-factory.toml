@@ -1,0 +1,34 @@
+# The factory itself, as a project of the factory.
+#
+# Owner's rule, 2026-11-16: the factory does not ship itself. For now this
+# record is here for one thing: the nightly review in
+# goals/software-factory/review.toml, which reads how the factory ran and
+# proposes goals to the owner in #software-factory. It has no pipeline, no
+# executive and no goal definition the owner can open a goal under, so a
+# proposal for this project that the owner approves is filed as a bead in the
+# tracker below, and the owner decides who builds it. The Rust flows, and the
+# rule that the factory never merges or deploys a change to itself, come with
+# beads sf-yd3.4 and sf-yd3.5.
+id = "software-factory"
+repo = "~/Source/software-factory"
+remote = "origin"
+# Work on the factory lands on this branch, not on main. The review reads it
+# as the remote has it.
+default_branch = "walking-skeleton"
+bead_actor = "factory"
+slack_channel = "software-factory"
+flow = "no-pipeline"
+forbidden_paths = [".github/**", ".beads/**", ".claude/**"]
+standards = ["AGENTS.md"]
+
+[beads]
+kind = "dolt"
+host = "127.0.0.1"
+port = 3306
+user = "root"
+database = "software-factory"
+
+[commands.hold]
+argv = ["sh", "-c", "echo 'software-factory has no pipeline yet: the factory does not build itself until sf-yd3.4 and sf-yd3.5 are done'; exit 1"]
+timeout_secs = 30
+shown = "say that this project has no pipeline yet"

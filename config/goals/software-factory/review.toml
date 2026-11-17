@@ -1,0 +1,53 @@
+# The nightly review of the factory as a whole: a run the factory starts by
+# itself. One agent, the inspector, is given how the factory ran since its
+# last run, made by code from the factory's own records (what `factory
+# report` prints), and what became of what it proposed before. It proposes
+# goals, for any project. Each proposal is posted in #software-factory with
+# an approve and a decline button.
+#
+# Nothing is opened, started or filed without the owner's button. Approving
+# a proposal for a project that has goal definitions opens the goal there,
+# as the owner's own message in that project's channel would. Approving one
+# for a project that has none, as the factory itself has none yet, files it
+# as a bead in that project's tracker. Declining records it, with the reason
+# if the owner replies under the message, and later runs are shown it.
+id = "review"
+
+# The agent of each run. A scheduled definition has no director; this table
+# gives the inspector its model, effort and time limit.
+[director]
+model = "claude-fable-5-2"
+effort = "high"
+timeout_secs = 2700
+
+[schedule]
+# Every night at 09:00 UTC, which is 04:00 Eastern Standard Time and 05:00
+# while daylight time is on. Owner's choice, 2026-11-16. A time the worker
+# was away for is made up once, when it is back.
+hour_utc = 9
+every_days = 1
+# The most goals one run may propose. What it leaves out goes in its journal
+# for the next run.
+proposes = 3
+charter = """
+Look at how the factory as a whole is working, and propose the few goals \
+that would make it work better. Four things, in this order. First, money \
+and time that bought nothing: units that parked or failed, fix rounds that \
+went in circles, checks that hit their time limit, steps that run for far \
+longer than the others, work that was done twice. Second, where the factory \
+stopped and waited for the owner: every question it asked, how long each \
+waited, and whether code or a clearer rule could have answered it. Third, \
+defects that got past the factory's own checks and were caught late: by CI \
+after the pipeline's checks passed, by the owner, or after landing. Fourth, \
+what the factory cannot see about itself: a figure the report should have \
+and does not.
+
+Propose a goal only where the figures show a cost that keeps coming back, \
+and name the figure the goal should move. One bad night is not a pattern: \
+say so in the digest and watch it. Prefer a change to the factory that \
+stops a kind of waste to a change in one project that mends one case. A \
+goal for a project's own code belongs to that project's upkeep unless the \
+figures show the factory at fault. Not yours: what the open goals already \
+cover, and anything that would have the factory merge or deploy a change \
+to itself, which stays with the owner.
+"""

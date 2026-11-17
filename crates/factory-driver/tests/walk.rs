@@ -4783,6 +4783,442 @@ fn a_maintenance_run_builds_what_it_marks_in_a_goal_the_factory_opens_and_ends()
 /// A definition with a schedule is run by the factory at its times: one
 /// agent, shown what the records say, which files beads and starts nothing.
 #[test]
+fn a_review_proposes_goals_and_only_the_owners_button_does_anything() {
+    use factory_driver::goal::{Scheduled, Supervisor, check_definitions};
+    use factory_slack::socket::Incoming;
+    use std::time::Duration;
+
+    let world = World::new("inspector", "true");
+    std::fs::create_dir_all(world.path("config/goals/toy")).unwrap();
+    let tier = "[director]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\n";
+    let timed =
+        "[schedule]\nhour_utc = 9\nproposes = 2\ncharter = \"Find what the factory wastes.\"\n";
+    let review = world.path("config/goals/toy/review.toml");
+    // A run that proposes goals files and builds nothing.
+    std::fs::write(
+        &review,
+        format!("id = \"review\"\n{tier}{timed}build_under = \"main\"\n"),
+    )
+    .unwrap();
+    let refused = check_definitions(&world.config()).unwrap_err().to_string();
+    assert!(
+        refused.contains("a run that proposes goals files and builds nothing"),
+        "{refused}"
+    );
+    std::fs::write(&review, format!("id = \"review\"\n{tier}{timed}")).unwrap();
+    let lines = check_definitions(&world.config()).unwrap().join("\n");
+    assert!(
+        lines.contains("toy/review: scheduled, inspector claude-opus-5-5 (high), every 1 day(s) at 09:00 UTC, proposes at most 2 goal(s) a run to the owner"),
+        "{lines}"
+    );
+
+    let say = |role: &str, n: u32, json: serde_json::Value| {
+        std::fs::create_dir_all(world.path("bin/state")).unwrap();
+        std::fs::write(
+            world.path(&format!("bin/state/{role}-{n}.json")),
+            json.to_string(),
+        )
+        .unwrap();
+    };
+    let proposal = |project: &str, title: &str| {
+        serde_json::json!({"project": project, "title": title,
+            "objective": "Fix rounds go in circles on the same failure.",
+            "stop_when": "The report shows no unit with more than two fix rounds for a week.",
+            "figures": "7 fix rounds on 2 units; move fix rounds per unit below 2."})
+    };
+    // It first asks for more than it may: three goals, one for a project
+    // the factory does not have, and a bead.
+    say(
+        "inspector",
+        1,
+        serde_json::json!({"summary": "Looked.", "digest": "Three things.", "journal": "",
+            "proposals": [proposal("toy", "One"), proposal("nowhere", "Two"), proposal("toy", "Three")],
+            "file": [{"title": "A bead"}]}),
+    );
+    say(
+        "inspector",
+        2,
+        serde_json::json!({"summary": "Fix rounds repeat.",
+            "digest": "Two units went round the same failure.",
+            "journal": "Watch the time limits.",
+            "proposals": [proposal("toy", "Stop a failure that repeats"), proposal("toy", "Shorten the Linux run")]}),
+    );
+
+    let mut sup = Supervisor::new(world.config(), None, vec!["OWNER".to_string()], false).unwrap();
+    let record_path = world.path("state/projects/toy/schedules/review/scheduled.json");
+    let record = || -> Scheduled {
+        serde_json::from_str(&std::fs::read_to_string(&record_path).unwrap()).unwrap()
+    };
+    let now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    };
+    let overdue = || {
+        let back = Scheduled {
+            since: now() - 2 * 86_400,
+            ..record()
+        };
+        std::fs::write(&record_path, serde_json::to_string(&back).unwrap()).unwrap();
+    };
+    let brief =
+        |n: usize| std::fs::read_to_string(world.path(&format!("bin/state/brief-{n}.md"))).unwrap();
+    let events = || {
+        std::fs::read_to_string(world.path("state/projects/toy/schedules/review/events.jsonl"))
+            .unwrap()
+    };
+    let beads = || -> Vec<String> {
+        std::fs::read_dir(world.path("beads"))
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("filed-"))
+            .collect()
+    };
+    let press = |sup: &mut Supervisor, user: &str, action: &str, id: &str| {
+        sup.incoming(Incoming::Action {
+            channel: String::new(),
+            user: user.to_string(),
+            action_id: action.to_string(),
+            value: id.to_string(),
+            message_ts: String::new(),
+        })
+        .unwrap();
+    };
+
+    // Seen for the first time it counts from now; a night later it runs.
+    assert!(!sup.pump(Duration::ZERO).unwrap());
+    assert!(world.calls().is_empty());
+    overdue();
+    assert!(sup.pump(Duration::ZERO).unwrap());
+    let calls = world.calls();
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    assert!(calls.iter().all(|call| call[0] == "inspector"), "{calls:?}");
+    assert_eq!(
+        calls[0][1], calls[1][1],
+        "the refusal went back to the same session"
+    );
+    let shown = brief(1);
+    assert!(
+        shown.starts_with("# Review of the factory, run 1\n\n## What these runs are for\n\nFind what the factory wastes.")
+            && shown.contains("at most 2 in this run")
+            && shown.contains("- `toy`: it has no goal definition the owner can open a goal under, so an approved proposal is filed as a bead")
+            && shown.contains("Made by code from the factory's own records.")
+            && shown.contains("\nUnits: ")
+            && shown.contains(&format!(
+                "The records themselves are under `{}`",
+                world.path("state").display()
+            ))
+            && shown.contains("None has been made yet."),
+        "{shown}"
+    );
+    let sent_back = brief(2);
+    assert!(
+        sent_back.contains(
+            "`file`: a review proposes goals to the owner; it files, starts and opens nothing"
+        ) && sent_back.contains("proposals: 3 proposed, and a run may propose 2 at most")
+            && sent_back.contains("proposals[2]: `nowhere` is not a project of this factory"),
+        "{sent_back}"
+    );
+
+    // Two proposals wait for the owner. Nothing is filed, opened or started.
+    let ran = record();
+    assert_eq!(
+        (ran.runs, ran.journal.as_str()),
+        (1, "Watch the time limits.")
+    );
+    assert_eq!(ran.proposals.len(), 2);
+    let (first, second) = (ran.proposals[0].clone(), ran.proposals[1].clone());
+    assert_eq!(
+        (
+            first.id.as_str(),
+            first.state.as_str(),
+            first.opens.as_str()
+        ),
+        ("toy-review-1-1", "waiting", "bead")
+    );
+    assert_eq!(second.id, "toy-review-1-2");
+    assert!(beads().is_empty(), "{:?}", beads());
+    assert!(sup.goals().next().is_none());
+    let said = events();
+    for part in [
+        "\"proposal.posted\"",
+        ":mag: *review* · run 1 · 2 proposal(s) below, each with its buttons",
+        "Two units went round the same failure.",
+        ":bulb: *Proposed goal for* `toy`: *Stop a failure that repeats*",
+        "approving files this as a bead in its tracker",
+    ] {
+        assert!(said.contains(part), "no {part} in {said}");
+    }
+
+    // Someone who is not the owner presses approve: nothing happens.
+    press(&mut sup, "SOMEONE", "proposal_approve", &first.id);
+    assert_eq!(record().proposals[0].state, "waiting");
+    assert!(beads().is_empty());
+
+    // The owner approves the first. The project has no goal definition the
+    // owner can open, so it is filed as a bead; pressing again files no
+    // second one.
+    press(&mut sup, "OWNER", "proposal_approve", &first.id);
+    press(&mut sup, "OWNER", "proposal_approve", &first.id);
+    let filed = beads();
+    assert_eq!(filed.len(), 1, "{filed:?}");
+    let text = std::fs::read_to_string(world.path("beads").join(&filed[0])).unwrap();
+    assert!(
+        text.contains("Stop a failure that repeats")
+            && text.contains("toy-review-1-1")
+            && text.contains("no unit with more than two fix rounds"),
+        "{text}"
+    );
+    let approved = record().proposals[0].clone();
+    assert_eq!(
+        (approved.state.as_str(), approved.by.as_str()),
+        ("approved", "OWNER")
+    );
+    assert!(
+        approved.made.starts_with("filed `filed-"),
+        "{}",
+        approved.made
+    );
+
+    // The owner declines the second, and says why under its message. A
+    // press after that changes nothing.
+    let mut posted = record();
+    posted.proposals[1].channel = "C1".to_string();
+    posted.proposals[1].ts = "111.222".to_string();
+    std::fs::write(&record_path, serde_json::to_string(&posted).unwrap()).unwrap();
+    press(&mut sup, "OWNER", "proposal_decline", &second.id);
+    press(&mut sup, "OWNER", "proposal_approve", &second.id);
+    sup.incoming(Incoming::Message {
+        channel: "C1".to_string(),
+        user: "OWNER".to_string(),
+        text: "The Linux run is as short as it gets.".to_string(),
+        ts: "111.333".to_string(),
+        thread_ts: Some("111.222".to_string()),
+    })
+    .unwrap();
+    let declined = record().proposals[1].clone();
+    assert_eq!(
+        (declined.state.as_str(), declined.reason.as_str()),
+        ("declined", "The Linux run is as short as it gets.")
+    );
+    assert_eq!(beads().len(), 1, "a declined proposal files nothing");
+    assert!(sup.goals().next().is_none());
+
+    // The project gets a goal definition the owner can open. The next
+    // night's run is shown what became of both, and proposes one goal.
+    std::fs::write(
+        world.path("config/goals/toy/main.toml"),
+        format!("id = \"main\"\ndefault = true\n{tier}"),
+    )
+    .unwrap();
+    say(
+        "inspector",
+        3,
+        serde_json::json!({"summary": "One more.", "digest": "Time limits were hit twice.",
+            "journal": "", "proposals": [proposal("toy", "Give the slow check a time limit")]}),
+    );
+    say(
+        "intake",
+        1,
+        serde_json::json!({"reply": "Here is the charter.", "ready": true,
+            "objective": "Give the slow check a time limit.", "stop_when": "It has one.",
+            "plan": "One bead.", "edits": []}),
+    );
+    let mut sup = Supervisor::new(world.config(), None, vec!["OWNER".to_string()], false).unwrap();
+    overdue();
+    assert!(sup.pump(Duration::ZERO).unwrap());
+    let shown = brief(3);
+    assert!(
+        shown.starts_with("# Review of the factory, run 2\n")
+            && shown.contains("- `toy`: an approved proposal opens a goal in it")
+            && shown.contains("- `toy-review-1-1` (")
+            && shown.contains("approved by the owner: filed `filed-")
+            && shown.contains("declined by the owner: “The Linux run is as short as it gets.”")
+            && shown.contains("## What the last run left for you\n\nWatch the time limits."),
+        "{shown}"
+    );
+    let third = record().proposals[2].clone();
+    assert_eq!(
+        (
+            third.id.as_str(),
+            third.state.as_str(),
+            third.opens.as_str()
+        ),
+        ("toy-review-2-1", "waiting", "goal")
+    );
+    assert!(
+        sup.goals().next().is_none(),
+        "nothing opens before the button"
+    );
+    let before = world.calls().len();
+
+    // Approving it opens the goal as the owner's own message would: the
+    // goal is there, with what the review proposed as its request, and its
+    // director is asked for a charter.
+    press(&mut sup, "OWNER", "proposal_approve", &third.id);
+    let goal = sup.goals().next().expect("a goal was opened").clone();
+    assert_eq!(goal.project, "toy");
+    let opened = record().proposals[2].clone();
+    assert_eq!(opened.state, "approved");
+    assert_eq!(
+        opened.made,
+        format!("goal `{}` is opened in `toy`", goal.id)
+    );
+    let calls = world.calls();
+    assert_eq!(calls.len(), before + 1, "{calls:?}");
+    assert_eq!(calls[before][0], "intake");
+    let asked = brief(before + 1);
+    assert!(
+        asked.contains("Give the slow check a time limit")
+            && asked.contains("Stop when: The report shows no unit with more than two fix rounds")
+            && asked.contains("`toy-review-2-1`"),
+        "{asked}"
+    );
+    assert_eq!(beads().len(), 1, "a goal was opened, not a second bead");
+
+    // A night with nothing worth a goal says so in one line.
+    say(
+        "inspector",
+        4,
+        serde_json::json!({"summary": "Quiet.", "digest": "Nothing stood out; I read the report.\nMore.",
+            "journal": "", "proposals": []}),
+    );
+    overdue();
+    assert!(sup.pump(Duration::ZERO).unwrap());
+    assert_eq!(record().proposals.len(), 3);
+    let said = events();
+    assert!(
+        said.contains(":mag: *review* · run 3: nothing worth proposing. Nothing stood out; I read the report.\""),
+        "{said}"
+    );
+}
+
+#[test]
+fn a_proposal_for_another_project_is_handed_to_that_projects_turn() {
+    use factory_driver::goal::{Event, Scheduled, Supervisor};
+    use factory_slack::socket::Incoming;
+
+    let world = World::new("inspector-far", "true");
+    // A second project, with a goal definition the owner can open. The
+    // review is the first project's.
+    let toy = std::fs::read_to_string(world.path("config/projects/toy.toml")).unwrap();
+    assert!(toy.contains("id = \"toy\""), "{toy}");
+    std::fs::write(
+        world.path("config/projects/far.toml"),
+        toy.replace("id = \"toy\"", "id = \"far\""),
+    )
+    .unwrap();
+    let tier = "[director]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\n";
+    for (project, file, text) in [
+        (
+            "far",
+            "main.toml",
+            format!("id = \"main\"\ndefault = true\n{tier}"),
+        ),
+        (
+            "toy",
+            "review.toml",
+            format!(
+                "id = \"review\"\n{tier}[schedule]\nhour_utc = 9\nproposes = 1\ncharter = \"Find what the factory wastes.\"\n"
+            ),
+        ),
+    ] {
+        let dir = world.path(&format!("config/goals/{project}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(file), text).unwrap();
+    }
+    std::fs::create_dir_all(world.path("bin/state")).unwrap();
+    std::fs::write(
+        world.path("bin/state/inspector-1.json"),
+        serde_json::json!({"summary": "One.", "digest": "One thing.", "journal": "",
+            "proposals": [{"project": "far", "title": "Stop a failure that repeats",
+                "objective": "Fix rounds go in circles.", "stop_when": "No unit has more than two.",
+                "figures": "7 fix rounds on 2 units."}]})
+        .to_string(),
+    )
+    .unwrap();
+
+    // The first project's turn, as the engine takes it: it acts for that
+    // project alone.
+    let record_path = world.path("state/projects/toy/schedules/review/scheduled.json");
+    let record = || -> Scheduled {
+        serde_json::from_str(&std::fs::read_to_string(&record_path).unwrap()).unwrap()
+    };
+    let turn = |event: Event| {
+        Supervisor::for_turn(world.config(), Some("toy"))
+            .unwrap()
+            .turn(event)
+    };
+    assert!(turn(Event::Tick).handed.is_empty());
+    let back = Scheduled {
+        since: record().since - 2 * 86_400,
+        ..record()
+    };
+    std::fs::write(&record_path, serde_json::to_string(&back).unwrap()).unwrap();
+    let ran = turn(Event::Tick);
+    assert_eq!(ran.trouble, None);
+    assert!(
+        ran.handed.is_empty(),
+        "nothing is handed on before the button"
+    );
+    let proposed = record().proposals[0].clone();
+    assert_eq!(
+        (
+            proposed.project.as_str(),
+            proposed.opens.as_str(),
+            proposed.state.as_str()
+        ),
+        ("far", "goal", "waiting")
+    );
+
+    // The owner approves. The other project's records are its own turn's
+    // to write: this turn opens nothing, and leaves the goal to be opened
+    // for whoever runs it to hand on.
+    let pressed = turn(Event::Slack(Incoming::Action {
+        channel: String::new(),
+        user: "OWNER".to_string(),
+        action_id: "proposal_approve".to_string(),
+        value: proposed.id.clone(),
+        message_ts: String::new(),
+    }));
+    assert_eq!(pressed.trouble, None);
+    assert_eq!(pressed.handed.len(), 1, "{:?}", pressed.handed);
+    let (project, event) = &pressed.handed[0];
+    assert_eq!(project, "far");
+    let Event::Open { project, text } = event else {
+        panic!("{event:?}");
+    };
+    assert_eq!(project, "far");
+    assert!(
+        text.starts_with("Stop a failure that repeats\n\nFix rounds go in circles.")
+            && text.contains(&proposed.id),
+        "{text}"
+    );
+    assert!(
+        !world.path("state/goals").exists()
+            || std::fs::read_dir(world.path("state/goals"))
+                .unwrap()
+                .next()
+                .is_none()
+    );
+    let approved = record().proposals[0].clone();
+    assert_eq!(approved.state, "approved");
+    assert_eq!(approved.made, "handed to `far`, which opens it in its turn");
+
+    // Handed in again, the press hands nothing on a second time.
+    let again = turn(Event::Slack(Incoming::Action {
+        channel: String::new(),
+        user: "OWNER".to_string(),
+        action_id: "proposal_approve".to_string(),
+        value: proposed.id,
+        message_ts: String::new(),
+    }));
+    assert!(again.handed.is_empty(), "{:?}", again.handed);
+}
+
+#[test]
 fn a_scheduled_definition_is_run_when_due_and_its_agent_only_files_beads() {
     use factory_driver::goal::{Scheduled, Supervisor, check_definitions};
     use std::time::Duration;

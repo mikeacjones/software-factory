@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use temporalio_client::errors::WorkflowInteractionError;
 use temporalio_client::{
     WorkflowDescribeOptions, WorkflowExecuteUpdateOptions, WorkflowExecutionStatus,
-    WorkflowGetResultOptions, WorkflowQueryOptions,
+    WorkflowGetResultOptions, WorkflowQueryOptions, WorkflowSignalOptions,
 };
 use temporalio_macros::activities;
 use temporalio_sdk::ApplicationFailure;
@@ -683,6 +683,31 @@ impl Steps {
                         Ok(Ok(mut turned)) => {
                             turned.launches =
                                 not_yet_there(&ctx.client(), turned.launches).await;
+                            // What the turn left for other projects is
+                            // signalled to each one's workflow. What
+                            // cannot be handed on is kept as the listener
+                            // keeps it, where it can be, and said.
+                            for (project, event) in std::mem::take(&mut turned.handed) {
+                                let told = ctx
+                                    .client()
+                                    .get_workflow_handle::<tiers::Project>(tiers::project_id(
+                                        &project,
+                                    ))
+                                    .signal(
+                                        tiers::Project::event,
+                                        event.clone(),
+                                        WorkflowSignalOptions::default(),
+                                    )
+                                    .await;
+                                if let Err(err) = told {
+                                    if let Event::Slack(incoming) = &event {
+                                        self.runner.keep(incoming);
+                                    }
+                                    turned.trouble.get_or_insert(format!(
+                                        "project `{project}` could not be handed what the owner approved: {err}"
+                                    ));
+                                }
+                            }
                             Ok(turned)
                         }
                         // The tiers could not be asked at all. Whoever

@@ -727,6 +727,13 @@ pub struct Schedule {
     /// many beads more than a run was last shown. Without it runs come by
     /// the clock only.
     pub when_class_breaks: Option<u32>,
+    /// The most goals one run may propose to the owner. With it the
+    /// definition is a review of the factory as a whole and not upkeep of
+    /// its project: its agent is shown how the factory ran, from the
+    /// records, and what became of what it proposed before, and proposes
+    /// goals for any project. It files nothing, and nothing it proposes is
+    /// opened without the owner's button.
+    pub proposes: Option<u32>,
 }
 
 fn default_every_days() -> u32 {
@@ -1051,6 +1058,19 @@ impl ConfigDir {
                     return Err(invalid(
                         "schedule: when_class_breaks is at least 1".to_string(),
                     ));
+                }
+                if let Some(most) = schedule.proposes {
+                    if !(1..=5).contains(&most) {
+                        return Err(invalid("schedule: proposes is from 1 to 5".to_string()));
+                    }
+                    if schedule.build_under.is_some()
+                        || schedule.when_class_breaks.is_some()
+                        || !schedule.reports.is_empty()
+                    {
+                        return Err(invalid(
+                            "schedule: a run that proposes goals files and builds nothing, so it cannot have build_under, reports or when_class_breaks".to_string(),
+                        ));
+                    }
                 }
             }
             if definition.designer.is_some() && definition.ship_flow.is_none() {

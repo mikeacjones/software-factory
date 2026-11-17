@@ -1,0 +1,16 @@
+# For a project the factory knows but does not build yet. A unit started on
+# such a project by hand runs the project's `hold` command, which says why
+# there is no pipeline and fails, and the unit parks there. Nothing is built,
+# committed, pushed or merged.
+#
+# A project using this flow defines the command hold.
+id = "no-pipeline"
+start = "hold"
+
+[[step]]
+id = "hold"
+kind = "command"
+command = "hold"
+# The command never passes. The flow still has to have a way to its end.
+on.pass = "end"
+on.fail = "park"

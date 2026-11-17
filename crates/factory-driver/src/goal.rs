@@ -47,6 +47,8 @@ use serde_json::{Value, json};
 
 use crate::{Driver, DriverError, Options, Ship, Status, Within, bead_source, under};
 
+pub mod review;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
@@ -623,6 +625,10 @@ pub struct Turned {
     /// asked for by then is in `launches` all the same.
     #[serde(default)]
     pub trouble: Option<String>,
+    /// Events for other projects' tiers, each with its project: what the
+    /// owner approved here that is another project's to open.
+    #[serde(default)]
+    pub handed: Vec<(String, Event)>,
 }
 
 /// The Slack settings as the factory uses them: the client, the owners,
@@ -1037,6 +1043,8 @@ pub struct Scheduled {
     /// How many beads each class of defect had broken when a run was last
     /// shown it: what a class has to exceed to call a run by itself.
     pub seen: BTreeMap<String, usize>,
+    /// The goals a review proposed to the owner, and what became of each.
+    pub proposals: Vec<review::Proposal>,
 }
 
 /// The classes of defect that call a maintenance run at once: each has
@@ -3682,6 +3690,20 @@ pub fn check_definitions(config: &ConfigDir) -> Result<Vec<String>, DriverError>
                         "it has a schedule, so it starts nothing: it cannot have a foreman, a designer or a stop_check".to_string(),
                     ));
                 }
+                if let Some(most) = schedule.proposes {
+                    // A review of the factory as a whole: its agent
+                    // proposes goals, and the owner's button opens them.
+                    config.role_prompt("inspector")?;
+                    lines.push(format!(
+                        "{id}/{}: scheduled, inspector {} ({}), every {} day(s) at {:02}:00 UTC, proposes at most {most} goal(s) a run to the owner",
+                        definition.id,
+                        definition.director.model,
+                        definition.director.effort,
+                        schedule.every_days,
+                        schedule.hour_utc,
+                    ));
+                    continue;
+                }
                 config.role_prompt("maintainer")?;
                 if let Some(name) = schedule
                     .reports
@@ -3797,6 +3819,12 @@ pub struct Supervisor {
     /// The one project this supervisor acts for, when it was made for a
     /// turn of that project. Otherwise it acts for every project.
     scope: Option<String>,
+    /// Every project's channel, by project: `channels` loses the other
+    /// projects' when the supervisor is made for one project's turn.
+    channel_of: BTreeMap<String, String>,
+    /// Events for projects this supervisor does not act for, for whoever
+    /// runs it to hand on.
+    handed: Vec<(String, Event)>,
 }
 
 impl Supervisor {
@@ -3886,12 +3914,18 @@ impl Supervisor {
             }
         }
         let (sender, receiver) = mpsc::channel();
+        let channel_of = channels
+            .iter()
+            .map(|(channel, project)| (project.clone(), channel.clone()))
+            .collect();
         Ok(Supervisor {
             config,
             factory,
             slack,
             owners,
             channels,
+            channel_of,
+            handed: Vec::new(),
             goals,
             executives,
             unit_slack,
@@ -3943,6 +3977,7 @@ impl Supervisor {
             due_at: self.next_due(),
             again_at: self.again_at(),
             trouble,
+            handed: std::mem::take(&mut self.handed),
         }
     }
 
@@ -4184,12 +4219,7 @@ impl Supervisor {
                         let Some(project) = self.channels.get(&channel).cloned() else {
                             return Ok(());
                         };
-                        // A project with an executive is spoken to through it.
-                        if self.config.project(&project)?.executive.is_some() {
-                            self.front_turn(&project, &channel, &ts, &user, &text)?;
-                        } else {
-                            self.open_goal(&project, &channel, &ts, &user, &text)?;
-                        }
+                        self.owner_opens(&project, &channel, &ts, &user, &text)?;
                         Ok(())
                     }
                     Some(root) => {
@@ -4214,8 +4244,10 @@ impl Supervisor {
                             (None, Some(project)) => self
                                 .front_turn(&project, &channel, &root, &user, &text)
                                 .map(|_| ()),
-                            // A pipeline's own thread: its driver reads it.
-                            (None, None) => Ok(()),
+                            // A reply under a proposal the owner declined
+                            // says why. Any other thread is a pipeline's
+                            // own: its driver reads it.
+                            (None, None) => self.proposal_reason(&channel, &root, &text),
                         }
                     }
                 }
@@ -4226,11 +4258,35 @@ impl Supervisor {
                 value,
                 ..
             } => {
-                if !self.owners.contains(&user) || !self.goals.contains_key(&value) {
+                if !self.owners.contains(&user) {
+                    return Ok(());
+                }
+                if let Some(approved) = review::pressed(&action_id) {
+                    return self.proposal_answered(&value, approved, &user);
+                }
+                if !self.goals.contains_key(&value) {
                     return Ok(());
                 }
                 self.act(&value, &action_id, &format!("<@{user}>"))
             }
+        }
+    }
+
+    /// What an owner's message at the top of a project's channel does: a
+    /// project with an executive is spoken to through it, and any other
+    /// has a goal opened. Returns the goal, if one was opened.
+    fn owner_opens(
+        &mut self,
+        project: &str,
+        channel: &str,
+        ts: &str,
+        user: &str,
+        text: &str,
+    ) -> Result<Option<String>, DriverError> {
+        if self.config.project(project)?.executive.is_some() {
+            self.front_turn(project, channel, ts, user, text)
+        } else {
+            self.open_goal(project, channel, ts, user, text)
         }
     }
 
@@ -6421,6 +6477,48 @@ impl Supervisor {
         std::fs::rename(&temp, &path).map_err(crate::io(&path))
     }
 
+    /// A scheduled run's agent could not be run. A usage limit is waited
+    /// out; anything else is tried again in half an hour, and after three
+    /// times the run is put off to its next time and the channel is told.
+    fn schedule_failed(
+        &mut self,
+        project: &Project,
+        definition: &GoalDefinition,
+        seat: &Seat,
+        record: &mut Scheduled,
+        reason: &str,
+    ) -> Result<(), DriverError> {
+        if let Some(until) = reason
+            .strip_prefix(LIMITED)
+            .and_then(|at| at.parse::<u64>().ok())
+        {
+            // Waiting for a usage window is not a failure.
+            record.retry_at = Some(until);
+        } else {
+            record.failures += 1;
+            self.log_at(
+                seat,
+                "schedule.failed",
+                json!({ "reason": reason, "failures": record.failures }),
+            );
+            if record.failures >= 3 {
+                // Given up until its next due time.
+                record.failures = 0;
+                record.retry_at = None;
+                record.since = now_unix();
+                self.tell_channel(project, seat, &format!(
+                    ":warning: The scheduled run `{}` of `{}` could not be run three times and is put off to its next time. The last reason: {}",
+                    definition.id,
+                    project.id,
+                    escape(&truncate(reason, 600))
+                ));
+            } else {
+                record.retry_at = Some(now_unix() + 1800);
+            }
+        }
+        self.save_schedule(seat, record)
+    }
+
     /// Run a scheduled definition if it is due: its agent is given the
     /// charter and what the records show, and files beads. Returns whether
     /// anything was done.
@@ -6477,6 +6575,9 @@ impl Supervisor {
             return Ok(false);
         }
         let called = if due > now_unix() { called } else { Vec::new() };
+        if let Some(most) = schedule.proposes {
+            return self.run_review(project, definition, schedule, &seat, record, most);
+        }
         let may_build = match (&schedule.build_under, &building) {
             (None, _) => MayBuild::FilesOnly,
             (Some(_), Some(goal)) => MayBuild::Building(goal.clone()),
@@ -6610,35 +6711,7 @@ impl Supervisor {
         let result = match self.run_agent(&seat, &mut record.usage, turn, &check) {
             Ok((result, _)) => result,
             Err(reason) => {
-                if let Some(until) = reason
-                    .strip_prefix(LIMITED)
-                    .and_then(|at| at.parse::<u64>().ok())
-                {
-                    // Waiting for a usage window is not a failure.
-                    record.retry_at = Some(until);
-                } else {
-                    record.failures += 1;
-                    self.log_at(
-                        &seat,
-                        "schedule.failed",
-                        json!({ "reason": reason, "failures": record.failures }),
-                    );
-                    if record.failures >= 3 {
-                        // Given up until its next due time.
-                        record.failures = 0;
-                        record.retry_at = None;
-                        record.since = now_unix();
-                        self.tell_channel(project, &seat, &format!(
-                            ":warning: The scheduled run `{}` of `{}` could not be run three times and is put off to its next time. The last reason: {}",
-                            definition.id,
-                            project.id,
-                            escape(&truncate(&reason, 600))
-                        ));
-                    } else {
-                        record.retry_at = Some(now_unix() + 1800);
-                    }
-                }
-                self.save_schedule(&seat, &record)?;
+                self.schedule_failed(project, definition, &seat, &mut record, &reason)?;
                 return Ok(true);
             }
         };
@@ -10461,6 +10534,7 @@ mod tests {
             reports: Vec::new(),
             build_under: None,
             when_class_breaks: None,
+            proposes: None,
         }
     }
 
