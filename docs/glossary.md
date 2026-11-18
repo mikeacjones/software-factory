@@ -74,7 +74,7 @@ What one bead goes through from being started to being landed: a unit walking it
 
 ## director
 
-The agent that directs a goal: it decides which bead's pipeline runs next, what to file, when the owner is needed and when to propose that the goal is complete. It starts fresh at every event and its decisions are checked by code. On a goal whose sub-goals have foremen it opens and ships sub-goals, and leaves their beads to them.
+The agent that directs a goal: it decides which bead's pipeline runs next, what to file, when the owner is needed and when to propose that the goal is complete (or, where the project sets `director_decides`, to end it). It starts fresh at every event and its decisions are checked by code. On a goal whose sub-goals have foremen it opens and ships sub-goals, and leaves their beads to them.
 
 ## executive
 

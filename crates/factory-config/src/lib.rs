@@ -360,6 +360,15 @@ pub struct Project {
     /// and that branch has been pushed.
     #[serde(default)]
     pub sync_branches: bool,
+    /// The owner has told every director of this project's goals to go with
+    /// its own recommendations. A director that would ask the owner which
+    /// way to go chooses itself and says what it chose in the goal's
+    /// thread, and code refuses a wake that only asks and leaves nothing
+    /// running. Its proposal that a goal is complete closes the goal. The
+    /// owner still starts each goal from its charter. A goal definition's
+    /// own `director_decides` overrides this.
+    #[serde(default)]
+    pub director_decides: bool,
     /// What the publication step should know about this project's commit
     /// messages and pull requests, such as the trailers it expects.
     pub publication_note: Option<String>,
@@ -795,6 +804,18 @@ pub struct GoalDefinition {
     pub schedule: Option<Schedule>,
     #[serde(default)]
     pub permissions: GoalPermissions,
+    /// This definition's own setting of the project's `director_decides`.
+    /// Left out, the project's applies: [`ConfigDir::goal_definitions`]
+    /// fills it in, so a loaded definition always has it.
+    pub director_decides: Option<bool>,
+}
+
+impl GoalDefinition {
+    /// Whether this goal's director goes with its own recommendations
+    /// rather than waiting for the owner. See `Project::director_decides`.
+    pub fn director_decides(&self) -> bool {
+        self.director_decides == Some(true)
+    }
 }
 
 /// When a definition runs by itself, and what each run is for.
@@ -1093,6 +1114,13 @@ impl ConfigDir {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             return Ok(Vec::new());
         };
+        // A definition that does not say whether its director decides alone
+        // takes the project's setting. A project that cannot be read here
+        // fails wherever it is read next; until then its goals ask.
+        let decides = self
+            .project(project)
+            .map(|project| project.director_decides)
+            .unwrap_or(false);
         let mut definitions = Vec::new();
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
@@ -1100,7 +1128,8 @@ impl ConfigDir {
                 continue;
             };
             let (path, text) = self.read(&format!("goals/{project}/{name}"))?;
-            let definition: GoalDefinition = parse(&path, &text)?;
+            let mut definition: GoalDefinition = parse(&path, &text)?;
+            definition.director_decides.get_or_insert(decides);
             let invalid = |reason: String| ConfigError::Invalid {
                 path: path.clone(),
                 reason,
@@ -1373,6 +1402,60 @@ timeout_secs = 60
         let err = dir.project("toy").unwrap_err().to_string();
         std::fs::remove_dir_all(&dir.0).unwrap();
         assert!(err.contains("`nope`"), "{err}");
+    }
+
+    #[test]
+    fn a_definition_takes_the_projects_director_decides_unless_it_says_otherwise() {
+        let definition = |id: &str, extra: &str| {
+            format!("id = \"{id}\"\n{extra}\n[director]\nmodel = \"m\"\neffort = \"high\"\n")
+        };
+        let write = |dir: &ConfigDir| {
+            let goals = dir.0.join("goals/toy");
+            std::fs::create_dir_all(&goals).unwrap();
+            std::fs::write(
+                goals.join("plain.toml"),
+                definition("plain", "default = true"),
+            )
+            .unwrap();
+            std::fs::write(
+                goals.join("asks.toml"),
+                definition("asks", "director_decides = false"),
+            )
+            .unwrap();
+            std::fs::write(
+                goals.join("decides.toml"),
+                definition("decides", "director_decides = true"),
+            )
+            .unwrap();
+        };
+        let decides = |dir: &ConfigDir| {
+            dir.goal_definitions("toy")
+                .unwrap()
+                .iter()
+                .map(|d| (d.id.clone(), d.director_decides()))
+                .collect::<Vec<_>>()
+        };
+        let owner = |plain: bool| {
+            vec![
+                ("asks".to_string(), false),
+                ("decides".to_string(), true),
+                ("plain".to_string(), plain),
+            ]
+        };
+
+        // By default every director asks.
+        let dir = dir_with(PROJECT);
+        write(&dir);
+        assert!(!dir.project("toy").unwrap().director_decides);
+        assert_eq!(decides(&dir), owner(false));
+        std::fs::remove_dir_all(&dir.0).unwrap();
+
+        // The project's setting reaches each definition that says nothing.
+        let dir =
+            dir_with(&PROJECT.replace("id = \"toy\"", "id = \"toy\"\ndirector_decides = true"));
+        write(&dir);
+        assert_eq!(decides(&dir), owner(true));
+        std::fs::remove_dir_all(&dir.0).unwrap();
     }
 
     #[test]

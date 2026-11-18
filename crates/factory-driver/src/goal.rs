@@ -1030,7 +1030,7 @@ pub fn wake_schema() -> Value {
         }))},
         "tell_executive": text_schema("Something for the project's executive, the level above goals, or empty. For tracker work that is not this goal's: an open bead that should be closed because what landed already delivers it or because it duplicates another, said with the bead IDs and the reason. The executive can close a bead; you cannot, and it is not a question for the owner."),
         "ask_owner": text_schema("One question only the owner can answer, or empty."),
-        "complete": { "type": "boolean", "description": "True to propose that the stop condition is met. The owner decides." },
+        "complete": { "type": "boolean", "description": "True when the stop condition is met. Whether that proposes the end of the goal to the owner or ends it is in your brief, under what you may decide." },
         "evidence": text_schema("When complete: how the stop condition is met, point by point, with what you checked. Otherwise empty."),
         "journal_entry": text_schema("What you want to remember at the next wake of this goal: decisions made, what you are waiting on, what you would do next. You start fresh each time; this is all that carries over. The brief shows only your newest entries, so carry forward here whatever still matters from the older ones: what is settled and not to be raised again, what you are waiting on."),
         "project_memory": text_schema("The whole new text of this project's memory, which every goal on the project reads, or empty to leave it as it is. Keep only durable facts about the project."),
@@ -2404,13 +2404,22 @@ pub fn decision_problems(
         }
     }
     // A goal must never be left with nothing that can move it.
-    let asks_owner = !strings(result, "ask_owner").trim().is_empty();
+    // A director that decides alone does not wait on the owner: a question
+    // goes alongside work, never in place of it.
+    let asks_owner =
+        !definition.director_decides() && !strings(result, "ask_owner").trim().is_empty();
     let needs_approval = goal.must_ask(definition.permissions.edit_beads, &edits)
         || (definition.permissions.file_beads == Permission::Ask
             && !items(result, "file").is_empty());
     if in_flight == 0 && !asks_owner && !complete && !needs_approval {
         problems.push(
-            if foreman {
+            if definition.director_decides() {
+                if foreman {
+                    "nothing would be running, and the owner has said you go with your own recommendations rather than wait for them: carry out what you would recommend (open a sub-goal, answer the foreman with `tell_foreman`, or ship the sub-goal), or complete the goal"
+                } else {
+                    "nothing would be running, and the owner has said you go with your own recommendations rather than wait for them: carry out what you would recommend (start a pipeline or ship the sub-goal), or complete the goal"
+                }
+            } else if foreman {
                 "nothing would be running and nobody would be asked: open a sub-goal, answer the foreman with `tell_foreman`, ship the sub-goal, ask the owner, or propose that the goal is complete"
             } else {
                 "nothing would be running and nobody would be asked: start a pipeline, ship the sub-goal, ask the owner, or propose that the goal is complete"
@@ -3122,6 +3131,20 @@ fn table(tracker: &[Summary], done: &[String]) -> String {
 }
 
 fn permission_text(definition: &GoalDefinition) -> String {
+    format!("{}\n{}", decisions_text(definition), owner_text(definition))
+}
+
+/// What is left to the owner: their questions, and the end of the goal.
+fn owner_text(definition: &GoalDefinition) -> String {
+    if definition.director_decides() {
+        "- Questions: the owner has said you go with your own recommendations, and this stands over anything agreed earlier about bringing decisions to them first. Where you would ask them which way to go, choose the way you would recommend, carry it out in this same result, and say in `summary` what you chose and why, so they can overrule it in the thread. `ask_owner` is only for what nobody but the owner can supply, such as access or a credential, and never stands in for work: code refuses a result that asks and leaves nothing running.\n- Ending the goal: yours. When you have checked the stop condition against the repository and the tracker, point by point, `complete` closes the goal, and the owner is shown your evidence.".to_string()
+    } else {
+        "- Ending the goal: you propose, the owner decides.".to_string()
+    }
+}
+
+/// What the director may decide about the work itself.
+fn decisions_text(definition: &GoalDefinition) -> String {
     let say = |permission: Permission| match permission {
         Permission::Allow => "is carried out at once",
         Permission::Ask => "is put to the owner, who approves or rejects it",
@@ -3132,7 +3155,7 @@ fn permission_text(definition: &GoalDefinition) -> String {
     if definition.foreman.is_some() {
         let slots = definition.director.slots;
         return format!(
-            "- Sub-goals: each is a part of the goal that lands as one pull request. {} Opening one (`open_subgoals`) hands it to its foreman, a separate agent that starts its beads through the light pipeline, rules on their findings, and reports to you when the sub-goal is ready to ship or when it needs you. You do not start beads: `start` is refused.\n- Answering a foreman: `tell_foreman` reaches the foreman of an open sub-goal, and wakes it.\n- Shipping: yours to decide, by naming the sub-goal in `ship` once nothing is running in it. It runs the whole verification once, opens one pull request for all of it and lands it, which closes its beads. Sub-goals ship one at a time, in the order you name them, and each takes in what landed before it first.\n- Filing a new bead {}.\n- Changing a bead that exists (criteria, priority, deferral) {}.\n- Ending the goal: you propose, the owner decides.",
+            "- Sub-goals: each is a part of the goal that lands as one pull request. {} Opening one (`open_subgoals`) hands it to its foreman, a separate agent that starts its beads through the light pipeline, rules on their findings, and reports to you when the sub-goal is ready to ship or when it needs you. You do not start beads: `start` is refused.\n- Answering a foreman: `tell_foreman` reaches the foreman of an open sub-goal, and wakes it.\n- Shipping: yours to decide, by naming the sub-goal in `ship` once nothing is running in it. It runs the whole verification once, opens one pull request for all of it and lands it, which closes its beads. Sub-goals ship one at a time, in the order you name them, and each takes in what landed before it first.\n- Filing a new bead {}.\n- Changing a bead that exists (criteria, priority, deferral) {}.",
             if slots > 1 {
                 format!(
                     "Up to {slots} may be waiting to land at once, and parts of the goal are meant to be worked on side by side unless one builds on another. What holds a sub-goal back is a dependency, never a shared file: name in its `after` the sub-goals whose work its beads build on, and code refuses to open it until they have landed. Two sub-goals with nothing between them may change the same files; what both changed is merged when the second ships, and a conflict there is resolved by a builder on its branch.{} Whenever a place is free, open the next part of the plan that builds on nothing an unlanded sub-goal will deliver. A dependency you leave out costs the later sub-goal its work, so say what each one needs; one that is not real makes the goal wait for nothing. Give a sub-goal `paths` when you can bound what it changes: its foreman keeps its beads inside them. Landing stays one at a time: each sub-goal's shipping first takes in what landed before it, and the whole verification runs on the result before its pull request opens.",
@@ -3146,7 +3169,7 @@ fn permission_text(definition: &GoalDefinition) -> String {
         );
     }
     format!(
-        "- Starting a pipeline: carried out at once, on a launchable bead, up to {} at a time.{}\n- Filing a new bead {}.\n- Changing a bead that exists (criteria, priority, deferral) {}.\n- Ending the goal: you propose, the owner decides.",
+        "- Starting a pipeline: carried out at once, on a launchable bead, up to {} at a time.{}\n- Filing a new bead {}.\n- Changing a bead that exists (criteria, priority, deferral) {}.",
         definition.max_pipelines,
         if definition.ship_flow.is_some() {
             "\n- Sub-goals: a bead runs inside a sub-goal, one sub-goal at a time. Its pipeline is light and ends by absorbing the bead's one commit into the sub-goal's branch; the bead stays open. Shipping the sub-goal runs the whole verification once, opens one pull request for all of it, and lands it, which closes its beads. A bead blocked only by beads the open sub-goal has absorbed is launchable."
@@ -6485,7 +6508,39 @@ impl Supervisor {
                 ),
             );
         }
-        if result.get("complete").and_then(Value::as_bool) == Some(true) {
+        let mut closed = false;
+        if result.get("complete").and_then(Value::as_bool) == Some(true)
+            && definition.director_decides()
+        {
+            // The owner has left the end of the goal to its director: it
+            // closes as the owner's Accept would, and they are told why.
+            let evidence = strings(&result, "evidence").to_string();
+            let checked = match goal.stop_check.as_ref().filter(|check| check.passed) {
+                Some(check) => format!(
+                    "\nThe goal's stop check (`{}`) passes on `{}`.",
+                    escape(&check.command),
+                    &check.commit[..check.commit.len().min(10)]
+                ),
+                None => String::new(),
+            };
+            goal.evidence = Some(evidence.clone());
+            goal.phase = Phase::Complete;
+            goal.inbox.clear();
+            self.log(
+                &goal,
+                "goal.complete",
+                json!({ "evidence": evidence, "by": "director" }),
+            );
+            self.say(
+                &goal,
+                &format!(
+                    ":checkered_flag: {} *Goal complete*, closed by its director, which this project leaves the end of a goal to.\n{}{checked}\nIf something is missing, say so in this thread and open a goal for it.",
+                    self.mentions(),
+                    quote(&truncate(&evidence, 2500))
+                ),
+            );
+            closed = true;
+        } else if result.get("complete").and_then(Value::as_bool) == Some(true) {
             let evidence = strings(&result, "evidence").to_string();
             let checked = match goal.stop_check.as_ref().filter(|check| check.passed) {
                 Some(check) => format!(
@@ -6721,6 +6776,13 @@ impl Supervisor {
         }
         for sub in &ships {
             self.ship(&mut goal, &definition, &source, sub)?;
+        }
+        if closed {
+            // Nothing runs in a complete goal: the place it held goes to
+            // the next goal waiting on the project.
+            let project = goal.project.clone();
+            self.save(goal)?;
+            return self.start_queued(&project);
         }
         self.save(goal)?;
         self.run_designers(id)?;

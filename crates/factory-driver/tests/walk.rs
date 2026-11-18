@@ -6835,6 +6835,108 @@ fn a_goal_is_not_proposed_as_complete_while_its_stop_check_fails() {
     assert_eq!(events.matches("\"stop_check.ran\"").count(), 2, "{events}");
 }
 
+/// On a project whose owner leaves decisions to the director, a wake that
+/// only asks the owner is refused, and the director's `complete` ends the
+/// goal without the owner's Accept.
+#[test]
+fn a_director_that_decides_alone_does_not_wait_and_ends_its_goal() {
+    use factory_driver::goal::{Phase, Supervisor};
+    use factory_slack::socket::Incoming;
+
+    let world = World::new("decides", "true");
+    let project = world.path("config/projects/toy.toml");
+    let text = std::fs::read_to_string(&project).unwrap();
+    // The setting belongs before the first table of the project file.
+    std::fs::write(&project, format!("director_decides = true\n{text}")).unwrap();
+    std::fs::create_dir_all(world.path("config/goals/toy")).unwrap();
+    std::fs::write(
+        world.path("config/goals/toy/main.toml"),
+        "id = \"main\"\n[director]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\n",
+    )
+    .unwrap();
+    factory_driver::goal::check_definitions(&world.config()).unwrap();
+
+    let say = |role: &str, n: u32, json: serde_json::Value| {
+        std::fs::create_dir_all(world.path("bin/state")).unwrap();
+        std::fs::write(
+            world.path(&format!("bin/state/{role}-{n}.json")),
+            json.to_string(),
+        )
+        .unwrap();
+    };
+    let direct = |fields: serde_json::Value| {
+        let mut result = serde_json::json!({
+            "summary": "Decided.", "start": [], "file": [], "edit": [], "dropped_findings": [],
+            "ask_owner": "", "complete": false, "evidence": "", "journal_entry": "", "project_memory": ""
+        });
+        for (key, value) in fields.as_object().unwrap() {
+            result[key] = value.clone();
+        }
+        result
+    };
+    say(
+        "intake",
+        1,
+        serde_json::json!({"reply": "Here is the charter.", "ready": true, "objective": "Ship it.", "stop_when": "It shipped.", "plan": "toy-1.", "edits": []}),
+    );
+    // It asks and leaves nothing running: refused, it decides instead.
+    say(
+        "director",
+        1,
+        direct(serde_json::json!({"ask_owner": "Rules A and B: shall I go ahead?"})),
+    );
+    say(
+        "director",
+        2,
+        direct(serde_json::json!({"complete": true, "evidence": "Checked: it shipped."})),
+    );
+
+    let mut sup = Supervisor::new(world.config(), None, vec!["OWNER".to_string()], false).unwrap();
+    let id = sup.open_directly("toy", "Ship it").unwrap();
+    sup.incoming(Incoming::Action {
+        channel: String::new(),
+        user: "OWNER".to_string(),
+        action_id: "goal_start".to_string(),
+        value: id.clone(),
+        message_ts: String::new(),
+    })
+    .unwrap();
+
+    let goal = sup.goals().next().unwrap().clone();
+    assert_eq!(goal.phase, Phase::Complete, "no Accept was needed");
+    assert_eq!(goal.evidence.as_deref(), Some("Checked: it shipped."));
+    let turns: Vec<usize> = world
+        .calls()
+        .iter()
+        .enumerate()
+        .filter(|(_, call)| call[0] == "director")
+        .map(|(at, _)| at + 1)
+        .collect();
+    assert_eq!(turns.len(), 2, "the question alone was sent back");
+    let brief =
+        |n: usize| std::fs::read_to_string(world.path(&format!("bin/state/brief-{n}.md"))).unwrap();
+    let first = brief(turns[0]);
+    assert!(
+        first.contains("the owner has said you go with your own recommendations")
+            && first.contains("- Ending the goal: yours."),
+        "{first}"
+    );
+    assert!(
+        brief(turns[1]).contains(
+            "nothing would be running, and the owner has said you go with your own recommendations"
+        ),
+        "{}",
+        brief(turns[1])
+    );
+    let events =
+        std::fs::read_to_string(world.path(&format!("state/goals/{id}/events.jsonl"))).unwrap();
+    assert!(
+        events.contains(r#""kind":"goal.complete""#) && events.contains(r#""by":"director""#),
+        "{events}"
+    );
+    assert!(!events.contains("goal_accept"), "{events}");
+}
+
 /// A second goal on a project waits for the first, and starts by itself.
 #[test]
 fn a_goal_started_while_another_runs_is_queued_and_starts_when_that_ends() {

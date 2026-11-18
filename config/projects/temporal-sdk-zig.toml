@@ -12,6 +12,11 @@ flow = "zig-sdk"
 # and that branch has been pushed. CI here runs on pull requests and on main,
 # so these pushes start none.
 sync_branches = true
+# The owner leaves decisions to each goal's director: one that would ask
+# which way to go chooses what it would recommend and says so in the thread,
+# and a goal it has checked against its stop condition it closes itself.
+# The owner still presses Start on each goal's charter.
+director_decides = true
 publication_note = """
 End the commit message with a trailer block: one `Bead: <full bead ID>` line for each bead the change covers, which is the trailer this repository's history uses (not `Refs:`), and after them the changelog trailer when the change needs one. A pull request is squashed when it lands, so the message written for the whole pull request, with a testing paragraph the factory adds, is what the default branch keeps: write it for someone reading the history a year from now."""
 
