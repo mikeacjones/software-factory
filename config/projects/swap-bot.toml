@@ -1,0 +1,76 @@
+id = "swap-bot"
+repo = "~/Source/reddit-trade-confirmation-bot-devvit"
+remote = "origin"
+default_branch = "main"
+bead_actor = "factory"
+slack_channel = "swap-bot"
+flow = "swap-bot"
+# The factory only keeps this bot's dependencies current for now: a weekly
+# run files one bead when npm reports anything outdated, and the factory
+# builds it under `bump` and lands it once CI is green. Nobody is asked:
+# directors go with their own recommendations.
+director_decides = true
+
+# Every worktree starts from a clean install of the locked dependencies, as
+# CI's `npm ci` does.
+setup = ["install"]
+
+# CI and the publish workflow are the owner's; the beads tracker is not in
+# this repository; CI commits the coverage badge on main itself.
+forbidden_paths = [".github/**", ".beads/**", ".claude/**", "worktrees/**"]
+standards = ["README.md"]
+test_patterns = ['\b(it|test|describe)(\.each)?\(', '\bexpect\(']
+
+publication_note = """
+Write the pull request for someone reading the history a year from now: name each package moved and from which version to which, and for each code change say which release of which package it answers. A pull request is squash-merged, so its title and body become the commit on main."""
+
+[beads]
+kind = "dolt"
+host = "127.0.0.1"
+port = 3306
+user = "root"
+database = "swap_bot"
+
+[github]
+repo = "mikeacjones/reddit-trade-confirmation-bot-devvit"
+write = ["mikeacjones/reddit-trade-confirmation-bot-devvit"]
+# Every bead has a GitHub issue, and the pull request that lands it closes it.
+issues = true
+issue_labels = ["type::{type}", "priority::{priority}"]
+# devvit-test.yml's one job runs `npm ci`, `tsc --noEmit` and the tests with
+# coverage on every pull request.
+required_checks = ["test"]
+ci_poll_secs = 30
+ci_timeout_secs = 1800
+ci_settle_secs = 30
+ci_reruns = 1
+merge_method = "squash"
+merge_subject = "{title} (#{number})"
+merge_body = "{commit_body}\n\n{testing}\n\n{commit_trailers}"
+delete_branch_after_merge = true
+
+[scopes]
+code = ["**"]
+
+[commands.install]
+argv = ["npm", "ci", "--no-audit", "--no-fund"]
+timeout_secs = 900
+could_not_run_when = ["ENOTFOUND", "ETIMEDOUT", "ECONNRESET", "EAI_AGAIN"]
+
+[commands.typecheck]
+argv = ["npm", "run", "typecheck"]
+timeout_secs = 600
+
+[commands.test]
+argv = ["npm", "test"]
+timeout_secs = 1200
+failure_lines = ['FAIL ', 'AssertionError', 'Error: ']
+triage = { rerun = true }
+
+# What the weekly run is shown before it decides: every dependency with a
+# newer release, as npm reports it. npm exits 1 when anything is outdated,
+# which a report may do.
+[commands.outdated]
+argv = ["sh", "-c", "npm ci --no-audit --no-fund >/dev/null 2>&1; npm outdated --long"]
+timeout_secs = 600
+shown = "list the dependencies that have newer releases"

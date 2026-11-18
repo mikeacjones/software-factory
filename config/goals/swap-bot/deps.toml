@@ -1,0 +1,45 @@
+# Weekly dependency upkeep of the swap bot: a run the factory starts by
+# itself. Its agent, the maintainer, is shown what `npm outdated` reports on
+# the default branch, and files at most one bead, marked to build: the
+# factory builds it under `bump` and squash-merges its pull request once CI
+# is green (owner's decision, 2026-11-18).
+id = "deps"
+
+# The agent of each run. A scheduled definition has no director; this table
+# gives the maintainer its model, effort and time limit.
+[director]
+model = "claude-opus-5-5"
+effort = "medium"
+timeout_secs = 1200
+
+[schedule]
+hour_utc = 14
+every_days = 7
+max_beads = 1
+reports = ["outdated"]
+build_under = "bump"
+charter = """
+Keep every dependency of the swap bot (a Reddit Devvit app in TypeScript) \
+on its latest release, `dependencies` and `devDependencies` alike, major \
+releases included. Your report is `npm outdated --long` on the default \
+branch: a package is behind when its Latest column is newer than what is \
+installed.
+
+When nothing is behind, file nothing and say so. When anything is, file \
+exactly one bead, marked to build, titled "Bump dependencies to their \
+latest releases", that lists each package with its current and latest \
+version. Its acceptance criteria: every listed package is at that latest \
+version in package.json and package-lock.json, with package.json's \
+version style kept (an exact pin stays exact, a caret range moves to a \
+caret on the new version); `devvit` and `@devvit/public-api` move together \
+to the same version, since the CLI and the API it builds against must \
+match; the code, tests and configuration are changed wherever a new \
+release needs it (read each major release's changelog or migration notes \
+and name what changed); `npm run typecheck` and `npm test` pass; nothing \
+under .github changes.
+
+Not yours: features, refactors that no release calls for, and the CI and \
+publish workflows. If a release cannot be adopted without a decision only \
+the owner can make, leave that package at its version, say why in the \
+bead, and bump the rest.
+"""

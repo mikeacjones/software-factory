@@ -1,0 +1,15 @@
+# The goal the weekly `deps` run's beads are built under: the factory opens
+# it by itself, starts each bead's pipeline (swap-bot.toml), and ends it
+# when the beads are closed. Its director runs on Opus, as does every agent
+# of this project that does not build or test.
+id = "bump"
+default = true
+flow = "swap-bot"
+max_pipelines = 1
+objective = "Keep the swap bot's dependencies on their latest releases, with the code changed as each new release needs."
+stop_when = "Every bead this goal was opened for is closed: its pull request is squash-merged on main with CI green."
+
+[director]
+model = "claude-opus-5-5"
+effort = "medium"
+timeout_secs = 1800
