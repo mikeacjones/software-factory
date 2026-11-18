@@ -8,6 +8,7 @@
 pub mod act;
 pub mod inbox;
 pub mod net;
+pub mod patch;
 pub mod records;
 pub mod runlog;
 pub mod server;

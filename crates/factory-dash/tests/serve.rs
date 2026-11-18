@@ -432,6 +432,110 @@ async fn what_waits_on_the_owner_and_the_conversation_are_read_from_the_records(
     std::fs::remove_dir_all(&state).unwrap();
 }
 
+/// Read server-sent events from a stream until `want` of them have come,
+/// as (name, data) pairs.
+fn events(
+    stream: &mut TcpStream,
+    buffer: &mut String,
+    want: usize,
+) -> Vec<(String, serde_json::Value)> {
+    let mut found = Vec::new();
+    let mut chunk = [0u8; 65536];
+    loop {
+        while let Some(end) = buffer.find("\n\n") {
+            let block: String = buffer.drain(..end + 2).collect();
+            let name = block.lines().find_map(|line| line.strip_prefix("event: "));
+            let data = block.lines().find_map(|line| line.strip_prefix("data: "));
+            if let (Some(name), Some(data)) = (name, data) {
+                found.push((name.to_string(), serde_json::from_str(data).unwrap()));
+                if found.len() == want {
+                    return found;
+                }
+            }
+        }
+        let read = stream.read(&mut chunk).unwrap();
+        assert!(read > 0, "the stream ended: {buffer}");
+        buffer.push_str(std::str::from_utf8(&chunk[..read]).unwrap());
+        // The answer's head comes first, once.
+        if buffer.starts_with("HTTP/") {
+            let Some((head, rest)) = buffer.split_once("\r\n\r\n") else {
+                continue;
+            };
+            assert!(
+                head.starts_with("HTTP/1.0 200") || head.starts_with("HTTP/1.1 200"),
+                "{head}"
+            );
+            assert!(head.contains("content-type: text/event-stream"), "{head}");
+            *buffer = rest.to_string();
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_stream_sends_the_picture_once_and_then_only_what_changed() {
+    let state = state("stream");
+    let address = open(&state, &["127.0.0.0/8"]).await;
+    let goal = state.join("goals/toy-g1/goal.json");
+    let (first, patched, whole) = tokio::task::spawn_blocking(move || {
+        let mut stream = TcpStream::connect(address).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(15)))
+            .unwrap();
+        // HTTP/1.0, so that the body comes as it is, not in chunks.
+        write!(
+            stream,
+            "GET /api/stream HTTP/1.0\r\nHost: {address}\r\n\r\n"
+        )
+        .unwrap();
+        let mut buffer = String::new();
+        let first = events(&mut stream, &mut buffer, 1).remove(0);
+
+        // A record changes: only that change comes, and nothing else.
+        let text = std::fs::read_to_string(&goal).unwrap();
+        std::fs::write(
+            &goal,
+            text.replace("Ship the feature.", "Ship the whole feature."),
+        )
+        .unwrap();
+        let patched = events(&mut stream, &mut buffer, 1).remove(0);
+        let whole = {
+            let mut asked = TcpStream::connect(address).unwrap();
+            write!(
+                asked,
+                "GET /api/snapshot HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            let mut answer = String::new();
+            asked.read_to_string(&mut answer).unwrap();
+            body(&answer)
+        };
+        (first, patched, whole)
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(first.0, "picture");
+    let picture = first.1["picture"].clone();
+    assert_eq!(
+        picture["projects"][0]["goals"][0]["objective"],
+        "Ship the feature."
+    );
+    assert_eq!(patched.0, "patch");
+    assert_eq!(patched.1["from"], first.1["tag"]);
+    let changes = patched.1["changes"].as_array().unwrap();
+    assert!(
+        changes.contains(&serde_json::json!([
+            "s",
+            ["projects", 0, "goals", 0, "objective"],
+            "Ship the whole feature."
+        ])),
+        "{changes:?}"
+    );
+    // Applied in order, the changes give the picture the server now holds.
+    assert_eq!(factory_dash::patch::apply(picture, changes), Some(whole));
+    std::fs::remove_dir_all(&state).unwrap();
+}
+
 /// The dashboard is an observer: nothing in it can write, remove or move
 /// a file or open a connection of its own, and the one program it may
 /// start is the factory's engine, to hand on the owner's acts.

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from 'svelte';
   // A project's map. It is laid out top-down by itself; whatever the owner
   // drags stays where it was put (in this browser) until Tidy.
   import { SvelteFlow, Background, Controls, MiniMap, type Edge, type Node } from '@xyflow/svelte';
@@ -11,6 +12,7 @@
   import MapTools from './MapTools.svelte';
   import { projectGraph, type Pipelines, type Ref } from '../lib/graph';
   import { load, save, loadChoice, saveChoice, loadOpen, saveOpen, type Placed } from '../lib/arrangement';
+  import { keep } from '../lib/same';
   import type { Item, Project } from '../lib/types';
 
   let {
@@ -42,8 +44,12 @@
     const built = projectGraph(project, inbox, chosen, minute, { pipelines, open, ontoggle: toggle });
     if (dragging) return;
     // A card the owner placed keeps its place; the rest are laid out.
-    nodes = built.nodes.map((node) => (placed[node.id] ? { ...node, position: placed[node.id] } : node));
-    edges = built.edges;
+    // What is drawn already and has not changed is kept as it is.
+    const fresh = built.nodes.map((node) => (placed[node.id] ? { ...node, position: placed[node.id] } : node));
+    const nextNodes = keep(untrack(() => nodes), fresh);
+    const nextEdges = keep(untrack(() => edges), built.edges);
+    if (nextNodes !== untrack(() => nodes)) nodes = nextNodes;
+    if (nextEdges !== untrack(() => edges)) edges = nextEdges;
     refs = built.refs;
   });
 

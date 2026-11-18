@@ -1,5 +1,5 @@
-// The live state of the page: the picture, read every two seconds while the
-// page is looked at, the server's clock, where the reader is, and what the
+// The live state of the page: the picture, kept up to date by the server
+// as it changes, the server's clock, where the reader is, and what the
 // owner has sent that the factory has not yet taken in.
 
 import type { Item, Picture, Line } from './types';
@@ -45,38 +45,91 @@ export function go(view: View) {
 addEventListener('popstate', () => { route.at = read(location.hash); });
 addEventListener('hashchange', () => { route.at = read(location.hash); });
 
+// The picture comes as a stream: the whole of it once, then only what
+// changed in it, applied where it is so that everything not touched by a
+// change (what is being read, typed or dragged) is left as it was.
+
+type Change = ['s', (string | number)[], unknown] | ['d', (string | number)[]] | ['t', (string | number)[], number];
+
 let tag: string | null = null;
 
-async function poll() {
-  try {
-    const answer = await fetch('/api/snapshot', {
-      cache: 'no-store',
-      headers: tag ? { 'If-None-Match': tag } : {},
-    });
-    const serverNow = Number(answer.headers.get('x-now'));
-    if (serverNow) live.skew = serverNow - Date.now() / 1000;
-    if (answer.status === 200) {
-      const picture: Picture = await answer.json();
-      tag = answer.headers.get('etag');
-      live.picture = picture;
-      // What was sent and has left the inbox has been taken in.
-      const waiting = new Set((picture.inbox || []).map((item) => item.key));
-      for (const key of Object.keys(live.sent)) if (!waiting.has(key)) delete live.sent[key];
-      // A new message is shown as sent until its thread is on record.
-      for (const project of picture.projects || []) {
-        const known = new Set([
-          ...(project.executive?.conversations || []).map((one) => one.ts),
-          ...(project.goals || []).map((goal) => goal.thread?.ts),
-        ]);
-        const left = (live.started[project.id] || []).filter((one) => !known.has(one.thread));
-        if (left.length !== (live.started[project.id] || []).length) live.started[project.id] = left;
-      }
+/** Apply the server's changes to the picture held (crates/factory-dash/src/patch.rs).
+ * False if one does not fit, and then the picture must be read whole again. */
+function apply(changes: Change[]): boolean {
+  for (const change of changes) {
+    const path = change[1];
+    if (!path.length) {
+      if (change[0] !== 's') return false;
+      live.picture = change[2] as Picture;
+      continue;
     }
-    if (answer.status === 200 || answer.status === 304) live.heard = Date.now() / 1000;
-  } catch {
-    // The pulse says so if it goes on.
+    let at: any = live.picture;
+    for (const step of path.slice(0, -1)) {
+      at = at?.[step];
+      if (at == null || typeof at !== 'object') return false;
+    }
+    const last = path[path.length - 1];
+    if (change[0] === 's') {
+      if (Array.isArray(at) && (typeof last !== 'number' || last > at.length)) return false;
+      at[last] = change[2];
+    } else if (change[0] === 'd') {
+      delete at[last];
+    } else {
+      const list = at[last];
+      if (!Array.isArray(list)) return false;
+      list.length = change[2];
+    }
   }
-  setTimeout(poll, document.hidden ? 15000 : 2000);
+  return true;
+}
+
+/** What the owner sent and the records now show has been taken in. */
+function settle(picture: Picture) {
+  const waiting = new Set((picture.inbox || []).map((item) => item.key));
+  for (const key of Object.keys(live.sent)) if (!waiting.has(key)) delete live.sent[key];
+  // A new message is shown as sent until its thread is on record.
+  for (const project of picture.projects || []) {
+    const known = new Set([
+      ...(project.executive?.conversations || []).map((one) => one.ts),
+      ...(project.goals || []).map((goal) => goal.thread?.ts),
+    ]);
+    const left = (live.started[project.id] || []).filter((one) => !known.has(one.thread));
+    if (left.length !== (live.started[project.id] || []).length) live.started[project.id] = left;
+  }
+}
+
+function heard(now: unknown) {
+  if (typeof now === 'number' && now) live.skew = now - Date.now() / 1000;
+  live.heard = Date.now() / 1000;
+}
+
+let source: EventSource | null = null;
+
+function listen() {
+  source?.close();
+  const stream = new EventSource('/api/stream');
+  source = stream;
+  stream.addEventListener('picture', (event) => {
+    const said = JSON.parse((event as MessageEvent).data);
+    tag = said.tag;
+    live.picture = said.picture;
+    settle(live.picture!);
+    heard(said.now);
+  });
+  stream.addEventListener('patch', (event) => {
+    const said = JSON.parse((event as MessageEvent).data);
+    // A change made to some other picture than this one: start again.
+    if (said.from !== tag || !apply(said.changes)) {
+      listen();
+      return;
+    }
+    tag = said.tag;
+    settle(live.picture!);
+    heard(said.now);
+  });
+  stream.addEventListener('beat', (event) => heard(JSON.parse((event as MessageEvent).data).now));
+  // The browser asks again by itself when the stream is lost; the pulse
+  // says so if it goes on.
 }
 
 async function askCanAct() {
@@ -91,7 +144,7 @@ async function askCanAct() {
 }
 
 export function start() {
-  poll();
+  listen();
   askCanAct();
   setInterval(() => { live.now = Date.now() / 1000 + live.skew; }, 1000);
 }

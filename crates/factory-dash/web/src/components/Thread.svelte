@@ -17,12 +17,16 @@
     const key = `${where}/${id}/${thread ?? ''}`;
     let gone = false;
     let timer = 0;
+    let last: string | null = null;
     loaded = false;
     lines = [];
     const look = async () => {
       const got = await conversation(where, id, thread);
       if (gone) return;
-      if (got) {
+      // The same conversation as before is left as it is drawn.
+      const said = got && JSON.stringify(got);
+      if (got && said !== last) {
+        last = said;
         const grew = got.lines.length !== lines.length;
         const follow = box ? box.scrollTop + box.clientHeight >= box.scrollHeight - 80 : true;
         lines = got.lines;
