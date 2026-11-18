@@ -147,6 +147,10 @@ kbd {
 .svelte-flow__edge.hot .svelte-flow__edge-path { stroke: var(--accent); stroke-width: 2; }
 .svelte-flow__edge.walked .svelte-flow__edge-path { stroke: var(--ink-3); stroke-width: 1.5; }
 .svelte-flow__edge.back .svelte-flow__edge-path { stroke-dasharray: 5 4; }
+.svelte-flow__edge.unwalked .svelte-flow__edge-path { opacity: 0.55; }
+.svelte-flow__edge.unwalked .svelte-flow__edge-text { opacity: 0.7; }
+.svelte-flow__edge.walked .svelte-flow__edge-text { fill: var(--ink-2); font-weight: 600; }
+.svelte-flow__node-pipeline { z-index: 0; }
 .svelte-flow__edge.waiting .svelte-flow__edge-path { stroke: var(--warning-solid); stroke-width: 2; }
 .svelte-flow__edge-label, .svelte-flow__edge-text { font-size: 11px; }
 .svelte-flow__edge-textbg { fill: var(--plane); }

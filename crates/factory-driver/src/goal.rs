@@ -1101,6 +1101,48 @@ pub fn echo_owner(
         })
 }
 
+/// Put a new message of the owner's, written somewhere other than Slack, at
+/// the top of the project's channel, as from that place, so that what the
+/// factory answers has a thread there to go in. Returns the channel and
+/// the message's time stamp, or None when the factory has no Slack or the
+/// project no channel yet.
+pub fn post_owner(
+    config: &ConfigDir,
+    project: &str,
+    text: &str,
+    from: &str,
+) -> Result<Option<(String, String)>, DriverError> {
+    let factory = config.factory()?;
+    let Some(settings) = factory.slack.as_ref() else {
+        return Ok(None);
+    };
+    let Some(name) = config.project(project)?.slack_channel else {
+        return Ok(None);
+    };
+    let known: BTreeMap<String, String> =
+        std::fs::read_to_string(factory.state_dir.join("channels.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default();
+    let Some(channel) = known.get(&name).cloned() else {
+        return Ok(None);
+    };
+    let (slack, _, _, _) = slack_of(settings)?;
+    let ts = slack
+        .post(
+            &channel,
+            None,
+            &format!(
+                "_The owner, from {from}:_\n{}",
+                quote(&truncate(text, 3500))
+            ),
+        )
+        .map_err(|err| {
+            DriverError::Preflight(format!("the message could not be put in Slack: {err}"))
+        })?;
+    Ok(Some((channel, ts)))
+}
+
 /// A pipeline a goal's record says is running.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunningPipeline {

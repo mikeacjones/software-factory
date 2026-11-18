@@ -85,6 +85,10 @@ export interface Bead {
   workflow?: string | null;
   runs?: string[];
   changed_at?: number;
+  /** How often each step ended with each outcome, as `step:outcome`. */
+  taken?: Record<string, number>;
+  /** Seconds each step has taken in all. */
+  spent?: Record<string, number>;
 }
 
 export interface SubGoal {
@@ -106,8 +110,17 @@ export interface SubGoal {
   ship?: Bead | null;
 }
 
+/** What a tier's log adds up to. */
+export interface Agents {
+  kinds: Record<string, number>;
+  roles: Record<string, { runs: number; failed: number; cost: number; last_at: number; model: string }>;
+  wakes: Record<string, number>;
+  subgoals: Record<string, Record<string, number>>;
+}
+
 export interface Goal {
   id: string;
+  agents?: Agents | null;
   phase: string;
   definition?: string;
   thread?: Thread | null;
@@ -137,6 +150,7 @@ export interface Conversation {
 }
 
 export interface Executive {
+  agents?: Agents | null;
   wakes?: number;
   cost?: number;
   threads?: number;

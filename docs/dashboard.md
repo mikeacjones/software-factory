@@ -28,12 +28,14 @@ The old page answered the third well and the first two not at all. It was one lo
 │ ● Live     │  Waiting 0 · Agents 3 · Running 3 · 18/27   │  (the chosen │
 │            ├─────────────────────────────────────────────┤   node:      │
 │ Inbox    1 │                                             │   bead and   │
-│ Floor    3 │  Exec ─┬─ Goal ─┬─ Sub-goal ─┬─ bead ▮▮▮▯▯   │   pipeline,  │
-│            │        │        │            └─ bead ▮▮▯▯▯   │   goal and   │
-│ PROJECTS   │        │        └─ Sub-goal (landed, folded)│   its talk,  │
-│ ● sf     1 │        └─ Goal ── Sub-goal ── …             │   executive  │
-│ ○ swap-bot │                                             │   and its    │
-│ ◉ zig    3 │                                   [minimap] │   threads)   │
+│ Floor    3 │  [Active pipelines|All|Cards]  [✦ Tidy]      │   pipeline,  │
+│            │                 Exec                        │   goal and   │
+│ PROJECTS   │          Goal ───────┴────── Goal           │   its talk,  │
+│ ● sf     1 │      Sub-goal  Sub-goal    Sub-goal         │   executive  │
+│ ○ swap-bot │   bead  ┌bead─────────┐  bead  bead         │   and its    │
+│ ◉ zig    3 │   card  │build  ×1    │  card  card         │   threads)   │
+│            │         │checks ×2 ┐  │                     │              │
+│            │         │break ─×3─fix│           [minimap] │              │
 │ ACCOUNTS   │                                             │              │
 │ claude ▬▬  │                                             │              │
 └────────────┴─────────────────────────────────────────────┴──────────────┘
@@ -41,8 +43,11 @@ The old page answered the third well and the first two not at all. It was one lo
 
 - **The sidebar is the map of places.** The inbox first, with its count; the floor; then every project with a dot (amber: waiting on you, orange: something parked, pulsing blue: working, green: open but quiet, grey: idle) and a count. The accounts sit at the foot as two thin bars each, since the owner most often needs only "is anything at a limit?". The tab's title carries the inbox count, so a pinned tab says when it needs a look.
 - **The inbox is a list and a reading pane.** Each item says what kind of answer it needs, which project and goal it is for, and how long it has waited. The pane holds the full question, the buttons in the order the factory posted them, a reply box when a reply is read, and the goal's whole conversation from its log, so the owner answers with the history in front of them. An answer sent dims the item until the factory's own records say it has been taken in; the item is never removed by the page alone.
-- **A project is a graph.** Executive, goals, sub-goals and beads, laid out left to right with dagre. Edges into anything running are animated, edges into anything waiting on the owner are amber, and sub-goals that have landed are folded to one node. Each bead carries its pipeline's steps as a row of marks, so a whole goal's progress shows at a glance. Choosing a node opens the inspector beside the graph; the choice is in the address, so it can be linked and survives a reload.
-- **A pipeline is a graph too.** A bead's flow is drawn from the flow definition the unit was pinned to: every step, every route with its outcome and its limit, routes back drawn dashed, the steps reached marked with how often, and the step it stands at lit. "Why is this bead still going?" becomes visible as the loop between `break` and `fix`.
+- **A project is a graph, top down.** Executive, then goals, sub-goals and beads below them, laid out with dagre. Edges into anything running are animated, edges into anything waiting on the owner are amber, and sub-goals that have landed are folded to one node. Every card has a fixed size that the layout and the page share, with its text clipped to fit, so no browser's fonts can make one card overlap another. Choosing a node opens the inspector beside the graph; the choice is in the address, so it can be linked and survives a reload.
+- **A bead is drawn with its whole pipeline.** A bead running, parked or asking the owner (or every bead that has started, or none: the toggle in the map's corner, remembered in the browser) is a frame holding its flow's steps. The main path, the longest chain of routes forward from the first step, runs straight down; a step off it, such as `fix`, stands beside it level with the steps that lead there, the routes into it on one rail; a route back up is dashed and runs down the right of the column; a route out of the flow (`park`, `ask`, `end`) drops to a mark on the left. Each route the bead has taken is drawn heavier with how often (from the outcomes of `step.ended` in the unit's log), each step with how often it was reached and the time spent in it, and the step it stands at is lit. "Why is this bead still going?" is the count on the dashed line from `break` back to `fix`. Every pipeline of one flow looks the same, so two can be compared at a glance.
+- **A tier is drawn with its agents.** The executive, a goal and a sub-goal open, like a bead, into a frame of their agents at work, counted from the tier's own log: what woke it across the top (the director's wakes by the reason `wake.routed` gives, with names and numbers taken out so that reasons of one shape add up; the owner's messages), each agent below as a column (the director, the director agreeing a charter, the designer, a foreman, the executive) with its runs, failures, cost and model, and under each agent on a bracket what it did and how often: sub-goals opened, pipelines started, beads filed and changed, foremen and the executive told, sub-goals shipped, questions to the owner, designs proposed, accepted and sent back, results refused by code, a foreman's reports. An agent at work now is lit. A foreman's cost is not shown, since the log does not say which sub-goal a foreman's run was for.
+- **Every card opens and folds.** The toggle in the map's corner sets what is open: what is active (beads running, parked or asking, and tiers whose agent is at work), everything, or nothing. Each card's ⤢ opens it and each frame's ⤡ folds it back, and that choice is kept in the browser until the corner toggle is changed.
+- **The owner can arrange the map.** Any card, frame or step can be dragged. Where the owner puts things is kept in that browser for that project and survives the refresh every two seconds and a reload; **Tidy** forgets it and lays the map out again.
 
 ## Answering from the page
 
@@ -51,7 +56,7 @@ An answer here is the same event as the same answer in Slack (see [architecture.
 ## Before Slack can go
 
 - **A pipeline step's question.** Its driver reads the answer from the unit's Slack thread while it waits, so the page can only show it and link there. It needs an answer the driver can read from somewhere else, such as a signal to the pipeline's workflow.
-- **Opening a goal or a conversation.** Today a new top-level message in the project's channel does it. `factory-engine open` exists; the page needs a "New goal" box per project that uses it, and an executive conversation started without Slack needs its own thread name.
+- **Opening a goal or a conversation** is done: each project's page has "Message the executive" ("Open a goal" where there is none), which `factory-engine owner <project> new` puts at the top of the project's channel as from the dashboard and hands to the tiers as the owner's message there, so the answer has a thread in Slack too. Without Slack it goes to the executive as a thread of the factory's own (`Event::Tell`), or opens a goal (`Event::Open`).
 - **Being told.** Slack notifies the owner's phone. A page can show a browser notification when the inbox grows, but only while it is open; a push channel is needed for the rest.
 - **The owner's identity.** The page acts as the first owner the Slack settings name. Without Slack the factory needs its own record of who the owner is.
 - **Who may act from the network.** Anyone on a network given with `--act-allow` can answer as the owner. That is the same trust as the LAN the dashboard already serves, but answers steer agents that run in bypass mode, so a sign-in is due before it is opened beyond one trusted network.

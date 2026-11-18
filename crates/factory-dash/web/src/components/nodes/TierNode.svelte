@@ -14,16 +14,19 @@
     waiting: number;
     chosen: boolean;
     progress?: [number, number];
+    size: { width: number; height: number };
+    ontoggle?: () => void;
   };
-  let { data }: NodeProps & { data: Data } = $props();
+  let { data, targetPosition = Position.Top, sourcePosition = Position.Bottom }: NodeProps & { data: Data } = $props();
 </script>
 
-<Handle type="target" position={Position.Left} />
-<div class="tier {data.level}" class:busy={data.busy} class:waiting={data.waiting > 0} class:chosen={data.chosen}>
+<Handle type="target" position={targetPosition} />
+<div class="tier {data.level}" style:width="{data.size.width}px" style:height="{data.size.height}px" class:busy={data.busy} class:waiting={data.waiting > 0} class:chosen={data.chosen}>
   <div class="top">
     <span class="label">{data.label}</span>
     {#if data.waiting}<span class="ask" title="Waiting on you">{data.waiting} for you</span>{/if}
     <span class="pill {data.tone}">{data.word}</span>
+    {#if data.ontoggle}<button class="toggle nodrag" title="Open: its agents at work" aria-label="Open: its agents at work" onclick={(event) => { event.stopPropagation(); data.ontoggle?.(); }}>⤢</button>{/if}
   </div>
   <p class="title" title={data.title}>{data.title}</p>
   {#if data.progress && data.progress[1]}
@@ -33,11 +36,11 @@
   {/if}
   {#if data.facts.length}<p class="facts">{data.facts.join(' · ')}</p>{/if}
 </div>
-<Handle type="source" position={Position.Right} />
+<Handle type="source" position={sourcePosition} />
 
 <style>
   .tier {
-    width: 270px; padding: 10px 12px; border-radius: var(--radius); background: var(--surface);
+    padding: 10px 12px; overflow: hidden; border-radius: var(--radius); background: var(--surface);
     border: 1px solid var(--line-2); box-shadow: var(--shadow); display: flex; flex-direction: column; gap: 5px;
     cursor: pointer; transition: border-color 0.15s, box-shadow 0.15s;
   }
@@ -55,7 +58,12 @@
     font-size: 13px; font-weight: 600; line-height: 1.3; color: var(--ink);
     display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
   }
-  .facts { font-size: 11px; color: var(--ink-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .facts { margin-top: auto; font-size: 11px; color: var(--ink-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .progress { height: 4px; background: var(--line); border-radius: 2px; overflow: hidden; }
   .progress span { display: block; height: 100%; background: var(--good); }
+  .toggle {
+    border: 1px solid var(--line-2); background: var(--surface); color: var(--ink-2); border-radius: 5px;
+    width: 22px; height: 20px; padding: 0; font-size: 12px; line-height: 1; cursor: pointer; flex: none;
+  }
+  .toggle:hover { background: var(--accent-soft); color: var(--accent); border-color: var(--accent); }
 </style>

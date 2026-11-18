@@ -1,9 +1,10 @@
 // A project as a graph: its executive, goals, sub-goals and beads, each a
 // node; and a bead's pipeline as a graph of its flow's steps and routes.
 
-import type { Edge, Node } from '@xyflow/svelte';
+import { Position, type Edge, type Node } from '@xyflow/svelte';
 import { beadState, model, money, plural, short, span, toneOf } from './format';
 import { layout } from './layout';
+import { executiveAgents, foremanAgents, goalAgents } from './agents';
 import type { Bead, Goal, Item, Project, Step, SubGoal } from './types';
 
 export type Ref =
@@ -12,6 +13,22 @@ export type Ref =
   | { level: 'subgoal'; goal: Goal; sub: SubGoal }
   | { level: 'bead'; goal?: Goal; sub?: SubGoal; bead: Bead }
   | { level: 'group' };
+
+/** The size of every kind of card, in the graph's own pixels. The cards
+ * are drawn at exactly these sizes (their text is clipped to fit), so the
+ * layout never places one over another whatever fonts the browser has. */
+export const SIZE = {
+  tier: { width: 270, height: 118 },
+  bead: { width: 250, height: 90 },
+  step: { width: 150, height: 52 },
+  end: { width: 76, height: 24 },
+};
+/** The frame around a pipeline drawn on the map: its header, and the
+ * space around its steps. */
+const FRAME = { header: 50, pad: 14 };
+
+/** Which beads have their whole pipeline drawn on the map. */
+export type Pipelines = 'active' | 'all' | 'cards';
 
 /** Sub-goals in these states are folded: their beads are not drawn. */
 const FOLDED = ['landed', 'dropped'];
@@ -39,14 +56,59 @@ export function nodeId(ref: Ref): string {
   }
 }
 
-export function projectGraph(project: Project, inbox: Item[], chosen: string | undefined, now: number) {
+export interface Drawing {
+  /** How beads and tiers are drawn unless the owner chose for one. */
+  pipelines: Pipelines;
+  /** The owner's choice for single cards: true open, false folded. */
+  open: Record<string, boolean>;
+  ontoggle: (id: string, open: boolean) => void;
+}
+
+type Inner = { nodes: (Node & { width: number; height: number })[]; edges: Edge[]; width: number; height: number };
+
+export function projectGraph(project: Project, inbox: Item[], chosen: string | undefined, now: number, drawing: Drawing = { pipelines: 'active', open: {}, ontoggle: () => {} }) {
+  const { pipelines } = drawing;
   const nodes: (Node & { width: number; height: number })[] = [];
+  const children: Node[] = [];
   const edges: Edge[] = [];
   const refs = new Map<string, Ref>();
-  const tier = (ref: Ref, data: Record<string, unknown>, height = 92) => {
+  const isOpen = (id: string, otherwise: boolean) => drawing.open[id] ?? otherwise;
+  /** A card drawn as a frame holding a graph of its own. */
+  const frame = (id: string, ref: Ref, data: Record<string, unknown>, inner: Inner) => {
+    const width = Math.max(SIZE.bead.width + 120, inner.width + FRAME.pad * 2);
+    const height = inner.height + FRAME.header + FRAME.pad;
+    nodes.push({ id, type: 'pipeline', position: { x: 0, y: 0 }, width, height, data: { ...data, size: { width, height }, ontoggle: () => drawing.ontoggle(id, false) } });
+    for (const node of inner.nodes) {
+      refs.set(node.id, ref);
+      children.push({ ...node, parentId: id, extent: 'parent', position: { x: node.position.x + FRAME.pad, y: node.position.y + FRAME.header } });
+    }
+    for (const edge of inner.edges) edges.push({ ...edge, zIndex: 1 });
+  };
+  /** A tier: a card, or, opened, a frame of its agents at work. */
+  const tier = (ref: Ref, data: Record<string, unknown>, agents?: (prefix: string) => Inner, running = false) => {
     const id = nodeId(ref);
     refs.set(id, ref);
-    nodes.push({ id, type: 'tier', data: { ...data, level: ref.level, chosen: chosen === id }, position: { x: 0, y: 0 }, width: 270, height });
+    const open = !!agents && isOpen(id, pipelines === 'all' || (pipelines === 'active' && running));
+    if (open && agents) {
+      frame(id, ref, {
+        id: data.label,
+        title: data.title,
+        tone: data.tone,
+        word: data.word,
+        where: (data.facts as string[]).join(' · '),
+        going: data.busy,
+        asks: (data.waiting as number) > 0,
+        chosen: chosen === id,
+      }, agents(`${id}::`));
+      return id;
+    }
+    nodes.push({
+      id,
+      type: 'tier',
+      data: { ...data, level: ref.level, chosen: chosen === id, size: SIZE.tier, ontoggle: agents ? () => drawing.ontoggle(id, true) : undefined },
+      position: { x: 0, y: 0 },
+      ...SIZE.tier,
+    });
     return id;
   };
   const link = (source: string, target: string, kind: 'hot' | 'waiting' | '' = '') => {
@@ -59,32 +121,39 @@ export function projectGraph(project: Project, inbox: Item[], chosen: string | u
       class: kind,
     });
   };
+  const drawn = (bead: Bead, id: string) => {
+    if (!bead.steps?.length) return false;
+    const active = bead.status === 'running' || bead.status === 'parked' || !!bead.asked;
+    return isOpen(id, pipelines === 'all' || (pipelines === 'active' && active));
+  };
   const beadNode = (bead: Bead, goal?: Goal, sub?: SubGoal, ship = false) => {
     const ref: Ref = { level: 'bead', goal, sub, bead };
     const id = nodeId(ref);
     refs.set(id, ref);
     const [tone, word] = beadState(bead);
-    nodes.push({
-      id,
-      type: 'bead',
-      position: { x: 0, y: 0 },
-      width: 250,
-      height: 78,
-      data: {
-        id: short(bead.bead, project.id),
-        title: bead.title || short(bead.bead, project.id),
-        tone,
-        word,
-        where: beadWhere(bead, now),
-        steps: bead.steps || [],
-        here: bead.run?.step || bead.command?.step || bead.step,
-        going: bead.status === 'running',
-        over: bead.status === 'ended',
-        ship,
-        asks: !!bead.asked,
-        chosen: chosen === id,
-      },
-    });
+    const data = {
+      id: short(bead.bead, project.id),
+      title: bead.title || short(bead.bead, project.id),
+      tone,
+      word,
+      where: beadWhere(bead, now),
+      steps: bead.steps || [],
+      here: bead.run?.step || bead.command?.step || bead.step,
+      going: bead.status === 'running',
+      over: bead.status === 'ended',
+      ship,
+      asks: !!bead.asked,
+      chosen: chosen === id,
+      cost: bead.cost ? money(bead.cost) : '',
+      flow: bead.flow,
+    };
+    if (!drawn(bead, id)) {
+      const ontoggle = bead.steps?.length ? () => drawing.ontoggle(id, true) : undefined;
+      nodes.push({ id, type: 'bead', position: { x: 0, y: 0 }, ...SIZE.bead, data: { ...data, size: SIZE.bead, ontoggle } });
+      return id;
+    }
+    // The bead as a frame holding its whole pipeline.
+    frame(id, ref, { ...data, where: `${data.where}${data.flow ? ` · flow ${data.flow}` : ''}` }, pipelineGraph(bead, 'TB', `${id}::`, true));
     return id;
   };
 
@@ -102,7 +171,7 @@ export function projectGraph(project: Project, inbox: Item[], chosen: string | u
       facts,
       busy: !!exec.run,
       waiting: inbox.filter((item) => !item.goal && item.kind === 'proposal').length,
-    }, 84);
+    }, exec.agents ? (prefix) => executiveAgents(exec.agents!, exec.run?.role, prefix) : undefined, !!exec.run);
   }
 
   for (const goal of project.goals || []) {
@@ -124,7 +193,7 @@ export function projectGraph(project: Project, inbox: Item[], chosen: string | u
       busy,
       waiting,
       progress: [done, beads.length],
-    }, 104);
+    }, goal.agents ? (prefix) => goalAgents(goal.agents!, goal.run?.role, prefix) : undefined, !!goal.run && goal.run.role !== 'foreman');
     if (root) link(root, gid, waiting ? 'waiting' : busy ? 'hot' : '');
 
     for (const sub of subs) {
@@ -147,7 +216,7 @@ export function projectGraph(project: Project, inbox: Item[], chosen: string | u
         busy: sbusy,
         waiting: sbeads.filter((bead) => bead.asked).length,
         progress: [sdone, sbeads.length],
-      }, 96);
+      }, goal.agents && sub.foreman?.wakes ? (prefix) => foremanAgents(goal.agents!, sub.id, sub.foreman?.wakes ?? 0, goal.run?.role === 'foreman' && !folded, prefix) : undefined);
       link(gid, sid, sbusy ? 'hot' : '');
       if (folded) continue;
       for (const bead of sbeads) link(sid, beadNode(bead, goal, sub), running(bead) ? 'hot' : bead.asked ? 'waiting' : '');
@@ -164,68 +233,175 @@ export function projectGraph(project: Project, inbox: Item[], chosen: string | u
       facts: [],
       busy: project.loose.some(running),
       waiting: 0,
-    }, 70);
+    });
     if (root) link(root, lid);
     for (const bead of project.loose) link(lid, beadNode(bead), running(bead) ? 'hot' : '');
   }
 
-  return { nodes: layout(nodes, edges, { ranksep: 60, nodesep: 12 }), edges, refs };
+  // Only the cards and frames are laid out; a pipeline's steps keep their
+  // places inside its frame, and come after it, as Svelte Flow needs.
+  const placed = layout(nodes, edges.filter((edge) => !edge.id.includes('::')), { rankdir: 'TB', ranksep: 70, nodesep: 24 });
+  return { nodes: [...placed, ...children], edges, refs };
 }
 
-/** A bead's pipeline: every step of its flow, and where each outcome
- * leads, with the way it has come drawn heavier. */
-export function pipelineGraph(bead: Bead, rankdir: 'LR' | 'TB' = 'LR') {
+/** A bead's pipeline: every step of its flow and where each outcome leads.
+ * A route the bead has taken is drawn heavier, with how often; a route
+ * back to an earlier step, a cycle, is dashed. `prefix` keeps the ids of
+ * one pipeline's steps apart from another's on the same map. */
+export function pipelineGraph(bead: Bead, rankdir: 'LR' | 'TB' = 'TB', prefix = '', quiet = false) {
   const steps: Step[] = bead.steps || [];
   const order = new Map(steps.map((step, index) => [step.id, index]));
   const here = bead.run?.step || bead.command?.step || bead.step;
+  const taken = bead.taken || {};
   const nodes: (Node & { width: number; height: number })[] = [];
   const edges: Edge[] = [];
-  const ends = new Set<string>();
+  const ends = new Map<string, string>();
   for (const step of steps) {
     let stateOf: string = step.rounds ? 'done' : 'todo';
     if (step.id === here && bead.status !== 'ended') {
       stateOf = bead.asked ? 'asks' : bead.status === 'running' ? 'now' : 'stopped';
     }
     nodes.push({
-      id: step.id,
+      id: prefix + step.id,
       type: 'step',
       position: { x: 0, y: 0 },
-      width: 140,
-      height: 46,
-      data: { ...step, state: stateOf, end: false },
+      ...SIZE.step,
+      data: { ...step, state: stateOf, end: false, spent: bead.spent?.[step.id] ?? 0, size: SIZE.step },
     });
     for (const route of step.routes || []) {
       // A route out of the flow (park, ask, absorb…) ends at a mark of its
       // own beside the step, so that no one mark pulls every step to it.
-      const target = order.has(route.to) ? route.to : `${step.id}→${route.to}`;
-      if (!order.has(route.to)) ends.add(target);
-      const back = order.has(route.to) && (order.get(route.to) ?? 0) <= (order.get(step.id) ?? 0);
-      const walked = step.rounds > 0 && (order.has(route.to) ? (steps[order.get(route.to)!].rounds > 0) : false);
-      const hot = route.to === here && bead.status === 'running' && step.rounds > 0;
+      const inside = order.has(route.to);
+      const target = prefix + (inside ? route.to : `${step.id}→${route.to}`);
+      if (!inside) ends.set(target, route.to);
+      const back = inside && (order.get(route.to) ?? 0) <= (order.get(step.id) ?? 0);
+      const times = taken[`${step.id}:${route.outcome}`] || 0;
+      const hot = times > 0 && route.to === here && bead.status === 'running';
+      const label = `${route.outcome}${route.max ? ` ≤${route.max}` : ''}${times ? ` · ×${times}` : ''}`;
       edges.push({
-        id: `${step.id}-${route.outcome}-${route.to}`,
-        source: step.id,
+        id: `${prefix}${step.id}-${route.outcome}-${route.to}`,
+        source: prefix + step.id,
         target,
-        label: route.max ? `${route.outcome} ≤${route.max}` : route.outcome,
+        // On the map a route not taken is drawn without words.
+        label: quiet && !times ? undefined : label,
         type: back ? 'default' : 'smoothstep',
         animated: hot,
-        class: [back ? 'back' : '', hot ? 'hot' : walked ? 'walked' : ''].join(' '),
+        class: [back ? 'back' : '', hot ? 'hot' : times ? 'walked' : 'unwalked'].join(' '),
+        // The next step in the flow's own order is its main path.
+        data: { weight: inside && (order.get(route.to) ?? 0) === (order.get(step.id) ?? 0) + 1 ? 20 : inside ? 2 : 1 },
       });
     }
   }
-  for (const end of ends) {
-    const name = end.slice(end.indexOf('→') + 1);
-    nodes.push({ id: end, type: 'step', position: { x: 0, y: 0 }, width: 70, height: 22, data: { id: name, kind: 'end', rounds: 0, state: 'end', end: true } });
+  for (const [id, name] of ends) {
+    nodes.push({ id, type: 'step', position: { x: 0, y: 0 }, ...SIZE.end, data: { id: name, kind: 'end', rounds: 0, state: 'end', end: true, size: SIZE.end } });
   }
-  // Back edges would pull the layout into knots: lay out with the forward
-  // ones and draw them all.
-  const forward = edges.filter((edge) => !String(edge.class).includes('back'));
-  return { nodes: layout(nodes, forward, { rankdir, ranksep: rankdir === 'TB' ? 34 : 46, nodesep: 18 }), edges };
+  const { placed, row, col } = arrange(steps, nodes, rankdir, prefix);
+  if (rankdir === 'TB') {
+    for (const edge of edges) {
+      const from = edge.source.slice(prefix.length);
+      const to = edge.target.slice(prefix.length);
+      Object.assign(edge, sides(from, to, row, col, to.includes('→')), { type: 'smoothstep', pathOptions: { offset: 18, borderRadius: 10 } });
+    }
+  }
+  // Where the steps came to lie, with the top-left corner at nought.
+  const left = Math.min(...placed.map((node) => node.position.x));
+  const top = Math.min(...placed.map((node) => node.position.y));
+  const moved = placed.map((node) => ({ ...node, position: { x: node.position.x - left, y: node.position.y - top } }));
+  const width = Math.max(0, ...moved.map((node) => node.position.x + (node.width ?? 0)));
+  const height = Math.max(0, ...moved.map((node) => node.position.y + (node.height ?? 0)));
+  return { nodes: moved, edges, width, height };
+}
+
+/** Where a pipeline's steps go. The main path (from the first step, each
+ * step's route to the soonest step after it in the flow) runs straight
+ * down one column, in the flow's order. A step off it, such as `fix`,
+ * stands in a column beside it, level with the last step on the path
+ * that leads to it. A route out of the flow is a mark to the left of the
+ * step it leaves. Laid out so, every pipeline of one flow looks the same,
+ * and a cycle reads as a line back up the column. */
+function arrange(steps: Step[], nodes: (Node & { width: number; height: number })[], rankdir: 'LR' | 'TB', prefix: string) {
+  const order = new Map(steps.map((step, index) => [step.id, index]));
+  // The longest chain of forward routes is the way a bead goes when
+  // nothing sends it back: that is the main path.
+  const forwardOf = (step: Step) =>
+    (step.routes || []).map((route) => route.to).filter((to) => (order.get(to) ?? -1) > (order.get(step.id) ?? 0));
+  const longest = new Map<string, number>();
+  for (const step of [...steps].reverse()) {
+    longest.set(step.id, 1 + Math.max(0, ...forwardOf(step).map((to) => longest.get(to) ?? 0)));
+  }
+  const spine: string[] = [];
+  let at: Step | undefined = steps[0];
+  while (at && !spine.includes(at.id)) {
+    spine.push(at.id);
+    const next: string | undefined = forwardOf(at).sort((a, b) =>
+      (longest.get(b) ?? 0) - (longest.get(a) ?? 0) || (order.get(a) ?? 0) - (order.get(b) ?? 0))[0];
+    at = next ? steps[order.get(next)!] : undefined;
+  }
+  const row = new Map(spine.map((id, index) => [id, index]));
+  const col = new Map(spine.map((id) => [id, 0]));
+  // Steps off the main path, beside the last step on it that leads there.
+  const taken = new Set<string>();
+  for (const step of steps) {
+    if (row.has(step.id)) continue;
+    const from = steps
+      .filter((one) => row.has(one.id) && (one.routes || []).some((route) => route.to === step.id))
+      .map((one) => row.get(one.id)!);
+    from.sort((a, b) => a - b);
+    let r = from.length ? from[Math.floor((from.length - 1) / 2)] : spine.length;
+    let c = 1;
+    while (taken.has(`${r}/${c}`)) c++;
+    taken.add(`${r}/${c}`);
+    row.set(step.id, r);
+    col.set(step.id, c);
+  }
+  const W = SIZE.step.width + 90;
+  const H = SIZE.step.height + 54;
+  const ends = new Map<string, number>();
+  const placed = nodes.map((node) => {
+    const local = node.id.slice(prefix.length);
+    let x: number;
+    let y: number;
+    if (local.includes('→')) {
+      // A mark beside the step it leaves, to its left.
+      const from = local.slice(0, local.indexOf('→'));
+      const n = ends.get(from) ?? 0;
+      ends.set(from, n + 1);
+      x = (col.get(from) ?? 0) * W - 24 - (n + 1) * (SIZE.end.width + 10);
+      // In the gap below its step, so the route drops down to it.
+      y = (row.get(from) ?? 0) * H + SIZE.step.height + 16;
+      if ((col.get(from) ?? 0) > 0) x = (col.get(from) ?? 0) * W + SIZE.step.width + 24 + n * (SIZE.end.width + 10);
+    } else {
+      x = (col.get(local) ?? 0) * W;
+      y = (row.get(local) ?? 0) * H;
+    }
+    const across = rankdir === 'LR';
+    return {
+      ...node,
+      targetPosition: across ? Position.Left : Position.Top,
+      sourcePosition: across ? Position.Right : Position.Bottom,
+      position: across ? { x: y * 1.6, y: x * 0.7 } : { x, y },
+    };
+  });
+  return { placed, row, col };
+}
+
+/** Which sides a route of a pipeline laid out top-down leaves and enters
+ * by: down the main path, out to the right into a side step and back in
+ * from its left, and up the right of the column for a cycle. */
+function sides(from: string, to: string, row: Map<string, number>, col: Map<string, number>, mark: boolean) {
+  if (mark) return {};
+  const [fr, fc, tr, tc] = [row.get(from) ?? 0, col.get(from) ?? 0, row.get(to) ?? 0, col.get(to) ?? 0];
+  if (fc === tc && tr === fr + 1) return {};
+  if (fc < tc) return { sourceHandle: 'right', targetHandle: 'left-in' };
+  if (fc > tc) return { sourceHandle: 'left', targetHandle: 'right-in' };
+  if (tr <= fr) return { sourceHandle: 'right', targetHandle: 'right-in' };
+  return { sourceHandle: 'left', targetHandle: 'left-in' };
 }
 
 /** What a node of a project's map stands for, in the picture as it is now. */
 export function findRef(project: Project, id: string | undefined): Ref | null {
   if (!id) return null;
+  id = id.split('::')[0];
   if (id === 'exec') return project.executive ? { level: 'executive' } : null;
   if (id === 'loose') return { level: 'group' };
   const [level, rest] = [id.slice(0, id.indexOf(':')), id.slice(id.indexOf(':') + 1)];

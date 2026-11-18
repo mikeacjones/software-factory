@@ -7,6 +7,7 @@
   import type { Project } from '../lib/types';
   import ProjectGraph from './ProjectGraph.svelte';
   import Inspector from './Inspector.svelte';
+  import NewMessage from './NewMessage.svelte';
 
   let { project, node }: { project: Project; node?: string } = $props();
 
@@ -15,6 +16,8 @@
   const pulse = $derived(project.pulse);
   const cost = $derived((project.goals || []).reduce((sum, goal) => sum + (goal.cost || 0), 0));
   let showFinished = $state(false);
+  let writing = $state(false);
+  const waitingNew = $derived((live.started[project.id] || []).length);
 </script>
 
 <div class="project">
@@ -22,7 +25,12 @@
     <div class="name">
       <h2>{project.id}</h2>
       {#if project.workflow}<a class="quiet" href={project.workflow} target="_blank" rel="noopener noreferrer">Workflow ↗</a>{/if}
+      <span class="spacer"></span>
+      <button class="btn primary" onclick={() => (writing = !writing)} title="A new message, as at the top of the project's channel">
+        ✎ {project.executive ? 'Message the executive' : 'Open a goal'}{waitingNew ? ` (${waitingNew} waiting)` : ''}
+      </button>
     </div>
+    {#if writing}<NewMessage {project} onclose={() => (writing = false)} />{/if}
     <dl class="stats">
       <div><dt>Waiting on you</dt><dd class:warn={!!pulse?.waiting}>{pulse?.waiting ?? 0}</dd></div>
       <div><dt>Agents at work</dt><dd class:run={!!pulse?.agents}>{pulse?.agents ?? 0}</dd></div>
@@ -87,6 +95,7 @@
   .project { display: flex; flex-direction: column; height: 100%; min-height: 0; }
   header { padding: 16px 20px 12px; border-bottom: 1px solid var(--line); background: var(--surface); display: flex; flex-direction: column; gap: 12px; }
   .name { display: flex; align-items: baseline; gap: 12px; }
+  .spacer { flex: 1; }
   h2 { font-size: 20px; letter-spacing: -0.01em; }
   .stats { display: flex; flex-wrap: wrap; gap: 6px 28px; margin: 0; }
   .stats div { display: flex; flex-direction: column; }
