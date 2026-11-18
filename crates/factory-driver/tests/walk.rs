@@ -887,6 +887,91 @@ fn a_step_can_be_run_by_codex_and_its_session_is_continued_by_codex() {
     }
 }
 
+/// The flow can move a step to another agent while a unit is part way:
+/// here the builder was codex's when the unit was built and is Claude's
+/// when it is sent to fix. A session ID means nothing to another agent, so
+/// the fix starts a fresh Claude session, briefed as a fresh step is, and
+/// the log says why.
+#[test]
+fn a_step_moved_to_another_agent_starts_fresh_instead_of_resuming_its_session() {
+    let world = World::new("agent-switch", "test -f $ALLOW || exit 127");
+    let allow = world.path("allow");
+    let project = world.path("config/projects/toy.toml");
+    let text = std::fs::read_to_string(&project).unwrap();
+    std::fs::write(&project, text.replace("$ALLOW", allow.to_str().unwrap())).unwrap();
+    world.with_codex(&["build", "fix"]);
+
+    // Built on codex; the tests cannot run yet, so the unit parks.
+    let mut driver = Driver::start(world.config(), "toy", "toy-1", &OPTIONS).unwrap();
+    assert!(matches!(driver.run().unwrap(), Status::Parked(_)));
+    let unit_id = driver.unit().id.to_string();
+    let built = driver.unit().sessions["build"].clone();
+    drop(driver);
+    let codex_runs = std::fs::read_to_string(world.path("bin/state/codex-calls"))
+        .unwrap()
+        .lines()
+        .count();
+
+    // The builder moves back to Claude, and the owner sends the unit to fix.
+    let flow = world.path("config/flows/build-break-review.toml");
+    let text = std::fs::read_to_string(&flow).unwrap();
+    std::fs::write(
+        &flow,
+        text.replace(
+            "agent = \"codex\"\nmodel = \"gpt-6.2-sol\"",
+            "model = \"claude-opus-5-5\"",
+        ),
+    )
+    .unwrap();
+    std::fs::write(&allow, "").unwrap();
+    let before = world.calls().len();
+    let carry_on = Options {
+        continued: Some("Carry on.".to_string()),
+        ..OPTIONS
+    };
+    let mut driver = Driver::resume(world.config(), &unit_id, &carry_on, Some("fix")).unwrap();
+    assert_eq!(driver.run().unwrap(), Status::Ended);
+
+    // Codex was not run again, and the fix was a fresh Claude session.
+    let codex_after = std::fs::read_to_string(world.path("bin/state/codex-calls"))
+        .unwrap()
+        .lines()
+        .count();
+    assert_eq!(codex_after, codex_runs);
+    let calls = world.calls();
+    let fix = calls[before..]
+        .iter()
+        .position(|call| call[0] == "builder")
+        .map(|at| before + at)
+        .expect("the fix ran");
+    assert_ne!(calls[fix][3], "codex", "{:?}", calls[fix]);
+    assert_ne!(
+        calls[fix][1], built,
+        "the fix did not resume codex's session"
+    );
+    let brief =
+        std::fs::read_to_string(world.path(&format!("bin/state/brief-{}.md", fix + 1))).unwrap();
+    assert!(
+        brief.contains("What has happened on this bead so far"),
+        "a fresh fix is briefed as a fresh step: {brief}"
+    );
+    // The fix, and here the publisher too, which also continues the
+    // builder's session: each was told it is a fresh session, and why.
+    let switched = events_named(&world, &driver, "session.not_continued");
+    assert!(!switched.is_empty());
+    for event in &switched {
+        assert_eq!(
+            (&event["of"], &event["made_by"], &event["agent"]),
+            (
+                &serde_json::json!("build"),
+                &serde_json::json!("codex"),
+                &serde_json::json!("claude")
+            ),
+            "{switched:?}"
+        );
+    }
+}
+
 /// A flow is refused when a step names an agent the factory has no
 /// settings for, a model that agent does not allow, or continues a session
 /// another agent started; and settings for an agent with no adapter are

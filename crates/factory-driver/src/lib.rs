@@ -1491,6 +1491,20 @@ impl Driver {
         self.log.path()
     }
 
+    /// The agent the latest run of `step` ran on, as this unit's log
+    /// recorded it when the run started. A run logged before runs named
+    /// their agent was Claude Code's.
+    fn session_agent(&self, step: &str) -> String {
+        std::fs::read_to_string(self.log.path())
+            .unwrap_or_default()
+            .lines()
+            .rev()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|event| event["kind"] == "run.started" && event["step"] == step)
+            .and_then(|event| event["data"]["agent"].as_str().map(str::to_string))
+            .unwrap_or_else(|| factory_claude::DEFAULT_AGENT.to_string())
+    }
+
     fn header(&self) -> String {
         format!(
             ":factory: *{}* · {}\n_Run `{}` · flow `{}` · reply here to steer, `stop` ends the run_",
@@ -2279,12 +2293,33 @@ impl Driver {
                 .filter(|current| current.step == step.id)
                 .map(|current| current.session.clone())
         });
-        let mut briefed = own_session.is_some();
-        let mut session = match (own_session, session_rule) {
-            (Some(id), _) => Session::Resume(id),
+        // A session ID means something only to the agent that made it: when
+        // the flow has moved a step to another agent since (a builder on
+        // codex, and then on Claude), the step starts fresh and is briefed
+        // as a fresh one is, rather than asking one agent to resume
+        // another's session.
+        let mut switched: Option<(String, String)> = None;
+        let mut session = match (own_session.clone(), session_rule) {
+            (Some(id), _) => {
+                let made_by = self.session_agent(&step.id);
+                if made_by == step.agent {
+                    Session::Resume(id)
+                } else {
+                    switched = Some((step.id.clone(), made_by));
+                    Session::Fresh
+                }
+            }
             (None, SessionRule::Fresh) => Session::Fresh,
             (None, SessionRule::Continue(earlier)) => match self.unit.sessions.get(earlier) {
-                Some(id) => Session::Resume(id.clone()),
+                Some(id) => {
+                    let made_by = self.session_agent(earlier);
+                    if made_by == step.agent {
+                        Session::Resume(id.clone())
+                    } else {
+                        switched = Some((earlier.clone(), made_by));
+                        Session::Fresh
+                    }
+                }
                 None => {
                     return Ok(StepEnd::Park(format!(
                         "step `{}` continues the session of `{earlier}`, which has not run",
@@ -2293,7 +2328,15 @@ impl Driver {
                 }
             },
         };
-        let continuing = matches!(session_rule, SessionRule::Continue(_));
+        if let Some((of, made_by)) = &switched {
+            self.event(
+                "session.not_continued",
+                Some(&step.id),
+                json!({ "of": of, "made_by": made_by, "agent": step.agent }),
+            )?;
+        }
+        let mut briefed = own_session.is_some() && switched.is_none();
+        let continuing = matches!(session_rule, SessionRule::Continue(_)) && switched.is_none();
         let diff_stat = factory_git::diff_stat(&cwd, &self.unit.base, "HEAD").unwrap_or_default();
         // A fresh session is given what earlier steps produced, in flow order.
         // A continued one already has its own history, and gets only feedback.
