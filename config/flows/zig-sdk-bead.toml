@@ -14,8 +14,12 @@ start = "build"
 id = "build"
 kind = "agent"
 role = "builder"
-model = "claude-opus-5-5"
-effort = "medium"
+# A trial: the builder is codex, on its own login. The tester, the reviewer
+# and the publisher stay Claude's. `fix` continues this session, so it is
+# codex's too.
+agent = "codex"
+model = "gpt-6.2-sol"
+effort = "high"
 session = "fresh"
 writes = ["code"]
 on.done = "checks"
@@ -106,12 +110,10 @@ on.needs_owner = { to = "ask", max = 2 }
 id = "fix"
 kind = "agent"
 role = "builder"
-model = "claude-opus-5-5"
-effort = "medium"
+agent = "codex"
+model = "gpt-6.2-sol"
+effort = "high"
 session = "continue:build"
-# From its second round on the fix gets more effort: by then the first
-# attempt has not held.
-effort_by_round = ["medium", "high"]
 writes = ["code"]
 on.done = { to = "checks", max = 8 }
 on.needs_owner = { to = "ask", max = 2 }
