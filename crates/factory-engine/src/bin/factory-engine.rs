@@ -173,6 +173,14 @@ async fn command(args: &[String]) -> Result<(), String> {
         .clone()
         .ok_or("factory.toml has no [temporal] table")?;
     match words.as_slice() {
+        // Can this build of the engine read this config? Deploy asks the
+        // engine of each release before making it current.
+        ["check"] => {
+            for line in factory_driver::goal::check_definitions(&config).map_err(|err| err.to_string())? {
+                println!("{line}");
+            }
+            Ok(())
+        }
         ["worker"] => {
             let settings = WorkerSettings {
                 address: temporal.address.clone(),

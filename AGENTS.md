@@ -30,6 +30,7 @@ factory run <project> <bead> --config config   # walk one bead to a pull request
 factory run --unit <unit> --config config      # continue a stopped or parked unit
 factory run --unit <unit> --from <step> --config config  # owner's override: move a unit to a step of the current flow
 factory serve --config config                  # what launchd starts: becomes the engine's worker
+factory-engine check --config config              # can this engine build read this config? (deploy asks it)
 factory-engine project <project> --config config   # where a project's tiers stand on the engine
 factory-engine standing <pipeline> --config config # where a pipeline stands
 factory-engine accounts --config config            # what the accounts workflow knows

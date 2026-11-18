@@ -35,6 +35,18 @@ pub struct Rig {
     pub workers: Vec<Child>,
 }
 
+/// A rig dropped without `stop`, as when its test fails part way, still
+/// ends its workers. Left running, they go on dialling their server's port,
+/// and once another test's fake server is given that port they talk to it.
+impl Drop for Rig {
+    fn drop(&mut self) {
+        for worker in &mut self.workers {
+            let _ = worker.kill();
+            let _ = worker.wait();
+        }
+    }
+}
+
 impl Rig {
     pub async fn start(name: &str) -> Option<Rig> {
         let Some(cli) = temporal_cli() else {

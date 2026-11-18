@@ -99,7 +99,30 @@ pub fn install_release(
     // that a release is one build of both.
     let engine = factory.with_file_name("factory-engine");
     if engine.is_file() {
-        put_program(&engine, &dir.join("factory-engine"))?;
+        let built = dir.join("factory-engine");
+        put_program(&engine, &built)?;
+        // A release whose engine cannot read its config would leave the
+        // service starting and dying until someone looks: the engine of a
+        // build older than the config, say, because only the factory's own
+        // binary was rebuilt. It is refused before it becomes current.
+        let checked = std::process::Command::new(&built)
+            .arg("check")
+            .arg("--config")
+            .arg(dir.join("config"))
+            .output()
+            .map_err(io(&built))?;
+        if !checked.status.success() {
+            let said = format!(
+                "{}{}",
+                String::from_utf8_lossy(&checked.stdout),
+                String::from_utf8_lossy(&checked.stderr)
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(DriverError::Preflight(format!(
+                "the engine built beside this factory cannot read this config, so the release was not made current: {}. Build every program of the workspace (`cargo build --release --locked --workspace --bins`) and deploy again",
+                said.trim()
+            )));
+        }
     }
     let link = current(state_dir);
     let staged = state_dir.join(format!("current.{}", std::process::id()));
@@ -507,6 +530,57 @@ mod tests {
                 .join(format!("current.{}", std::process::id()))
                 .exists()
         );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_release_whose_engine_cannot_read_its_config_never_becomes_current() {
+        use std::os::unix::fs::PermissionsExt;
+        let root =
+            std::env::temp_dir().join(format!("factory-engine-check-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (state, source) = (root.join("state"), root.join("source"));
+        std::fs::create_dir_all(source.join("config")).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(source.join("factory"), "build").unwrap();
+        std::fs::write(source.join("config/factory.toml"), "fine").unwrap();
+        // The engine says whether it can read the config it is pointed at.
+        let engine = source.join("factory-engine");
+        std::fs::write(
+            &engine,
+            "#!/bin/sh
+[ \"$1\" = check ] && [ \"$2\" = --config ] || exit 2
+grep -q fine \"$3/factory.toml\" || { echo \"unknown field fallback_model\"; exit 1; }
+",
+        )
+        .unwrap();
+        std::fs::set_permissions(&engine, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let install = |name: &str| {
+            install_release(
+                &state,
+                &source.join("factory"),
+                &source.join("config"),
+                name,
+                3,
+            )
+        };
+
+        let good = install("2026-11-18T150000Z-aaa").unwrap();
+        assert!(good.join("factory-engine").is_file());
+
+        std::fs::write(source.join("config/factory.toml"), "new field").unwrap();
+        let err = install("2026-11-18T160000Z-bbb").unwrap_err().to_string();
+        assert!(
+            err.contains("cannot read this config") && err.contains("unknown field fallback_model"),
+            "{err}"
+        );
+        // The service goes on with the release it had, and the refused one
+        // is gone.
+        assert_eq!(
+            std::fs::canonicalize(current(&state)).unwrap(),
+            std::fs::canonicalize(&good).unwrap()
+        );
+        assert!(!releases(&state).join("2026-11-18T160000Z-bbb").exists());
         std::fs::remove_dir_all(&root).unwrap();
     }
 
