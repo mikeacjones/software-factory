@@ -1,0 +1,33 @@
+# How the goals the owner opens on the swap bot are run: audits, features,
+# fixes, anything that is not the weekly dependency bump. What a goal is for
+# is agreed in its charter with the director; this says who directs it.
+#
+# Worked in sub-goals, each landing as one pull request: every bead goes
+# through swap-bot-bead and is absorbed into its sub-goal's branch, and
+# swap-bot-ship verifies, opens and lands the sub-goal once. Everything runs
+# on Opus or below: the bot is small enough that nothing needs Fable, and it
+# has no designer, since a builder can settle the shape of a change this size
+# itself (owner's decision, 2026-11-18).
+id = "work"
+default = true
+flow = "swap-bot-bead"
+ship_flow = "swap-bot-ship"
+max_pipelines = 2
+
+[director]
+model = "claude-opus-5-5"
+effort = "high"
+timeout_secs = 2400
+slots = 2
+
+[foreman]
+model = "claude-opus-5-5"
+effort = "high"
+timeout_secs = 1800
+slots = 2
+
+[permissions]
+# New beads are the director's call. A bead this goal's own agents filed it
+# changes alone; one the owner wrote is put to the owner.
+file_beads = "allow"
+edit_beads = "own"

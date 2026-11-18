@@ -22,6 +22,7 @@
             if (run.where === 'unit' && bead.unit === run.id) return bead.runs;
           }
         }
+        for (const bead of goal.beads || []) if (run.where === 'unit' && bead.unit === run.id) return bead.runs;
       }
       for (const bead of project.loose || []) if (run.where === 'unit' && bead.unit === run.id) return bead.runs;
     }

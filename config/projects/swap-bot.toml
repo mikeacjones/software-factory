@@ -24,6 +24,17 @@ test_patterns = ['\b(it|test|describe)(\.each)?\(', '\bexpect\(']
 publication_note = """
 Write the pull request for someone reading the history a year from now: name each package moved and from which version to which, and for each code change say which release of which package it answers. A pull request is squash-merged, so its title and body become the commit on main."""
 
+# The executive is who the owner talks to in #swap-bot. A new message in the
+# channel goes to it: it answers, or opens a goal under one of the
+# definitions in goals/swap-bot/ and hands the thread to that goal's
+# director. Opus: the bot is small enough that nothing here needs Fable.
+# One goal at a time, since any goal here may touch the whole bot.
+[executive]
+model = "claude-opus-5-5"
+effort = "high"
+timeout_secs = 1800
+slots = 1
+
 [beads]
 kind = "dolt"
 host = "127.0.0.1"

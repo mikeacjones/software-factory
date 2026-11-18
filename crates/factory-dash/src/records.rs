@@ -513,13 +513,19 @@ fn pulse(project: &Value, runs: &[Value], waiting: usize) -> Value {
         .as_array()
         .into_iter()
         .flatten()
-        .flat_map(|goal| goal["subgoals"].as_array().into_iter().flatten())
-        .flat_map(|sub| {
-            sub["beads"]
+        .flat_map(|goal| {
+            goal["subgoals"]
                 .as_array()
                 .into_iter()
                 .flatten()
-                .chain(sub["ship"].as_object().map(|_| &sub["ship"]))
+                .flat_map(|sub| {
+                    sub["beads"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .chain(sub["ship"].as_object().map(|_| &sub["ship"]))
+                })
+                .chain(goal["beads"].as_array().into_iter().flatten())
         })
         .chain(project["loose"].as_array().into_iter().flatten());
     for unit in units {
@@ -1067,6 +1073,19 @@ impl Reader {
                 "ship": shipping,
             }));
         }
+        // A goal run with no sub-goals has its director start each
+        // pipeline itself: those are the goal's own beads.
+        let mut own: Vec<String> = Vec::new();
+        for unit in &units {
+            if unit["subgoal"].is_null()
+                && unit["ship"] != true
+                && let Some(bead) = unit["bead"].as_str()
+                && !own.iter().any(|known| known == bead)
+            {
+                own.push(bead.to_string());
+            }
+        }
+        let own: Vec<Value> = own.iter().map(|bead| row(self, bead, false, "")).collect();
         let (files, run) = self.tier(
             "goal",
             id,
@@ -1123,6 +1142,7 @@ impl Reader {
             "cost": goal["usage"]["cost_usd"].as_f64().unwrap_or(0.0),
             "started_at": goal["started_at"],
             "subgoals": subgoals,
+            "beads": own,
             "run": run,
             "runs": files,
         })

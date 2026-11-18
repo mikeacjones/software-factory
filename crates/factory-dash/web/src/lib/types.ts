@@ -133,6 +133,8 @@ export interface Goal {
   cost?: number;
   started_at?: number;
   subgoals?: SubGoal[];
+  /** Beads whose pipelines the director started itself, in no sub-goal. */
+  beads?: Bead[];
   run?: Run | null;
   runs?: string[];
   evidence?: string | null;

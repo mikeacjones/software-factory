@@ -4085,12 +4085,12 @@ pub fn front_brief(
     memory: &str,
 ) -> String {
     let mut out = format!(
-        "# The owner wrote in the channel of project `{project}`\n\n{}\n\n## The kinds of goal you can open\n\n",
+        "# The owner wrote in the channel of project `{project}`\n\n{}\n\n## The kinds of goal you can open\n\nEach is how a goal is run, not what it is for: the goal's own objective is agreed in its charter. Open one only if it suits the work (see your instructions for when none does).\n\n",
         quote_plain(text)
     );
-    for definition in definitions {
+    for definition in definitions.iter().filter(|one| one.schedule.is_none()) {
         out.push_str(&format!(
-            "- `{}`{}: {}\n",
+            "- `{}`{}: {}\n  - Runs as: {}\n",
             definition.id,
             if definition.default {
                 " (the usual one)"
@@ -4101,8 +4101,12 @@ pub fn front_brief(
                 (Some(objective), Some(stop)) => format!("{objective} Stop when: {stop}"),
                 (Some(objective), None) => objective.clone(),
                 _ => "no standing objective; the owner says what it is for".to_string(),
-            }
+            },
+            definition_shape(definition, definitions),
         ));
+    }
+    if !definitions.iter().any(|one| one.schedule.is_none()) {
+        out.push_str("None.\n");
     }
     out.push_str("\n## Goals of this project that have not ended\n\n");
     let live: Vec<&&Goal> = goals
@@ -4125,6 +4129,56 @@ pub fn front_brief(
         },
     ));
     out
+}
+
+/// How a goal under a definition is run, in a line: the agents above its
+/// pipelines, its pipelines, and the scheduled runs that build under it.
+pub fn definition_shape(definition: &GoalDefinition, all: &[GoalDefinition]) -> String {
+    let mut parts = vec![format!(
+        "director {} ({})",
+        definition.director.model, definition.director.effort
+    )];
+    match &definition.foreman {
+        Some(tier) => parts.push(format!(
+            "worked in sub-goals, each run by a foreman {} ({})",
+            tier.model, tier.effort
+        )),
+        None => parts.push("no sub-goals: the director starts each pipeline itself".to_string()),
+    }
+    match &definition.designer {
+        Some(tier) => parts.push(format!(
+            "each sub-goal designed first by a designer {} ({})",
+            tier.model, tier.effort
+        )),
+        None => parts.push("no designer".to_string()),
+    }
+    parts.push(format!(
+        "pipeline `{}`, at most {} at a time",
+        definition.flow.as_deref().unwrap_or("the project's own"),
+        definition.max_pipelines
+    ));
+    parts.push(if definition.ship_flow.is_some() {
+        "one pull request for each sub-goal".to_string()
+    } else {
+        "one pull request for each bead".to_string()
+    });
+    let feeders: Vec<String> = all
+        .iter()
+        .filter(|one| {
+            one.schedule
+                .as_ref()
+                .and_then(|schedule| schedule.build_under.as_deref())
+                == Some(definition.id.as_str())
+        })
+        .map(|one| format!("`{}`", one.id))
+        .collect();
+    if !feeders.is_empty() {
+        parts.push(format!(
+            "the scheduled run(s) {} build what they file under it",
+            feeders.join(", ")
+        ));
+    }
+    parts.join("; ")
 }
 
 /// The briefing for an executive given what directors passed up to it.
@@ -5209,11 +5263,11 @@ impl Supervisor {
         let Some(tier) = project.executive.clone() else {
             return Ok(None);
         };
-        let definitions: Vec<GoalDefinition> = self
-            .config
-            .goal_definitions(project_id)?
-            .into_iter()
+        let all_definitions = self.config.goal_definitions(project_id)?;
+        let definitions: Vec<GoalDefinition> = all_definitions
+            .iter()
             .filter(|definition| definition.schedule.is_none())
+            .cloned()
             .collect();
         let mut executive = self
             .executives
@@ -5273,7 +5327,14 @@ impl Supervisor {
                     .collect();
                 (
                     Session::Fresh,
-                    front_brief(project_id, text, &definitions, &goals, &tracker, &memory),
+                    front_brief(
+                        project_id,
+                        text,
+                        &all_definitions,
+                        &goals,
+                        &tracker,
+                        &memory,
+                    ),
                 )
             }
         };
@@ -6873,10 +6934,14 @@ impl Supervisor {
                 if light && !handed_up(&route, result).is_empty() {
                     return Vec::new();
                 }
+                // The tracker as it is now, not as the brief showed it: the
+                // director may have filed beads with `bd` in this very
+                // wake, and a bead it filed is one it may start.
+                let now_open = source.list_open().ok();
                 let mut problems = decision_problems(
                     &definition,
                     &snapshot,
-                    &tracker,
+                    now_open.as_deref().unwrap_or(&tracker),
                     &launchable,
                     &steps,
                     result,
@@ -9756,6 +9821,35 @@ mod tests {
             "id = \"d\"\nmax_pipelines = {max}\n[director]\nmodel = \"m\"\neffort = \"high\"\n[permissions]\nedit_beads = \"{edit}\"\n"
         ))
         .unwrap()
+    }
+
+    /// The executive is shown how each kind of goal it may open is run,
+    /// so that it can tell when none suits the work, and never a scheduled
+    /// one as a goal to open.
+    #[test]
+    fn the_executive_sees_how_each_kind_of_goal_is_run() {
+        let bump: GoalDefinition = toml::from_str(
+            "id = \"bump\"\ndefault = true\nflow = \"toy\"\nmax_pipelines = 1\nobjective = \"Keep the dependencies current.\"\n[director]\nmodel = \"claude-opus-5-5\"\neffort = \"medium\"\n",
+        )
+        .unwrap();
+        let deps: GoalDefinition = toml::from_str(
+            "id = \"deps\"\n[director]\nmodel = \"claude-opus-5-5\"\neffort = \"medium\"\n[schedule]\nhour_utc = 14\nevery_days = 7\nmax_beads = 1\nbuild_under = \"bump\"\ncharter = \"Bump.\"\n",
+        )
+        .unwrap();
+        let work: GoalDefinition = toml::from_str(
+            "id = \"work\"\nflow = \"toy\"\nship_flow = \"toy-ship\"\nmax_pipelines = 2\n[director]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\n[foreman]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\n",
+        )
+        .unwrap();
+        let brief = front_brief("toy", "Audit it", &[bump, deps, work], &[], &[], "");
+        assert!(
+            brief.contains("- `bump` (the usual one): Keep the dependencies current.\n  - Runs as: director claude-opus-5-5 (medium); no sub-goals: the director starts each pipeline itself; no designer; pipeline `toy`, at most 1 at a time; one pull request for each bead; the scheduled run(s) `deps` build what they file under it\n"),
+            "{brief}"
+        );
+        assert!(
+            brief.contains("- `work`: no standing objective; the owner says what it is for\n  - Runs as: director claude-opus-5-5 (high); worked in sub-goals, each run by a foreman claude-opus-5-5 (high); no designer; pipeline `toy`, at most 2 at a time; one pull request for each sub-goal\n"),
+            "{brief}"
+        );
+        assert!(!brief.contains("- `deps`"), "{brief}");
     }
 
     fn goal() -> Goal {
