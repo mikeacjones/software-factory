@@ -836,8 +836,24 @@ pub fn load_flow(
     let mut models: std::collections::BTreeSet<String> =
         factory.allowed_models.iter().cloned().collect();
     models.extend(factory.model_override.values().cloned());
+    // An agent the factory has settings for but no adapter for could run
+    // nothing: it is refused here, before a step names it.
+    for name in factory.agent.keys() {
+        if name == factory_claude::DEFAULT_AGENT || factory_claude::harness(name).is_none() {
+            return Err(DriverError::Preflight(format!(
+                "`[agent.{name}]`: the factory has no adapter for an agent of that name besides `{}`; it has: {}",
+                factory_claude::DEFAULT_AGENT,
+                factory_claude::harness_names().join(", ")
+            )));
+        }
+    }
     flow.check(&Registry {
         roles: factory_brief::role_registry(),
+        agents: factory
+            .agent
+            .iter()
+            .map(|(name, agent)| (name.clone(), agent.allowed_models.iter().cloned().collect()))
+            .collect(),
         models,
         commands: project.commands.keys().cloned().collect(),
         scopes: project.scopes.keys().cloned().collect(),
@@ -2173,7 +2189,25 @@ impl Driver {
         };
         let outcomes = self.flow.outcomes(&step.id)?;
         let schema = factory_brief::schema(contract, &outcomes);
-        let model = self.model(model);
+        // Another agent's step names its own model, which no override of
+        // a Claude model stands in for, and uses its own login: it is not
+        // run under one of the factory's Claude accounts.
+        let other_agent = self
+            .factory
+            .agent
+            .get(&step.agent)
+            .filter(|_| step.agent != factory_claude::DEFAULT_AGENT)
+            .cloned();
+        let agent_bin = match &other_agent {
+            Some(agent) => agent.bin.clone(),
+            None => self.factory.claude_bin.clone(),
+        };
+        let with_accounts =
+            factory_claude::harness(&step.agent).is_none_or(|harness| harness.uses_accounts());
+        let model = match &other_agent {
+            Some(_) => model.clone(),
+            None => self.model(model),
+        };
         let round = self.unit.position.round();
         // A step can be given more effort in its later rounds.
         let effort = match step.effort_by_round.len() {
@@ -2418,6 +2452,9 @@ impl Driver {
             // The account is chosen afresh for every run: the one whose
             // session resets soonest, or a wait when all are at a limit.
             let (account, oauth_token) = loop {
+                if !with_accounts {
+                    break (format!("{}'s own login", step.agent), None);
+                }
                 if let Some(id) = self.account.clone() {
                     // Chosen by what walks the flow, which knows every
                     // account's limits and who else is waiting for one.
@@ -2444,7 +2481,8 @@ impl Driver {
                 }
             };
             let spec = RunSpec {
-                claude_bin: self.factory.claude_bin.clone(),
+                agent: step.agent.clone(),
+                bin: agent_bin.clone(),
                 model: model.clone(),
                 effort: effort.clone(),
                 session: session.clone(),
@@ -2458,8 +2496,8 @@ impl Driver {
                 session_file: Some(in_flight.clone()),
             };
             self.event("run.started", Some(&step.id), json!({
-                "run": self.unit.runs, "role": role, "model": model, "effort": effort,
-                "account": account,
+                "run": self.unit.runs, "role": role, "agent": step.agent, "model": model,
+                "effort": effort, "account": account,
                 "session": match &session { Session::Fresh => json!("fresh"), Session::Resume(id) => json!(id) },
                 "cwd": cwd, "log": log_path,
             }))?;
@@ -2562,7 +2600,9 @@ impl Driver {
             // Said while the step ran: for the next agent step.
             self.unit.owner_messages.extend(heard);
             let usage = finished.transcript.usage();
-            observe_account(&self.factory, &account, usage.rate_limit.as_ref(), &model);
+            if with_accounts {
+                observe_account(&self.factory, &account, usage.rate_limit.as_ref(), &model);
+            }
             self.record_usage(&step.id, &usage);
             if let Some(id) = &finished.transcript.session_id {
                 self.unit.in_step = Some(InStep {
@@ -2575,7 +2615,10 @@ impl Driver {
             let unexpected: Vec<&String> = usage
                 .models
                 .keys()
-                .filter(|used| !self.factory.allowed_models.contains(used))
+                .filter(|used| match &other_agent {
+                    Some(agent) => !agent.allowed_models.contains(used),
+                    None => !self.factory.allowed_models.contains(used),
+                })
                 .collect();
             self.event(
                 "run.ended",
@@ -2764,7 +2807,8 @@ impl Driver {
                 }
                 Outcome::AuthError(message) => {
                     return Ok(StepEnd::Park(format!(
-                        "Claude refused the login: {message}"
+                        "the agent `{}` refused the login: {message}",
+                        step.agent
                     )));
                 }
                 Outcome::BudgetExceeded => {

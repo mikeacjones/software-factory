@@ -5818,7 +5818,9 @@ impl Supervisor {
                 Err(err) => return Err(err.to_string()),
             };
             let spec = RunSpec {
-                claude_bin: self.factory.claude_bin.clone(),
+                // The tiers are run by Claude Code.
+                agent: factory_claude::DEFAULT_AGENT.to_string(),
+                bin: self.factory.claude_bin.clone(),
                 model,
                 effort: tier.effort.clone(),
                 session: session.clone(),

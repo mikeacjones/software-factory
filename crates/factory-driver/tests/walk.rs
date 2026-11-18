@@ -797,6 +797,153 @@ fn the_owner_steers_and_answers_in_the_runs_thread() {
     assert!(!kinds.iter().any(|kind| kind == "slack.failed"));
 }
 
+/// Any agent step can be run by another agent than Claude Code. Here the
+/// builder's two steps are codex's: it builds, and its session is resumed
+/// for the fix, while the tester, the reviewer and the publisher stay
+/// Claude's. A codex step runs under codex's own login and is counted for
+/// what each run used.
+#[test]
+fn a_step_can_be_run_by_codex_and_its_session_is_continued_by_codex() {
+    let world = World::new("codex", "test -f feature.txt");
+    world.with_codex(&["build", "fix"]);
+
+    let mut driver = Driver::start(world.config(), "toy", "toy-1", &OPTIONS).unwrap();
+    assert_eq!(driver.run().unwrap(), Status::Ended);
+
+    // Codex was run headless, with the model the step names, once fresh
+    // and then resuming that session.
+    let codex = std::fs::read_to_string(world.path("bin/state/codex-calls")).unwrap();
+    let codex: Vec<&str> = codex.lines().collect();
+    assert!(codex.len() >= 2, "{codex:#?}");
+    assert!(
+        codex[0].starts_with("exec --json --dangerously-bypass-approvals-and-sandbox")
+            && codex[0].contains("--model gpt-6.2-sol")
+            && codex[0].contains("model_reasoning_effort=\"medium\""),
+        "{}",
+        codex[0]
+    );
+    assert!(
+        codex[1].starts_with("exec resume fake-builder-1 --json"),
+        "{}",
+        codex[1]
+    );
+
+    // Every builder run was codex's, and nothing else was.
+    let calls = world.calls();
+    for call in &calls {
+        assert_eq!(call[0] == "builder", call[3] == "codex", "{call:?}");
+    }
+    assert!(calls.iter().any(|call| call[0] == "tester"));
+    assert!(calls.iter().any(|call| call[0] == "publisher"));
+
+    let started = events_named(&world, &driver, "run.started");
+    let builds: Vec<&serde_json::Value> = started
+        .iter()
+        .filter(|run| run["role"] == "builder")
+        .collect();
+    assert_eq!(builds.len(), codex.len());
+    for run in &builds {
+        assert_eq!(run["agent"], "codex");
+        assert_eq!(run["model"], "gpt-6.2-sol");
+        assert_eq!(run["account"], "codex's own login");
+    }
+    assert!(
+        started
+            .iter()
+            .any(|run| run["role"] == "tester" && run["agent"] == "claude")
+    );
+    // The stream reports the session's running total: each run is
+    // counted for its own part.
+    for run in events_named(&world, &driver, "run.ended") {
+        if let Some(used) = run["usage"]["models"].get("gpt-6.2-sol") {
+            assert_eq!(
+                (
+                    &used["input_tokens"],
+                    &used["cache_read_tokens"],
+                    &used["output_tokens"]
+                ),
+                (
+                    &serde_json::json!(2000),
+                    &serde_json::json!(1000),
+                    &serde_json::json!(100)
+                ),
+                "{run}"
+            );
+            assert_eq!(run["unexpected_models"], serde_json::json!([]));
+        }
+    }
+}
+
+/// A flow is refused when a step names an agent the factory has no
+/// settings for, a model that agent does not allow, or continues a session
+/// another agent started; and settings for an agent with no adapter are
+/// refused whatever the flows say.
+#[test]
+fn a_step_whose_agent_cannot_run_it_is_refused_before_anything_starts() {
+    let refused = |change: &dyn Fn(&World)| {
+        let world = World::new("codex-refused", "true");
+        world.with_codex(&["build", "fix"]);
+        change(&world);
+        match Driver::start(world.config(), "toy", "toy-1", &OPTIONS) {
+            Err(err) => err.to_string(),
+            Ok(_) => panic!("the flow was accepted"),
+        }
+    };
+    let rewrite = |world: &World, file: &str, from: &str, to: &str| {
+        let path = world.path(file);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(from), "{file} has no {from}");
+        std::fs::write(&path, text.replacen(from, to, 1)).unwrap();
+    };
+    let flow = "config/flows/build-break-review.toml";
+
+    let said = refused(&|world| rewrite(world, flow, "agent = \"codex\"", "agent = \"cursor\""));
+    assert!(
+        said.contains("step `build`: unknown agent `cursor`"),
+        "{said}"
+    );
+    let said = refused(&|world| {
+        rewrite(
+            world,
+            flow,
+            "model = \"gpt-6.2-sol\"",
+            "model = \"claude-opus-5-5\"",
+        )
+    });
+    assert!(
+        said.contains("model `claude-opus-5-5` is not allowed for the agent `codex`"),
+        "{said}"
+    );
+    // The fix would continue the builder's session under Claude.
+    let said = refused(&|world| {
+        let path = world.path(flow);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let at = text.find("id = \"fix\"").unwrap();
+        let fixed = text[at..].replacen(
+            "agent = \"codex\"\nmodel = \"gpt-6.2-sol\"",
+            "model = \"claude-opus-5-5\"",
+            1,
+        );
+        std::fs::write(&path, format!("{}{fixed}", &text[..at])).unwrap();
+    });
+    assert!(
+        said.contains("step `fix`: continues the session of `build`, which another agent runs"),
+        "{said}"
+    );
+    let said = refused(&|world| {
+        rewrite(
+            world,
+            "config/factory.toml",
+            "[agent.codex]",
+            "[agent.cursor]",
+        )
+    });
+    assert!(
+        said.contains("`[agent.cursor]`: the factory has no adapter"),
+        "{said}"
+    );
+}
+
 /// Set `quiet` in a world that already has Slack.
 fn quiet(world: &World) {
     let factory = world.path("config/factory.toml");

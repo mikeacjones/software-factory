@@ -112,12 +112,16 @@ impl World {
                 .unwrap();
             }
         }
+        let codex = path("bin/codex");
+        std::fs::copy(driver_tests().join("fake-codex.py"), &codex).unwrap();
+        std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::write(
             path("config/factory.toml"),
             format!(
-                "state_dir = \"{}\"\nclaude_bin = \"{}\"\nallowed_models = [\"claude-opus-5-5\", \"claude-sonnet-5-5\"]\n",
+                "state_dir = \"{}\"\nclaude_bin = \"{}\"\nallowed_models = [\"claude-opus-5-5\", \"claude-sonnet-5-5\"]\n\n[agent.codex]\nbin = \"{}\"\nallowed_models = [\"gpt-6.2-sol\"]\n",
                 path("state").display(),
-                fake.display()
+                fake.display(),
+                codex.display()
             ),
         )
         .unwrap();
@@ -282,6 +286,33 @@ merge_body = \"{{summary}}\\n\\n{{testing}}\\n\\nBead: {{bead}}\"
             .lines()
             .map(str::to_string)
             .collect()
+    }
+
+    /// Have the named steps of the toy's flow run by the `codex` agent,
+    /// which every world has, played by a scripted stand-in. A step that
+    /// continued one of their sessions under Claude starts its own.
+    pub fn with_codex(&self, steps: &[&str]) {
+        let flow = self.path("config/flows/build-break-review.toml");
+        let mut text = std::fs::read_to_string(&flow).unwrap();
+        for step in steps {
+            let head = format!("id = \"{step}\"\nkind = \"agent\"\n");
+            assert!(text.contains(&head), "the flow has no agent step `{step}`");
+            let at = text.find(&head).unwrap() + head.len();
+            let end = at + text[at..].find("\n[[step]]").unwrap_or(text.len() - at);
+            let block = text[at..end].replace(
+                "model = \"claude-opus-5-5\"",
+                "agent = \"codex\"\nmodel = \"gpt-6.2-sol\"",
+            );
+            text.replace_range(at..end, &block);
+        }
+        if steps.contains(&"build") {
+            let head = "id = \"describe\"";
+            let at = text.find(head).unwrap();
+            let fresh =
+                text[at..].replacen("session = \"continue:build\"", "session = \"fresh\"", 1);
+            text.replace_range(at.., &fresh);
+        }
+        std::fs::write(&flow, text).unwrap();
     }
 
     pub fn scenario(&self, words: &str) {

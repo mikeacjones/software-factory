@@ -1,0 +1,8 @@
+{"type":"thread.started","thread_id":"01a1ebcf-1d62-71b0-a5b2-74185654debf"}
+{"type":"item.completed","item":{"id":"item_0","type":"error","message":"Codex is ignoring 1 unrecognized configuration setting. Check for typos or deprecated settings."}}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"I’ll create `c.txt` and verify its contents."}}
+{"type":"item.started","item":{"id":"item_3","type":"command_execution","command":"/bin/zsh -lc 'printf hi > c.txt && cat c.txt'","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_3","type":"command_execution","command":"/bin/zsh -lc 'printf hi > c.txt && cat c.txt'","aggregated_output":"hi","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_4","type":"agent_message","text":"{\n  \"outcome\": \"done\",\n  \"summary\": \"Created `c.txt`.\",\n  \"files_touched\": [\"c.txt\"]\n}"}}
+{"type":"turn.completed","usage":{"input_tokens":32477,"cached_input_tokens":16000,"cache_write_input_tokens":0,"output_tokens":153,"reasoning_output_tokens":0}}

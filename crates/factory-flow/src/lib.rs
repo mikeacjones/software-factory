@@ -184,10 +184,16 @@ struct RawMemberTable {
     when_changed: Vec<String>,
 }
 
+/// The agent a step runs under when it names none.
+pub const DEFAULT_AGENT: &str = "claude";
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Step {
     pub id: String,
     pub kind: StepKind,
+    /// For an agent step: the agent that runs it, such as `claude` or
+    /// `codex`. Its model is one that agent allows.
+    pub agent: String,
     /// The artifact a command step writes, such as a directory of reports.
     pub produces: Option<String>,
     /// The artifacts an agent step is given. Each must have been produced,
@@ -226,6 +232,7 @@ struct RawStep {
     id: String,
     kind: String,
     role: Option<String>,
+    agent: Option<String>,
     model: Option<String>,
     effort: Option<String>,
     session: Option<String>,
@@ -301,6 +308,9 @@ pub struct Registry {
     /// Each role with the outcomes it may return.
     pub roles: BTreeMap<String, BTreeSet<String>>,
     pub models: BTreeSet<String>,
+    /// Every agent a step may name other than the default, with the
+    /// models it allows.
+    pub agents: BTreeMap<String, BTreeSet<String>>,
     pub commands: BTreeSet<String>,
     pub scopes: BTreeSet<String>,
 }
@@ -381,8 +391,19 @@ impl Flow {
                             }
                         }
                     }
-                    if !registry.models.contains(model) {
-                        problems.push(format!("step `{id}`: model `{model}` is not allowed"));
+                    let agent = &step.agent;
+                    if agent == DEFAULT_AGENT {
+                        if !registry.models.contains(model) {
+                            problems.push(format!("step `{id}`: model `{model}` is not allowed"));
+                        }
+                    } else {
+                        match registry.agents.get(agent) {
+                            None => problems.push(format!("step `{id}`: unknown agent `{agent}`")),
+                            Some(models) if !models.contains(model) => problems.push(format!(
+                                "step `{id}`: model `{model}` is not allowed for the agent `{agent}`"
+                            )),
+                            Some(_) => {}
+                        }
                     }
                     for scope in writes {
                         if !registry.scopes.contains(scope) {
@@ -399,6 +420,13 @@ impl Flow {
                             Some(StepKind::Agent {
                                 workspace: other, ..
                             }) => {
+                                // A session belongs to the agent that
+                                // started it.
+                                if self.step(earlier).is_some_and(|other| &other.agent != agent) {
+                                    problems.push(format!(
+                                        "step `{id}`: continues the session of `{earlier}`, which another agent runs"
+                                    ));
+                                }
                                 // A session lives where it was started.
                                 if other != workspace {
                                     problems.push(format!(
@@ -883,6 +911,12 @@ fn convert(mut raw: RawStep) -> Result<Step, String> {
             raw.id
         ));
     }
+    if raw.agent.is_some() && !matches!(kind, StepKind::Agent { .. }) {
+        return Err(format!(
+            "step `{}`: only an agent step is run by an agent",
+            raw.id
+        ));
+    }
     if raw.needs.is_some() && !matches!(kind, StepKind::Agent { .. }) {
         return Err(format!(
             "step `{}`: only an agent step can need an artifact",
@@ -892,6 +926,7 @@ fn convert(mut raw: RawStep) -> Result<Step, String> {
     Ok(Step {
         id: raw.id,
         kind,
+        agent: raw.agent.unwrap_or_else(|| DEFAULT_AGENT.to_string()),
         produces: raw.produces,
         needs: raw.needs.unwrap_or_default(),
         when_changed: raw.when_changed.unwrap_or_default(),
@@ -1090,9 +1125,65 @@ on.failed = "park"
         Registry {
             roles,
             models: set(&["m"]),
+            agents: BTreeMap::from([("other".to_string(), set(&["o"]))]),
             commands: set(&["test", "fmt", "vet"]),
             scopes: set(&["code"]),
         }
+    }
+
+    #[test]
+    fn a_step_names_the_agent_that_runs_it_and_a_model_that_agent_allows() {
+        // A step that names no agent is the default's, on its models.
+        let flow = Flow::parse(FLOW).unwrap();
+        assert!(flow.steps.iter().all(|step| step.agent == DEFAULT_AGENT));
+        flow.check(&registry()).unwrap();
+
+        let tester = "role = \"tester\"\nmodel = \"m\"";
+        let other = FLOW.replace(
+            tester,
+            "role = \"tester\"\nagent = \"other\"\nmodel = \"o\"",
+        );
+        let flow = Flow::parse(&other).unwrap();
+        assert_eq!(flow.step("break").unwrap().agent, "other");
+        flow.check(&registry()).unwrap();
+
+        // The other agent's model is not the default's, nor the reverse.
+        let said = problems(&FLOW.replace(
+            tester,
+            "role = \"tester\"\nagent = \"other\"\nmodel = \"m\"",
+        ));
+        assert_eq!(
+            said,
+            ["step `break`: model `m` is not allowed for the agent `other`"]
+        );
+        let said = problems(&FLOW.replace(tester, "role = \"tester\"\nmodel = \"o\""));
+        assert_eq!(said, ["step `break`: model `o` is not allowed"]);
+        let said = problems(&FLOW.replace(
+            tester,
+            "role = \"tester\"\nagent = \"nobody\"\nmodel = \"m\"",
+        ));
+        assert_eq!(said, ["step `break`: unknown agent `nobody`"]);
+
+        // A session is continued by the agent that started it.
+        let build = "role = \"builder\"\nmodel = \"m\"\neffort = \"medium\"\nwrites";
+        assert!(FLOW.contains(build));
+        let said = problems(&FLOW.replacen(
+            build,
+            "role = \"builder\"\nagent = \"other\"\nmodel = \"o\"\neffort = \"medium\"\nwrites",
+            1,
+        ));
+        assert!(
+            said.iter().any(|problem| problem
+                .contains("continues the session of `build`, which another agent runs")),
+            "{said:?}"
+        );
+
+        // Only an agent step has an agent.
+        let text = FLOW.replace(
+            "command = \"test\"\non.pass",
+            "command = \"test\"\nagent = \"other\"\non.pass",
+        );
+        assert!(matches!(Flow::parse(&text), Err(FlowError::Invalid { .. })));
     }
 
     fn problems(text: &str) -> Vec<String> {

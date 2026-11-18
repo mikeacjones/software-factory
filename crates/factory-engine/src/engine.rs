@@ -319,7 +319,11 @@ impl Pipeline {
             // An agent step runs under an account, and which one is not
             // its to choose: it asks, and waits here if there is none.
             let account = match &step.kind {
-                StepKind::Agent { model, .. } if !input.accounts.is_empty() => {
+                // Only Claude Code's steps: another agent uses its own
+                // login, and nothing here hands that out.
+                StepKind::Agent { model, .. }
+                    if !input.accounts.is_empty() && step.agent == factory_flow::DEFAULT_AGENT =>
+                {
                     let who = ctx.info().workflow_id().to_string();
                     loop {
                         ctx.state_mut(|state| state.account_ready = false);

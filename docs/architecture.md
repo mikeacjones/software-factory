@@ -36,7 +36,7 @@ Owner's decision, 2026-11-14. Every agent runs in bypass mode as the owner's acc
 | Flow | The flow schema, its validator, and the flow engine: `step(flow, state, observation)` returns the next state and a list of actions, with no I/O | `factory-flow` |
 | State | Every Redis key and stream, typed records, leases, pauses, the artifact store, the audit log | `factory-state` |
 | Supervision | Spawn a child, stream its output, judge it alive or stalled; the *slot* runner daemon; the reaper that kills a slot's whole process tree | `factory-supervise` |
-| Claude adapter | The worker command line, the stream parser, how a run ended, the *account* tracker, and a fake `claude` for tests | `factory-claude` |
+| Agent adapters | What the factory needs of an agent's command-line tool, as one trait (`Harness`): the worker command line, the stream parser and how a run ended. Claude Code is the default; a step of a flow names another with `agent`, and `codex` is the first. Also the *account* tracker for Claude Code, and a fake `claude` and `codex` for tests | `factory-claude` |
 | Beads adapter | Typed wrapper over `bd`, always with an explicit database; the readiness check | `factory-beads` |
 | Git adapter | Worktrees, checkpoints, branches, pushes, with timeouts | `factory-git` |
 | GitHub adapter | Pull requests, CI watching, the serial lander, issue sync, behind a write allowlist | `factory-github` |

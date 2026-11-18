@@ -32,6 +32,11 @@ pub struct Factory {
     #[serde(default = "default_gh")]
     pub gh_bin: String,
     pub allowed_models: Vec<String>,
+    /// The agents a step may be run by besides Claude Code, by the name a
+    /// step gives: `[agent.codex]`. A step that names none is run by
+    /// `claude_bin`, on one of `allowed_models`.
+    #[serde(default)]
+    pub agent: BTreeMap<String, AgentSettings>,
     /// Replace a model wherever a flow names it. Tests map everything to Haiku.
     #[serde(default)]
     pub model_override: BTreeMap<String, String>,
@@ -288,6 +293,16 @@ fn default_poll() -> u64 {
 
 fn default_answer_wait() -> u64 {
     12 * 60 * 60
+}
+
+/// An agent a step may be run by, other than Claude Code.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentSettings {
+    /// The agent's binary.
+    pub bin: String,
+    /// The models a step run by this agent may name.
+    pub allowed_models: Vec<String>,
 }
 
 /// One project: `projects/<id>.toml`.

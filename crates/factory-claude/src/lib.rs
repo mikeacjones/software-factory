@@ -1,12 +1,15 @@
-//! Everything that touches the `claude` binary: the exact command line of a
+//! Everything that touches an agent's binary: the exact command line of a
 //! worker, a typed reading of its output stream, the one way each run ended,
-//! and what it used.
+//! and what it used. This file is the `claude` binary's; [`harness`] is what
+//! every agent is to the factory, and [`codex`] is the `codex` binary's.
 //!
 //! Workers are headless and in bypass mode. `is_error` on the result is the
 //! authority on whether a run succeeded: the subtype has been seen to say
 //! "success" on a run that failed.
 
 pub mod accounts;
+pub mod codex;
+pub mod harness;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -17,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub use factory_supervise::Error as SuperviseError;
+pub use harness::{DEFAULT_AGENT, Harness, harness, harness_names};
 
 /// Start a new session, or carry on an earlier one.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -28,7 +32,10 @@ pub enum Session {
 /// One run of one agent step.
 #[derive(Clone, Debug)]
 pub struct RunSpec {
-    pub claude_bin: String,
+    /// The agent that runs the step: the name of a [`Harness`].
+    pub agent: String,
+    /// That agent's binary.
+    pub bin: String,
     pub model: String,
     pub effort: String,
     pub session: Session,
@@ -54,7 +61,7 @@ pub struct RunSpec {
 /// `--bare`, and a session is resumed by ID, never by "most recent".
 pub fn command(spec: &RunSpec) -> Spec {
     let mut argv: Vec<String> = [
-        spec.claude_bin.as_str(),
+        spec.bin.as_str(),
         "--print",
         "--output-format",
         "stream-json",
@@ -374,6 +381,9 @@ pub struct Transcript {
     pub tool_calls: u64,
     /// The most recent thing the model said or did, for a status line.
     pub last_activity: Option<String>,
+    /// The last thing the model said, in full, for an agent whose typed
+    /// result is what it says last.
+    pub last_message: Option<String>,
     /// Lines of a type this parser does not read, by type.
     pub unknown: BTreeMap<String, u64>,
     /// Lines that were not JSON objects.
@@ -536,14 +546,26 @@ pub fn run(
     log: &Path,
     tick: &mut dyn FnMut(&Transcript) -> Control,
 ) -> Result<Finished, SuperviseError> {
-    let transcript = std::cell::RefCell::new(Transcript::default());
+    let harness = harness(&spec.agent).ok_or_else(|| SuperviseError::Io {
+        path: log.to_path_buf(),
+        source: std::io::Error::other(format!("the factory has no agent `{}`", spec.agent)),
+    })?;
+    let mut begun = Transcript::default();
+    harness.begin(spec, &mut begun);
+    let transcript = std::cell::RefCell::new(begun);
+    let command = harness
+        .command(spec, log)
+        .map_err(|source| SuperviseError::Io {
+            path: log.to_path_buf(),
+            source,
+        })?;
     let exit = factory_supervise::stream(
-        &command(spec),
+        &command,
         log,
         &mut |line| {
             let mut transcript = transcript.borrow_mut();
             let known = transcript.session_id.is_some();
-            transcript.observe(line);
+            harness.observe(&mut transcript, line);
             if let (false, Some(id), Some(file)) =
                 (known, &transcript.session_id, &spec.session_file)
             {
@@ -552,9 +574,10 @@ pub fn run(
         },
         &mut || tick(&transcript.borrow()),
     )?;
-    let transcript = transcript.into_inner();
+    let mut transcript = transcript.into_inner();
+    harness.settle(spec, log, &mut transcript);
     Ok(Finished {
-        outcome: classify(&transcript, &exit),
+        outcome: harness.classify(&transcript, &exit),
         transcript,
         exit,
     })
@@ -717,7 +740,8 @@ mod tests {
 
     fn spec(session: Session) -> RunSpec {
         RunSpec {
-            claude_bin: "claude".to_string(),
+            agent: "claude".to_string(),
+            bin: "claude".to_string(),
             model: "claude-opus-5-5".to_string(),
             effort: "medium".to_string(),
             session,
@@ -751,7 +775,7 @@ mod tests {
         }
         let file = dir.join("in-flight.session");
         let mut run = spec(Session::Fresh);
-        run.claude_bin = stand_in.to_string_lossy().into_owned();
+        run.bin = stand_in.to_string_lossy().into_owned();
         run.cwd = dir.clone();
         run.timeout = Duration::from_millis(1500);
         run.session_file = Some(file.clone());

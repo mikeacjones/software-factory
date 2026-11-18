@@ -95,3 +95,12 @@ quiet = true
 env_file = "~/.config/software-factory/judge.env"   # TYPESAFE_API_KEY=...
 model = "jev-1.13.0"                                # a fixed version, never an alias
 timeout_secs = 5
+
+# An agent a step may be run by instead of Claude Code: a step of a flow
+# names it with `agent = "codex"` and one of these models. It runs headless
+# under the tool's own login (`codex login`), not under one of the accounts
+# above. It has no budget cap, and it reports tokens with no price, so its
+# steps show no cost.
+[agent.codex]
+bin = "codex"
+allowed_models = ["gpt-6.2-sol"]

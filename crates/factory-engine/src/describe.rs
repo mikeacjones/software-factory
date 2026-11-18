@@ -90,7 +90,12 @@ pub fn step_kind(step: &Step) -> String {
                 Workspace::Unit => "",
                 Workspace::Scratch => ", in a throwaway worktree",
             };
-            format!("the {role} ({model}, {effort} effort{session}{place})")
+            let agent = if step.agent == factory_flow::DEFAULT_AGENT {
+                String::new()
+            } else {
+                format!("{}, ", step.agent)
+            };
+            format!("the {role} ({agent}{model}, {effort} effort{session}{place})")
         }
         StepKind::Command { command, policy } => {
             let rule = match policy {

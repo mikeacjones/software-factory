@@ -1,0 +1,29 @@
+# Any agent step can be run by another agent than Claude Code: codex first.
+# Each check is an acceptance line of bead sf-h6m.
+id = "agents"
+title = "Any agent step can be run by another agent than Claude Code, starting with codex"
+bead = "sf-h6m"
+
+[[check]]
+id = "harness"
+tier = "hermetic"
+bead = "sf-h6m"
+claim = "An agent is found by the name a step gives. Codex's command is `codex exec`, headless and with approvals off, with the step's model and effort, the result's schema as a file and the role at the top of a fresh session's briefing; a resumed run names its session. A recorded stream parses into its session, its typed result and its usage; a resumed run is counted for what it used and not for the session's running total; and a crash, a failed turn, a refused login and a result that is not typed are told apart."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-claude", "--lib", "--", "harness::tests", "codex::tests"]
+timeout_secs = 900
+
+[[check]]
+id = "flow-rules"
+tier = "hermetic"
+bead = "sf-h6m"
+claim = "A step that names no agent is Claude Code's, on the factory's allowed models. A step may name another agent and one of that agent's models; a flow is refused when a step names an agent the factory has no settings for, a model its agent does not allow, or continues a session another agent started, and when a step that is not an agent step names an agent."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-flow", "--lib", "--", "a_step_names_the_agent_that_runs_it_and_a_model_that_agent_allows"]
+timeout_secs = 900
+
+[[check]]
+id = "codex-step"
+tier = "hermetic"
+bead = "sf-h6m"
+claim = "A unit whose build and fix steps name codex is built by codex and fixed in that codex session, under codex's own login and none of the factory's accounts, while its tester, reviewer and publisher are Claude Code's; it lands. Settings for an agent the factory has no adapter for are refused before anything starts."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-driver", "--test", "walk", "--", "a_step_can_be_run_by_codex_and_its_session_is_continued_by_codex", "a_step_whose_agent_cannot_run_it_is_refused_before_anything_starts"]
+timeout_secs = 900
