@@ -164,7 +164,10 @@ function filesOf(picture, run) {
 
 // ---- Accounts -------------------------------------------------------
 
-function windowHtml(account, win, label, perWhat) {
+// `asked` is set for a window only the usage endpoint reports, such as one
+// model's own week: no run says how fast it is going, so the note says
+// when it was read instead.
+function windowHtml(account, win, label, perWhat, asked) {
   const used = win.utilization || 0;
   const level = used >= 0.9 ? 'crit' : used >= 0.7 ? 'warn' : '';
   const open = win.resets_at != null;
@@ -176,7 +179,11 @@ function windowHtml(account, win, label, perWhat) {
     notes.push('No window is open. The next run on this account opens one.');
   }
   const rate = win.per_hour == null ? null : win.per_hour * (perWhat === 'day' ? 24 : 1);
-  if (open && rate == null) notes.push('Too few readings yet to say how fast it is going.');
+  if (asked) {
+    notes.push(open && win.read_at
+      ? `As the usage endpoint gave it ${time(win.read_at, 'ago')}; runs do not report this window.`
+      : 'Only the usage endpoint reports this window.');
+  } else if (open && rate == null) notes.push('Too few readings yet to say how fast it is going.');
   if (open && rate === 0) notes.push('Nothing used lately.');
   if (open && rate > 0) notes.push(`Using <b>${pct(rate)}</b> a${perWhat === 'day' ? ' day' : 'n hour'} lately.`);
   let warn = '';
@@ -254,8 +261,11 @@ function accountHtml(account) {
   if (account.concern) foot.unshift(`<span class="warnline">${esc(account.concern)}</span>`);
   return `<article class="account">
     <div class="account-top"><h3>${esc(account.name)}</h3>${status}</div>
-    ${windowHtml(account.name, account.five_hour, '5-hour window', 'hour')}
-    ${windowHtml(account.name, account.seven_day, '7-day window', 'day')}
+    ${windowHtml(account.name, account.five_hour, '5-hour window · all models', 'hour')}
+    ${windowHtml(account.name, account.seven_day, '7-day window · all models', 'day')}
+    ${Object.entries(account.models || {}).map(([model, win]) => (
+      windowHtml(account.name, win, `${esc(model.charAt(0).toUpperCase() + model.slice(1))} · 7-day window`, 'day', true)
+    )).join('')}
     <div class="account-foot">${foot.map((line) => `<p>${line}</p>`).join('')}</div>
   </article>`;
 }

@@ -33,6 +33,12 @@ pub struct AccountState {
     /// family such as `fable`) and when each ends.
     #[serde(default)]
     pub blocked: BTreeMap<String, u64>,
+    /// Weekly windows of one model each, such as Fable's, by model family.
+    /// Only the usage endpoint gives these, so they are as of
+    /// `usage_checked_at`: a run's rate-limit event reports the account's
+    /// two windows and nothing per model.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub models: BTreeMap<String, Window>,
     /// When this was last learned, and from what.
     pub updated_at: u64,
     /// When the usage endpoint was last asked, whether or not it answered.
@@ -400,12 +406,16 @@ pub fn state_from_usage(answer: &Value, now: u64) -> Option<AccountState> {
             Some("session") => state.five_hour = Some(window),
             Some("weekly_all") => state.seven_day = Some(window),
             // A weekly limit on one model, such as Fable.
-            Some("weekly_scoped") if percent >= 100.0 && resets_at > now => {
+            Some("weekly_scoped") => {
                 if let Some(name) = limit
                     .pointer("/scope/model/display_name")
                     .and_then(Value::as_str)
                 {
-                    state.blocked.insert(name.to_lowercase(), resets_at);
+                    let name = name.to_lowercase();
+                    if percent >= 100.0 && resets_at > now {
+                        state.blocked.insert(name.clone(), resets_at);
+                    }
+                    state.models.insert(name, window);
                 }
             }
             _ => {}
@@ -1189,6 +1199,10 @@ mod tests {
             parse_time("2026-11-15T01:00:00Z")
         );
         assert_eq!(state.seven_day.as_ref().unwrap().utilization, 0.84);
+        // Fable's own week is kept as a window of its own.
+        let fable = &state.models["fable"];
+        assert_eq!(fable.utilization, 1.0);
+        assert_eq!(fable.resets_at, parse_time("2026-11-18T07:00:00Z").unwrap());
         // Fable's own weekly limit is full: Fable must go elsewhere, Opus need not.
         assert!(state.available_at("claude-fable-5-2", now) > now);
         assert_eq!(state.available_at("claude-opus-5-5", now), 0);
@@ -1196,6 +1210,20 @@ mod tests {
             state_from_usage(&serde_json::json!({"error": "x"}), now),
             None
         );
+    }
+
+    #[test]
+    fn a_model_week_short_of_its_limit_is_kept_without_blocking() {
+        let answer = serde_json::json!({"limits": [
+            {"kind": "weekly_scoped", "percent": 40, "resets_at": "2026-11-18T07:00:00+00:00",
+             "scope": {"model": {"display_name": "Fable"}}}
+        ]});
+        let now = parse_time("2026-11-14T20:00:00Z").unwrap();
+        let state = state_from_usage(&answer, now).unwrap();
+        assert_eq!(state.models["fable"].utilization, 0.4);
+        assert_eq!(state.models["fable"].status, "allowed");
+        assert!(state.blocked.is_empty());
+        assert_eq!(state.available_at("claude-fable-5-2", now), 0);
     }
 
     #[test]

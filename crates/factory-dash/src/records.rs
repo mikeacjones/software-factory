@@ -936,6 +936,39 @@ impl Reader {
                 };
             let five = one("five_hour", FIVE_HOURS, 3600, &|reading| reading.five);
             let seven = one("seven_day", SEVEN_DAYS, 24 * 3600, &|reading| reading.seven);
+            // One model's own week, such as Fable's. Only the usage endpoint
+            // reports it, so it is as of the last time that was asked, and
+            // no run's readings make a trail or a rate for it.
+            let checked_at = record["usage_checked_at"].as_u64().unwrap_or(0);
+            let models: serde_json::Map<String, Value> = record["models"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .filter_map(|(model, known)| {
+                    let window = window_of(known)?;
+                    let shown = if window.resets_at > now {
+                        json!({
+                            "utilization": window.utilization,
+                            "resets_at": window.resets_at,
+                            "length": SEVEN_DAYS,
+                            "status": known["status"],
+                            "read_at": checked_at,
+                            "trail": [],
+                        })
+                    } else {
+                        // It has reset since it was read: nothing is known
+                        // of the new one but that it started empty.
+                        json!({
+                            "utilization": 0.0,
+                            "resets_at": Value::Null,
+                            "length": SEVEN_DAYS,
+                            "status": "allowed",
+                            "trail": [],
+                        })
+                    };
+                    Some((model.clone(), shown))
+                })
+                .collect();
             let spent = |since: u64| -> f64 {
                 mine.iter()
                     .filter(|reading| reading.at + since >= now)
@@ -951,6 +984,7 @@ impl Reader {
                 "name": name,
                 "five_hour": five,
                 "seven_day": seven,
+                "models": models,
                 "blocked": record["blocked"],
                 "concern": record["concern"],
                 "spent_hour": spent(3600),

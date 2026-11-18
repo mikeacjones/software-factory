@@ -24,7 +24,7 @@ fn state(name: &str) -> PathBuf {
     };
     put(
         "accounts.json",
-        r#"{"one":{"five_hour":{"utilization":0.4,"resets_at":99999999999,"status":"allowed"},"seven_day":{"utilization":0.1,"resets_at":99999999999,"status":"allowed"},"blocked":{},"updated_at":1,"concern":null,"identity":"not for the page"}}"#,
+        r#"{"one":{"five_hour":{"utilization":0.4,"resets_at":99999999999,"status":"allowed"},"seven_day":{"utilization":0.1,"resets_at":99999999999,"status":"allowed"},"models":{"fable":{"utilization":0.6,"resets_at":99999999999,"status":"allowed"},"opus":{"utilization":0.9,"resets_at":2,"status":"allowed"}},"blocked":{},"updated_at":1,"usage_checked_at":7,"concern":null,"identity":"not for the page"}}"#,
     );
     put(
         "projects/toy/executive.json",
@@ -161,6 +161,13 @@ async fn the_picture_shows_the_tiers_the_pipeline_the_account_and_the_run() {
     assert_eq!(account["name"], "one");
     assert_eq!(account["five_hour"]["utilization"], 0.45);
     assert_eq!(account["seven_day"]["utilization"], 0.1);
+    // A model's own week, apart from the account's two windows, as of when
+    // the usage endpoint was last asked; one that has reset since is empty.
+    assert_eq!(account["models"]["fable"]["utilization"], 0.6);
+    assert_eq!(account["models"]["fable"]["resets_at"], 99999999999u64);
+    assert_eq!(account["models"]["fable"]["read_at"], 7);
+    assert_eq!(account["models"]["opus"]["utilization"], 0.0);
+    assert!(account["models"]["opus"]["resets_at"].is_null());
     assert_eq!(account["runs"][0]["id"], "toy-1-17");
     assert_eq!(picture["runs"].as_array().unwrap().len(), 1);
     // Whose account it is stays in the factory's record.
