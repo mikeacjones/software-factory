@@ -5,6 +5,7 @@ mod check;
 mod docs;
 mod error;
 mod gate;
+mod release;
 mod selftest;
 
 use std::collections::BTreeSet;
@@ -21,6 +22,10 @@ usage:
                                             the check and gate commands say no when they should
   cargo xtask gate --list                   every gate with its checks and tiers
   cargo xtask gate <id> [--tier <tier>]...  run a gate; tiers: hermetic, host, live, owner
+  cargo xtask release-notes <version>       draft docs/releases/v<version>.md from the commits
+  cargo xtask package --target <triple> [--zig]
+                                            build one platform's archive into target/dist
+  cargo xtask release <version> [--dry-run] check this commit can be <version>, then tag and push
 
 gate exit codes: 0 passed, 1 failed, 2 incomplete (a tier was skipped)";
 
@@ -106,6 +111,9 @@ fn run(args: &[String]) -> Result<u8, Error> {
             Ok(u8::from(failed))
         }
         "gate" => gate_command(root, rest),
+        "release-notes" => release::notes_command(&root, rest),
+        "package" => release::package_command(&root, rest),
+        "release" => release::release_command(&root, rest),
         other => Err(Error::Usage(format!("unknown command `{other}`"))),
     }
 }

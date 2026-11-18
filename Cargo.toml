@@ -29,6 +29,9 @@ toml = "1"
 ureq = { version = "3", features = ["json"] }
 
 [workspace.package]
+# The release version of every crate. `cargo xtask release` checks that
+# the tag it cuts is this version, so bump it in the release commit.
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.100"
 publish = false

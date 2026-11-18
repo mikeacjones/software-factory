@@ -1,0 +1,82 @@
+# Builds and publishes a release when a tag `v<version>` is pushed, which
+# `cargo xtask release <version>` does after checking the commit. See
+# docs/releasing.md.
+#
+# One archive per platform, named as Temporal names its releases'
+# archives (software_factory_<version>_<os>_<arch>.tar.gz), and a
+# checksums.txt of their SHA-256 sums. The release's notes are
+# docs/releases/v<version>.md, followed by GitHub's generated list of pull
+# requests and the full changelog link.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # Every platform is built on one macOS host, the way the release is
+    # built and checked by hand: macOS natively, Linux through zig, for
+    # glibc 2.28 and later.
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: The tag is the workspace version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          found="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)"
+          if [ "$version" != "$found" ]; then
+            echo "::error::tag $GITHUB_REF_NAME but Cargo.toml's workspace version is $found"
+            exit 1
+          fi
+          test -f "docs/releases/$GITHUB_REF_NAME.md" || { echo "::error::docs/releases/$GITHUB_REF_NAME.md is missing"; exit 1; }
+      - name: Toolchain and targets
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+      - run: cargo install --locked cargo-zigbuild@0.24.1
+      - run: cargo xtask package --target aarch64-apple-darwin
+      - run: cargo xtask package --target x86_64-apple-darwin
+      - run: cargo xtask package --target aarch64-unknown-linux-gnu --zig
+      - run: cargo xtask package --target x86_64-unknown-linux-gnu --zig
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: target/dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - name: checksums.txt
+        working-directory: dist
+        run: sha256sum *.tar.gz > checksums.txt && cat checksums.txt
+      - name: Make the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          prerelease=()
+          case "$version" in 0.*|*-*) prerelease=(--prerelease) ;; esac
+          gh release create "$GITHUB_REF_NAME" \
+            --verify-tag \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file "docs/releases/$GITHUB_REF_NAME.md" \
+            --generate-notes \
+            "${prerelease[@]}" \
+            dist/*.tar.gz dist/checksums.txt

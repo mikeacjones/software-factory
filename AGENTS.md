@@ -15,6 +15,7 @@ cargo xtask docs             # glossary terms, doc links, the size of this file
 cargo xtask selftest         # the check and gate commands can be trusted to say no
 cargo xtask gate --list      # every gate with its checks and tiers
 cargo xtask gate <id>        # prove a milestone; the report is target/gates/<id>.json
+cargo xtask release <version> # tag and push a release (docs/releasing.md)
 proofs/backup_beads.sh backup   # back up every bead database, then verify by restoring
 proofs/backup_beads.sh verify   # restore the latest backup set and compare
 proofs/walk_scratch.sh          # one scratch bead through the real flow on Haiku (real Claude calls)

@@ -530,6 +530,10 @@ fn factory_core_now() -> u64 {
 #[tokio::main]
 async fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args == ["--version"] {
+        println!("factory-engine {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
     match command(&args).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(reason) => {

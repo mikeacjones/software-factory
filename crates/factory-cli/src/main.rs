@@ -13,6 +13,7 @@ use factory_driver::{
 
 const USAGE: &str = "\
 usage:
+  factory --version                           the release this build is
   factory run <project> <bead> [--no-slack]   walk one bead through its project's flow
   factory run --unit <unit> [--no-slack]      continue a stopped or parked unit
   factory run --unit <unit> --from <step>     owner's override: put the unit at that step
@@ -244,6 +245,10 @@ fn serve_on_engine(
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args == ["--version"] {
+        println!("factory {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
     match run(&args) {
         Ok(code) => ExitCode::from(code),
         Err(message) => {

@@ -560,7 +560,7 @@ dependencies = [
 
 [[package]]
 name = "factory-beads"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "factory-supervise",
  "serde",
@@ -570,7 +570,7 @@ dependencies = [
 
 [[package]]
 name = "factory-brief"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "factory-beads",
  "factory-config",
@@ -583,7 +583,7 @@ dependencies = [
 
 [[package]]
 name = "factory-checks"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "factory-git",
  "factory-supervise",
@@ -596,7 +596,7 @@ dependencies = [
 
 [[package]]
 name = "factory-claude"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "factory-supervise",
  "serde",
@@ -607,7 +607,7 @@ dependencies = [
 
 [[package]]
 name = "factory-cli"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "factory-beads",
  "factory-claude",
@@ -619,7 +619,7 @@ dependencies = [
 
 [[package]]
 name = "factory-config"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "factory-core",
  "serde",
@@ -629,7 +629,7 @@ dependencies = [
 
 [[package]]
 name = "factory-core"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -638,7 +638,7 @@ dependencies = [
 
 [[package]]
 name = "factory-dash"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "http-body-util",
  "hyper",
@@ -651,7 +651,7 @@ dependencies = [
 
 [[package]]
 name = "factory-driver"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "factory-beads",
  "factory-brief",
@@ -672,7 +672,7 @@ dependencies = [
 
 [[package]]
 name = "factory-engine"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "factory-claude",
  "factory-config",
@@ -693,7 +693,7 @@ dependencies = [
 
 [[package]]
 name = "factory-flow"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "serde",
  "thiserror",
@@ -702,7 +702,7 @@ dependencies = [
 
 [[package]]
 name = "factory-git"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "factory-supervise",
  "thiserror",
@@ -710,7 +710,7 @@ dependencies = [
 
 [[package]]
 name = "factory-github"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "factory-supervise",
  "serde_json",
@@ -719,7 +719,7 @@ dependencies = [
 
 [[package]]
 name = "factory-slack"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "rustls",
  "serde",
@@ -732,7 +732,7 @@ dependencies = [
 
 [[package]]
 name = "factory-supervise"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "thiserror",
 ]
@@ -4015,7 +4015,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "jsonschema",
  "serde",
