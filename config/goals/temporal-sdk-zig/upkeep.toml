@@ -11,7 +11,9 @@ id = "upkeep"
 # The agent of each run. A scheduled definition has no director; this table
 # gives the maintainer its model, effort and time limit.
 [director]
-model = "claude-fable-5-2"
+# Opus: it files beads from what the records show, and every bead it marks
+# to build still goes through the whole pipeline and its review.
+model = "claude-opus-5-5"
 effort = "high"
 timeout_secs = 2700
 

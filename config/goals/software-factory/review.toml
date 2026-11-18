@@ -16,7 +16,8 @@ id = "review"
 # The agent of each run. A scheduled definition has no director; this table
 # gives the inspector its model, effort and time limit.
 [director]
-model = "claude-fable-5-2"
+# Opus: it proposes goals, and the owner's button decides each one.
+model = "claude-opus-5-5"
 effort = "high"
 timeout_secs = 2700
 

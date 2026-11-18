@@ -46,7 +46,10 @@ standards = ["AGENTS.md", "CONTRIBUTING.md"]
 # and only goals whose charters name paths that do not overlap. A goal that
 # could touch anything runs alone.
 [executive]
-model = "claude-fable-5-2"
+# Opus: it routes the owner's messages to goals and closes beads it is
+# told to. None of that needs Fable, and Fable's weekly limit is kept for
+# the designers and the directors' planning.
+model = "claude-opus-5-5"
 effort = "high"
 timeout_secs = 1800
 slots = 2
