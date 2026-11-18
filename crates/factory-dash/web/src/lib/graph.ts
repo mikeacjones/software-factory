@@ -177,7 +177,8 @@ export function projectGraph(project: Project, inbox: Item[], chosen: string | u
   for (const goal of project.goals || []) {
     const [tone, word] = toneOf(goal.phase);
     const subs = goal.subgoals || [];
-    const beads = subs.flatMap((sub) => sub.beads || []);
+    const own = goal.beads || [];
+    const beads = [...subs.flatMap((sub) => sub.beads || []), ...own];
     const done = beads.filter((bead) => ['absorbed', 'landed'].includes(bead.state || '')).length;
     const busy = !!goal.run || beads.some(running) || subs.some((sub) => sub.ship && running(sub.ship));
     const waiting = waitingFor(goal.id);
@@ -222,6 +223,7 @@ export function projectGraph(project: Project, inbox: Item[], chosen: string | u
       for (const bead of sbeads) link(sid, beadNode(bead, goal, sub), running(bead) ? 'hot' : bead.asked ? 'waiting' : '');
       if (sub.ship) link(sid, beadNode(sub.ship, goal, sub, true), running(sub.ship) ? 'hot' : '');
     }
+    for (const bead of own) link(gid, beadNode(bead, goal), running(bead) ? 'hot' : bead.asked ? 'waiting' : '');
   }
 
   if (project.loose?.length) {
@@ -415,6 +417,10 @@ export function findRef(project: Project, id: string | undefined): Ref | null {
     if (!goal) {
       const bead = (project.loose || []).find((one) => (one.unit || one.bead) === key);
       return bead ? { level: 'bead', bead } : null;
+    }
+    if (!parts[1]) {
+      const bead = (goal.beads || []).find((one) => (one.unit || one.bead) === key);
+      return bead ? { level: 'bead', goal, bead } : null;
     }
     if (parts[3] === 'ship' && sub?.ship) return { level: 'bead', goal, sub, bead: sub.ship };
     const bead = sub?.beads?.find((one) => (one.unit || one.bead) === key);

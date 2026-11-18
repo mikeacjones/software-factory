@@ -213,6 +213,10 @@ fn of_goal(project: &str, goal: &Value) -> Vec<Value> {
             items.extend(of_unit(project, unit, Some(id)));
         }
     }
+    // The pipelines a director started itself, in no sub-goal.
+    for unit in goal["beads"].as_array().into_iter().flatten() {
+        items.extend(of_unit(project, unit, Some(id)));
+    }
     items
 }
 
@@ -264,6 +268,18 @@ fn of_unit(project: &str, unit: &Value, goal: Option<&str>) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_question_from_a_pipeline_the_director_started_itself_is_in_the_inbox() {
+        let project = json!({
+            "id": "toy",
+            "goals": [{"id": "g1", "phase": "running", "objective": "Audit it", "subgoals": [],
+                "beads": [{"unit": "u1", "bead": "toy-1", "title": "A spike", "asked": {"step": "build", "question": "Which API?", "at": 80}, "status": "running", "thread": {"channel": "C1", "ts": "9.9"}}]}],
+        });
+        let items = of_project(&project, &[]);
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!(items[0]["goal"], "g1");
+    }
 
     #[test]
     fn each_thing_the_factory_waits_for_is_one_item_with_the_acts_that_answer_it() {

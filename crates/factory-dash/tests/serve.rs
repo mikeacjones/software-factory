@@ -432,6 +432,28 @@ async fn what_waits_on_the_owner_and_the_conversation_are_read_from_the_records(
     std::fs::remove_dir_all(&state).unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pipeline_a_director_started_in_no_sub_goal_is_drawn_under_its_goal() {
+    let state = state("own-beads");
+    std::fs::write(
+        state.join("goals/toy-g1/goal.json"),
+        r#"{"id":"toy-g1","project":"toy","phase":"running","charter":{"objective":"Audit it."},"wakes":1,
+            "units":[{"bead":"toy-1","unit":"toy-1-17","state":"running","ship":false,"subgoal":null}],
+            "subgoals":[],"usage":{"cost_usd":1.0},"started_at":5}"#,
+    )
+    .unwrap();
+    let address = open(&state, &["127.0.0.0/8"]).await;
+    let picture = body(&ask(address, "GET", "/api/snapshot", &address.to_string()).await);
+    let project = &picture["projects"][0];
+    let goal = &project["goals"][0];
+    assert_eq!(goal["beads"][0]["unit"], "toy-1-17", "{goal}");
+    assert_eq!(goal["beads"][0]["state"], "running");
+    // It is the goal's, not a pipeline run by hand.
+    assert_eq!(project["loose"], serde_json::json!([]), "{project}");
+    assert_eq!(project["pulse"]["pipelines"], 1);
+    std::fs::remove_dir_all(&state).unwrap();
+}
+
 /// Read server-sent events from a stream until `want` of them have come,
 /// as (name, data) pairs.
 fn events(

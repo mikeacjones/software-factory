@@ -78,7 +78,7 @@ The agent that directs a goal: it decides which bead's pipeline runs next, what 
 
 ## executive
 
-The agent the owner talks to in a project's channel, above every goal's director. It answers, or opens a goal under one of the project's goal definitions and hands the thread to that goal's director, and it decides which waiting goals may start beside the ones running. It is the tier of a project.
+The agent the owner talks to in a project's channel, above every goal's director. It answers, or opens a goal under one of the project's goal definitions and hands the thread to that goal's director, and it decides which waiting goals may start beside the ones running. It is shown how a goal under each definition is run (its tiers, its pipelines, the scheduled runs that build under it), and when none suits the work it proposes a new definition to the owner instead of opening the goal under one that does not. It is the tier of a project.
 
 It is also where tracker work that is no goal's goes. A director that finds an open bead needing no work, because what landed delivers it or it duplicates another, passes it up to the executive, not to the owner. The executive can close such a bead, and its issue with it, at once or as soon as a bead it names has landed; code refuses one a goal is working on.
 
