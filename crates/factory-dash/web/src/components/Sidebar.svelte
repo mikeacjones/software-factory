@@ -8,7 +8,7 @@
   const agents = $derived((live.picture?.runs || []).length);
   const accounts = $derived(live.picture?.accounts || []);
   const silent = $derived(live.heard ? live.now - live.skew - live.heard : 0);
-  const stale = $derived(live.heard > 0 && silent > 12);
+  const stale = $derived(live.heard > 0 && silent > 25);
 
   function subline(project: Project): string {
     const p = project.pulse;

@@ -1,20 +1,27 @@
 //! The page and what it asks for, over HTTP.
 //!
 //! Only reading is offered: the page, the picture of the factory, and
-//! parts of runs' logs. A connection from an address outside the allowed
-//! networks is closed before a byte of it is read.
+//! parts of runs' logs; and the owner's acts, to those allowed. A
+//! connection from an address outside the allowed networks is closed
+//! before a byte of it is read.
+//!
+//! The page is sent the picture as a stream of events (`/api/stream`):
+//! the whole picture once, then only what changed in it, when it changes.
 
 use std::collections::hash_map::DefaultHasher;
 use std::convert::Infallible;
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use http_body_util::Full;
-use hyper::body::{Bytes, Incoming};
+use http_body_util::combinators::BoxBody;
+use hyper::body::{Body, Bytes, Frame, Incoming};
 use hyper::header::{self, HeaderValue};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -22,14 +29,14 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use serde_json::json;
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, mpsc, watch};
 
 use http_body_util::{BodyExt, Limited};
 
 use crate::act::{self, Act, Engine};
 use crate::net::{Net, host_is_ours, may_connect};
 use crate::records::{Links, Reader};
-use crate::{runlog, thread};
+use crate::{patch, runlog, thread};
 
 const PAGE: &str = include_str!("../assets/index.html");
 const STYLE: &str = include_str!("../assets/app.css");
@@ -41,6 +48,9 @@ const LOOK_EVERY: Duration = Duration::from_secs(2);
 const LOOKED_LATELY_SECS: u64 = 30;
 /// How many connections are answered at once.
 const MOST_CONNECTIONS: usize = 64;
+/// How often a stream says it is still there when nothing has changed,
+/// so the page can tell a quiet factory from a server that has gone.
+const BEAT_EVERY: Duration = Duration::from_secs(10);
 
 /// What the server is run with.
 #[derive(Clone, Debug)]
@@ -63,6 +73,7 @@ pub struct Settings {
 /// The picture as it was last read.
 #[derive(Default)]
 struct Picture {
+    value: serde_json::Value,
     body: Bytes,
     tag: String,
 }
@@ -70,7 +81,8 @@ struct Picture {
 struct Shared {
     settings: Settings,
     reader: Mutex<Reader>,
-    picture: RwLock<Arc<Picture>>,
+    /// The latest picture; every stream open holds a receiver of it.
+    pictures: watch::Sender<Arc<Picture>>,
     asked_at: AtomicU64,
     /// One act at a time is handed on, in the order they came.
     acting: tokio::sync::Mutex<()>,
@@ -93,20 +105,30 @@ impl Shared {
         let body = picture.to_string();
         let mut hasher = DefaultHasher::new();
         body.hash(&mut hasher);
-        let fresh = Arc::new(Picture {
-            tag: format!("\"{:016x}\"", hasher.finish()),
-            body: Bytes::from(body),
+        let tag = format!("\"{:016x}\"", hasher.finish());
+        // The streams are woken only when something has changed.
+        self.pictures.send_if_modified(|held| {
+            if held.tag == tag {
+                return false;
+            }
+            *held = Arc::new(Picture {
+                value: picture,
+                body: Bytes::from(body),
+                tag,
+            });
+            true
         });
-        if let Ok(mut held) = self.picture.write() {
-            *held = fresh;
-        }
     }
 
     fn picture(&self) -> Arc<Picture> {
-        self.picture
-            .read()
-            .map(|held| held.clone())
-            .unwrap_or_default()
+        self.pictures.borrow().clone()
+    }
+
+    /// Whether somebody is looking: a stream is open, or the picture was
+    /// asked for lately.
+    fn watched(&self) -> bool {
+        self.pictures.receiver_count() > 0
+            || self.asked_at.load(Ordering::Relaxed) + LOOKED_LATELY_SECS >= now()
     }
 }
 
@@ -116,21 +138,21 @@ pub async fn serve(listener: TcpListener, settings: Settings) -> std::io::Result
     let shared = Arc::new(Shared {
         settings,
         reader: Mutex::new(reader),
-        picture: RwLock::new(Arc::default()),
+        pictures: watch::Sender::new(Arc::default()),
         asked_at: AtomicU64::new(0),
         acting: tokio::sync::Mutex::new(()),
     });
     // The first picture is there before the first question.
     let first = shared.clone();
     let _ = tokio::task::spawn_blocking(move || first.look()).await;
-    // The records are read again and again, but only while somebody
-    // has asked lately: an unwatched page costs nothing.
+    // The records are read again and again, but only while somebody is
+    // looking: an unwatched page costs nothing.
     let looker = shared.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(LOOK_EVERY);
         loop {
             tick.tick().await;
-            if looker.asked_at.load(Ordering::Relaxed) + LOOKED_LATELY_SECS < now() {
+            if !looker.watched() {
                 continue;
             }
             let again = looker.clone();
@@ -187,10 +209,15 @@ fn refused(peer: SocketAddr) {
     }
 }
 
-type Answer = Response<Full<Bytes>>;
+type Answer = Response<BoxBody<Bytes, Infallible>>;
 
 fn reply(status: StatusCode, kind: &'static str, body: impl Into<Bytes>) -> Answer {
-    let mut answer = Response::new(Full::new(body.into()));
+    dressed(status, kind, BoxBody::new(Full::new(body.into())))
+}
+
+/// An answer with the headers every answer carries.
+fn dressed(status: StatusCode, kind: &'static str, body: BoxBody<Bytes, Infallible>) -> Answer {
+    let mut answer = Response::new(body);
     *answer.status_mut() = status;
     let headers = answer.headers_mut();
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(kind));
@@ -385,6 +412,7 @@ async fn answer(shared: &Arc<Shared>, request: Request<Incoming>, peer: SocketAd
                 _ => plain(StatusCode::NOT_FOUND, "There is no such conversation.\n"),
             }
         }
+        "/api/stream" => stream(shared),
         "/api/snapshot" => {
             shared.asked_at.store(now(), Ordering::Relaxed);
             let picture = shared.picture();
@@ -411,6 +439,94 @@ async fn answer(shared: &Arc<Shared>, request: Request<Incoming>, peer: SocketAd
             }
         }
         _ => plain(StatusCode::NOT_FOUND, "There is no such page.\n"),
+    }
+}
+
+/// The picture as a stream of server-sent events: `picture` with the
+/// whole of it first, then `patch` with what changed (see [`patch`])
+/// each time it does, and `beat` with the server's clock when nothing
+/// has for a while. Each stream works out its changes from what it sent
+/// last, so a page that applies them in order holds the picture exactly.
+fn stream(shared: &Arc<Shared>) -> Answer {
+    let (sender, receiver) = mpsc::channel(8);
+    let pictures = shared.pictures.subscribe();
+    tokio::spawn(feed(pictures, sender));
+    let mut answer = dressed(
+        StatusCode::OK,
+        "text/event-stream",
+        BoxBody::new(Feed(receiver)),
+    );
+    answer
+        .headers_mut()
+        .insert("x-accel-buffering", HeaderValue::from_static("no"));
+    answer
+}
+
+/// One event, as a stream carries it.
+fn event(name: &str, data: &serde_json::Value) -> Bytes {
+    Bytes::from(format!("event: {name}\ndata: {data}\n\n"))
+}
+
+/// Send a stream its events until the page goes away.
+async fn feed(mut pictures: watch::Receiver<Arc<Picture>>, out: mpsc::Sender<Bytes>) {
+    let mut sent = pictures.borrow_and_update().clone();
+    // A page that loses the stream asks again after two seconds.
+    let first = format!(
+        "retry: 2000\nevent: picture\ndata: {{\"tag\":{},\"now\":{},\"picture\":",
+        json!(sent.tag),
+        now()
+    );
+    let mut whole = Vec::with_capacity(first.len() + sent.body.len() + 3);
+    whole.extend_from_slice(first.as_bytes());
+    whole.extend_from_slice(&sent.body);
+    whole.extend_from_slice(b"}\n\n");
+    if out.send(Bytes::from(whole)).await.is_err() {
+        return;
+    }
+    let mut beat = tokio::time::interval(BEAT_EVERY);
+    beat.tick().await;
+    loop {
+        let next = tokio::select! {
+            changed = pictures.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                let fresh = pictures.borrow_and_update().clone();
+                if fresh.tag == sent.tag {
+                    continue;
+                }
+                let changes = patch::diff(&sent.value, &fresh.value);
+                let said = event(
+                    "patch",
+                    &json!({"from": sent.tag, "tag": fresh.tag, "now": now(), "changes": changes}),
+                );
+                sent = fresh;
+                beat.reset();
+                said
+            }
+            _ = beat.tick() => event("beat", &json!({"now": now()})),
+            () = out.closed() => return,
+        };
+        if out.send(next).await.is_err() {
+            return;
+        }
+    }
+}
+
+/// The body of a stream: whatever its feed sends, for as long as it does.
+struct Feed(mpsc::Receiver<Bytes>);
+
+impl Body for Feed {
+    type Data = Bytes;
+    type Error = Infallible;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
+        self.0
+            .poll_recv(context)
+            .map(|said| said.map(|bytes| Ok(Frame::data(bytes))))
     }
 }
 

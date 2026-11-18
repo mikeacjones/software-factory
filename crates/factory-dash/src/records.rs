@@ -334,6 +334,9 @@ pub fn digest(log: &str) -> Digest {
     digest
 }
 
+/// How often the clock an account's rates are worked out by moves.
+const RATE_CLOCK_SECS: u64 = 60;
+
 /// How fast a window is being used, and whether it runs out.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Burn {
@@ -778,7 +781,9 @@ impl Reader {
         }
         inbox.sort_by_key(|item| std::cmp::Reverse(item["at"].as_u64().unwrap_or(0)));
 
-        let accounts = self.accounts(now, &mut gathered);
+        // An account's rates are worked out to the minute, so that the
+        // clock moving alone does not change the picture every read.
+        let accounts = self.accounts(now - now % RATE_CLOCK_SECS, &mut gathered);
         json!({
             "inbox": inbox,
             "release": fs::read_link(state.join("current"))
