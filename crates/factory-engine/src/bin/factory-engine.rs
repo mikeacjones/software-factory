@@ -18,6 +18,9 @@
 //!   factory-engine owner <project> say <channel|-> <thread> <text>
 //!                                             hand the project the owner's reply in a
 //!                                             thread, as Slack would; `-` is no channel
+//!   factory-engine owner <project> new <text>
+//!                                             a new message of the owner's, as at the top
+//!                                             of the project's channel
 //!   factory-engine accounts                   what every account has left, and who waits
 //!   factory-engine accounts recheck           look at every account again now, as after
 //!                                             a usage reset; those waiting are released
@@ -356,6 +359,55 @@ async fn command(args: &[String]) -> Result<(), String> {
             {
                 eprintln!("factory-engine: {err}");
             }
+            Ok(())
+        }
+        ["owner", project, "new", text @ ..] if !text.is_empty() => {
+            // A new message of the owner's, as at the top of the project's
+            // channel: to its executive, or a new goal where it has none.
+            // It is put in the channel first, so that the answer has a
+            // thread there; without Slack it goes to the executive as a
+            // thread of the factory's own.
+            config.project(project).map_err(|err| err.to_string())?;
+            let user = factory_driver::goal::owner_id(&config).map_err(|err| err.to_string())?;
+            let text = text.join(" ");
+            let posted = factory_driver::goal::post_owner(&config, project, &text, "the dashboard")
+                .map_err(|err| err.to_string())?;
+            let client = connect(&temporal.address, &temporal.namespace).await?;
+            let (event, thread) = match posted {
+                Some((channel, ts)) => (
+                    factory_driver::goal::Event::Slack(factory_slack::socket::Incoming::Message {
+                        channel,
+                        user,
+                        text,
+                        ts: ts.clone(),
+                        thread_ts: None,
+                    }),
+                    ts,
+                ),
+                None => {
+                    let ts = format!("{}.000000", factory_core_now());
+                    let has_executive = config
+                        .project(project)
+                        .map(|project| project.executive.is_some())
+                        .unwrap_or(false);
+                    let event = if has_executive {
+                        factory_driver::goal::Event::Tell {
+                            project: project.to_string(),
+                            thread: ts.clone(),
+                            text,
+                        }
+                    } else {
+                        factory_driver::goal::Event::Open {
+                            project: project.to_string(),
+                            text,
+                        }
+                    };
+                    (event, ts)
+                }
+            };
+            tell(&client, &reach(&temporal), project, event).await?;
+            println!("handed to project `{project}`: a new message");
+            println!("thread {thread}");
             Ok(())
         }
         ["start", project, bead] => {

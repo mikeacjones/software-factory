@@ -16,6 +16,8 @@ export const live = $state({
   whyNot: '' as string,
   /** Acts sent, by inbox item, until the item leaves the inbox. */
   sent: {} as Record<string, { label: string; at: number }>,
+  /** New messages to a project, until its records show the conversation. */
+  started: {} as Record<string, { text: string; at: number; thread: string }[]>,
 });
 
 export type View =
@@ -60,6 +62,15 @@ async function poll() {
       // What was sent and has left the inbox has been taken in.
       const waiting = new Set((picture.inbox || []).map((item) => item.key));
       for (const key of Object.keys(live.sent)) if (!waiting.has(key)) delete live.sent[key];
+      // A new message is shown as sent until its thread is on record.
+      for (const project of picture.projects || []) {
+        const known = new Set([
+          ...(project.executive?.conversations || []).map((one) => one.ts),
+          ...(project.goals || []).map((goal) => goal.thread?.ts),
+        ]);
+        const left = (live.started[project.id] || []).filter((one) => !known.has(one.thread));
+        if (left.length !== (live.started[project.id] || []).length) live.started[project.id] = left;
+      }
     }
     if (answer.status === 200 || answer.status === 304) live.heard = Date.now() / 1000;
   } catch {
@@ -112,6 +123,17 @@ export async function press(project: string, actionId: string, value: string, ke
 export async function reply(project: string, channel: string, thread: string, text: string, key?: string): Promise<Sent> {
   const done = await send({ project, act: 'say', channel: channel || '', thread, text });
   if (done.ok && key) live.sent[key] = { label: 'Replied', at: live.now };
+  return done;
+}
+
+/** A new message, as at the top of the project's channel: to its
+ * executive, or a new goal where it has none. */
+export async function startConversation(project: string, text: string): Promise<Sent> {
+  const done = await send({ project, act: 'new', text });
+  if (done.ok) {
+    const thread = /thread (\S+)/.exec(done.said)?.[1] ?? '';
+    live.started[project] = [...(live.started[project] || []), { text, at: live.now, thread }];
+  }
   return done;
 }
 

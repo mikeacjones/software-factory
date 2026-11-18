@@ -68,7 +68,7 @@
             <h2>{bead.title || bead.bead} <span class="quiet">· {bead.flow}</span></h2>
             <button class="btn" onclick={() => (wide = false)}>Close <kbd>esc</kbd></button>
           </header>
-          <PipelineGraph {bead} direction="LR" height="100%" />
+          <PipelineGraph {bead} height="100%" />
         </div>
       </div>
     {/if}
@@ -156,6 +156,9 @@
         <ul class="list">{#each exec.pending as one (one.bead)}<li><span class="mono">{short(one.bead, project.id)}</span> as {one.as}, once <span class="mono">{short(one.once_closed, project.id)}</span> is closed</li>{/each}</ul>
       </section>
     {/if}
+    {#each live.started[project.id] || [] as one (one.thread || one.at)}
+      <p class="quiet small">⏳ You wrote “{one.text.length > 80 ? `${one.text.slice(0, 79)}…` : one.text}” {ago(one.at, live.now)}; the executive has not answered yet.</p>
+    {/each}
     <section>
       <h3>Conversations with you</h3>
       <ul class="list">

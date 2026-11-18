@@ -88,6 +88,102 @@ pub struct Question {
     pub at: u64,
 }
 
+/// What one kind of agent of a tier has done, from its runs' records.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RoleTally {
+    pub runs: u64,
+    /// Runs that did not complete.
+    pub failed: u64,
+    pub cost: f64,
+    pub last_at: u64,
+    /// The model of its last run.
+    pub model: String,
+}
+
+/// What a tier's log adds up to: how often each kind of thing happened,
+/// each agent's runs, what woke the director, and what happened in each
+/// sub-goal.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Tally {
+    pub kinds: BTreeMap<String, u64>,
+    pub roles: BTreeMap<String, RoleTally>,
+    pub wakes: BTreeMap<String, u64>,
+    pub subgoals: BTreeMap<String, BTreeMap<String, u64>>,
+}
+
+impl Tally {
+    fn take(&mut self, kind: &str, data: &Value, at: u64) {
+        *self.kinds.entry(kind.to_string()).or_default() += 1;
+        let (prefix, verb) = kind.split_once('.').unwrap_or((kind, ""));
+        // A run of one of the tiers' agents, ended or failed. Other things
+        // fail too (an issue that could not be made) and are not runs.
+        let agent = data["role"].is_string()
+            || matches!(
+                prefix,
+                "executive" | "director" | "designer" | "foreman" | "maintainer" | "inspector"
+            );
+        if agent && (verb == "ran" && data["usage"].is_object() || verb == "failed") {
+            let role = data["role"].as_str().unwrap_or(prefix).to_string();
+            let tally = self.roles.entry(role).or_default();
+            tally.runs += 1;
+            if verb == "failed" || data["outcome"].as_str().is_some_and(|o| o != "completed") {
+                tally.failed += 1;
+            }
+            tally.cost += data["usage"]["cost_usd"].as_f64().unwrap_or(0.0);
+            tally.last_at = tally.last_at.max(at);
+            if let Some(model) = data["usage"]["models"]
+                .as_object()
+                .and_then(|m| m.keys().next())
+            {
+                tally.model = model.clone();
+            }
+        }
+        if kind == "wake.routed"
+            && let Some(why) = data["why"].as_str()
+        {
+            *self.wakes.entry(why.to_string()).or_default() += 1;
+        }
+        if let Some(subgoal) = data["subgoal"].as_str() {
+            let key = match data["report"].as_str() {
+                Some(report) => format!("{kind}:{report}"),
+                None => kind.to_string(),
+            };
+            *self
+                .subgoals
+                .entry(subgoal.to_string())
+                .or_default()
+                .entry(key)
+                .or_default() += 1;
+        }
+    }
+
+    /// As the page reads it.
+    pub fn shown(&self) -> Value {
+        let roles: Map<String, Value> = self
+            .roles
+            .iter()
+            .map(|(role, tally)| {
+                (
+                    role.clone(),
+                    json!({
+                        "runs": tally.runs,
+                        "failed": tally.failed,
+                        "cost": tally.cost,
+                        "last_at": tally.last_at,
+                        "model": tally.model,
+                    }),
+                )
+            })
+            .collect();
+        json!({
+            "kinds": self.kinds,
+            "roles": roles,
+            "wakes": self.wakes,
+            "subgoals": self.subgoals,
+        })
+    }
+}
+
 /// What an event log says that the picture needs.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Digest {
@@ -105,6 +201,13 @@ pub struct Digest {
     pub said: Option<Question>,
     /// When the owner last wrote or pressed something.
     pub owner_at: u64,
+    /// How often each step ended with each outcome, as `step:outcome`:
+    /// how often each route of the flow was taken.
+    pub taken: BTreeMap<String, u64>,
+    /// How long each step has taken in all, in seconds.
+    pub spent: BTreeMap<String, u64>,
+    /// What a tier's log adds up to.
+    pub tally: Tally,
 }
 
 fn window_of(value: &Value) -> Option<Window> {
@@ -130,6 +233,9 @@ pub fn digest(log: &str) -> Digest {
         };
         let at = event["time_unix"].as_u64().unwrap_or(0);
         let data = &event["data"];
+        digest
+            .tally
+            .take(event["kind"].as_str().unwrap_or(""), data, at);
         match event["kind"].as_str().unwrap_or("") {
             "run.started" => {
                 let run = OpenRun {
@@ -166,7 +272,14 @@ pub fn digest(log: &str) -> Digest {
                     since: at,
                 });
             }
-            "step.ended" => digest.step = None,
+            "step.ended" => {
+                digest.step = None;
+                let step = text(&event["step"]);
+                if let Some(outcome) = data["outcome"].as_str() {
+                    *digest.taken.entry(format!("{step}:{outcome}")).or_default() += 1;
+                }
+                *digest.spent.entry(step).or_default() += data["secs"].as_u64().unwrap_or(0);
+            }
             "owner.asked" => {
                 digest.asked = Some(Question {
                     step: text(&event["step"]),
@@ -811,7 +924,13 @@ impl Reader {
             .collect();
         conversations.sort_by_key(|one| std::cmp::Reverse(one["at"].as_u64().unwrap_or(0)));
         conversations.truncate(12);
+        let tally = if changed_at(&events) > 0 {
+            self.digest(&events).tally.shown()
+        } else {
+            Value::Null
+        };
         json!({
+            "agents": tally,
             "conversations": conversations,
             "wakes": record["wakes"],
             "cost": record["usage"]["cost_usd"].as_f64().unwrap_or(0.0),
@@ -956,6 +1075,7 @@ impl Reader {
         let request = &goal["request"];
         json!({
             "id": id,
+            "agents": digest.tally.shown(),
             "phase": goal["phase"],
             "definition": goal["definition"],
             "thread": thread_of(&goal["channel"], &goal["thread_ts"]),
@@ -1092,6 +1212,8 @@ impl Reader {
             "status": status,
             "parked": parked.map_or(Value::Null, |reason| cut(&json!(reason), 1200)),
             "asked": asked,
+            "taken": digest.taken,
+            "spent": digest.spent,
             "thread": thread_of(&unit["thread"]["channel"], &unit["thread"]["root_ts"]),
             "flow": unit["flow"],
             "step": position["step"],
@@ -1289,6 +1411,45 @@ mod tests {
         );
         assert_eq!(read.run, None);
         assert_eq!(read.handed.get("one"), Some(&101));
+        // A step that ended without saying how is timed, not counted.
+        assert!(read.taken.is_empty());
+        assert_eq!(read.spent.get("build"), Some(&0));
+        let walked = digest(
+            &[
+                r#"{"time_unix":1,"kind":"step.ended","step":"break","data":{"outcome":"broken","secs":30}}"#,
+                r#"{"time_unix":2,"kind":"step.ended","step":"fix","data":{"outcome":"done","secs":20}}"#,
+                r#"{"time_unix":3,"kind":"step.ended","step":"break","data":{"outcome":"broken","secs":10}}"#,
+            ]
+            .join("\n"),
+        );
+        assert_eq!(walked.taken.get("break:broken"), Some(&2));
+
+        // A tier's log: its agents' runs, what woke it, its sub-goals.
+        let tier = digest(
+            &[
+                r#"{"time_unix":5,"kind":"wake.routed","data":{"route":"settle","why":"the owner"}}"#,
+                r#"{"time_unix":6,"kind":"director.ran","data":{"role":"director","outcome":"completed","usage":{"cost_usd":2.5,"models":{"claude-fable-5-2":{}}}}}"#,
+                r#"{"time_unix":7,"kind":"executive.failed","data":{"error":"limit"}}"#,
+                r#"{"time_unix":8,"kind":"foreman.decided","data":{"report":"ready","subgoal":"s1"}}"#,
+                r#"{"time_unix":9,"kind":"bead.filed","data":{"bead":"b"}}"#,
+            ]
+            .join("\n"),
+        )
+        .tally;
+        assert_eq!(tier.wakes.get("the owner"), Some(&1));
+        let director = &tier.roles["director"];
+        assert_eq!(
+            (director.runs, director.failed, director.last_at),
+            (1, 0, 6)
+        );
+        assert_eq!(director.model, "claude-fable-5-2");
+        assert_eq!(
+            (tier.roles["executive"].runs, tier.roles["executive"].failed),
+            (1, 1)
+        );
+        assert_eq!(tier.subgoals["s1"].get("foreman.decided:ready"), Some(&1));
+        assert_eq!(tier.kinds.get("bead.filed"), Some(&1));
+        assert_eq!(walked.spent.get("break"), Some(&40));
         assert_eq!(
             read.step,
             Some(OpenStep {

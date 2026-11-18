@@ -50,6 +50,8 @@ pub enum Act {
         thread: String,
         text: String,
     },
+    /// A new message, as at the top of the project's channel.
+    New { project: String, text: String },
 }
 
 /// Why an act was not handed on.
@@ -139,7 +141,18 @@ impl Act {
                     text,
                 })
             }
-            _ => Err(Refusal::Malformed("an act is `press` or `say`".into())),
+            Some("new") => {
+                let text = field("text").trim().to_string();
+                if text.is_empty() || text.chars().count() > MOST_TEXT {
+                    return Err(Refusal::Malformed(format!(
+                        "a message is 1 to {MOST_TEXT} characters"
+                    )));
+                }
+                Ok(Act::New { project, text })
+            }
+            _ => Err(Refusal::Malformed(
+                "an act is `press`, `say` or `new`".into(),
+            )),
         }
     }
 
@@ -178,12 +191,23 @@ impl Act {
                 "--".into(),
                 text.clone(),
             ],
+            Act::New { project, text } => vec![
+                "owner".into(),
+                project.clone(),
+                "new".into(),
+                "--".into(),
+                text.clone(),
+            ],
         }
     }
 
     /// What the act was, in a line, for the server's log.
     pub fn line(&self) -> String {
         match self {
+            Act::New { project, text } => format!(
+                "{project}: wrote a new message ({} characters)",
+                text.chars().count()
+            ),
             Act::Press {
                 project,
                 action_id,
@@ -258,6 +282,13 @@ mod tests {
                     .to_vec()
             )
         );
+        let new = Act::read(&json!({"project": "toy", "act": "new", "text": "What is parked?"}));
+        assert_eq!(
+            new.map(|act| act.args()),
+            Ok(["owner", "toy", "new", "--", "What is parked?"]
+                .map(String::from)
+                .to_vec())
+        );
         for refused in [
             json!({"project": "toy", "act": "press", "action_id": "rm_rf", "value": "g"}),
             json!({"project": "toy", "act": "press", "action_id": "goal_start", "value": "--config"}),
@@ -267,6 +298,7 @@ mod tests {
             json!({"project": "toy", "act": "say", "channel": "C1", "thread": "1.1", "text": "   "}),
             json!({"project": "toy", "act": "say", "channel": "C1", "thread": "1.1", "text": "x".repeat(MOST_TEXT + 1)}),
             json!({"project": "toy", "act": "run"}),
+            json!({"project": "toy", "act": "new", "text": " "}),
         ] {
             assert!(Act::read(&refused).is_err(), "{refused}");
         }
