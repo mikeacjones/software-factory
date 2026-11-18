@@ -43,6 +43,22 @@ model = "claude-fable-5-2"
 effort = "high"
 timeout_secs = 2400
 slots = 2
+# When every account is at its Fable limit the director goes on with Opus
+# rather than leave its goal waiting for the window to reopen.
+fallback_model = "claude-opus-5-5"
+
+# Code routes each director wake from the goal's record, with no model
+# asked. The owner, a new goal, a landed sub-goal and a design to rule on
+# go to the director's own model. A foreman's ready report on a sub-goal
+# whose planned beads are all absorbed, with nothing added, running, or
+# waiting on the owner or the default branch, goes to `ship`, which may
+# only ship it or hand it up. Escalations, failures and notes go to
+# `settle`, which may start, continue, ship and talk to the foreman and the
+# executive, and hands anything else up. A handed-up wake runs again on
+# the director's own model in the same turn.
+[routes]
+ship = "claude-sonnet-5-5"
+settle = "claude-opus-5-5"
 
 [foreman]
 model = "claude-opus-5-5"
@@ -60,6 +76,11 @@ slots = 2
 #
 # It runs as a turn of the project's tiers, like the foreman, so while it
 # reads no other tier of the project is woken. Pipelines carry on.
+#
+# It always runs on Fable and has no fallback: the slices it designs are
+# what every builder of the sub-goal is held to, so a design waits for
+# Fable rather than being written by another model. Config refuses a
+# designer with a fallback_model.
 [designer]
 model = "claude-fable-5-2"
 effort = "high"

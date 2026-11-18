@@ -1574,31 +1574,12 @@ impl Driver {
         };
         let mut data = what;
         let failed = |why: String| json!({ "why": why });
-        let key = factory_config::read_env_file(&settings.env_file)
-            .map_err(|error| error.to_string())
-            .and_then(|env| {
-                env.get(&settings.key_env)
-                    .filter(|key| !key.trim().is_empty())
-                    .cloned()
-                    .ok_or_else(|| {
-                        format!(
-                            "{} has no {}",
-                            settings.env_file.display(),
-                            settings.key_env
-                        )
-                    })
-            });
         let home = std::env::var("HOME").ok();
-        let reading = key.and_then(|key| {
+        let reading = judge_client(settings).and_then(|judge| {
             let excerpt = factory_checks::judge::failure_excerpt(output, patterns, home.as_deref());
-            factory_checks::judge::Judge::new(
-                &settings.url,
-                &settings.model,
-                key,
-                Duration::from_secs(settings.timeout_secs),
-            )
-            .kind(preface, &excerpt)
-            .map_err(|error| error.to_string())
+            judge
+                .kind(preface, &excerpt)
+                .map_err(|error| error.to_string())
         });
         let (kind, said) = match reading {
             Ok(judged) => (
@@ -5781,6 +5762,33 @@ fn preflight(factory: &Factory, project: &Project) -> Result<(), DriverError> {
         return Err(DriverError::Preflight("`gh` is not logged in".to_string()));
     }
     Ok(())
+}
+
+/// The classifier the `[judge]` table names, with its key read from the
+/// owner's file, or why it cannot be reached.
+pub(crate) fn judge_client(
+    settings: &factory_config::JudgeSettings,
+) -> Result<factory_checks::judge::Judge, String> {
+    let key = factory_config::read_env_file(&settings.env_file)
+        .map_err(|error| error.to_string())
+        .and_then(|env| {
+            env.get(&settings.key_env)
+                .filter(|key| !key.trim().is_empty())
+                .cloned()
+                .ok_or_else(|| {
+                    format!(
+                        "{} has no {}",
+                        settings.env_file.display(),
+                        settings.key_env
+                    )
+                })
+        })?;
+    Ok(factory_checks::judge::Judge::new(
+        &settings.url,
+        &settings.model,
+        key,
+        Duration::from_secs(settings.timeout_secs),
+    ))
 }
 
 #[cfg(test)]

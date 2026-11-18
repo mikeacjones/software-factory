@@ -3251,7 +3251,8 @@ fn a_foreman_runs_a_sub_goals_beads_and_the_director_only_plans_and_ships() {
     std::fs::create_dir_all(world.path("config/goals/toy")).unwrap();
     std::fs::write(
         world.path("config/goals/toy/main.toml"),
-        "id = \"main\"\nflow = \"zig-sdk-bead\"\nship_flow = \"zig-sdk-ship\"\n[director]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\n[foreman]\nmodel = \"claude-opus-5-5\"\neffort = \"medium\"\n",
+        // Wakes that only settle what one sub-goal needs run on Sonnet.
+        "id = \"main\"\nflow = \"zig-sdk-bead\"\nship_flow = \"zig-sdk-ship\"\n[routes]\nsettle = \"claude-sonnet-5-5\"\n[director]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\n[foreman]\nmodel = \"claude-opus-5-5\"\neffort = \"medium\"\n",
     )
     .unwrap();
     let say = |role: &str, n: u32, json: String| {
@@ -3535,6 +3536,42 @@ fn a_foreman_runs_a_sub_goals_beads_and_the_director_only_plans_and_ships() {
             "no {kind} in the goal's log"
         );
     }
+
+    // Code routed each wake by what woke it, and each ran on its model: the
+    // start and the landed sub-goal on the director's own; the foreman's
+    // question, and its ready report on a sub-goal it had added a bead to,
+    // on the settle model.
+    let mut routes = Vec::new();
+    let mut models = Vec::new();
+    for line in log.lines() {
+        let event: serde_json::Value = serde_json::from_str(line).unwrap();
+        match event["kind"].as_str() {
+            Some("wake.routed") => {
+                routes.push(event["data"]["route"].as_str().unwrap().to_string())
+            }
+            Some("director.ran") if event["data"]["role"] == "director" => models.push(
+                event["data"]["usage"]["models"]
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ),
+            _ => {}
+        }
+    }
+    assert_eq!(routes, ["own", "settle", "settle", "own"], "{log}");
+    assert_eq!(
+        models,
+        [
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-sonnet-5-5",
+            "claude-opus-5-5"
+        ]
+    );
+    assert!(log.contains("beads added to it: "), "{log}");
 
     sup.incoming(Incoming::Action {
         channel: String::new(),
@@ -6935,6 +6972,101 @@ fn a_director_that_decides_alone_does_not_wait_and_ends_its_goal() {
         "{events}"
     );
     assert!(!events.contains("goal_accept"), "{events}");
+}
+
+/// A director whose model is at its limit on every account runs on its
+/// tier's fallback model instead of waiting, and says so in the log.
+#[test]
+fn a_director_at_its_models_limit_runs_on_its_fallback_instead_of_waiting() {
+    use factory_driver::goal::{Phase, Supervisor};
+    use factory_slack::socket::Incoming;
+
+    let world = World::new("fallback", "true");
+    let factory = world.path("config/factory.toml");
+    let text = std::fs::read_to_string(&factory).unwrap();
+    std::fs::write(
+        &factory,
+        format!("limit_grace_secs = 0\n{text}\n[[account]]\nid = \"a\"\n"),
+    )
+    .unwrap();
+    // The only account is out of Opus for an hour.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    std::fs::create_dir_all(world.path("state")).unwrap();
+    std::fs::write(
+        world.path("state/accounts.json"),
+        serde_json::json!({"a": {"blocked": {"opus": now + 3600}, "updated_at": now}}).to_string(),
+    )
+    .unwrap();
+    std::fs::create_dir_all(world.path("config/goals/toy")).unwrap();
+    let definition = world.path("config/goals/toy/main.toml");
+    let body = "id = \"main\"\n[director]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\n";
+    std::fs::write(
+        &definition,
+        format!("{body}fallback_model = \"claude-sonnet-5-5\"\n"),
+    )
+    .unwrap();
+    factory_driver::goal::check_definitions(&world.config()).unwrap();
+
+    let say = |role: &str, n: u32, json: serde_json::Value| {
+        std::fs::create_dir_all(world.path("bin/state")).unwrap();
+        std::fs::write(
+            world.path(&format!("bin/state/{role}-{n}.json")),
+            json.to_string(),
+        )
+        .unwrap();
+    };
+    say(
+        "intake",
+        1,
+        serde_json::json!({"reply": "Here is the charter.", "ready": true, "objective": "Ship it.", "stop_when": "It shipped.", "plan": "toy-1.", "edits": []}),
+    );
+    say(
+        "director",
+        1,
+        serde_json::json!({
+            "summary": "Decided.", "start": [], "file": [], "edit": [], "dropped_findings": [],
+            "ask_owner": "", "complete": true, "evidence": "It shipped.", "journal_entry": "", "project_memory": ""
+        }),
+    );
+
+    let mut sup = Supervisor::new(world.config(), None, vec!["OWNER".to_string()], false).unwrap();
+    let id = sup.open_directly("toy", "Ship it").unwrap();
+    sup.incoming(Incoming::Action {
+        channel: String::new(),
+        user: "OWNER".to_string(),
+        action_id: "goal_start".to_string(),
+        value: id.clone(),
+        message_ts: String::new(),
+    })
+    .unwrap();
+
+    // It did not wait: the director ran, on Sonnet, and proposed the end.
+    let goal = sup.goals().next().unwrap().clone();
+    assert_eq!(goal.phase, Phase::ProposedComplete);
+    let log =
+        std::fs::read_to_string(world.path(&format!("state/goals/{id}/events.jsonl"))).unwrap();
+    assert!(!log.contains(r#""kind":"accounts.limited""#), "{log}");
+    let fell: serde_json::Value = log
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|event| event["kind"] == "director.fell_back")
+        .expect("no director.fell_back in the log");
+    assert_eq!(fell["data"]["from"], "claude-opus-5-5");
+    assert_eq!(fell["data"]["to"], "claude-sonnet-5-5");
+    let ran = log
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|event| event["kind"] == "director.ran" && event["data"]["role"] == "director")
+        .unwrap();
+    assert!(
+        ran["data"]["usage"]["models"]
+            .get("claude-sonnet-5-5")
+            .is_some(),
+        "{ran}"
+    );
 }
 
 /// A second goal on a project waits for the first, and starts by itself.

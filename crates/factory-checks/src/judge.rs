@@ -42,6 +42,37 @@ pub const KINDS: [(&str, &str); 6] = [
     ),
 ];
 
+/// What a director wake needs decided: the question asked, in shadow,
+/// of a wake code routed to `settle`, where the record alone does not
+/// say how much the wake needs. Jev is shown only facts code wrote (what
+/// woke the director, how far each sub-goal is, what ended how), never an
+/// agent's words: one sentence of an agent's account was enough to move
+/// its readings before. The reading is logged as `wake.judged` beside
+/// what the director then decided (`wake.decided`, the same three
+/// answers, from the decisions themselves), and routes nothing until the
+/// two have been compared. Were it to route, `replan` would go to the
+/// director's own model, `rule` to `routes.settle` and `proceed` to
+/// `routes.ship`. The heaviest answer comes first, so that the model's
+/// lean toward the first answer errs toward the stronger model.
+pub const NEEDS: [(&str, &str); 3] = [
+    (
+        "replan",
+        "The goal's plan has to change: work added, dropped, split or reordered, a bead's acceptance criteria or priority changed, the owner asked, or the goal ended",
+    ),
+    (
+        "rule",
+        "One piece of work needs a choice between options while the plan stands: continue a stopped pipeline from a chosen step, tell a foreman how to go on, ship despite a known gap, or pass tracker work to the executive",
+    ),
+    (
+        "proceed",
+        "Nothing is in question: start or ship what the plan already says comes next",
+    ),
+];
+
+/// The question [`NEEDS`] answers.
+pub const NEEDS_ASKED: &str =
+    "What does the director of this goal have to decide now, given only these facts";
+
 /// The most lines of a failure that are sent, and the most of each line.
 /// The model's readings get worse as what it is sent grows with lines that
 /// have nothing to do with the question.
@@ -133,52 +164,79 @@ pub fn failure_excerpt(output: &str, patterns: &[String], home: Option<&str>) ->
 /// The request that asks what kind of failure `excerpt` shows. `preface`
 /// is what the factory knows that the lines do not say, such as that the
 /// command reached its time limit, or which CI jobs failed.
-pub fn kind_request(model: &str, preface: &str, excerpt: &str) -> Value {
-    let criteria: serde_json::Map<String, Value> = KINDS
-        .iter()
-        .map(|(kind, means)| ((*kind).to_string(), json!(means)))
-        .collect();
+pub fn kind_request(model: &str, preface: &str, excerpt: &str) -> String {
     let state = if preface.trim().is_empty() {
         excerpt.to_string()
     } else {
         format!("{}\n{excerpt}", preface.trim())
     };
-    json!({
-        "model": model,
-        "state": state,
-        "questions": {
-            "kind": {
-                "type": "choice",
-                "instructions": "What kind of failure do these build or test output lines show",
-                "criteria": criteria,
-            }
-        }
-    })
+    choice_request(
+        model,
+        &state,
+        "kind",
+        "What kind of failure do these build or test output lines show",
+        &KINDS,
+    )
+}
+
+/// A request that asks one question with fixed answers about `state`, as
+/// the JSON text that is sent. The answers keep the order they are given
+/// in, since the model leans toward what comes first: written out by hand,
+/// because a JSON map here would sort them by name.
+pub fn choice_request(
+    model: &str,
+    state: &str,
+    question: &str,
+    instructions: &str,
+    choices: &[(&str, &str)],
+) -> String {
+    let criteria: Vec<String> = choices
+        .iter()
+        .map(|(choice, means)| format!("{}:{}", json!(choice), json!(means)))
+        .collect();
+    format!(
+        r#"{{"model":{},"state":{},"questions":{{{}:{{"type":"choice","instructions":{},"criteria":{{{}}}}}}}}}"#,
+        json!(model),
+        json!(state),
+        json!(question),
+        json!(instructions),
+        criteria.join(",")
+    )
 }
 
 /// What the service's answer to [`kind_request`] says.
 pub fn parse_kind(answer: &Value, millis: u64) -> Result<Judged, JudgeError> {
-    let kind = &answer["answers"]["kind"];
-    let choice = kind["choice"]
+    parse_choice(answer, "kind", &KINDS, millis)
+}
+
+/// What the service's answer to a [`choice_request`] says of `question`.
+pub fn parse_choice(
+    answer: &Value,
+    question: &str,
+    choices: &[(&str, &str)],
+    millis: u64,
+) -> Result<Judged, JudgeError> {
+    let said = &answer["answers"][question];
+    let choice = said["choice"]
         .as_str()
         .ok_or_else(|| JudgeError::Shape("it names no choice".to_string()))?;
-    if !KINDS.iter().any(|(known, _)| *known == choice) {
+    if !choices.iter().any(|(known, _)| *known == choice) {
         return Err(JudgeError::Shape(format!(
-            "`{choice}` is not a kind that was asked for"
+            "`{choice}` is not an answer that was offered"
         )));
     }
-    let probabilities = KINDS
+    let probabilities = choices
         .iter()
         .map(|(known, _)| {
             (
                 (*known).to_string(),
-                kind["probabilities"][*known].as_f64().unwrap_or(0.0),
+                said["probabilities"][*known].as_f64().unwrap_or(0.0),
             )
         })
         .collect();
     Ok(Judged {
         kind: choice.to_string(),
-        confidence: kind["confidence"].as_f64().unwrap_or(0.0),
+        confidence: said["confidence"].as_f64().unwrap_or(0.0),
         probabilities,
         model: answer["model"].as_str().unwrap_or("").to_string(),
         millis,
@@ -227,12 +285,30 @@ impl Judge {
 
     /// Ask what kind of failure `excerpt` shows.
     pub fn kind(&self, preface: &str, excerpt: &str) -> Result<Judged, JudgeError> {
+        let request = kind_request(&self.model, preface, excerpt);
+        self.send(request, parse_kind)
+    }
+
+    /// Ask what a director wake needs decided, from `facts` code wrote.
+    pub fn needs(&self, facts: &str) -> Result<Judged, JudgeError> {
+        let request = choice_request(&self.model, facts, "needs", NEEDS_ASKED, &NEEDS);
+        self.send(request, |answer, millis| {
+            parse_choice(answer, "needs", &NEEDS, millis)
+        })
+    }
+
+    fn send(
+        &self,
+        request: String,
+        parse: impl Fn(&Value, u64) -> Result<Judged, JudgeError>,
+    ) -> Result<Judged, JudgeError> {
         let started = Instant::now();
         let mut response = self
             .agent
             .post(&self.url)
             .header("Authorization", &format!("Bearer {}", self.key))
-            .send_json(kind_request(&self.model, preface, excerpt))
+            .header("Content-Type", "application/json")
+            .send(request.as_bytes())
             .map_err(|error| JudgeError::Http(error.to_string()))?;
         let status = response.status().as_u16();
         let body = response
@@ -246,7 +322,7 @@ impl Judge {
         let answer: Value =
             serde_json::from_str(&body).map_err(|error| JudgeError::Shape(error.to_string()))?;
         let millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        parse_kind(&answer, millis)
+        parse(&answer, millis)
     }
 }
 
@@ -339,11 +415,12 @@ mod tests {
 
     #[test]
     fn the_question_has_fixed_answers_in_a_fixed_order() {
-        let request = kind_request(
+        let request: Value = serde_json::from_str(&kind_request(
             "jev-1.13.0",
             "The command reached its time limit.",
             "error: x",
-        );
+        ))
+        .unwrap();
         assert_eq!(request["model"], "jev-1.13.0");
         assert_eq!(
             request["state"],
@@ -353,10 +430,18 @@ mod tests {
         assert_eq!(question["type"], "choice");
         let kinds: Vec<&String> = question["criteria"].as_object().unwrap().keys().collect();
         assert_eq!(kinds.len(), 6);
+        // Sent in the order of KINDS, not sorted by name.
+        let text = kind_request("m", "", "error: x");
+        let at: Vec<usize> = KINDS
+            .iter()
+            .map(|(kind, _)| text.find(&format!("\"{kind}\":")).unwrap())
+            .collect();
+        assert!(at.windows(2).all(|pair| pair[0] < pair[1]), "{text}");
         // Only the kind is asked: not whether it is a flake, and not
         // whether the test or the code is wrong.
         assert_eq!(request["questions"].as_object().unwrap().len(), 1);
-        assert_eq!(kind_request("m", " ", "error: x")["state"], "error: x");
+        let bare: Value = serde_json::from_str(&kind_request("m", " ", "error: x")).unwrap();
+        assert_eq!(bare["state"], "error: x");
     }
 
     #[test]
@@ -394,7 +479,10 @@ mod tests {
         let (url, served) = serve_once("200 OK", odd);
         let judge = Judge::new(url, "m", "k", Duration::from_secs(5));
         let unknown = judge.kind("", "error").unwrap_err().to_string();
-        assert!(unknown.contains("`gremlins` is not a kind"), "{unknown}");
+        assert!(
+            unknown.contains("`gremlins` is not an answer that was offered"),
+            "{unknown}"
+        );
         served.join().unwrap();
 
         // Nothing listens here.
@@ -403,5 +491,35 @@ mod tests {
         drop(listener);
         let judge = Judge::new(url, "m", "k", Duration::from_secs(2));
         assert!(matches!(judge.kind("", "error"), Err(JudgeError::Http(_))));
+    }
+
+    #[test]
+    fn the_needs_question_offers_its_answers_heaviest_first_and_reads_the_reply() {
+        let text = choice_request("m", "fa\"cts", "needs", NEEDS_ASKED, &NEEDS);
+        // The order the answers are offered in is part of the question.
+        let at: Vec<usize> = ["replan", "rule", "proceed"]
+            .iter()
+            .map(|choice| text.find(&format!("\"{choice}\":")).unwrap())
+            .collect();
+        assert!(at.windows(2).all(|pair| pair[0] < pair[1]), "{text}");
+        let request: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(request["state"], "fa\"cts");
+        assert_eq!(request["questions"]["needs"]["type"], "choice");
+        assert_eq!(
+            request["questions"]["needs"]["criteria"]
+                .as_object()
+                .unwrap()
+                .len(),
+            3
+        );
+        let answer: Value = serde_json::from_str(
+            r#"{"model":"jev-1.13.0","answers":{"needs":{"type":"choice","choice":"rule","confidence":0.8,"probabilities":{"replan":0.15,"rule":0.8,"proceed":0.05}}}}"#,
+        )
+        .unwrap();
+        let read = parse_choice(&answer, "needs", &NEEDS, 9).unwrap();
+        assert_eq!(read.kind, "rule");
+        assert_eq!(read.probabilities[0], ("replan".to_string(), 0.15));
+        // An answer about another question is not this one's.
+        assert!(parse_choice(&answer, "kind", &KINDS, 9).is_err());
     }
 }

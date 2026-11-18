@@ -804,10 +804,33 @@ pub struct GoalDefinition {
     pub schedule: Option<Schedule>,
     #[serde(default)]
     pub permissions: GoalPermissions,
+    /// Lighter models for director wakes that code can tell need less than
+    /// the director's own. Without them every wake runs on `director`.
+    #[serde(default)]
+    pub routes: Routes,
     /// This definition's own setting of the project's `director_decides`.
     /// Left out, the project's applies: [`ConfigDir::goal_definitions`]
     /// fills it in, so a loaded definition always has it.
     pub director_decides: Option<bool>,
+}
+
+/// Which model a director wake runs on, by what woke it. Code decides
+/// the route from the goal's record alone, with no model asked: a wake the
+/// owner, a new goal, a landed sub-goal or a design waiting for a ruling
+/// woke is the director's own; a foreman's report that a sub-goal is ready,
+/// with every planned bead absorbed and nothing else in question, is a
+/// `ship` wake; what is left over (an escalation, a pipeline or a ship
+/// that failed, a note from the executive) is a `settle` wake. A lighter
+/// model may make only the decisions its route allows, and hands anything
+/// else up to the director's own model in the same wake.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Routes {
+    /// May only ship the sub-goal, or hand it up.
+    pub ship: Option<String>,
+    /// May start, continue, ship, and talk to the foreman and the
+    /// executive; never plan, file, change beads or end the goal.
+    pub settle: Option<String>,
 }
 
 impl GoalDefinition {
@@ -886,6 +909,11 @@ pub struct Tier {
     /// a target: the agent runs work together only when it is safe to.
     #[serde(default = "default_slots")]
     pub slots: u32,
+    /// The model to run instead when every account is at its limit for
+    /// `model`, so that the agent goes on rather than waits for a window
+    /// to reopen. Without it the agent waits. A designer has none: what it
+    /// designs binds every builder of its sub-goal.
+    pub fallback_model: Option<String>,
 }
 
 fn default_slots() -> u32 {
@@ -1139,6 +1167,18 @@ impl ConfigDir {
                     "id is `{}` but the file is named `{name}`",
                     definition.id
                 )));
+            }
+            // A design binds every builder of its sub-goal: it waits for
+            // its own model rather than being written by another.
+            if definition
+                .designer
+                .as_ref()
+                .is_some_and(|designer| designer.fallback_model.is_some())
+            {
+                return Err(invalid(
+                    "the designer cannot have a fallback_model: a design binds every builder of its sub-goal, so it waits for its own model"
+                        .to_string(),
+                ));
             }
             if definition.max_pipelines == 0 {
                 return Err(invalid("max_pipelines must be at least 1".to_string()));
@@ -1442,6 +1482,25 @@ timeout_secs = 60
                 ("plain".to_string(), plain),
             ]
         };
+
+        // A designer may not fall back to another model.
+        let dir = dir_with(PROJECT);
+        let goals = dir.0.join("goals/toy");
+        std::fs::create_dir_all(&goals).unwrap();
+        std::fs::write(
+            goals.join("main.toml"),
+            format!(
+                "{}[designer]\nmodel = \"m\"\neffort = \"high\"\nfallback_model = \"n\"\n",
+                definition("main", "default = true")
+            ),
+        )
+        .unwrap();
+        let err = dir.goal_definitions("toy").unwrap_err().to_string();
+        assert!(
+            err.contains("the designer cannot have a fallback_model"),
+            "{err}"
+        );
+        std::fs::remove_dir_all(&dir.0).unwrap();
 
         // By default every director asks.
         let dir = dir_with(PROJECT);
