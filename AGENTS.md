@@ -40,7 +40,8 @@ factory slack check --config config            # does the Slack socket connect?
 factory accounts --config config               # each Claude account's windows, and which a run would use
 factory findings <project> --config config     # the classes of defect the project's testers have proved
 factory report --since 24h --config config     # how the factory ran: units, cost, rounds, steps, parks, triage, waits
-factory-dash serve --allow <network>           # the live page of all of it, read-only (docs/architecture.md)
+factory-dash serve --allow <network>           # the owner's workspace and inbox (docs/dashboard.md)
+factory-engine owner <project> press|say ...   # an owner's act from outside Slack, as Slack would carry it
 ```
 
 `config/` holds the project records, flows and role prompts. A unit's state, event log, artifacts and worktree are under `~/.local/state/software-factory/`.

@@ -24,9 +24,12 @@ use serde_json::json;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 
+use http_body_util::{BodyExt, Limited};
+
+use crate::act::{self, Act, Engine};
 use crate::net::{Net, host_is_ours, may_connect};
 use crate::records::{Links, Reader};
-use crate::runlog;
+use crate::{runlog, thread};
 
 const PAGE: &str = include_str!("../assets/index.html");
 const STYLE: &str = include_str!("../assets/app.css");
@@ -49,6 +52,12 @@ pub struct Settings {
     /// Host names the page may be asked for under, besides addresses.
     pub names: Vec<String>,
     pub links: Links,
+    /// The factory's engine command, to hand the owner's acts to. None
+    /// leaves the page as it was: reading only.
+    pub engine: Option<Engine>,
+    /// The networks whose people may act from the page, a part of those
+    /// that may connect. None means nobody.
+    pub act_allow: Vec<Net>,
 }
 
 /// The picture as it was last read.
@@ -63,6 +72,8 @@ struct Shared {
     reader: Mutex<Reader>,
     picture: RwLock<Arc<Picture>>,
     asked_at: AtomicU64,
+    /// One act at a time is handed on, in the order they came.
+    acting: tokio::sync::Mutex<()>,
 }
 
 fn now() -> u64 {
@@ -107,6 +118,7 @@ pub async fn serve(listener: TcpListener, settings: Settings) -> std::io::Result
         reader: Mutex::new(reader),
         picture: RwLock::new(Arc::default()),
         asked_at: AtomicU64::new(0),
+        acting: tokio::sync::Mutex::new(()),
     });
     // The first picture is there before the first question.
     let first = shared.clone();
@@ -147,7 +159,7 @@ pub async fn serve(listener: TcpListener, settings: Settings) -> std::io::Result
             let _place = place;
             let service = service_fn(move |request| {
                 let shared = shared.clone();
-                async move { Ok::<_, Infallible>(answer(&shared, request).await) }
+                async move { Ok::<_, Infallible>(answer(&shared, request, peer).await) }
             });
             let _ = http1::Builder::new()
                 .timer(TokioTimer::new())
@@ -187,8 +199,11 @@ fn reply(status: StatusCode, kind: &'static str, body: impl Into<Bytes>) -> Answ
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
         HeaderValue::from_static(
-            "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; \
-             img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+            // The graphs place their nodes with style attributes; no
+            // style sheet but the page's own is loaded.
+            "default-src 'none'; script-src 'self'; style-src 'self'; style-src-elem 'self'; \
+             style-src-attr 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; \
+             base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
         ),
     );
     headers.insert(
@@ -214,7 +229,122 @@ fn plain(status: StatusCode, text: &'static str) -> Answer {
     reply(status, "text/plain; charset=utf-8", text)
 }
 
-async fn answer(shared: &Arc<Shared>, request: Request<Incoming>) -> Answer {
+fn json_reply(status: StatusCode, body: &serde_json::Value) -> Answer {
+    reply(status, "application/json", body.to_string())
+}
+
+/// Whether the page may act for whoever is asking, and if not why.
+fn may_act(shared: &Shared, peer: SocketAddr) -> Result<&Engine, &'static str> {
+    let Some(engine) = &shared.settings.engine else {
+        return Err("The dashboard was started without the factory's engine, so it only reads.");
+    };
+    if !engine.command.is_file() {
+        return Err("The factory's engine command is not where the dashboard was told it is.");
+    }
+    if !may_connect(&shared.settings.act_allow, peer.ip()) {
+        return Err("Acting from the page is not allowed from this network (see --act-allow).");
+    }
+    Ok(engine)
+}
+
+/// An act the owner sends from the page. A browser sends the header and
+/// the type only from the page itself: another site's page cannot without
+/// asking first, and is never answered when it asks.
+async fn act_answer(shared: &Arc<Shared>, request: Request<Incoming>, peer: SocketAddr) -> Answer {
+    let engine = match may_act(shared, peer) {
+        Ok(engine) => engine.clone(),
+        Err(why) => return json_reply(StatusCode::FORBIDDEN, &json!({"ok": false, "error": why})),
+    };
+    let headers = request.headers();
+    let ours = headers
+        .get("x-factory-owner")
+        .is_some_and(|value| value == "1")
+        && headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|kind| kind.to_str().ok())
+            .is_some_and(|kind| kind.starts_with("application/json"));
+    let host = headers
+        .get(header::HOST)
+        .and_then(|host| host.to_str().ok())
+        .unwrap_or("");
+    let same_origin = headers
+        .get(header::ORIGIN)
+        .and_then(|origin| origin.to_str().ok())
+        .is_none_or(|origin| {
+            origin
+                .split_once("://")
+                .is_some_and(|(_, rest)| rest == host)
+        });
+    if !ours || !same_origin {
+        return json_reply(
+            StatusCode::FORBIDDEN,
+            &json!({"ok": false, "error": "Only the page itself may act."}),
+        );
+    }
+    let Ok(body) = Limited::new(request.into_body(), 32 * 1024).collect().await else {
+        return json_reply(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            &json!({"ok": false, "error": "Too long."}),
+        );
+    };
+    let asked: serde_json::Value = serde_json::from_slice(&body.to_bytes()).unwrap_or_default();
+    let act = match Act::read(&asked) {
+        Ok(act) => act,
+        Err(why) => {
+            return json_reply(
+                StatusCode::BAD_REQUEST,
+                &json!({"ok": false, "error": why.to_string()}),
+            );
+        }
+    };
+    let _turn = shared.acting.lock().await;
+    let done = act::hand_on(&engine, &act).await;
+    eprintln!(
+        "{} from {}: {}",
+        act.line(),
+        peer.ip(),
+        match &done {
+            Ok(_) => "handed on".to_string(),
+            Err(why) => why.to_string(),
+        }
+    );
+    // The records change as the tiers take it in: read them soon.
+    shared.asked_at.store(now(), Ordering::Relaxed);
+    match done {
+        Ok(said) => json_reply(StatusCode::OK, &json!({"ok": true, "said": said})),
+        Err(why) => json_reply(
+            StatusCode::BAD_GATEWAY,
+            &json!({"ok": false, "error": why.to_string()}),
+        ),
+    }
+}
+
+/// A conversation with the owner, for `where=goal&id=…` or
+/// `where=project&id=…&thread=…`.
+fn conversation(state: &Path, query: &str) -> Option<String> {
+    let field = |name: &str| {
+        query
+            .split('&')
+            .filter_map(|pair| pair.split_once('='))
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| value)
+    };
+    let id = field("id").filter(|id| plain_name(id))?;
+    let found = match field("where")? {
+        "goal" => thread::of_goal(&state.join("goals").join(id).join("events.jsonl"))?,
+        "project" => {
+            let ts = field("thread").filter(|ts| plain_name(ts))?;
+            let text =
+                std::fs::read_to_string(state.join("projects").join(id).join("executive.json"))
+                    .ok()?;
+            thread::of_executive(&serde_json::from_str(&text).ok()?, ts)?
+        }
+        _ => return None,
+    };
+    Some(found.to_string())
+}
+
+async fn answer(shared: &Arc<Shared>, request: Request<Incoming>, peer: SocketAddr) -> Answer {
     let host = request
         .headers()
         .get(header::HOST)
@@ -226,14 +356,35 @@ async fn answer(shared: &Arc<Shared>, request: Request<Incoming>) -> Answer {
             "This page is not served under that name.\n",
         );
     }
+    if request.method() == Method::POST && request.uri().path() == "/api/act" {
+        return act_answer(shared, request, peer).await;
+    }
     if request.method() != Method::GET && request.method() != Method::HEAD {
-        return plain(StatusCode::METHOD_NOT_ALLOWED, "Only reading is offered.\n");
+        return plain(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "Only reading is offered, and the owner's acts at /api/act.\n",
+        );
     }
     match request.uri().path() {
         "/" => reply(StatusCode::OK, "text/html; charset=utf-8", PAGE),
         "/app.css" => reply(StatusCode::OK, "text/css; charset=utf-8", STYLE),
         "/app.js" => reply(StatusCode::OK, "text/javascript; charset=utf-8", SCRIPT),
         "/healthz" => plain(StatusCode::OK, "ok\n"),
+        "/api/can-act" => json_reply(
+            StatusCode::OK,
+            &match may_act(shared, peer) {
+                Ok(_) => json!({"act": true}),
+                Err(why) => json!({"act": false, "why": why}),
+            },
+        ),
+        "/api/thread" => {
+            let query = request.uri().query().unwrap_or("").to_string();
+            let state = shared.settings.state.clone();
+            match tokio::task::spawn_blocking(move || conversation(&state, &query)).await {
+                Ok(Some(body)) => reply(StatusCode::OK, "application/json", body),
+                _ => plain(StatusCode::NOT_FOUND, "There is no such conversation.\n"),
+            }
+        }
         "/api/snapshot" => {
             shared.asked_at.store(now(), Ordering::Relaxed);
             let picture = shared.picture();

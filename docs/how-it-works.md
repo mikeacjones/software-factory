@@ -62,7 +62,7 @@ flowchart TB
     steps -->|"a question for the owner"| slack
 ```
 
-The dashboard (`factory-dash`) is outside this picture on purpose: it only reads the state directory.
+The dashboard (`factory-dash`) is outside this picture on purpose: it reads the state directory, and hands what the owner answers on it to `factory-engine owner`, which signals the project's workflow as the listener does for Slack.
 
 ## 2. A goal, from the owner's message to a landed pull request
 

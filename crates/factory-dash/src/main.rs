@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use factory_dash::act::Engine;
 use factory_dash::net::Net;
 use factory_dash::records::{Links, Reader};
 use factory_dash::server::{Settings, serve};
@@ -23,6 +24,15 @@ factory-dash snapshot [options]   print the picture once, as JSON
   --temporal-ui <url>    the Temporal server's web pages, to link to
   --namespace <name>     the factory's namespace there
                          (default: software-factory)
+  --slack <url>          the Slack workspace, as https://example.slack.com,
+                         to link each conversation to its thread there
+  --act-allow <network>  a network whose people may answer the factory from
+                         the page: a reply, Start, Accept, Approve; may be
+                         given more than once (default: 127.0.0.0/8)
+  --engine <command>     the factory's engine command the owner's acts are
+                         handed to (default: <state>/current/factory-engine)
+  --engine-config <dir>  the config it reads (default: <state>/current/config)
+  --read-only            offer no acts at all, only reading
 ";
 
 /// What can go wrong before the page is served.
@@ -65,7 +75,12 @@ fn asked(args: &[String]) -> Result<Asked, Error> {
     let mut links = Links {
         temporal_ui: None,
         namespace: "software-factory".to_string(),
+        slack: None,
     };
+    let mut act_allow = Vec::new();
+    let mut engine: Option<PathBuf> = None;
+    let mut engine_config: Option<PathBuf> = None;
+    let mut read_only = false;
     while let Some(option) = args.next() {
         let mut value = || {
             args.next()
@@ -86,12 +101,33 @@ fn asked(args: &[String]) -> Result<Asked, Error> {
             "--name" => names.push(value()?),
             "--temporal-ui" => links.temporal_ui = Some(value()?),
             "--namespace" => links.namespace = value()?,
+            "--slack" => links.slack = Some(value()?),
+            "--act-allow" => {
+                let network = value()?;
+                act_allow.push(Net::parse(&network).ok_or_else(|| {
+                    Error::Usage(format!(
+                        "`{network}` is not a network like 192.168.101.0/24"
+                    ))
+                })?);
+            }
+            "--engine" => engine = Some(PathBuf::from(value()?)),
+            "--engine-config" => engine_config = Some(PathBuf::from(value()?)),
+            "--read-only" => read_only = true,
             other => return Err(Error::Usage(format!("unknown option `{other}`"))),
         }
     }
     if allow.is_empty() {
         allow.extend(Net::parse("127.0.0.0/8"));
     }
+    if act_allow.is_empty() {
+        act_allow.extend(Net::parse("127.0.0.0/8"));
+    }
+    // The engine of the release the factory runs, with the config that
+    // release reads, so an act is handed on as that factory expects it.
+    let engine = (!read_only).then(|| Engine {
+        command: engine.unwrap_or_else(|| state.join("current").join("factory-engine")),
+        config: engine_config.unwrap_or_else(|| state.join("current").join("config")),
+    });
     Ok(Asked {
         command,
         listen,
@@ -100,6 +136,8 @@ fn asked(args: &[String]) -> Result<Asked, Error> {
             allow,
             names,
             links,
+            engine,
+            act_allow,
         },
     })
 }

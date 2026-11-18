@@ -12,6 +12,12 @@
 //!                                             are doing, and what waits its turn
 //!   factory-engine open <project> <text>      open a goal as the owner's message in the
 //!                                             project's channel would
+//!   factory-engine owner <project> press <action> <value>
+//!                                             hand the project a button the owner
+//!                                             pressed, as Slack would
+//!   factory-engine owner <project> say <channel|-> <thread> <text>
+//!                                             hand the project the owner's reply in a
+//!                                             thread, as Slack would; `-` is no channel
 //!   factory-engine accounts                   what every account has left, and who waits
 //!   factory-engine accounts recheck           look at every account again now, as after
 //!                                             a usage reset; those waiting are released
@@ -161,6 +167,9 @@ async fn command(args: &[String]) -> Result<(), String> {
                 ));
             }
             "--wait" => wait = true,
+            // Everything after `--` is a word, however it begins: what the
+            // owner wrote may look like an option.
+            "--" => words.extend(rest.by_ref().map(String::as_str)),
             flag if flag.starts_with("--") => return Err(format!("unknown option `{flag}`")),
             word => words.push(word),
         }
@@ -305,6 +314,48 @@ async fn command(args: &[String]) -> Result<(), String> {
             };
             tell(&client, &reach(&temporal), project, event).await?;
             println!("handed to project `{project}`: its tiers open the goal in their turn");
+            Ok(())
+        }
+        ["owner", project, "press", action_id, value] => {
+            // A button the owner pressed somewhere other than Slack, handed
+            // to the project's tiers as the press in Slack would be.
+            config.project(project).map_err(|err| err.to_string())?;
+            let user = factory_driver::goal::owner_id(&config).map_err(|err| err.to_string())?;
+            let client = connect(&temporal.address, &temporal.namespace).await?;
+            let event = factory_driver::goal::Event::Slack(factory_slack::socket::Incoming::Action {
+                channel: String::new(),
+                user,
+                action_id: action_id.to_string(),
+                value: value.to_string(),
+                message_ts: String::new(),
+            });
+            tell(&client, &reach(&temporal), project, event).await?;
+            println!("handed to project `{project}`: {action_id} on {value}");
+            Ok(())
+        }
+        ["owner", project, "say", channel, thread_ts, text @ ..] if !text.is_empty() => {
+            // A reply the owner wrote somewhere other than Slack, handed to
+            // the project's tiers as a reply in that thread would be, and
+            // put in the Slack thread too so that it still reads whole.
+            config.project(project).map_err(|err| err.to_string())?;
+            let user = factory_driver::goal::owner_id(&config).map_err(|err| err.to_string())?;
+            let text = text.join(" ");
+            let channel = channel.trim_start_matches('-').to_string();
+            let client = connect(&temporal.address, &temporal.namespace).await?;
+            let event = factory_driver::goal::Event::Slack(factory_slack::socket::Incoming::Message {
+                channel: channel.clone(),
+                user,
+                text: text.clone(),
+                ts: format!("{}.000000", factory_core_now()),
+                thread_ts: Some(thread_ts.to_string()),
+            });
+            tell(&client, &reach(&temporal), project, event).await?;
+            println!("handed to project `{project}`: a reply in thread {thread_ts}");
+            if let Err(err) =
+                factory_driver::goal::echo_owner(&config, &channel, thread_ts, &text, "the dashboard")
+            {
+                eprintln!("factory-engine: {err}");
+            }
             Ok(())
         }
         ["start", project, bead] => {

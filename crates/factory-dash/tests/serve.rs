@@ -8,6 +8,7 @@ use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use factory_dash::act::Engine;
 use factory_dash::net::Net;
 use factory_dash::records::Links;
 use factory_dash::server::{Settings, serve};
@@ -66,6 +67,17 @@ fn state(name: &str) -> PathBuf {
 
 /// Serve a state directory on a port of this machine, to the given networks.
 async fn open(state: &Path, allow: &[&str]) -> SocketAddr {
+    open_acting(state, allow, None, &[]).await
+}
+
+/// The same, with an engine the owner's acts are handed to, by those of
+/// the networks `act_allow`.
+async fn open_acting(
+    state: &Path,
+    allow: &[&str],
+    engine: Option<Engine>,
+    act_allow: &[&str],
+) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let settings = Settings {
@@ -75,7 +87,13 @@ async fn open(state: &Path, allow: &[&str]) -> SocketAddr {
         links: Links {
             temporal_ui: Some("http://engine.test:8080".to_string()),
             namespace: "factory".to_string(),
+            slack: None,
         },
+        engine,
+        act_allow: act_allow
+            .iter()
+            .map(|net| Net::parse(net).unwrap())
+            .collect(),
     };
     tokio::spawn(serve(listener, settings));
     address
@@ -268,8 +286,155 @@ async fn a_connection_from_outside_the_allowed_networks_gets_nothing() {
     std::fs::remove_dir_all(&state).unwrap();
 }
 
+/// Send an act as the page does, with whatever headers are given.
+async fn post(address: SocketAddr, headers: &str, body: &str) -> String {
+    let (headers, body) = (headers.to_string(), body.to_string());
+    tokio::task::spawn_blocking(move || {
+        let mut stream = TcpStream::connect(address).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+        let _ = write!(
+            stream,
+            "POST /api/act HTTP/1.1\r\nHost: {address}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let mut answer = String::new();
+        let _ = stream.read_to_string(&mut answer);
+        answer
+    })
+    .await
+    .unwrap()
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn the_owner_acts_from_the_page_through_the_engine_and_nobody_else_does() {
+    use std::os::unix::fs::PermissionsExt;
+    let state = state("acts");
+    // An engine that says what it was asked to do.
+    let heard = state.join("heard");
+    let engine = state.join("factory-engine");
+    std::fs::write(
+        &engine,
+        format!(
+            "#!/bin/sh\nprintf '%s|' \"$@\" > {}\necho handed\n",
+            heard.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&engine, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let with = Engine {
+        command: engine.clone(),
+        config: state.join("config"),
+    };
+    let address = open_acting(
+        &state,
+        &["127.0.0.0/8"],
+        Some(with.clone()),
+        &["127.0.0.0/8"],
+    )
+    .await;
+    let page = "X-Factory-Owner: 1\r\nContent-Type: application/json\r\n";
+    let press = r#"{"project":"toy","act":"press","action_id":"goal_start","value":"toy-g1"}"#;
+
+    // Without the page's own header, or from another site, nothing is done.
+    for headers in [
+        "Content-Type: application/json\r\n".to_string(),
+        "X-Factory-Owner: 1\r\nContent-Type: text/plain\r\n".to_string(),
+        format!("{page}Origin: http://evil.example\r\n"),
+    ] {
+        let answer = post(address, &headers, press).await;
+        assert!(answer.starts_with("HTTP/1.1 403"), "{headers}: {answer}");
+    }
+    assert!(!heard.exists());
+    // A button the factory never posts is not pressed.
+    let answer = post(
+        address,
+        page,
+        r#"{"project":"toy","act":"press","action_id":"rm","value":"x"}"#,
+    )
+    .await;
+    assert!(answer.starts_with("HTTP/1.1 400"), "{answer}");
+    assert!(!heard.exists());
+
+    let answer = post(
+        address,
+        &format!("{page}Origin: http://{address}\r\n"),
+        press,
+    )
+    .await;
+    assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+    assert_eq!(body(&answer)["said"], "handed");
+    assert_eq!(
+        std::fs::read_to_string(&heard).unwrap(),
+        format!(
+            "--config|{}|owner|toy|press|goal_start|toy-g1|",
+            state.join("config").display()
+        )
+    );
+    // A reply never reaches the engine as an option.
+    let say = r#"{"project":"toy","act":"say","channel":"C1","thread":"1.1","text":"--wait now"}"#;
+    assert!(post(address, page, say).await.starts_with("HTTP/1.1 200"));
+    assert!(
+        std::fs::read_to_string(&heard)
+            .unwrap()
+            .ends_with("|say|C1|1.1|--|--wait now|")
+    );
+    let can = body(&ask(address, "GET", "/api/can-act", &address.to_string()).await);
+    assert_eq!(can["act"], true);
+
+    // Those who may read but not act are told so, and nothing is done.
+    std::fs::remove_file(&heard).unwrap();
+    let reader = open_acting(&state, &["127.0.0.0/8"], Some(with), &["192.168.101.0/24"]).await;
+    let answer = post(reader, page, press).await;
+    assert!(answer.starts_with("HTTP/1.1 403"), "{answer}");
+    let can = body(&ask(reader, "GET", "/api/can-act", &reader.to_string()).await);
+    assert_eq!(can["act"], false);
+    assert!(!heard.exists());
+    std::fs::remove_dir_all(&state).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn what_waits_on_the_owner_and_the_conversation_are_read_from_the_records() {
+    let state = state("inbox");
+    std::fs::write(
+        state.join("goals/toy-g1/goal.json"),
+        r#"{"id":"toy-g1","project":"toy","phase":"proposed_complete","channel":"C1","thread_ts":"5.5",
+            "charter":{"objective":"Ship the feature.","stop_when":"It ships."},"evidence":"PR #1 merged","units":[],"subgoals":[],"started_at":5}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        state.join("goals/toy-g1/events.jsonl"),
+        [
+            r#"{"time_unix":6,"kind":"owner.message","data":{"text":"Go"}}"#,
+            r#"{"time_unix":7,"kind":"slack.prompt","data":{"text":"Done, accept?"}}"#,
+        ]
+        .join("\n"),
+    )
+    .unwrap();
+    let address = open(&state, &["127.0.0.0/8"]).await;
+    let host = address.to_string();
+    let picture = body(&ask(address, "GET", "/api/snapshot", &host).await);
+    let item = &picture["inbox"][0];
+    assert_eq!(item["kind"], "completion");
+    assert_eq!(item["actions"][0]["action_id"], "goal_accept");
+    assert_eq!(
+        item["reply"],
+        serde_json::json!({"channel": "C1", "ts": "5.5"})
+    );
+    assert_eq!(picture["projects"][0]["pulse"]["waiting"], 1);
+    assert_eq!(picture["projects"][0]["pulse"]["state"], "waiting");
+
+    let thread = body(&ask(address, "GET", "/api/thread?where=goal&id=toy-g1", &host).await);
+    assert_eq!(thread["lines"][0]["who"], "owner");
+    assert_eq!(thread["lines"][1]["text"], "Done, accept?");
+    let refused = ask(address, "GET", "/api/thread?where=goal&id=..", &host).await;
+    assert!(refused.starts_with("HTTP/1.1 404"), "{refused}");
+    std::fs::remove_dir_all(&state).unwrap();
+}
+
 /// The dashboard is an observer: nothing in it can write, remove or move
-/// a file, start a program, or open a connection of its own.
+/// a file or open a connection of its own, and the one program it may
+/// start is the factory's engine, to hand on the owner's acts.
 #[test]
 fn nothing_in_the_dashboard_writes_or_reaches_out() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -279,6 +444,12 @@ fn nothing_in_the_dashboard_writes_or_reaches_out() {
         let text = std::fs::read_to_string(&path).unwrap();
         // The tests in a file may write what they then read.
         let code = text.split("#[cfg(test)]").next().unwrap();
+        let starts = code.matches("Command::new").count();
+        if path.ends_with("act.rs") {
+            assert_eq!(starts, 1, "act.rs starts one program, the engine");
+        } else {
+            assert_eq!(starts, 0, "{} starts a program", path.display());
+        }
         for forbidden in [
             "fs::write",
             "File::create",
@@ -289,7 +460,7 @@ fn nothing_in_the_dashboard_writes_or_reaches_out() {
             "fs::rename",
             "fs::copy",
             "set_permissions",
-            "Command::new",
+            "std::process::Command",
             "TcpStream",
             "UdpSocket",
             "::connect(",
@@ -304,4 +475,54 @@ fn nothing_in_the_dashboard_writes_or_reaches_out() {
         read += 1;
     }
     assert!(read >= 5, "the sources were not found in {}", src.display());
+}
+
+/// The page the program embeds is built from the page's sources as they
+/// are: a change to `web` without `npm run build` fails here, with the
+/// same hash of the sources the build writes beside what it built.
+#[test]
+fn the_embedded_page_is_built_from_its_sources() {
+    fn files(root: &Path, at: &str, into: &mut Vec<String>) {
+        let path = root.join(at);
+        if path.is_dir() {
+            for entry in std::fs::read_dir(&path).unwrap() {
+                let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+                files(root, &format!("{at}/{name}"), into);
+            }
+        } else {
+            into.push(at.to_string());
+        }
+    }
+    let web = Path::new(env!("CARGO_MANIFEST_DIR")).join("web");
+    let mut all = Vec::new();
+    for at in [
+        "index.html",
+        "package.json",
+        "package-lock.json",
+        "svelte.config.js",
+        "vite.config.ts",
+        "tsconfig.json",
+        "src",
+    ] {
+        files(&web, at, &mut all);
+    }
+    all.sort();
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut eat = |bytes: &[u8]| {
+        for byte in bytes {
+            hash = (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3);
+        }
+    };
+    for name in &all {
+        eat(name.as_bytes());
+        eat(&[0]);
+        eat(&std::fs::read(web.join(name)).unwrap());
+        eat(&[0]);
+    }
+    let built = std::fs::read_to_string(web.join("../assets/source.txt")).unwrap();
+    assert_eq!(
+        built.trim(),
+        format!("{hash:016x}"),
+        "the page was not rebuilt after its sources changed: run `npm ci && npm run build` in crates/factory-dash/web"
+    );
 }
