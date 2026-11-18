@@ -47,6 +47,9 @@ pub struct RunSpec {
     /// The briefing, fed on stdin.
     pub prompt: String,
     pub budget_usd: Option<f64>,
+    /// The tool servers this run is given, for an agent that is handed
+    /// them run by run: name, command and arguments.
+    pub tools: Vec<ToolServer>,
     pub timeout: Duration,
     /// The account's token, for an account that is not the CLI's own login.
     pub oauth_token: Option<String>,
@@ -55,6 +58,14 @@ pub struct RunSpec {
     /// file says which session to resume instead of starting over. The
     /// caller removes it when the run has ended.
     pub session_file: Option<PathBuf>,
+}
+
+/// A tool server a run is given.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolServer {
+    pub name: String,
+    pub command: String,
+    pub args: Vec<String>,
 }
 
 /// The exact command for a run. Always headless, always bypass mode, never
@@ -750,6 +761,7 @@ mod tests {
             cwd: PathBuf::from("/work"),
             prompt: "the brief".to_string(),
             budget_usd: Some(25.0),
+            tools: Vec::new(),
             timeout: Duration::from_secs(60),
             oauth_token: None,
             session_file: None,

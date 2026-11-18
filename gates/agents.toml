@@ -24,6 +24,6 @@ timeout_secs = 900
 id = "codex-step"
 tier = "hermetic"
 bead = "sf-h6m"
-claim = "A unit whose build and fix steps name codex is built by codex and fixed in that codex session, under codex's own login and none of the factory's accounts, while its tester, reviewer and publisher are Claude Code's; it lands. Settings for an agent the factory has no adapter for are refused before anything starts."
+claim = "A unit whose build and fix steps name codex is built by codex and fixed in that codex session, under codex's own login and none of the factory's accounts, while its tester, reviewer and publisher are Claude Code's; it lands. Each codex run is given the tool servers its agent's settings name for a directory like its own, with the directory filled in, and no other. Settings for an agent the factory has no adapter for are refused before anything starts."
 command = ["cargo", "test", "--locked", "--offline", "--package", "factory-driver", "--test", "walk", "--", "a_step_can_be_run_by_codex_and_its_session_is_continued_by_codex", "a_step_whose_agent_cannot_run_it_is_refused_before_anything_starts"]
 timeout_secs = 900

@@ -5829,6 +5829,7 @@ impl Supervisor {
                 cwd: cwd.clone(),
                 prompt: prompt.clone(),
                 budget_usd: project.limits.step_budget_usd,
+                tools: Vec::new(),
                 timeout: Duration::from_secs(tier.timeout_secs),
                 oauth_token,
                 session_file: None,

@@ -827,6 +827,18 @@ fn a_step_can_be_run_by_codex_and_its_session_is_continued_by_codex() {
         "{}",
         codex[1]
     );
+    // Every run is given the tool servers that fit its directory, with
+    // the directory filled in, and no other.
+    let home = std::env::var("HOME").unwrap();
+    for call in &codex {
+        assert!(
+            call.contains(&format!("mcp_servers.here.command=\"{home}/bridge\""))
+                && call.contains("mcp_servers.here.args=[\"--workspace\",\"/")
+                && !call.contains("{cwd}")
+                && !call.contains("elsewhere"),
+            "{call}"
+        );
+    }
 
     // Every builder run was codex's, and nothing else was.
     let calls = world.calls();
@@ -846,6 +858,7 @@ fn a_step_can_be_run_by_codex_and_its_session_is_continued_by_codex() {
         assert_eq!(run["agent"], "codex");
         assert_eq!(run["model"], "gpt-6.2-sol");
         assert_eq!(run["account"], "codex's own login");
+        assert_eq!(run["tools"], serde_json::json!(["here"]));
     }
     assert!(
         started
@@ -931,12 +944,9 @@ fn a_step_whose_agent_cannot_run_it_is_refused_before_anything_starts() {
         "{said}"
     );
     let said = refused(&|world| {
-        rewrite(
-            world,
-            "config/factory.toml",
-            "[agent.codex]",
-            "[agent.cursor]",
-        )
+        let path = world.path("config/factory.toml");
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, text.replace("[agent.codex", "[agent.cursor")).unwrap();
     });
     assert!(
         said.contains("`[agent.cursor]`: the factory has no adapter"),

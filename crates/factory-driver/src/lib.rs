@@ -847,6 +847,19 @@ pub fn load_flow(
             )));
         }
     }
+    for (name, agent) in &factory.agent {
+        // A tool server's name is a key on the agent's command line.
+        if let Some(server) = agent.mcp.keys().find(|server| {
+            server.is_empty()
+                || !server
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+        }) {
+            return Err(DriverError::Preflight(format!(
+                "`[agent.{name}.mcp.{server}]`: a tool server's name is letters, digits, `-` and `_`"
+            )));
+        }
+    }
     flow.check(&Registry {
         roles: factory_brief::role_registry(),
         agents: factory
@@ -2241,6 +2254,28 @@ impl Driver {
             }
         };
 
+        // The tool servers the agent's settings give a run in a directory
+        // like this one: a language server only where its language is.
+        let tools: Vec<factory_claude::ToolServer> = other_agent
+            .iter()
+            .flat_map(|agent| agent.mcp.iter())
+            .filter(|(_, server)| {
+                server
+                    .when_file
+                    .as_ref()
+                    .is_none_or(|file| cwd.join(file).exists())
+            })
+            .map(|(name, server)| factory_claude::ToolServer {
+                name: name.clone(),
+                command: server.command.clone(),
+                args: server
+                    .args
+                    .iter()
+                    .map(|arg| arg.replace("{cwd}", &cwd.to_string_lossy()))
+                    .collect(),
+            })
+            .collect();
+
         // A run of this step that was cut off when whatever was watching it
         // died left its session's ID behind. That session has the work it
         // had done: it is resumed, not started over.
@@ -2491,6 +2526,7 @@ impl Driver {
                 cwd: cwd.clone(),
                 prompt,
                 budget_usd: self.project.limits.step_budget_usd,
+                tools: tools.clone(),
                 timeout,
                 oauth_token,
                 session_file: Some(in_flight.clone()),
@@ -2498,6 +2534,7 @@ impl Driver {
             self.event("run.started", Some(&step.id), json!({
                 "run": self.unit.runs, "role": role, "agent": step.agent, "model": model,
                 "effort": effort, "account": account,
+                "tools": tools.iter().map(|tool| &tool.name).collect::<Vec<_>>(),
                 "session": match &session { Session::Fresh => json!("fresh"), Session::Resume(id) => json!(id) },
                 "cwd": cwd, "log": log_path,
             }))?;

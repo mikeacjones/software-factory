@@ -303,6 +303,24 @@ pub struct AgentSettings {
     pub bin: String,
     /// The models a step run by this agent may name.
     pub allowed_models: Vec<String>,
+    /// Tool servers a run of this agent is given, by name: the language
+    /// servers, each behind a bridge that speaks the Model Context
+    /// Protocol.
+    #[serde(default)]
+    pub mcp: BTreeMap<String, ToolServer>,
+}
+
+/// A tool server started for a run of an agent.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolServer {
+    pub command: String,
+    /// `{cwd}` is the directory the run works in.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Start the server only for a run whose directory holds this file:
+    /// `build.zig` for the Zig language server, and so on.
+    pub when_file: Option<String>,
 }
 
 /// One project: `projects/<id>.toml`.
@@ -927,6 +945,13 @@ impl ConfigDir {
         }
         if let Some(slack) = &mut factory.slack {
             slack.env_file = expand_home(&slack.env_file);
+        }
+        for agent in factory.agent.values_mut() {
+            for server in agent.mcp.values_mut() {
+                server.command = expand_home(Path::new(&server.command))
+                    .to_string_lossy()
+                    .into_owned();
+            }
         }
         if let Some(judge) = factory.judge.as_mut() {
             judge.env_file = expand_home(&judge.env_file);

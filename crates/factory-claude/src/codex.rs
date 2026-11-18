@@ -33,9 +33,24 @@ fn effort(effort: &str) -> &str {
 
 /// The briefing as the run is given it.
 fn briefing(spec: &RunSpec) -> String {
+    // The roles call the language server the `LSP` tool, as Claude Code
+    // has it. Here it is a tool server's tools.
+    let tools = if spec.tools.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\nWhere your role speaks of the `LSP` tool: you have it as the tools of the tool server{} {} (definition, references, hover, diagnostics).",
+            if spec.tools.len() == 1 { "" } else { "s" },
+            spec.tools
+                .iter()
+                .map(|tool| format!("`{}`", tool.name))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
     match &spec.session {
         Session::Fresh if !spec.system_prompt.trim().is_empty() => format!(
-            "# Your role\n\n{}\n\n# Your briefing\n\n{}\n\nEnd with the structured result and nothing else.",
+            "# Your role\n\n{}{tools}\n\n# Your briefing\n\n{}\n\nEnd with the structured result and nothing else.",
             spec.system_prompt.trim(),
             spec.prompt
         ),
@@ -84,12 +99,24 @@ impl Harness for Codex {
                 &format!("model_reasoning_effort=\"{}\"", effort(&spec.effort)),
                 "--output-schema",
                 &schema.to_string_lossy(),
-                // The briefing is read from stdin.
-                "-",
             ]
             .iter()
             .map(|part| part.to_string()),
         );
+        // The user's settings are left out, and with them any tool server
+        // named there: the run's own are given here, each time.
+        for tool in &spec.tools {
+            let key = format!("mcp_servers.{}", tool.name);
+            // A JSON string, and a JSON list of strings, are TOML too.
+            argv.extend([
+                "--config".to_string(),
+                format!("{key}.command={}", json!(tool.command)),
+                "--config".to_string(),
+                format!("{key}.args={}", json!(tool.args)),
+            ]);
+        }
+        // The briefing is read from stdin.
+        argv.push("-".to_string());
         let mut command = Spec::new(argv, &spec.cwd, spec.timeout);
         command.stdin = Some(briefing(spec));
         // A worker must not inherit the identity of whatever session
@@ -295,6 +322,11 @@ mod tests {
             cwd: dir.to_path_buf(),
             prompt: "Build the bead.".to_string(),
             budget_usd: Some(25.0),
+            tools: vec![crate::ToolServer {
+                name: "zls".to_string(),
+                command: "/opt/bridge".to_string(),
+                args: vec!["--workspace".to_string(), "/w t".to_string()],
+            }],
             timeout: Duration::from_secs(60),
             oauth_token: None,
             session_file: None,
@@ -344,8 +376,19 @@ mod tests {
             std::fs::read_to_string(&schema).unwrap(),
             r#"{"type":"object"}"#
         );
+        // Its tool servers are given on the command line, since the
+        // user's settings are left out.
+        assert!(
+            argv.contains("--config mcp_servers.zls.command=\"/opt/bridge\"")
+                && argv.contains("--config mcp_servers.zls.args=[\"--workspace\",\"/w t\"]"),
+            "{argv}"
+        );
         let stdin = command.stdin.unwrap();
         assert!(stdin.contains("You are the builder.") && stdin.contains("Build the bead."));
+        assert!(
+            stdin.contains("the tools of the tool server `zls`"),
+            "{stdin}"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

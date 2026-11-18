@@ -104,3 +104,28 @@ timeout_secs = 5
 [agent.codex]
 bin = "codex"
 allowed_models = ["gpt-6.2-sol"]
+
+# The language servers Claude Code has through its plugins, for codex: each
+# behind a bridge that offers a language server's definitions, references,
+# hover and diagnostics as tools (github.com/isaacphi/mcp-language-server,
+# installed with `go install`). One is started only for a run whose
+# directory holds the file that marks its language.
+[agent.codex.mcp.zls]
+command = "~/go/bin/mcp-language-server"
+args = ["--workspace", "{cwd}", "--lsp", "zls"]
+when_file = "build.zig"
+
+[agent.codex.mcp.rust-analyzer]
+command = "~/go/bin/mcp-language-server"
+args = ["--workspace", "{cwd}", "--lsp", "rust-analyzer"]
+when_file = "Cargo.toml"
+
+[agent.codex.mcp.gopls]
+command = "~/go/bin/mcp-language-server"
+args = ["--workspace", "{cwd}", "--lsp", "gopls"]
+when_file = "go.mod"
+
+[agent.codex.mcp.pyright]
+command = "~/go/bin/mcp-language-server"
+args = ["--workspace", "{cwd}", "--lsp", "pyright-langserver", "--", "--stdio"]
+when_file = "pyproject.toml"

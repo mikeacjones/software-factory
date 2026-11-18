@@ -305,6 +305,17 @@ merge_body = \"{{summary}}\\n\\n{{testing}}\\n\\nBead: {{bead}}\"
             );
             text.replace_range(at..end, &block);
         }
+        // Two tool servers: one for any git worktree, one for a kind of
+        // project the toy is not.
+        let factory = self.path("config/factory.toml");
+        let settings = std::fs::read_to_string(&factory).unwrap();
+        std::fs::write(
+            &factory,
+            format!(
+                "{settings}\n[agent.codex.mcp.here]\ncommand = \"~/bridge\"\nargs = [\"--workspace\", \"{{cwd}}\"]\nwhen_file = \".git\"\n\n[agent.codex.mcp.elsewhere]\ncommand = \"bridge\"\nwhen_file = \"build.zig\"\n"
+            ),
+        )
+        .unwrap();
         if steps.contains(&"build") {
             let head = "id = \"describe\"";
             let at = text.find(head).unwrap();
