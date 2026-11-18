@@ -15,6 +15,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value, json};
 
+use crate::inbox;
+
 /// A five-hour window, in seconds.
 pub const FIVE_HOURS: u64 = 5 * 3600;
 /// A seven-day window, in seconds.
@@ -33,6 +35,9 @@ pub struct Links {
     /// The address of the Temporal server's web pages, if there are any.
     pub temporal_ui: Option<String>,
     pub namespace: String,
+    /// The Slack workspace's address, as `https://example.slack.com`, to
+    /// link each conversation to its thread there.
+    pub slack: Option<String>,
 }
 
 /// One window of an account as a run saw it.
@@ -74,6 +79,15 @@ pub struct OpenStep {
     pub since: u64,
 }
 
+/// A question put to the owner that has had no answer since.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Question {
+    /// The step that asked, for a unit's question.
+    pub step: String,
+    pub text: String,
+    pub at: u64,
+}
+
 /// What an event log says that the picture needs.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Digest {
@@ -82,6 +96,15 @@ pub struct Digest {
     pub handed: BTreeMap<String, u64>,
     pub run: Option<OpenRun>,
     pub step: Option<OpenStep>,
+    /// A unit's step that asked the owner and has not been answered.
+    pub asked: Option<Question>,
+    /// What the factory last said that needs the owner (`slack.need`),
+    /// when the owner has neither written nor pressed anything since.
+    pub need: Option<Question>,
+    /// What the factory last said to the owner of any kind, and when.
+    pub said: Option<Question>,
+    /// When the owner last wrote or pressed something.
+    pub owner_at: u64,
 }
 
 fn window_of(value: &Value) -> Option<Window> {
@@ -144,6 +167,29 @@ pub fn digest(log: &str) -> Digest {
                 });
             }
             "step.ended" => digest.step = None,
+            "owner.asked" => {
+                digest.asked = Some(Question {
+                    step: text(&event["step"]),
+                    text: text(&data["question"]),
+                    at,
+                });
+            }
+            "owner.answered" => digest.asked = None,
+            "slack.need" | "slack.say" | "slack.prompt" => {
+                let said = Question {
+                    step: String::new(),
+                    text: text(&data["text"]),
+                    at,
+                };
+                if event["kind"] == "slack.need" {
+                    digest.need = Some(said.clone());
+                }
+                digest.said = Some(said);
+            }
+            "owner.message" | "owner.action" => {
+                digest.owner_at = at;
+                digest.need = None;
+            }
             _ => {}
         }
         // Whatever ended a run says what the run used.
@@ -339,6 +385,102 @@ fn cut(value: &Value, most: usize) -> Value {
     }
 }
 
+/// How busy a project is, at a glance: for the list of projects.
+fn pulse(project: &Value, runs: &[Value], waiting: usize) -> Value {
+    let id = project["id"].as_str().unwrap_or("");
+    let agents = runs.iter().filter(|run| run["project"] == id).count();
+    let mut pipelines = 0;
+    let mut parked = 0;
+    let mut beads = 0;
+    let mut done = 0;
+    let units = project["goals"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|goal| goal["subgoals"].as_array().into_iter().flatten())
+        .flat_map(|sub| {
+            sub["beads"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .chain(sub["ship"].as_object().map(|_| &sub["ship"]))
+        })
+        .chain(project["loose"].as_array().into_iter().flatten());
+    for unit in units {
+        beads += 1;
+        match unit["status"].as_str().unwrap_or("") {
+            "running" => pipelines += 1,
+            "parked" => parked += 1,
+            _ => {}
+        }
+        if matches!(unit["state"].as_str(), Some("absorbed" | "landed")) {
+            done += 1;
+        }
+    }
+    let goals = project["goals"].as_array().map_or(0, Vec::len);
+    let state = if waiting > 0 {
+        "waiting"
+    } else if parked > 0 {
+        "parked"
+    } else if agents + pipelines > 0 {
+        "working"
+    } else if goals > 0 {
+        "open"
+    } else {
+        "idle"
+    };
+    json!({
+        "state": state,
+        "agents": agents,
+        "pipelines": pipelines,
+        "parked": parked,
+        "waiting": waiting,
+        "goals": goals,
+        "beads": beads,
+        "done": done,
+    })
+}
+
+/// Where a conversation with the owner is: a Slack channel and the
+/// message its thread hangs from. A goal opened without Slack has no
+/// channel, and is still found by its thread.
+fn thread_of(channel: &Value, ts: &Value) -> Value {
+    match (channel.as_str(), ts.as_str()) {
+        (Some(channel), Some(ts)) if !ts.is_empty() => json!({"channel": channel, "ts": ts}),
+        _ => Value::Null,
+    }
+}
+
+/// Changes to beads put to the owner, as the page shows them.
+fn edits(list: &Value) -> Vec<Value> {
+    list.as_array()
+        .into_iter()
+        .flatten()
+        .map(|edit| {
+            json!({
+                "bead": edit["bead"],
+                "acceptance_criteria": cut(&edit["acceptance_criteria"], 1200),
+                "priority": edit["priority"],
+                "defer": edit["defer"],
+                "reason": cut(&edit["reason"], 600),
+            })
+        })
+        .collect()
+}
+
+/// Where a flow's step goes on each outcome: `on.done = "checks"` or
+/// `on.fail = { to = "fix", max = 2 }`.
+fn routes(on: &Value) -> Vec<Value> {
+    on.as_object()
+        .into_iter()
+        .flatten()
+        .filter_map(|(outcome, route)| {
+            let to = route.as_str().or_else(|| route["to"].as_str())?;
+            Some(json!({"outcome": outcome, "to": to, "max": route["max"]}))
+        })
+        .collect()
+}
+
 /// Reads the factory's records. It remembers what it read of a file
 /// until the file changes, so a look costs little while little happens.
 pub struct Reader {
@@ -481,6 +623,7 @@ impl Reader {
         }
 
         let mut shown = Vec::new();
+        let mut inbox = Vec::new();
         for project in &projects {
             let mut active = Vec::new();
             let mut finished = Vec::new();
@@ -506,22 +649,30 @@ impl Reader {
                 .filter_map(|unit| self.unit(unit, Value::Null, &mut gathered))
                 .collect();
             let executive = self.executive(project, now, &mut gathered);
-            shown.push(json!({
+            let mut shown_project = json!({
                 "id": project,
                 "workflow": self.workflow(&format!("project-{project}")),
                 "executive": executive,
                 "goals": active,
                 "finished": finished,
                 "loose": loose,
-            }));
+            });
+            let proposals = self.proposals(project);
+            let waiting = inbox::of_project(&shown_project, &proposals);
+            shown_project["pulse"] = pulse(&shown_project, &gathered.runs, waiting.len());
+            inbox.extend(waiting);
+            shown.push(shown_project);
         }
+        inbox.sort_by_key(|item| std::cmp::Reverse(item["at"].as_u64().unwrap_or(0)));
 
         let accounts = self.accounts(now, &mut gathered);
         json!({
+            "inbox": inbox,
             "release": fs::read_link(state.join("current"))
                 .ok()
                 .and_then(|to| to.file_name().map(|name| name.to_string_lossy().into_owned())),
             "links": {
+                "slack": self.links.slack.as_ref().map(|url| url.trim_end_matches('/').to_string()),
                 "accounts": self.workflow("accounts"),
                 "intake": self.workflow("intake"),
             },
@@ -529,6 +680,38 @@ impl Reader {
             "runs": gathered.runs,
             "projects": shown,
         })
+    }
+
+    /// The goals a project's reviews proposed that the owner has not
+    /// answered.
+    fn proposals(&mut self, project: &str) -> Vec<Value> {
+        let schedules = self.state.join("projects").join(project).join("schedules");
+        let mut waiting = Vec::new();
+        for schedule in dirs(&schedules) {
+            let Some(record) = self.record(&schedules.join(&schedule).join("scheduled.json"))
+            else {
+                continue;
+            };
+            for proposal in record["proposals"].as_array().into_iter().flatten() {
+                if proposal["state"] != "waiting" {
+                    continue;
+                }
+                waiting.push(json!({
+                    "id": proposal["id"],
+                    "schedule": schedule,
+                    "project": proposal["project"],
+                    "title": cut(&proposal["title"], 300),
+                    "objective": cut(&proposal["objective"], 6000),
+                    "stop_when": cut(&proposal["stop_when"], 3000),
+                    "figures": cut(&proposal["figures"], 3000),
+                    "opens": proposal["opens"],
+                    "at": proposal["at"],
+                    "channel": proposal["channel"],
+                    "ts": proposal["ts"],
+                }));
+            }
+        }
+        waiting
     }
 
     /// A tier's runs in a directory, and the one still going, if any. A
@@ -602,7 +785,34 @@ impl Reader {
             gathered,
         );
         let threads = record["threads"].as_object();
+        // The newest of its conversations with the owner, to open.
+        let mut conversations: Vec<Value> = threads
+            .into_iter()
+            .flatten()
+            .map(|(ts, thread)| {
+                let said = thread["said"]
+                    .as_array()
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                let first = said
+                    .iter()
+                    .find(|pair| pair[0] == "owner")
+                    .map_or(&Value::Null, |pair| &pair[1]);
+                json!({
+                    "ts": ts,
+                    "at": ts.split('.').next().and_then(|secs| secs.parse::<u64>().ok()),
+                    "channel": thread["channel"],
+                    "goal": thread["goal"],
+                    "first": cut(first, 200),
+                    "last": said.last().map_or(Value::Null, |pair| pair[0].clone()),
+                    "lines": said.len(),
+                })
+            })
+            .collect();
+        conversations.sort_by_key(|one| std::cmp::Reverse(one["at"].as_u64().unwrap_or(0)));
+        conversations.truncate(12);
         json!({
+            "conversations": conversations,
             "wakes": record["wakes"],
             "cost": record["usage"]["cost_usd"].as_f64().unwrap_or(0.0),
             "threads": threads.map_or(0, Map::len),
@@ -741,9 +951,43 @@ impl Reader {
             json!({"project": goal["project"], "goal": id, "what": "the goal"}),
             gathered,
         );
+        let digest = self.digest(&dir.join("events.jsonl"));
+        let charter = &goal["charter"];
+        let request = &goal["request"];
         json!({
             "id": id,
             "phase": goal["phase"],
+            "definition": goal["definition"],
+            "thread": thread_of(&goal["channel"], &goal["thread_ts"]),
+            "charter": if charter.is_object() {
+                json!({
+                    "objective": cut(&charter["objective"], 4000),
+                    "stop_when": cut(&charter["stop_when"], 4000),
+                    "plan": cut(&charter["plan"], 6000),
+                    "paths": charter["paths"],
+                    "edits": edits(&goal["charter_edits"]),
+                })
+            } else {
+                Value::Null
+            },
+            "request": if request.is_object() {
+                json!({
+                    "files": request["files"].as_array().into_iter().flatten().map(|file| json!({
+                        "title": cut(&file["title"], 300),
+                        "type": file["type"],
+                        "priority": file["priority"],
+                        "description": cut(&file["description"], 1200),
+                    })).collect::<Vec<_>>(),
+                    "edits": edits(&request["edits"]),
+                })
+            } else {
+                Value::Null
+            },
+            "evidence": cut(&goal["evidence"], 4000),
+            "default_red": goal["default_red"].is_object() || goal["default_red"].is_string(),
+            "need": digest.need.as_ref().map(|need| json!({"text": cut(&json!(need.text), 4000), "at": need.at})),
+            "said": digest.said.as_ref().map(|said| json!({"text": cut(&json!(said.text), 4000), "at": said.at})),
+            "owner_at": digest.owner_at,
             "objective": cut(&goal["charter"]["objective"], 600),
             "stop_when": cut(&goal["charter"]["stop_when"], 900),
             "wakes": goal["wakes"],
@@ -763,7 +1007,9 @@ impl Reader {
     fn unit(&mut self, id: &str, workflow: Value, gathered: &mut Gathered) -> Option<Value> {
         let dir = self.state.join("units").join(id);
         let unit = self.record(&dir.join("unit.json"))?;
-        let status = unit["status"].as_str().unwrap_or("");
+        // A parked unit's status is the reason it parked, under `parked`.
+        let parked = unit["status"]["parked"].as_str();
+        let status = parked.map_or(unit["status"].as_str().unwrap_or(""), |_| "parked");
         let position = &unit["position"];
         let steps: Vec<Value> = self
             .record(&dir.join("flow.toml"))
@@ -777,7 +1023,9 @@ impl Reader {
                                 "id": name,
                                 "kind": step["kind"],
                                 "role": step["role"],
+                                "model": step["model"],
                                 "rounds": position["rounds"][name].as_u64().unwrap_or(0),
+                                "routes": routes(&step["on"]),
                             })
                         })
                         .collect()
@@ -831,11 +1079,20 @@ impl Reader {
             .flat_map(Map::values)
             .map(|step| step["usage"]["cost_usd"].as_f64().unwrap_or(0.0))
             .sum();
+        let asked = match (&digest.asked, going) {
+            (Some(asked), true) => {
+                json!({"step": asked.step, "question": cut(&json!(asked.text), 2000), "at": asked.at})
+            }
+            _ => Value::Null,
+        };
         Some(json!({
             "unit": id,
             "bead": unit["bead"],
             "title": unit["title"],
             "status": status,
+            "parked": parked.map_or(Value::Null, |reason| cut(&json!(reason), 1200)),
+            "asked": asked,
+            "thread": thread_of(&unit["thread"]["channel"], &unit["thread"]["root_ts"]),
             "flow": unit["flow"],
             "step": position["step"],
             "steps": steps,

@@ -4,49 +4,12 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
-<title>Factory Floor</title>
+<title>Factory</title>
 <link rel="icon" href="data:,">
-<link rel="stylesheet" href="/app.css">
-<script src="/app.js" defer></script>
+  <script type="module" crossorigin src="/app.js"></script>
+  <link rel="stylesheet" crossorigin href="/app.css">
 </head>
 <body>
-<header class="top">
-  <div class="wrap top-row">
-    <h1>Factory floor</h1>
-    <p id="pulse" class="pulse" role="status">Connecting…</p>
-  </div>
-</header>
-
-<main class="wrap">
-  <section aria-labelledby="h-now">
-    <h2 id="h-now">Running now</h2>
-    <div id="now" class="now"><p class="quiet">Reading the factory's records…</p></div>
-  </section>
-
-  <section aria-labelledby="h-accounts">
-    <h2 id="h-accounts">Accounts</h2>
-    <div id="accounts" class="accounts"></div>
-  </section>
-
-  <div id="projects"></div>
-</main>
-
-<aside id="drawer" class="drawer" hidden aria-labelledby="drawer-title">
-  <header class="drawer-top">
-    <div class="drawer-name">
-      <h2 id="drawer-title">Run</h2>
-      <p id="drawer-sub" class="quiet"></p>
-    </div>
-    <button id="drawer-close" class="btn" type="button" aria-label="Close the run">Close</button>
-  </header>
-  <div class="drawer-bar">
-    <label for="drawer-run">Run</label>
-    <select id="drawer-run"></select>
-    <span id="drawer-state" class="quiet" role="status"></span>
-  </div>
-  <ol id="feed" class="feed" aria-live="off"></ol>
-</aside>
-
-<div id="tip" class="tip" hidden></div>
+<div id="app"></div>
 </body>
 </html>

@@ -1049,6 +1049,58 @@ fn slack_of(
     Ok((slack, owners, need("SLACK_APP_TOKEN")?, api))
 }
 
+/// The owner the factory hears, for an act of theirs that reaches it some
+/// way other than Slack: the first of the owners its Slack settings name,
+/// since it is their acts that the tiers obey.
+pub fn owner_id(config: &ConfigDir) -> Result<String, DriverError> {
+    let factory = config.factory()?;
+    let settings = factory.slack.as_ref().ok_or_else(|| {
+        DriverError::Preflight(
+            "factory.toml has no [slack] table, so it names no owner".to_string(),
+        )
+    })?;
+    let (_, owners, _, _) = slack_of(settings)?;
+    owners.into_iter().next().ok_or_else(|| {
+        DriverError::Preflight(format!(
+            "{} names no owner in SLACK_OWNER_USER_ID",
+            settings.env_file.display()
+        ))
+    })
+}
+
+/// Put what the owner wrote somewhere other than Slack into the Slack
+/// thread it answers, so that the thread there still reads as the whole
+/// conversation. The factory does not hear its own bot's messages.
+pub fn echo_owner(
+    config: &ConfigDir,
+    channel: &str,
+    thread_ts: &str,
+    text: &str,
+    from: &str,
+) -> Result<(), DriverError> {
+    let factory = config.factory()?;
+    let Some(settings) = factory.slack.as_ref() else {
+        return Ok(());
+    };
+    if channel.is_empty() {
+        return Ok(());
+    }
+    let (slack, _, _, _) = slack_of(settings)?;
+    slack
+        .post(
+            channel,
+            Some(thread_ts),
+            &format!(
+                "_The owner, from {from}:_\n{}",
+                quote(&truncate(text, 3500))
+            ),
+        )
+        .map(|_| ())
+        .map_err(|err| {
+            DriverError::Preflight(format!("the reply could not be put in Slack: {err}"))
+        })
+}
+
 /// A pipeline a goal's record says is running.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunningPipeline {
