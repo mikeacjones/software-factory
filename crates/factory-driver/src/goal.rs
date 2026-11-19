@@ -717,6 +717,13 @@ pub struct Goal {
     pub id: String,
     pub project: String,
     pub definition: String,
+    /// The hash of the definition's text when the goal opened: every wake
+    /// reads that copy from the store, so a definition put in force or
+    /// released since does not change a goal already open. `None` on a
+    /// record written before goals were pinned, or with no store, and such
+    /// a goal reads the definition in force.
+    #[serde(default)]
+    pub definition_hash: Option<String>,
     pub phase: Phase,
     pub channel: String,
     /// The owner's message that opened the goal: the root of its thread.
@@ -5106,7 +5113,16 @@ impl Supervisor {
             .join(" ")
     }
 
+    /// The definition a goal runs under: the copy it was pinned to when it
+    /// opened, or for a goal with no pin the one in force.
     fn definition(&self, goal: &Goal) -> Result<GoalDefinition, DriverError> {
+        if let Some(hash) = &goal.definition_hash {
+            return Ok(self.config.stored_goal_definition(
+                &goal.project,
+                &goal.definition,
+                hash,
+            )?);
+        }
         self.config
             .goal_definitions(&goal.project)?
             .into_iter()
@@ -5272,10 +5288,12 @@ impl Supervisor {
             copy += 1;
             name = format!("{project}-g{}-{copy}", now_unix());
         }
+        let definition_hash = self.config.pin_goal_definition(project, definition)?;
         let goal = Goal {
             id: name,
             project: project.to_string(),
             definition: definition.to_string(),
+            definition_hash,
             phase: Phase::Intake,
             channel: channel.to_string(),
             thread_ts: ts.to_string(),
@@ -5306,7 +5324,7 @@ impl Supervisor {
         self.log(
             &goal,
             "goal.opened",
-            json!({ "text": text, "definition": goal.definition, "by_executive": goal.handoff.is_some() }),
+            json!({ "text": text, "definition": goal.definition, "definition_hash": goal.definition_hash, "by_executive": goal.handoff.is_some() }),
         );
         Ok(id)
     }
