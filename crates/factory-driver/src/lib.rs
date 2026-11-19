@@ -83,6 +83,11 @@ pub enum DriverError {
     },
     #[error("bead `{bead}` may not be launched:\n  - {}", reasons.join("\n  - "))]
     NotLaunchable { bead: String, reasons: Vec<String> },
+    #[error("the goal definition was not put in force for `{project}`:\n  - {}", problems.join("\n  - "))]
+    DefinitionRefused {
+        project: String,
+        problems: Vec<String>,
+    },
     #[error(transparent)]
     Account(#[from] factory_claude::accounts::AccountError),
     #[error("{0}")]

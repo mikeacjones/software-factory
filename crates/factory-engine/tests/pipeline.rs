@@ -209,6 +209,67 @@ fn unit_record(world: &World, unit: &str) -> serde_json::Value {
     serde_json::from_str(&text).unwrap()
 }
 
+/// What deploy asks of a release's engine, `factory-engine check`, is
+/// asked over the stored goal definitions as well as the release's: one
+/// stored for a pipeline the release no longer has makes it fail, and so
+/// the release is refused. It needs no server.
+#[test]
+fn the_engines_check_fails_on_a_stored_definition_the_release_cannot_run() {
+    let world = World::new("engine-check-stored", "true");
+    let factory = world.path("config/factory.toml");
+    let text = std::fs::read_to_string(&factory).unwrap();
+    std::fs::write(
+        &factory,
+        format!(
+            "{text}\n[temporal]\naddress = \"http://127.0.0.1:1\"\nnamespace = \"default\"\ntask_queue = \"factory-engine-check-stored\"\n"
+        ),
+    )
+    .unwrap();
+    std::fs::create_dir_all(world.path("config/goals/toy")).unwrap();
+    std::fs::write(
+        world.path("config/goals/toy/main.toml"),
+        "id = \"main\"\n[director]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\n",
+    )
+    .unwrap();
+    let flow = std::fs::read_to_string(world.path("config/flows/build-break-review.toml"))
+        .unwrap()
+        .replace("id = \"build-break-review\"", "id = \"careful\"");
+    std::fs::write(world.path("config/flows/careful.toml"), flow).unwrap();
+    factory_driver::goal::enable_definition(
+        &world.config(),
+        "toy",
+        "id = \"main\"\nflow = \"careful\"\n[director]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\n",
+    )
+    .unwrap();
+    let check = || {
+        Command::new(env!("CARGO_BIN_EXE_factory-engine"))
+            .args(["check", "--config"])
+            .arg(world.path("config"))
+            .output()
+            .unwrap()
+    };
+    let passed = check();
+    let said = String::from_utf8_lossy(&passed.stdout).into_owned();
+    assert!(passed.status.success(), "{passed:?}");
+    assert!(
+        said.contains("toy/main: director") && said.contains("pipeline `careful`"),
+        "{said}"
+    );
+
+    std::fs::remove_file(world.path("config/flows/careful.toml")).unwrap();
+    let failed = check();
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&failed.stdout),
+        String::from_utf8_lossy(&failed.stderr)
+    );
+    assert!(!failed.status.success(), "{said}");
+    assert!(
+        said.contains("goal definition `main` of `toy`: its pipeline cannot be used"),
+        "{said}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_bead_that_may_not_be_launched_ends_its_pipeline_at_once_and_says_why() {
     let Some(shop) = Shop::open("engine-refused", "true", "").await else {
