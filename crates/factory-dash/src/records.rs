@@ -780,7 +780,13 @@ impl Reader {
                 "loose": loose,
             });
             let proposals = self.proposals(project);
-            let waiting = inbox::of_project(&shown_project, &proposals);
+            // The definitions its executive proposed are on its record.
+            let record = self.record(&state.join("projects").join(project).join("executive.json"));
+            let waiting = inbox::of_project(
+                &shown_project,
+                &proposals,
+                record.as_deref().unwrap_or(&Value::Null),
+            );
             shown_project["pulse"] = pulse(&shown_project, &gathered.runs, waiting.len());
             inbox.extend(waiting);
             shown.push(shown_project);

@@ -3,7 +3,8 @@
 //! Every item is something the factory has stopped to ask the owner, read
 //! from the same records the rest of the page is: a charter to start, a
 //! completion to accept, bead changes to approve, a question a director or
-//! a step put, a goal a review proposed. Each says which of the owner's
+//! a step put, a goal a review proposed, a goal definition the executive
+//! proposed. Each says which of the owner's
 //! acts would answer it: the buttons the factory posted with it, and
 //! whether a reply in its thread is read. Those acts are the ones Slack
 //! carries, so answering here or there is the same to the factory.
@@ -41,10 +42,85 @@ fn headline(value: &Value, most: usize) -> String {
     }
 }
 
-/// Everything waiting on the owner in one project, newest first.
-pub fn of_project(project: &Value, proposals: &[Value]) -> Vec<Value> {
-    let id = text(&project["id"]);
+/// The seconds of a Slack time stamp, which is what a thread is named by.
+fn secs_of(ts: &Value) -> Option<u64> {
+    text(ts).split('.').next()?.parse().ok()
+}
+
+/// What a proposal's message shows in its code block: the definition's
+/// text, or its diff against the one in force, as Slack was given it. The
+/// reason above it is quoted, so the first fence at a line's start opens
+/// the block, and nothing after the block has one.
+fn shown(message: &str) -> Option<String> {
+    let (_, rest) = message.split_once("\n```\n")?;
+    let (inside, _) = rest.rsplit_once("```")?;
+    Some(
+        inside
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&amp;", "&"),
+    )
+}
+
+/// The goal definitions a project's executive proposed that the owner
+/// has neither approved nor rejected, one item each, read from the
+/// executive's record (`executive.json`). One that was approved, rejected
+/// or superseded is settled, and gone from here.
+fn of_executive(project: &str, executive: &Value) -> Vec<Value> {
     let mut items = Vec::new();
+    for (root, thread) in executive["threads"].as_object().into_iter().flatten() {
+        let proposals = thread["proposals"].as_array().map(Vec::as_slice);
+        for (at, proposal) in proposals.unwrap_or_default().iter().enumerate() {
+            if proposal["state"] != "waiting" {
+                continue;
+            }
+            // The buttons name the thread and the proposal's place in it,
+            // from 1, as the ones posted in Slack do.
+            let value = format!("{root}/{}", at + 1);
+            let definition = text(&proposal["id"]);
+            let change = proposal["change"] == true;
+            let body = shown(text(&proposal["message"]))
+                .unwrap_or_else(|| text(&proposal["text"]).to_string());
+            let fence = if body.ends_with('\n') { "" } else { "\n" };
+            let thread_at = json!(root);
+            items.push(json!({
+                "key": format!("definition:{value}"),
+                "kind": "definition",
+                "project": project,
+                "goal": thread["goal"],
+                "title": if change {
+                    format!("Change goal definition `{definition}`")
+                } else {
+                    format!("New goal definition `{definition}`")
+                },
+                "summary": "The executive proposes a goal definition, as none in force suits the work. Approve puts it in force and opens the goal under it in this thread; it is checked again first. Reject stores nothing, and the executive is told.",
+                "at": secs_of(&proposal["ts"]).or_else(|| secs_of(&thread_at)),
+                "sections": [
+                    {"label": "Why", "text": proposal["reason"]},
+                    {
+                        "label": if change { "The change, against the definition in force" } else { "The definition" },
+                        "text": format!("```\n{body}{fence}```"),
+                    },
+                ],
+                "actions": [
+                    press("Approve: put it in force and open the goal", "primary", "definition_approve", &value),
+                    press("Reject", "plain", "definition_reject", &value),
+                ],
+                // A reply goes to the executive, and after a Reject it is
+                // kept as why.
+                "reply": {"channel": thread["channel"], "ts": root, "hint": "Goes to the executive in this thread. After rejecting, your next reply is kept as why."},
+                "slack": {"channel": thread["channel"], "ts": root},
+            }));
+        }
+    }
+    items
+}
+
+/// Everything waiting on the owner in one project, newest first.
+/// `executive` is the project's executive's record, or null.
+pub fn of_project(project: &Value, proposals: &[Value], executive: &Value) -> Vec<Value> {
+    let id = text(&project["id"]);
+    let mut items = of_executive(id, executive);
     for goal in project["goals"].as_array().into_iter().flatten() {
         items.extend(of_goal(id, goal));
     }
@@ -276,9 +352,82 @@ mod tests {
             "goals": [{"id": "g1", "phase": "running", "objective": "Audit it", "subgoals": [],
                 "beads": [{"unit": "u1", "bead": "toy-1", "title": "A spike", "asked": {"step": "build", "question": "Which API?", "at": 80}, "status": "running", "thread": {"channel": "C1", "ts": "9.9"}}]}],
         });
-        let items = of_project(&project, &[]);
+        let items = of_project(&project, &[], &Value::Null);
         assert_eq!(items.len(), 1, "{items:?}");
         assert_eq!(items[0]["goal"], "g1");
+    }
+
+    #[test]
+    fn a_definition_the_executive_proposed_waits_with_its_diff_and_both_buttons_until_settled() {
+        let project = json!({"id": "toy", "goals": [], "loose": []});
+        let diff = "--- main.toml (in force)\n+++ main.toml (proposed)\n@@ -1,2 +1,3 @@\n id = \"main\"\n+flow = \"light\"\n+note = \"a &lt; b &amp;&amp; c\"\n default = true\n";
+        let message = format!(
+            ":scroll: *Proposed goal definition* `main` for `toy`: a change to `main`, the definition in force with that ID\n> ```\n> `main` is one at a time\n```\n{diff}```\nApprove puts it in force and opens the goal under it in this thread. It is checked again first."
+        );
+        let mut executive = json!({
+            "project": "toy",
+            "threads": {
+                "500.0": {"channel": "C1", "goal": null, "said": [], "proposals": [
+                    {"id": "wide", "text": "id = \"wide\"\n", "state": "superseded", "superseded_by": 2, "message": "old", "ts": "501.0"},
+                    {"id": "main", "text": "id = \"main\"\nflow = \"light\"\n", "reason": "`main` is one at a time", "change": true,
+                     "state": "waiting", "message": message, "ts": "502.5"},
+                ]},
+                "600.0": {"channel": "C1", "goal": null, "said": [], "proposals": [
+                    {"id": "narrow", "text": "id = \"narrow\"\n", "state": "rejected", "by": "OWNER", "message": "x", "ts": "601.0"},
+                ]},
+            },
+        });
+        let items = of_project(&project, &[], &executive);
+        assert_eq!(items.len(), 1, "{items:?}");
+        let item = &items[0];
+        assert_eq!(item["kind"], "definition");
+        assert_eq!(item["key"], "definition:500.0/2");
+        assert_eq!(item["title"], "Change goal definition `main`");
+        assert_eq!(item["at"], 502);
+        assert_eq!(item["sections"][0]["text"], "`main` is one at a time");
+        // The diff as the owner reads it in Slack, in a code block.
+        assert_eq!(
+            item["sections"][1]["text"],
+            format!(
+                "```\n{}```",
+                diff.replace("&lt;", "<").replace("&amp;", "&")
+            )
+        );
+        // The buttons Slack carries, naming the thread and the proposal.
+        let actions: Vec<(&str, &str)> = item["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| {
+                (
+                    a["action_id"].as_str().unwrap(),
+                    a["value"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            actions,
+            [
+                ("definition_approve", "500.0/2"),
+                ("definition_reject", "500.0/2")
+            ]
+        );
+        assert_eq!(item["reply"]["ts"], "500.0");
+        assert_eq!(item["reply"]["channel"], "C1");
+
+        // A new definition is shown whole, under its own title.
+        executive["threads"]["600.0"]["proposals"][0]["state"] = json!("waiting");
+        let items = of_project(&project, &[], &executive);
+        assert_eq!(items.len(), 2, "{items:?}");
+        assert_eq!(items[0]["title"], "New goal definition `narrow`");
+        assert_eq!(items[0]["sections"][1]["text"], "```\nid = \"narrow\"\n```");
+
+        // Once settled, by either button, it is gone.
+        for settled in ["approved", "rejected"] {
+            executive["threads"]["500.0"]["proposals"][1]["state"] = json!(settled);
+            executive["threads"]["600.0"]["proposals"][0]["state"] = json!(settled);
+            assert!(of_project(&project, &[], &executive).is_empty());
+        }
     }
 
     #[test]
@@ -302,7 +451,7 @@ mod tests {
         let proposals = vec![
             json!({"id": "r-1-1", "project": "toy", "title": "Do a thing", "at": 100, "opens": "bead", "channel": "C9", "ts": "5.5"}),
         ];
-        let items = of_project(&project, &proposals);
+        let items = of_project(&project, &proposals, &Value::Null);
         let kinds: Vec<&str> = items
             .iter()
             .map(|item| item["kind"].as_str().unwrap())

@@ -1084,6 +1084,21 @@ pub fn owner_id(config: &ConfigDir) -> Result<String, DriverError> {
     })
 }
 
+/// A button the owner pressed somewhere other than Slack, such as on the
+/// dashboard, as the event Slack carries for the same press. It goes to
+/// the same handler: what a press does is read from the action and the
+/// value alone (a goal, a review's proposal, or a proposed definition's
+/// thread and place), never from where the message with the button was.
+pub fn owner_press(config: &ConfigDir, action_id: &str, value: &str) -> Result<Event, DriverError> {
+    Ok(Event::Slack(Incoming::Action {
+        channel: String::new(),
+        user: owner_id(config)?,
+        action_id: action_id.to_string(),
+        value: value.to_string(),
+        message_ts: String::new(),
+    }))
+}
+
 /// Put what the owner wrote somewhere other than Slack into the Slack
 /// thread it answers, so that the thread there still reads as the whole
 /// conversation. The factory does not hear its own bot's messages.

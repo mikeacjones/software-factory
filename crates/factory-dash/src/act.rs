@@ -14,7 +14,7 @@ use serde_json::Value;
 
 /// The buttons the factory posts to the owner, and so the only ones the
 /// page may press.
-pub const BUTTONS: [&str; 7] = [
+pub const BUTTONS: [&str; 9] = [
     "goal_start",
     "goal_accept",
     "goal_stop",
@@ -22,6 +22,8 @@ pub const BUTTONS: [&str; 7] = [
     "request_reject",
     "proposal_approve",
     "proposal_decline",
+    "definition_approve",
+    "definition_reject",
 ];
 
 /// The longest reply the page hands on.
@@ -92,6 +94,15 @@ fn stamp(ts: &str) -> bool {
     !ts.is_empty() && ts.len() <= 40 && ts.chars().all(|c| c.is_ascii_digit() || c == '.')
 }
 
+/// What a button names: one of the factory's names, or a definition the
+/// executive proposed, as its thread and its place there (`<ts>/<n>`).
+fn named(value: &str) -> bool {
+    plain(value)
+        || value.split_once('/').is_some_and(|(thread, n)| {
+            stamp(thread) && !n.is_empty() && n.len() <= 6 && n.chars().all(|c| c.is_ascii_digit())
+        })
+}
+
 impl Act {
     /// Read an act from what the page sent, or say why it is not one.
     pub fn read(body: &Value) -> Result<Act, Refusal> {
@@ -111,7 +122,7 @@ impl Act {
                         "`{action_id}` is not a button the factory posts"
                     )));
                 }
-                if !plain(&value) {
+                if !named(&value) {
                     return Err(Refusal::Malformed(
                         "the button names nothing the factory knows".into(),
                     ));
@@ -271,6 +282,18 @@ mod tests {
                 .map(String::from)
                 .to_vec())
         );
+        // A proposed definition is named by its thread and its place there.
+        for action in ["definition_approve", "definition_reject"] {
+            let press = Act::read(
+                &json!({"project": "toy", "act": "press", "action_id": action, "value": "1700000000.123456/2"}),
+            );
+            assert_eq!(
+                press.map(|act| act.args()),
+                Ok(["owner", "toy", "press", action, "1700000000.123456/2"]
+                    .map(String::from)
+                    .to_vec())
+            );
+        }
         let say = Act::read(
             &json!({"project": "toy", "act": "say", "channel": "", "thread": "17.5", "text": "  --config /tmp/x  "}),
         );
@@ -291,6 +314,12 @@ mod tests {
         );
         for refused in [
             json!({"project": "toy", "act": "press", "action_id": "rm_rf", "value": "g"}),
+            json!({"project": "toy", "act": "press", "action_id": "definition_delete", "value": "500.0/1"}),
+            json!({"project": "toy", "act": "press", "action_id": "definition_approve", "value": "500.0/"}),
+            json!({"project": "toy", "act": "press", "action_id": "definition_approve", "value": "/1"}),
+            json!({"project": "toy", "act": "press", "action_id": "definition_reject", "value": "500.0/1/2"}),
+            json!({"project": "toy", "act": "press", "action_id": "definition_reject", "value": "../x/1"}),
+            json!({"project": "toy", "act": "press", "action_id": "definition_reject", "value": "-5/1"}),
             json!({"project": "toy", "act": "press", "action_id": "goal_start", "value": "--config"}),
             json!({"project": "../x", "act": "press", "action_id": "goal_start", "value": "g"}),
             json!({"project": "toy", "act": "say", "channel": "C 1", "thread": "1.1", "text": "hi"}),
