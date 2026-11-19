@@ -171,7 +171,7 @@ pub struct PumpCall {
 const NEVER_STARTED_SECS: u64 = 120;
 
 /// What the watcher says of a pipeline the server does not know.
-const NEVER_STARTED: &str = "The engine has no pipeline for it: it was never started.";
+pub const NEVER_STARTED: &str = "The engine has no pipeline for it: it was never started.";
 
 /// The pipeline an event says was never started, when that is what the
 /// event says.
