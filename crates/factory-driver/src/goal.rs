@@ -4355,6 +4355,112 @@ pub fn enable_definition(
     Ok(config.store_goal_definition(project, text)?)
 }
 
+/// Where the factory's own repository keeps a project's goal definition
+/// `id`: the release's file for it, as the owner commits it.
+pub fn release_definition_path(project: &str, id: &str) -> String {
+    format!("config/goals/{project}/{id}.toml")
+}
+
+/// The bead [`file_catch_up_bead`] filed.
+#[derive(Clone, Debug)]
+pub struct CatchUp {
+    /// The factory's own project, whose tracker it is in.
+    pub project: String,
+    pub bead: factory_beads::Bead,
+    /// The path is one no step of that project may change, so the bead is
+    /// the owner's to do and was filed deferred, where no pipeline takes
+    /// it up.
+    pub owners: bool,
+}
+
+/// File a bead to commit a goal definition put in force with
+/// [`enable_definition`] to the release, so that the release catches up
+/// and the stored copy is dropped as matching. Goal definitions are the
+/// factory's config, so the bead goes to the factory's own project, the
+/// one with a `[self_deploy]` table, whatever project the definition is
+/// for. It carries the text and its hash. When that project's
+/// `forbidden_paths` cover the file, as they cover its own definitions,
+/// no pipeline of it may commit the file: the bead says the owner does,
+/// and is filed deferred. When the release's file already has the text,
+/// there is nothing to commit, and no bead is filed: `None`.
+pub fn file_catch_up_bead(
+    config: &ConfigDir,
+    project: &str,
+    stored: &factory_config::StoredGoalDefinition,
+    text: &str,
+) -> Result<Option<CatchUp>, DriverError> {
+    let path = release_definition_path(project, &stored.id);
+    let released = std::fs::read_to_string(
+        config
+            .0
+            .join("goals")
+            .join(project)
+            .join(format!("{}.toml", stored.id)),
+    )
+    .ok();
+    if released.as_deref() == Some(text) {
+        return Ok(None);
+    }
+    let mut own = None;
+    for id in config.projects()? {
+        let record = config.project(&id)?;
+        if record.self_deploy.is_some() {
+            own = Some(record);
+            break;
+        }
+    }
+    let own = own.ok_or_else(|| {
+        DriverError::Preflight(format!(
+            "no project is the factory's own (none has a [self_deploy] table), so no bead was filed: commit the text of {} to {path} by hand",
+            stored.path.display()
+        ))
+    })?;
+    let owners = !factory_checks::scope_violations(
+        std::slice::from_ref(&path),
+        &["**".to_string()],
+        &own.forbidden_paths,
+    )?
+    .is_empty();
+    let release = if released.is_some() {
+        "The release's file for it says otherwise, and the stored copy is in force over it until the release carries this text."
+    } else {
+        "The release has no file for it yet."
+    };
+    let who = if owners {
+        "\n\nNo step of this project may change that path (it is in `forbidden_paths`), so the owner commits it by hand. The bead is deferred so that no pipeline takes it up."
+    } else {
+        ""
+    };
+    let new = NewBead {
+        title: format!(
+            "Commit goal definition `{}` of `{project}` to {path}",
+            stored.id
+        ),
+        issue_type: "task".to_string(),
+        priority: 2,
+        description: format!(
+            "The owner put goal definition `{id}` of project `{project}` in force with `factory goal enable`. Its text is stored at {stored_at} under its SHA-256, {hash}. {release}\n\nCommit the text below, exactly, as `{path}`, or copy the stored file: the file must have that SHA-256. Once a release carries it, the stored copy matches the release's file and is dropped as the definitions are read, and the release's file is in force again.{who}\n\n```toml\n{text}{newline}```",
+            id = stored.id,
+            stored_at = stored.path.display(),
+            hash = stored.hash,
+            newline = if text.ends_with('\n') { "" } else { "\n" },
+        ),
+        acceptance_criteria: format!(
+            "`{path}` on the default branch has exactly the text in the description (SHA-256 {}), and `factory goal check` passes with it.",
+            stored.hash
+        ),
+        parent: None,
+        discovered_from: None,
+        deferred: owners,
+    };
+    let bead = bead_source(&own).create(&new, &own.bead_actor)?;
+    Ok(Some(CatchUp {
+        project: own.id.as_str().to_string(),
+        bead,
+        owners,
+    }))
+}
+
 /// The problems of a project's set of goal definitions with a candidate
 /// in force, or why the candidate cannot be read at all.
 fn candidate_problems(

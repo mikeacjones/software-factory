@@ -5,7 +5,9 @@ use std::process::ExitCode;
 
 use factory_beads::readiness;
 use factory_config::ConfigDir;
-use factory_driver::goal::{Supervisor, check_definitions};
+use factory_driver::goal::{
+    Supervisor, check_definitions, enable_definition, file_catch_up_bead, release_definition_path,
+};
 use factory_driver::{
     AccountPick, Driver, ISSUE_SWEEP_MIN_AGE_SECS, Options, Status, bead_source, load_flow,
     pick_account, sweep_issues, usage_report,
@@ -46,7 +48,15 @@ usage:
                                               account now belongs to, after a deliberate change
   factory slack check                         connect the Slack socket once and say whether it worked
   factory goal check                          check every project's goal definitions
-  factory goal list                           the goals the factory knows and where each stands
+  factory goal list                           every project's goal definitions in force, and
+                                              the goals the factory knows and where each stands
+  factory goal enable <project> <file>        put the goal definition in <file> in force for
+                                              the project without a release: check it with the
+                                              project's definitions, store it, have the running
+                                              worker take it up, and file a bead in the
+                                              factory's own project to commit it to
+                                              config/goals/<project>/. A definition with a
+                                              problem is not stored, and each is printed
   factory bead <project> <bead>               show a bead and whether it may be launched
   factory report [--since 24h] [--project <id>] [--json]
                                               how the factory ran in a period, from its own
@@ -243,6 +253,87 @@ fn serve_on_engine(
         .arg(&config.0)
         .exec();
     Err(format!("{} could not be started: {err}", engine.display()))
+}
+
+/// `factory goal enable`: put a goal definition in force for a project
+/// without a release, have the running worker take it up, and file the
+/// bead that brings the release up to it.
+fn goal_enable(config: &ConfigDir, project: &str, file: &str) -> Result<u8, String> {
+    let text = std::fs::read_to_string(file).map_err(|err| format!("{file}: {err}"))?;
+    let stored = enable_definition(config, project, &text)
+        .map_err(|err| format!("{file}: {err}\nnothing was stored"))?;
+    let id = &stored.id;
+    println!(
+        "`{id}` is in force for `{project}`: stored as {}",
+        stored.path.display()
+    );
+    let mut failed = Vec::new();
+    match tell_engine(config, project, id) {
+        Ok(said) => print!("{said}"),
+        Err(err) => failed.push(format!("the running worker was not told: {err}")),
+    }
+    match file_catch_up_bead(config, project, &stored, &text) {
+        Ok(None) => println!(
+            "the release's {} already has this text: no bead was filed",
+            release_definition_path(project, id)
+        ),
+        Ok(Some(catch_up)) if catch_up.owners => println!(
+            "filed {} in `{}`, deferred: it is yours to commit as {}, since no step there may change that path",
+            catch_up.bead.id,
+            catch_up.project,
+            release_definition_path(project, id)
+        ),
+        Ok(Some(catch_up)) => println!(
+            "filed {} in `{}` to commit it as {}",
+            catch_up.bead.id,
+            catch_up.project,
+            release_definition_path(project, id)
+        ),
+        Err(err) => failed.push(format!("no bead was filed: {err}")),
+    }
+    if failed.is_empty() {
+        Ok(0)
+    } else {
+        Err(format!(
+            "`{id}` is in force for `{project}`, but {}",
+            failed.join("; and ")
+        ))
+    }
+}
+
+/// Have the running worker take up a goal definition put in force: the
+/// engine's `enabled` command, run as the service runs the engine. Returns
+/// what it said. Without an engine the service reads the definitions in
+/// force whenever it opens a goal, and nothing needs telling.
+fn tell_engine(config: &ConfigDir, project: &str, id: &str) -> Result<String, String> {
+    let factory = config.factory().map_err(|err| err.to_string())?;
+    let Some(temporal) = factory.temporal.as_ref() else {
+        return Ok(
+            "the factory has no engine ([temporal] is not set): the service reads the definitions in force each time it opens a goal\n"
+                .to_string(),
+        );
+    };
+    let engine = temporal
+        .engine_bin
+        .clone()
+        .unwrap_or_else(|| factory.state_dir.join("bin/factory-engine"));
+    let said = std::process::Command::new(&engine)
+        .args(["enabled", project, id, "--config"])
+        .arg(&config.0)
+        .output()
+        .map_err(|err| format!("{} could not be run: {err}", engine.display()))?;
+    if said.status.success() {
+        Ok(String::from_utf8_lossy(&said.stdout).into_owned())
+    } else {
+        let stderr = String::from_utf8_lossy(&said.stderr);
+        let stdout = String::from_utf8_lossy(&said.stdout);
+        Err(format!(
+            "`{} enabled {project} {id}` {}: {}",
+            engine.display(),
+            said.status,
+            format!("{stdout}{stderr}").trim()
+        ))
+    }
 }
 
 fn main() -> ExitCode {
@@ -648,7 +739,40 @@ fn run(args: &[String]) -> Result<u8, String> {
             }
             Ok(0)
         }
+        ["goal", "enable", project, file] => goal_enable(&args.config, project, file),
         ["goal", "list"] => {
+            for project in args.config.projects().map_err(|err| fail(&err))? {
+                let definitions = args
+                    .config
+                    .goal_definitions_in_force(&project)
+                    .map_err(|err| fail(&err))?;
+                for in_force in definitions {
+                    let definition = &in_force.definition;
+                    let mut kind = Vec::new();
+                    if definition.default {
+                        kind.push("default");
+                    }
+                    if definition.schedule.is_some() {
+                        kind.push("scheduled");
+                    }
+                    println!(
+                        "definition {project}/{}{}  {} {}\n    {}",
+                        definition.id,
+                        if kind.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" ({})", kind.join(", "))
+                        },
+                        if in_force.stored {
+                            "stored copy"
+                        } else {
+                            "release"
+                        },
+                        &in_force.hash[..12.min(in_force.hash.len())],
+                        in_force.path.display()
+                    );
+                }
+            }
             let supervisor =
                 Supervisor::new(args.config, None, Vec::new(), false).map_err(|err| fail(&err))?;
             for goal in supervisor.goals() {
