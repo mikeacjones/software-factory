@@ -9,6 +9,8 @@
 #     break-once     the tester breaks the change the first time
 #     test-fails     the test command fails until a fix was given a note
 #     hang-build     the first build reports its session and never ends
+#     slow-build     the build reports its session, notes state/building,
+#                    and takes 20 seconds
 #     limited        the first tester run stops at a usage limit for 3 seconds
 #     hold-<unit>    that unit's build waits until state/release-<unit> exists
 #     limits-<account>  an agent run under that account stops at a usage limit
@@ -59,6 +61,13 @@ case "$scenario" in
     if [ "$FACTORY_STEP" = build ] && [ -z "$FACTORY_SESSION" ]; then
       echo $$ > "$state/hung.pid"
       exec sleep 300
+    fi ;;
+esac
+case "$scenario" in
+  *slow-build*)
+    if [ "$FACTORY_STEP" = build ]; then
+      touch "$state/building"
+      sleep 20
     fi ;;
 esac
 case "$scenario" in

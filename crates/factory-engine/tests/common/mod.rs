@@ -114,6 +114,7 @@ impl Rig {
             ])
             .arg(self.dir.join("step.sh"))
             .env("FACTORY_BUILD", build)
+            .env("FACTORY_DRAIN", self.dir.join("state/drain"))
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -192,6 +193,19 @@ impl Rig {
     /// workflow started itself is looked at.
     pub async fn assert_steps_described(&self, workflow: &str) {
         self.described(workflow, false).await;
+    }
+
+    /// The events of a workflow's history, as the server gives them.
+    pub async fn events(&self, workflow: &str) -> Vec<serde_json::Value> {
+        let json = self
+            .client()
+            .get_workflow_handle::<UntypedWorkflow>(workflow.to_string())
+            .fetch_history(WorkflowFetchHistoryOptions::default())
+            .to_json()
+            .await
+            .unwrap();
+        let history: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        history["events"].as_array().unwrap().clone()
     }
 
     async fn described(&self, workflow: &str, from_its_start: bool) {

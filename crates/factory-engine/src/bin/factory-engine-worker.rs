@@ -2,6 +2,9 @@
 //!
 //!   factory-engine-worker <address> <namespace> <task-queue> <deployment>
 //!                         <build-id> <versioned|unversioned> <command>...
+//!
+//! With `FACTORY_DRAIN` set to a path, the worker stops at a safe point
+//! once a file is there, as the factory's worker does at its drain flag.
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -37,6 +40,7 @@ async fn main() -> ExitCode {
     };
     let runner = Arc::new(ExecRunner {
         argv: command.to_vec(),
+        drain: std::env::var_os("FACTORY_DRAIN").map(std::path::PathBuf::from),
     });
     match run(settings, runner).await {
         Ok(()) => ExitCode::SUCCESS,

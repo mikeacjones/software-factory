@@ -333,6 +333,136 @@ async fn a_step_whose_worker_dies_resumes_its_session_under_the_next_worker() {
     rig.stop().await;
 }
 
+/// A deploy asks the worker to stop at a safe point while an agent step
+/// is running, and the step goes on far longer than its heartbeat timeout.
+/// It goes on saying it is alive while the worker takes on nothing new, and
+/// ends on that worker as the first and only attempt: the worker that
+/// starts next goes on from the step after it, and runs nothing again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_long_agent_step_finishes_on_a_draining_worker_as_its_first_attempt() {
+    let Some(mut rig) = Rig::start("drain").await else {
+        return;
+    };
+    rig.scenario("slow-build");
+    let old = rig.worker("b1", "unversioned");
+    let old_pid = rig.workers[old].id();
+    let client = rig.client();
+    let handle = client
+        .start_workflow(
+            Pipeline::run,
+            rig.input("toy-1", BUILD_BREAK_REVIEW),
+            WorkflowStartOptions::new(rig.queue.clone(), "toy-1".to_string()).build(),
+        )
+        .await
+        .unwrap();
+    rig.wait_for("the build never started", || {
+        rig.dir.join("state/building").exists()
+    });
+    // The build has 20 seconds to go. Its heartbeat timeout is three beats
+    // of a second, so the server gives it up for lost after 3 seconds
+    // without a heartbeat.
+    let drained = Instant::now();
+    std::fs::write(rig.dir.join("state/drain"), "").unwrap();
+
+    // The worker leaves by itself, and only once the build has ended.
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let left = loop {
+        if let Some(status) = rig.workers[old].try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "the draining worker never left");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert!(left.success(), "the draining worker left as {left}");
+    // Six heartbeat timeouts and more went by while it drained.
+    assert!(
+        drained.elapsed() >= Duration::from_secs(18),
+        "the worker left after {:?}, before the build could have ended",
+        drained.elapsed()
+    );
+
+    // The worker of the next release takes the pipeline on from there.
+    std::fs::remove_file(rig.dir.join("state/drain")).unwrap();
+    rig.worker("b2", "unversioned");
+    let end = handle
+        .get_result(WorkflowGetResultOptions::default())
+        .await
+        .unwrap();
+    assert!(end.ended);
+    let calls = rig.calls();
+    let builds: Vec<&String> = calls
+        .iter()
+        .filter(|call| call.contains(" build "))
+        .collect();
+    assert_eq!(
+        builds,
+        ["toy-1 agent build round=1 session=- note=- build=b1"],
+        "the build ran once, on the old worker: {calls:?}"
+    );
+    assert!(
+        calls
+            .iter()
+            .filter(|call| !call.contains(" build "))
+            .all(|call| call.ends_with("build=b2")),
+        "every later step ran on the new worker: {calls:?}"
+    );
+
+    // On the server, the build is one attempt, started and completed on
+    // the worker that was draining, and nothing timed out.
+    let events = rig.events("toy-1").await;
+    let kind = |event: &serde_json::Value| {
+        event["attributes"]
+            .as_object()
+            .and_then(|attributes| attributes.keys().next().cloned())
+            .unwrap_or_default()
+    };
+    let attributes = |event: &serde_json::Value| {
+        event["attributes"]
+            .as_object()
+            .and_then(|attributes| attributes.values().next().cloned())
+            .unwrap_or_default()
+    };
+    let text = serde_json::to_string_pretty(&events).unwrap();
+    assert!(
+        !events.iter().any(|event| kind(event).contains("TimedOut")),
+        "something timed out: {text}"
+    );
+    // The build is the flow's first step, and the first agent step.
+    let scheduled = events
+        .iter()
+        .find(|event| {
+            kind(event).starts_with("ActivityTaskScheduled")
+                && attributes(event)["activity_type"]["name"]
+                    .as_str()
+                    .is_some_and(|name| name.contains("agent"))
+        })
+        .unwrap_or_else(|| panic!("the build was never scheduled: {text}"));
+    let id = scheduled["event_id"].clone();
+    let started: Vec<serde_json::Value> = events
+        .iter()
+        .filter(|event| {
+            kind(event).starts_with("ActivityTaskStarted")
+                && attributes(event)["scheduled_event_id"] == id
+        })
+        .map(attributes)
+        .collect();
+    assert_eq!(started.len(), 1, "{text}");
+    assert_eq!(started[0]["attempt"], 1, "{text}");
+    let identity = started[0]["identity"].as_str().unwrap_or_default();
+    assert!(
+        identity.starts_with(&format!("{old_pid}@")),
+        "the build was not run by the old worker, process {old_pid}: {identity}"
+    );
+    assert!(
+        events.iter().any(|event| {
+            kind(event).starts_with("ActivityTaskCompleted")
+                && attributes(event)["scheduled_event_id"] == id
+        }),
+        "the build's result never reached the server: {text}"
+    );
+    rig.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_usage_limit_is_waited_out_on_a_timer_with_nothing_running() {
     let Some(mut rig) = Rig::start("limited").await else {

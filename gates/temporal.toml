@@ -33,6 +33,14 @@ command = ["cargo", "test", "--locked", "--offline", "--package", "factory-engin
 timeout_secs = 900
 
 [[check]]
+id = "drain-keeps-long-steps"
+tier = "host"
+bead = "sf-9a0.17"
+claim = "On a Temporal server started on this machine, a worker asked to stop at a safe point while an agent step runs goes on heartbeating it: a build that runs more than six heartbeat timeouts past the drain completes on that worker as attempt 1, with nothing in the pipeline's history timed out, the worker leaves by itself with status 0 once the build has ended, and the worker that starts next goes on from the step after it without running the build again. Separately, a step asked for again after its first attempt already wrote its `step.ended` for the same round hands back that outcome without running the step again or parking the unit."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-engine", "--package", "factory-driver", "--", "--test-threads=1", "a_long_agent_step_finishes_on_a_draining_worker_as_its_first_attempt", "a_step_asked_for_again_after_it_ended_hands_back_its_outcome_without_running"]
+timeout_secs = 900
+
+[[check]]
 id = "accounts-workflow"
 tier = "host"
 bead = "sf-9a0.3"

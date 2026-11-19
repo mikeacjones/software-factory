@@ -1097,6 +1097,9 @@ impl Steps {
 /// (`FACTORY_KIND=accounts`), it answers `accounts <picture as JSON>`.
 pub struct ExecRunner {
     pub argv: Vec<String>,
+    /// A file whose being there asks the worker to stop at a safe point,
+    /// as the factory's drain flag does. `None` never asks.
+    pub drain: Option<std::path::PathBuf>,
 }
 
 impl ExecRunner {
@@ -1208,6 +1211,10 @@ impl StepRunner for ExecRunner {
             .find_map(|line| line.strip_prefix("accounts "))
             .ok_or("the command did not say what the accounts have left")?;
         serde_json::from_str(picture).map_err(|err| format!("the accounts' picture: {err}"))
+    }
+
+    fn draining(&self) -> bool {
+        self.drain.as_ref().is_some_and(|flag| flag.exists())
     }
 }
 
