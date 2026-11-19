@@ -3085,6 +3085,146 @@ fn a_stored_definition_in_force_over_a_different_release_is_reported_by_the_chec
 }
 
 #[test]
+fn a_candidate_definition_with_problems_is_not_stored_and_its_problems_are_returned() {
+    use factory_driver::goal::{check_candidate, check_definitions, enable_definition};
+    let world = World::new("goal-defs-candidate", "true");
+    std::fs::create_dir_all(world.path("config/goals/toy")).unwrap();
+    let definition = |flow: &str, model: &str| {
+        format!("id = \"main\"\n{flow}\n[director]\nmodel = \"{model}\"\neffort = \"high\"\n")
+    };
+    std::fs::write(
+        world.path("config/goals/toy/main.toml"),
+        definition("", "claude-opus-5-5"),
+    )
+    .unwrap();
+    let store = world.path("state/goals/toy/main");
+
+    // Each file on its own is sound, so only the check of what it names
+    // over the set in force can refuse it.
+    let bad = definition("flow = \"no-such-flow\"", "claude-opus-5-5");
+    let problems = check_candidate(&world.config(), "toy", &bad);
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(
+        problems[0].contains("goal definition `main` of `toy`: its pipeline cannot be used"),
+        "{problems:?}"
+    );
+    let refused = enable_definition(&world.config(), "toy", &bad).unwrap_err();
+    match &refused {
+        factory_driver::DriverError::DefinitionRefused {
+            project,
+            problems: said,
+        } => {
+            assert_eq!(project, "toy");
+            assert_eq!(said, &problems);
+        }
+        other => panic!("{other}"),
+    }
+    assert!(refused.to_string().contains("its pipeline cannot be used"));
+    let bad_model = definition("", "some-other-model");
+    assert!(
+        enable_definition(&world.config(), "toy", &bad_model)
+            .unwrap_err()
+            .to_string()
+            .contains("the director's model `some-other-model` is not allowed")
+    );
+    // A text that cannot be read as a definition is a problem as well.
+    assert_eq!(check_candidate(&world.config(), "toy", "id = ").len(), 1);
+    assert!(!store.exists(), "nothing was stored");
+    assert_eq!(
+        check_definitions(&world.config()).unwrap(),
+        ["toy/main: director claude-opus-5-5 (high), pipeline `build-break-review`, 1 at a time"]
+    );
+
+    // A sound one is checked the same way, and stored.
+    let good = definition("max_pipelines = 2", "claude-opus-5-5");
+    assert!(check_candidate(&world.config(), "toy", &good).is_empty());
+    let stored = enable_definition(&world.config(), "toy", &good).unwrap();
+    assert!(stored.path.starts_with(&store), "{}", stored.path.display());
+    assert_eq!(
+        check_definitions(&world.config()).unwrap().last().unwrap(),
+        "toy/main: director claude-opus-5-5 (high), pipeline `build-break-review`, 2 at a time"
+    );
+}
+
+#[test]
+fn a_candidate_is_checked_with_the_rest_of_its_set_in_force() {
+    use factory_driver::goal::{check_candidate, enable_definition};
+    let world = World::new("goal-defs-candidate-set", "true");
+    std::fs::create_dir_all(world.path("config/goals/toy")).unwrap();
+    let main = "id = \"main\"\ndefault = true\n[director]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\n";
+    std::fs::write(world.path("config/goals/toy/main.toml"), main).unwrap();
+    let builder = "id = \"build\"\n[director]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\n";
+    std::fs::write(world.path("config/goals/toy/build.toml"), builder).unwrap();
+    let scheduled = |under: &str| {
+        format!(
+            "id = \"tend\"\n[director]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\n[schedule]\nevery_days = 1\nhour_utc = 3\ncharter = \"Tend it.\"\nbuild_under = \"{under}\"\n"
+        )
+    };
+    std::fs::write(world.path("config/goals/toy/tend.toml"), scheduled("build")).unwrap();
+    assert!(check_candidate(&world.config(), "toy", &scheduled("build")).is_empty());
+
+    // The candidate names a definition the set does not have.
+    let problems = check_candidate(&world.config(), "toy", &scheduled("nothing"));
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(
+        problems[0].contains("builds under `nothing`, which is not a goal definition"),
+        "{problems:?}"
+    );
+
+    // The candidate takes the place of a definition another one names:
+    // the other is the one with the problem, and it is reported.
+    let builder_scheduled = "id = \"build\"\n[director]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\n[schedule]\nevery_days = 1\nhour_utc = 4\ncharter = \"Tend it.\"\n";
+    let problems = check_candidate(&world.config(), "toy", builder_scheduled);
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(
+        problems[0].contains("goal definition `tend` of `toy`")
+            && problems[0].contains("which has a schedule itself"),
+        "{problems:?}"
+    );
+    assert!(enable_definition(&world.config(), "toy", builder_scheduled).is_err());
+    assert!(!world.path("state/goals/toy/build").exists());
+}
+
+#[test]
+fn a_release_is_refused_when_a_stored_definition_names_what_it_lacks() {
+    use factory_driver::goal::{check_definitions, enable_definition};
+    let world = World::new("goal-defs-stored-release", "true");
+    std::fs::create_dir_all(world.path("config/goals/toy")).unwrap();
+    std::fs::write(
+        world.path("config/goals/toy/main.toml"),
+        "id = \"main\"\n[director]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\n",
+    )
+    .unwrap();
+    // This release has a second pipeline, and the owner puts in force a
+    // definition that runs under it.
+    let flow = std::fs::read_to_string(world.path("config/flows/build-break-review.toml"))
+        .unwrap()
+        .replace("id = \"build-break-review\"", "id = \"careful\"");
+    std::fs::write(world.path("config/flows/careful.toml"), flow).unwrap();
+    enable_definition(
+        &world.config(),
+        "toy",
+        "id = \"main\"\nflow = \"careful\"\n[director]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\n",
+    )
+    .unwrap();
+    let lines = check_definitions(&world.config()).unwrap();
+    assert!(
+        lines.last().unwrap().contains("pipeline `careful`"),
+        "{lines:?}"
+    );
+
+    // The next release has no such pipeline. Its check, which deploy runs
+    // through the engine before making it current, is over the stored
+    // definition as well as its own, and fails.
+    std::fs::remove_file(world.path("config/flows/careful.toml")).unwrap();
+    let refused = check_definitions(&world.config()).unwrap_err().to_string();
+    assert!(
+        refused.contains("goal definition `main` of `toy`: its pipeline cannot be used"),
+        "{refused}"
+    );
+}
+
+#[test]
 fn a_run_refused_at_a_limit_continues_its_session_under_another_account() {
     let world = World::new("accounts", "true");
     world.scenario("limit-default-once");

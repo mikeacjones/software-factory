@@ -4307,229 +4307,299 @@ pub fn check_definitions(config: &ConfigDir) -> Result<Vec<String>, DriverError>
         for warning in &loaded.warnings {
             lines.push(format!("warning: {warning}"));
         }
-        for definition in loaded.definitions {
-            let refuse = |reason: String| {
-                DriverError::Preflight(format!(
-                    "goal definition `{}` of `{id}`: {reason}",
-                    definition.id
-                ))
-            };
-            if let Some(name) = &definition.stop_check
-                && !project.commands.contains_key(name)
-            {
-                return Err(refuse(format!(
-                    "its stop_check `{name}` is not a command of the project"
-                )));
-            }
-            let mut with_flow = project.clone();
-            if let Some(flow) = &definition.flow {
-                with_flow.flow = flow.clone();
-            }
-            let (flow, _) = crate::load_flow(config, &factory, &with_flow)
-                .map_err(|err| refuse(format!("its pipeline cannot be used: {err}")))?;
-            if let Some(ship) = &definition.ship_flow {
-                let ends_with = |flow: &factory_flow::Flow, action: &str| {
-                    flow.steps.iter().any(|step| {
-                        matches!(&step.kind, factory_flow::StepKind::Action { action: named } if named == action)
-                    })
-                };
-                let reconciles = flow.steps.iter().any(|step| {
-                    matches!(&step.kind, factory_flow::StepKind::Action { action } if action == "absorb")
-                        && step.on.contains_key("moved")
-                        && step.on.contains_key("conflict")
-                });
-                if definition
-                    .foreman
-                    .as_ref()
-                    .is_some_and(|tier| tier.slots > 1)
-                    && !reconciles
-                {
-                    return Err(refuse(format!(
-                        "its foreman may run beads side by side, so the `absorb` step of its bead pipeline `{}` must route `moved` and `conflict`",
-                        flow.id
-                    )));
-                }
-                if !ends_with(&flow, "absorb") {
-                    return Err(refuse(format!(
-                        "it ships sub-goals, so its bead pipeline `{}` must end by absorbing into one (action `absorb`)",
-                        flow.id
-                    )));
-                }
-                let mut with_ship = project.clone();
-                with_ship.flow = ship.clone();
-                let (ship_flow, _) = crate::load_flow(config, &factory, &with_ship)
-                    .map_err(|err| refuse(format!("its ship pipeline cannot be used: {err}")))?;
-                if definition.director.slots > 1 && !ends_with(&ship_flow, "sync") {
-                    return Err(refuse(format!(
-                        "its director may have sub-goals side by side, so its ship pipeline `{}` must take in the default branch before it verifies (action `sync`)",
-                        ship_flow.id
-                    )));
-                }
-                if !ends_with(&ship_flow, "land") {
-                    return Err(refuse(format!(
-                        "its ship pipeline `{}` never lands (action `land`)",
-                        ship_flow.id
-                    )));
-                }
-            }
-            if !factory.allowed_models.contains(&definition.director.model) {
-                return Err(refuse(format!(
-                    "the director's model `{}` is not allowed",
-                    definition.director.model
-                )));
-            }
-            // Every model a wake may run on is one the factory allows.
-            let named = [
-                (
-                    "the director's fallback_model",
-                    &definition.director.fallback_model,
-                ),
-                ("routes.ship", &definition.routes.ship),
-                ("routes.settle", &definition.routes.settle),
-            ];
-            for (what, model) in named {
-                if let Some(model) = model
-                    && !factory.allowed_models.contains(model)
-                {
-                    return Err(refuse(format!("{what} `{model}` is not allowed")));
-                }
-            }
-            if let Some(foreman) = &definition.foreman
-                && let Some(model) = &foreman.fallback_model
-                && !factory.allowed_models.contains(model)
-            {
-                return Err(refuse(format!(
-                    "the foreman's fallback_model `{model}` is not allowed"
-                )));
-            }
-            if definition.schedule.is_some()
-                && (definition.routes.ship.is_some() || definition.routes.settle.is_some())
-            {
-                return Err(refuse(
-                    "it has a schedule, so its runs are not woken by what happens in a goal: it cannot have routes"
-                        .to_string(),
-                ));
-            }
-            if let Some(schedule) = &definition.schedule {
-                // The factory runs it by the clock: one agent, which files
-                // beads and starts nothing.
-                if definition.foreman.is_some()
-                    || definition.designer.is_some()
-                    || definition.stop_check.is_some()
-                {
-                    return Err(refuse(
-                        "it has a schedule, so it starts nothing: it cannot have a foreman, a designer or a stop_check".to_string(),
-                    ));
-                }
-                if let Some(most) = schedule.proposes {
-                    // A review of the factory as a whole: its agent
-                    // proposes goals, and the owner's button opens them.
-                    config.role_prompt("inspector")?;
-                    lines.push(format!(
-                        "{id}/{}: scheduled, inspector {} ({}), every {} day(s) at {:02}:00 UTC, proposes at most {most} goal(s) a run to the owner",
-                        definition.id,
-                        definition.director.model,
-                        definition.director.effort,
-                        schedule.every_days,
-                        schedule.hour_utc,
-                    ));
-                    continue;
-                }
-                config.role_prompt("maintainer")?;
-                if let Some(name) = schedule
-                    .reports
-                    .iter()
-                    .find(|name| !project.commands.contains_key(name.as_str()))
-                {
-                    return Err(refuse(format!(
-                        "its schedule's report `{name}` is not a command of the project"
-                    )));
-                }
-                let mut builds = String::new();
-                if let Some(under) = &schedule.build_under {
-                    // What a run marks to build is built by a goal under
-                    // a definition that can run one.
-                    let found = config
-                        .goal_definitions(&id)?
-                        .into_iter()
-                        .find(|other| &other.id == under);
-                    match found {
-                        Some(other) if other.schedule.is_none() => {}
-                        Some(_) => {
-                            return Err(refuse(format!(
-                                "its schedule builds under `{under}`, which has a schedule itself and so runs no goal"
-                            )));
-                        }
-                        None => {
-                            return Err(refuse(format!(
-                                "its schedule builds under `{under}`, which is not a goal definition of the project"
-                            )));
-                        }
-                    }
-                    builds = format!(", and builds what it marks under `{under}`");
-                }
-                if let Some(step) = schedule.when_class_breaks {
-                    builds.push_str(&format!(
-                        ", called at once when a class of defect breaks {step} more bead(s)"
-                    ));
-                }
-                if schedule.direct {
-                    lines.push(format!(
-                        "{id}/{}: scheduled, direct: every {} day(s) at {:02}:00 UTC, one pipeline under `{}` on a bead filed from the charter, with no agent before it",
-                        definition.id,
-                        schedule.every_days,
-                        schedule.hour_utc,
-                        schedule.build_under.as_deref().unwrap_or("")
-                    ));
-                    continue;
-                }
-                lines.push(format!(
-                    "{id}/{}: scheduled, maintainer {} ({}), every {} day(s) at {:02}:00 UTC, at most {} bead(s) a run{builds}",
-                    definition.id,
-                    definition.director.model,
-                    definition.director.effort,
-                    schedule.every_days,
-                    schedule.hour_utc,
-                    schedule.max_beads
-                ));
-                continue;
-            }
-            for role in ["director", "director-intake"] {
-                config.role_prompt(role)?;
-            }
-            let mut foreman = String::new();
-            if let Some(tier) = &definition.foreman {
-                if !factory.allowed_models.contains(&tier.model) {
-                    return Err(refuse(format!(
-                        "the foreman's model `{}` is not allowed",
-                        tier.model
-                    )));
-                }
-                config.role_prompt("foreman")?;
-                foreman = format!(", foreman {} ({})", tier.model, tier.effort);
-            }
-            if let Some(tier) = &definition.designer {
-                if !factory.allowed_models.contains(&tier.model) {
-                    return Err(refuse(format!(
-                        "the designer's model `{}` is not allowed",
-                        tier.model
-                    )));
-                }
-                config.role_prompt("designer")?;
-                foreman.push_str(&format!(", designer {} ({})", tier.model, tier.effort));
-            }
-            lines.push(format!(
-                "{id}/{}: director {} ({}){foreman}, pipeline `{}`, {} at a time{}",
-                definition.id,
-                definition.director.model,
-                definition.director.effort,
-                flow.id,
-                definition.max_pipelines,
-                if definition.default { ", default" } else { "" }
-            ));
+        for definition in &loaded.definitions {
+            lines.push(check_definition(
+                config,
+                &factory,
+                &project,
+                definition,
+                &loaded.definitions,
+            )?);
         }
     }
     Ok(lines)
+}
+
+/// Check a goal definition the owner would put in force, as if it were
+/// stored, without storing it: the project's whole set of definitions is
+/// checked as [`check_definitions`] checks it, with the candidate taking
+/// the place of the definition in force with the same ID. Returns the
+/// problems, one line each, for every definition of the set that has one:
+/// none when the candidate may be put in force.
+pub fn check_candidate(config: &ConfigDir, project: &str, text: &str) -> Vec<String> {
+    candidate_problems(config, project, text).unwrap_or_else(|err| vec![err.to_string()])
+}
+
+/// Put a goal definition in force for a project, over the one with the
+/// same ID, once [`check_candidate`] finds no problem with it. A
+/// definition with problems is not stored, and the problems are returned.
+pub fn enable_definition(
+    config: &ConfigDir,
+    project: &str,
+    text: &str,
+) -> Result<factory_config::StoredGoalDefinition, DriverError> {
+    let problems = check_candidate(config, project, text);
+    if !problems.is_empty() {
+        return Err(DriverError::DefinitionRefused {
+            project: project.to_string(),
+            problems,
+        });
+    }
+    Ok(config.store_goal_definition(project, text)?)
+}
+
+/// The problems of a project's set of goal definitions with a candidate
+/// in force, or why the candidate cannot be read at all.
+fn candidate_problems(
+    config: &ConfigDir,
+    project: &str,
+    text: &str,
+) -> Result<Vec<String>, DriverError> {
+    // The candidate first: it refuses a project that is not a plain name.
+    let candidate = config.goal_definitions_with(project, text)?;
+    let factory = config.factory()?;
+    let record = config.project(project)?;
+    Ok(candidate
+        .definitions
+        .iter()
+        .filter_map(|definition| {
+            check_definition(
+                config,
+                &factory,
+                &record,
+                definition,
+                &candidate.definitions,
+            )
+            .err()
+            .map(|err| err.to_string())
+        })
+        .collect())
+}
+
+/// Check one goal definition of a project against what it names, among
+/// `set`, every definition of the project that is in force with it.
+/// Returns the line that describes it, or its first problem.
+fn check_definition(
+    config: &ConfigDir,
+    factory: &Factory,
+    project: &Project,
+    definition: &GoalDefinition,
+    set: &[GoalDefinition],
+) -> Result<String, DriverError> {
+    let id = project.id.as_str();
+    let refuse = |reason: String| {
+        DriverError::Preflight(format!(
+            "goal definition `{}` of `{id}`: {reason}",
+            definition.id
+        ))
+    };
+    if let Some(name) = &definition.stop_check
+        && !project.commands.contains_key(name)
+    {
+        return Err(refuse(format!(
+            "its stop_check `{name}` is not a command of the project"
+        )));
+    }
+    let mut with_flow = project.clone();
+    if let Some(flow) = &definition.flow {
+        with_flow.flow = flow.clone();
+    }
+    let (flow, _) = crate::load_flow(config, factory, &with_flow)
+        .map_err(|err| refuse(format!("its pipeline cannot be used: {err}")))?;
+    if let Some(ship) = &definition.ship_flow {
+        let ends_with = |flow: &factory_flow::Flow, action: &str| {
+            flow.steps.iter().any(|step| {
+                matches!(&step.kind, factory_flow::StepKind::Action { action: named } if named == action)
+            })
+        };
+        let reconciles = flow.steps.iter().any(|step| {
+            matches!(&step.kind, factory_flow::StepKind::Action { action } if action == "absorb")
+                && step.on.contains_key("moved")
+                && step.on.contains_key("conflict")
+        });
+        if definition
+            .foreman
+            .as_ref()
+            .is_some_and(|tier| tier.slots > 1)
+            && !reconciles
+        {
+            return Err(refuse(format!(
+                "its foreman may run beads side by side, so the `absorb` step of its bead pipeline `{}` must route `moved` and `conflict`",
+                flow.id
+            )));
+        }
+        if !ends_with(&flow, "absorb") {
+            return Err(refuse(format!(
+                "it ships sub-goals, so its bead pipeline `{}` must end by absorbing into one (action `absorb`)",
+                flow.id
+            )));
+        }
+        let mut with_ship = project.clone();
+        with_ship.flow = ship.clone();
+        let (ship_flow, _) = crate::load_flow(config, factory, &with_ship)
+            .map_err(|err| refuse(format!("its ship pipeline cannot be used: {err}")))?;
+        if definition.director.slots > 1 && !ends_with(&ship_flow, "sync") {
+            return Err(refuse(format!(
+                "its director may have sub-goals side by side, so its ship pipeline `{}` must take in the default branch before it verifies (action `sync`)",
+                ship_flow.id
+            )));
+        }
+        if !ends_with(&ship_flow, "land") {
+            return Err(refuse(format!(
+                "its ship pipeline `{}` never lands (action `land`)",
+                ship_flow.id
+            )));
+        }
+    }
+    if !factory.allowed_models.contains(&definition.director.model) {
+        return Err(refuse(format!(
+            "the director's model `{}` is not allowed",
+            definition.director.model
+        )));
+    }
+    // Every model a wake may run on is one the factory allows.
+    let named = [
+        (
+            "the director's fallback_model",
+            &definition.director.fallback_model,
+        ),
+        ("routes.ship", &definition.routes.ship),
+        ("routes.settle", &definition.routes.settle),
+    ];
+    for (what, model) in named {
+        if let Some(model) = model
+            && !factory.allowed_models.contains(model)
+        {
+            return Err(refuse(format!("{what} `{model}` is not allowed")));
+        }
+    }
+    if let Some(foreman) = &definition.foreman
+        && let Some(model) = &foreman.fallback_model
+        && !factory.allowed_models.contains(model)
+    {
+        return Err(refuse(format!(
+            "the foreman's fallback_model `{model}` is not allowed"
+        )));
+    }
+    if definition.schedule.is_some()
+        && (definition.routes.ship.is_some() || definition.routes.settle.is_some())
+    {
+        return Err(refuse(
+            "it has a schedule, so its runs are not woken by what happens in a goal: it cannot have routes"
+                .to_string(),
+        ));
+    }
+    if let Some(schedule) = &definition.schedule {
+        // The factory runs it by the clock: one agent, which files
+        // beads and starts nothing.
+        if definition.foreman.is_some()
+            || definition.designer.is_some()
+            || definition.stop_check.is_some()
+        {
+            return Err(refuse(
+                "it has a schedule, so it starts nothing: it cannot have a foreman, a designer or a stop_check".to_string(),
+            ));
+        }
+        if let Some(most) = schedule.proposes {
+            // A review of the factory as a whole: its agent
+            // proposes goals, and the owner's button opens them.
+            config.role_prompt("inspector")?;
+            return Ok(format!(
+                "{id}/{}: scheduled, inspector {} ({}), every {} day(s) at {:02}:00 UTC, proposes at most {most} goal(s) a run to the owner",
+                definition.id,
+                definition.director.model,
+                definition.director.effort,
+                schedule.every_days,
+                schedule.hour_utc,
+            ));
+        }
+        config.role_prompt("maintainer")?;
+        if let Some(name) = schedule
+            .reports
+            .iter()
+            .find(|name| !project.commands.contains_key(name.as_str()))
+        {
+            return Err(refuse(format!(
+                "its schedule's report `{name}` is not a command of the project"
+            )));
+        }
+        let mut builds = String::new();
+        if let Some(under) = &schedule.build_under {
+            // What a run marks to build is built by a goal under
+            // a definition that can run one.
+            let found = set.iter().find(|other| &other.id == under);
+            match found {
+                Some(other) if other.schedule.is_none() => {}
+                Some(_) => {
+                    return Err(refuse(format!(
+                        "its schedule builds under `{under}`, which has a schedule itself and so runs no goal"
+                    )));
+                }
+                None => {
+                    return Err(refuse(format!(
+                        "its schedule builds under `{under}`, which is not a goal definition of the project"
+                    )));
+                }
+            }
+            builds = format!(", and builds what it marks under `{under}`");
+        }
+        if let Some(step) = schedule.when_class_breaks {
+            builds.push_str(&format!(
+                ", called at once when a class of defect breaks {step} more bead(s)"
+            ));
+        }
+        if schedule.direct {
+            return Ok(format!(
+                "{id}/{}: scheduled, direct: every {} day(s) at {:02}:00 UTC, one pipeline under `{}` on a bead filed from the charter, with no agent before it",
+                definition.id,
+                schedule.every_days,
+                schedule.hour_utc,
+                schedule.build_under.as_deref().unwrap_or("")
+            ));
+        }
+        return Ok(format!(
+            "{id}/{}: scheduled, maintainer {} ({}), every {} day(s) at {:02}:00 UTC, at most {} bead(s) a run{builds}",
+            definition.id,
+            definition.director.model,
+            definition.director.effort,
+            schedule.every_days,
+            schedule.hour_utc,
+            schedule.max_beads
+        ));
+    }
+    for role in ["director", "director-intake"] {
+        config.role_prompt(role)?;
+    }
+    let mut foreman = String::new();
+    if let Some(tier) = &definition.foreman {
+        if !factory.allowed_models.contains(&tier.model) {
+            return Err(refuse(format!(
+                "the foreman's model `{}` is not allowed",
+                tier.model
+            )));
+        }
+        config.role_prompt("foreman")?;
+        foreman = format!(", foreman {} ({})", tier.model, tier.effort);
+    }
+    if let Some(tier) = &definition.designer {
+        if !factory.allowed_models.contains(&tier.model) {
+            return Err(refuse(format!(
+                "the designer's model `{}` is not allowed",
+                tier.model
+            )));
+        }
+        config.role_prompt("designer")?;
+        foreman.push_str(&format!(", designer {} ({})", tier.model, tier.effort));
+    }
+    Ok(format!(
+        "{id}/{}: director {} ({}){foreman}, pipeline `{}`, {} at a time{}",
+        definition.id,
+        definition.director.model,
+        definition.director.effort,
+        flow.id,
+        definition.max_pipelines,
+        if definition.default { ", default" } else { "" }
+    ))
 }
 
 pub struct Supervisor {

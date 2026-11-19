@@ -1284,14 +1284,46 @@ impl ConfigDir {
     /// `<state_dir>/goals/<project>/<id>/<hash>.toml`, and that ID's
     /// `current` file is made to name the hash. The definition is checked
     /// as a release file is, and so is the project's set of definitions
-    /// with it in force, before anything is written. Earlier copies stay
-    /// where they are, so a goal that names one by its hash can still read
-    /// it.
+    /// with it in force (see [`ConfigDir::goal_definitions_with`]), before
+    /// anything is written. Earlier copies stay where they are, so a goal
+    /// that names one by its hash can still read it.
+    ///
+    /// This checks the definition on its own and the set's one default,
+    /// not what the definitions name: their pipelines, models and prompts.
+    /// The factory puts a definition in force through
+    /// `factory_driver::goal::enable_definition`, which checks those too.
     pub fn store_goal_definition(
         &self,
         project: &str,
         text: &str,
     ) -> Result<StoredGoalDefinition, ConfigError> {
+        let candidate = self.goal_definitions_with(project, text)?;
+        let StoredGoalDefinition { id, hash, path } = candidate.stored;
+        let io = |path: &Path| {
+            let path = path.to_path_buf();
+            move |source| ConfigError::Io { path, source }
+        };
+        let dir = path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| path.clone());
+        std::fs::create_dir_all(&dir).map_err(io(&dir))?;
+        write_whole(&path, text).map_err(io(&path))?;
+        let current = dir.join(CURRENT);
+        write_whole(&current, &format!("{hash}\n")).map_err(io(&current))?;
+        Ok(StoredGoalDefinition { id, hash, path })
+    }
+
+    /// A project's goal definitions in force as they would be were `text`
+    /// stored and put in force, without storing it: the release's, with
+    /// the stored copies in force and then the candidate taking their
+    /// places by ID. The candidate is checked as a release file is, and the
+    /// set must still have one default. Nothing is written.
+    pub fn goal_definitions_with(
+        &self,
+        project: &str,
+        text: &str,
+    ) -> Result<Candidate, ConfigError> {
         let store = self.goal_store()?.ok_or_else(|| ConfigError::Io {
             path: self.0.join("factory.toml"),
             source: std::io::Error::from(std::io::ErrorKind::NotFound),
@@ -1307,28 +1339,23 @@ impl ConfigDir {
                 "project `{project}` and goal definition `{id}` are each named with letters, digits, `-` and `_`"
             )));
         }
-        let dir = store.join(project).join(&id);
-        let path = dir.join(format!("{hash}.toml"));
+        let path = store.join(project).join(&id).join(format!("{hash}.toml"));
         let named = format!("it is stored under `{id}`");
         let definition = check_goal_definition(&path, &id, &named, text, self.decides(project))?;
-        let mut set = self.goal_definitions(project)?;
-        set.retain(|other| other.id != id);
-        set.push(definition);
-        if !one_default(&set) {
+        let mut definitions = self.goal_definitions(project)?;
+        definitions.retain(|other| other.id != id);
+        definitions.push(definition);
+        definitions.sort_by(|a, b| a.id.cmp(&b.id));
+        if !one_default(&definitions) {
             return Err(refuse(
                 "with it in force, exactly one goal definition of the project must still be marked `default = true`"
                     .to_string(),
             ));
         }
-        let io = |path: &Path| {
-            let path = path.to_path_buf();
-            move |source| ConfigError::Io { path, source }
-        };
-        std::fs::create_dir_all(&dir).map_err(io(&dir))?;
-        write_whole(&path, text).map_err(io(&path))?;
-        let current = dir.join(CURRENT);
-        write_whole(&current, &format!("{hash}\n")).map_err(io(&current))?;
-        Ok(StoredGoalDefinition { id, hash, path })
+        Ok(Candidate {
+            stored: StoredGoalDefinition { id, hash, path },
+            definitions,
+        })
     }
 
     /// The stored copy of a project's goal definition `id` whose text has
@@ -1429,6 +1456,17 @@ impl std::fmt::Display for StoredOverride {
             self.release.display()
         )
     }
+}
+
+/// A project's goal definitions as they would be with one more stored and
+/// in force: see [`ConfigDir::goal_definitions_with`].
+#[derive(Clone, Debug)]
+pub struct Candidate {
+    /// Where the candidate would be stored, and under what.
+    pub stored: StoredGoalDefinition,
+    /// Every definition that would be in force, the candidate among them,
+    /// in order of ID.
+    pub definitions: Vec<GoalDefinition>,
 }
 
 /// A goal definition written to the store.
@@ -2374,6 +2412,52 @@ timeout_secs = 60
             err.contains("its text has changed since it was stored"),
             "{err}"
         );
+        std::fs::remove_dir_all(&dir.0).unwrap();
+    }
+
+    #[test]
+    fn the_set_with_a_candidate_in_force_is_read_without_storing_it() {
+        let (dir, store) = dir_with_store(PROJECT);
+        release(&dir, "main", &goal("main", "default = true"));
+        release(&dir, "bugs", &goal("bugs", "max_pipelines = 1"));
+        dir.store_goal_definition("toy", &goal("bugs", "max_pipelines = 2"))
+            .unwrap();
+        let written = |store: &Path| {
+            let mut files: Vec<_> = std::fs::read_dir(store.join("bugs"))
+                .unwrap()
+                .flatten()
+                .map(|entry| entry.file_name())
+                .collect();
+            files.sort();
+            files
+        };
+        let before = written(&store);
+
+        // The candidate takes the place of the stored copy in force, which
+        // took the release's; the rest of the set is as it is.
+        let text = goal("bugs", "max_pipelines = 3");
+        let candidate = dir.goal_definitions_with("toy", &text).unwrap();
+        assert_eq!(candidate.stored.id, "bugs");
+        assert_eq!(candidate.stored.hash, goal_definition_hash(&text));
+        let in_force: Vec<_> = candidate
+            .definitions
+            .iter()
+            .map(|d| (d.id.as_str(), d.max_pipelines))
+            .collect();
+        assert_eq!(in_force, [("bugs", 3), ("main", 1)]);
+        assert!(!candidate.stored.path.exists());
+        assert_eq!(written(&store), before);
+        assert_eq!(dir.goal_definitions("toy").unwrap()[0].max_pipelines, 2);
+
+        // A new ID joins the set, and the one-default rule holds over it.
+        let added = dir.goal_definitions_with("toy", &goal("docs", "")).unwrap();
+        assert_eq!(added.definitions.len(), 3);
+        let err = dir
+            .goal_definitions_with("toy", &goal("docs", "default = true"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("exactly one goal definition"), "{err}");
+        assert!(!store.join("docs").exists());
         std::fs::remove_dir_all(&dir.0).unwrap();
     }
 
