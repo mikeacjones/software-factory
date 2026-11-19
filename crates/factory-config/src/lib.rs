@@ -1235,7 +1235,7 @@ impl ConfigDir {
         };
         let (_, texts) = self.in_force_with_texts(project)?;
         let dir = store.join(project).join(id);
-        let Some(text) = texts.get(id) else {
+        let Some(InForceText { text, .. }) = texts.get(id) else {
             return Err(ConfigError::Invalid {
                 path: self.0.join("goals").join(project),
                 reason: format!("project `{project}` has no goal definition `{id}`"),
@@ -1262,12 +1262,37 @@ impl ConfigDir {
         Ok(Some(hash))
     }
 
+    /// Every goal definition of a project in force, in order of ID, each
+    /// with the hash of its text and whether that text is the release's or
+    /// a stored copy: what `factory goal list` shows. Reads as
+    /// [`ConfigDir::goal_definitions`] does, and so drops a stored copy the
+    /// release has caught up with.
+    pub fn goal_definitions_in_force(
+        &self,
+        project: &str,
+    ) -> Result<Vec<GoalDefinitionInForce>, ConfigError> {
+        let (loaded, mut texts) = self.in_force_with_texts(project)?;
+        Ok(loaded
+            .definitions
+            .into_iter()
+            .filter_map(|definition| {
+                let text = texts.remove(&definition.id)?;
+                Some(GoalDefinitionInForce {
+                    hash: goal_definition_hash(&text.text),
+                    path: text.path,
+                    stored: text.stored,
+                    definition,
+                })
+            })
+            .collect())
+    }
+
     /// [`ConfigDir::goal_definitions_and_warnings`], and the text of each
-    /// definition in force by its ID.
+    /// definition in force by its ID, with where it was read.
     fn in_force_with_texts(
         &self,
         project: &str,
-    ) -> Result<(GoalDefinitions, BTreeMap<String, String>), ConfigError> {
+    ) -> Result<(GoalDefinitions, BTreeMap<String, InForceText>), ConfigError> {
         let decides = self.decides(project);
         let dir = self.0.join("goals").join(project);
         let mut release: BTreeMap<String, (PathBuf, String, GoalDefinition)> = BTreeMap::new();
@@ -1306,17 +1331,29 @@ impl ConfigDir {
                         project: project.to_string(),
                         id: id.clone(),
                         hash: goal_definition_hash(&text),
-                        stored: path,
+                        stored: path.clone(),
                         release: release.clone(),
                     }),
                     None => {}
                 }
+                let text = InForceText {
+                    text,
+                    path,
+                    stored: true,
+                };
                 stored.insert(id, (text, definition));
             }
         }
-        let mut by_id: BTreeMap<String, (String, GoalDefinition)> = release
+        let mut by_id: BTreeMap<String, (InForceText, GoalDefinition)> = release
             .into_iter()
-            .map(|(id, (_, text, definition))| (id, (text, definition)))
+            .map(|(id, (path, text, definition))| {
+                let text = InForceText {
+                    text,
+                    path,
+                    stored: false,
+                };
+                (id, (text, definition))
+            })
             .collect();
         by_id.extend(stored);
         let mut texts = BTreeMap::new();
@@ -1531,6 +1568,26 @@ pub struct Candidate {
     /// Every definition that would be in force, the candidate among them,
     /// in order of ID.
     pub definitions: Vec<GoalDefinition>,
+}
+
+/// A goal definition in force, and where its text is: see
+/// [`ConfigDir::goal_definitions_in_force`].
+#[derive(Clone, Debug)]
+pub struct GoalDefinitionInForce {
+    pub definition: GoalDefinition,
+    /// The hash of its text.
+    pub hash: String,
+    /// The file its text was read from: the release's, or the stored copy.
+    pub path: PathBuf,
+    /// Whether that is a stored copy rather than the release's file.
+    pub stored: bool,
+}
+
+/// The text of a goal definition in force, and where it was read.
+struct InForceText {
+    text: String,
+    path: PathBuf,
+    stored: bool,
 }
 
 /// A goal definition written to the store.
@@ -2416,6 +2473,59 @@ timeout_secs = 60
             .stored_goal_definition("toy", "bugs", &stored.hash)
             .unwrap();
         assert_eq!(read.max_pipelines, 3);
+        std::fs::remove_dir_all(&dir.0).unwrap();
+    }
+
+    #[test]
+    fn each_definition_in_force_says_whether_its_text_is_the_releases_or_stored() {
+        let (dir, store) = dir_with_store(PROJECT);
+        let main = release(&dir, "main", &goal("main", "default = true"));
+        release(&dir, "bugs", &goal("bugs", "max_pipelines = 1"));
+        let bugs = goal("bugs", "max_pipelines = 3");
+        let fresh = goal("fresh", "");
+        let stored_bugs = dir.store_goal_definition("toy", &bugs).unwrap();
+        let stored_fresh = dir.store_goal_definition("toy", &fresh).unwrap();
+
+        let shown = |dir: &ConfigDir| -> Vec<(String, String, PathBuf, bool)> {
+            dir.goal_definitions_in_force("toy")
+                .unwrap()
+                .into_iter()
+                .map(|d| (d.definition.id, d.hash, d.path, d.stored))
+                .collect()
+        };
+        assert_eq!(
+            shown(&dir),
+            [
+                (
+                    "bugs".to_string(),
+                    stored_bugs.hash.clone(),
+                    stored_bugs.path.clone(),
+                    true
+                ),
+                (
+                    "fresh".to_string(),
+                    stored_fresh.hash.clone(),
+                    stored_fresh.path.clone(),
+                    true
+                ),
+                (
+                    "main".to_string(),
+                    goal_definition_hash(&goal("main", "default = true")),
+                    main.clone(),
+                    false
+                ),
+            ]
+        );
+
+        // Once the release says what the stored copy says, it is the
+        // release's file that is in force.
+        let caught_up = release(&dir, "bugs", &bugs);
+        let shown = shown(&dir);
+        assert_eq!(
+            shown[0],
+            ("bugs".to_string(), stored_bugs.hash, caught_up, false)
+        );
+        assert!(!store.join("bugs/current").exists());
         std::fs::remove_dir_all(&dir.0).unwrap();
     }
 

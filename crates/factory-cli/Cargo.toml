@@ -19,3 +19,6 @@ factory-driver.workspace = true
 factory-claude.workspace = true
 factory-core.workspace = true
 factory-supervise.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
