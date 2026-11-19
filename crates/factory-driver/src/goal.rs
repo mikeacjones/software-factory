@@ -5289,7 +5289,7 @@ impl Supervisor {
                         match (goal, front) {
                             (Some(id), _) => self.owner_said(&id, &text),
                             (None, Some(project)) => self
-                                .front_turn(&project, &channel, &root, &user, &text)
+                                .front_turn(&project, &channel, &root, &user, &text, None)
                                 .map(|_| ()),
                             // A reply under a proposal the owner declined
                             // says why. Any other thread is a pipeline's
@@ -5314,6 +5314,9 @@ impl Supervisor {
                 if action_id == proposed::APPROVE {
                     return self.definition_approved(&value, &user);
                 }
+                if action_id == proposed::REJECT {
+                    return self.definition_rejected(&value, &user);
+                }
                 if !self.goals.contains_key(&value) {
                     return Ok(());
                 }
@@ -5334,7 +5337,7 @@ impl Supervisor {
         text: &str,
     ) -> Result<Option<String>, DriverError> {
         if self.config.project(project)?.executive.is_some() {
-            self.front_turn(project, channel, ts, user, text)
+            self.front_turn(project, channel, ts, user, text, None)
         } else {
             self.open_goal(project, channel, ts, user, text)
         }
@@ -5461,7 +5464,7 @@ impl Supervisor {
             self.executives.len() + self.goals.len()
         );
         let thread = thread.map(str::to_string).unwrap_or(opened);
-        let goal = self.front_turn(project, "", &thread, &owner, text)?;
+        let goal = self.front_turn(project, "", &thread, &owner, text, None)?;
         Ok((thread, goal))
     }
 
@@ -5473,6 +5476,10 @@ impl Supervisor {
     /// answers, and when it knows what goal the owner wants it opens one:
     /// from then the thread belongs to that goal and its director. Returns
     /// the goal, if this turn opened it.
+    ///
+    /// `rejected` is the place of a proposed definition the owner has just
+    /// rejected: then `text` is what the thread's record says the owner
+    /// did, and the executive is told of the rejection, not of a message.
     fn front_turn(
         &mut self,
         project_id: &str,
@@ -5480,6 +5487,7 @@ impl Supervisor {
         root: &str,
         user: &str,
         text: &str,
+        rejected: Option<usize>,
     ) -> Result<Option<String>, DriverError> {
         let project = self.config.project(project_id)?;
         let Some(tier) = project.executive.clone() else {
@@ -5517,12 +5525,21 @@ impl Supervisor {
                 .is_some_and(|(who, said)| who == "owner" && said == text);
         if !again {
             front.said.push(("owner".to_string(), text.to_string()));
+            // The owner's first word after rejecting the last proposal is
+            // why they rejected it.
+            if rejected.is_none()
+                && let Some(last) = front.proposals.last_mut()
+                && last.state == "rejected"
+                && last.why.is_empty()
+            {
+                last.why = text.to_string();
+            }
         }
         // Its seat has to exist before it runs.
         executive.threads.insert(root.to_string(), front.clone());
         self.save_executive(executive.clone())?;
         let seat = self.executive_seat(project_id);
-        if !again {
+        if !again && rejected.is_none() {
             self.log_at(
                 &seat,
                 "owner.message",
@@ -5533,10 +5550,7 @@ impl Supervisor {
         let (session, prompt) = match &front.session {
             Some(session) => (
                 Session::Resume(session.clone()),
-                format!(
-                    "The owner replied in the thread:\n\n{}\n",
-                    quote_plain(text)
-                ),
+                proposed::resumed_prompt(&front, text, rejected),
             ),
             None => {
                 let tracker = bead_source(&project).list_open()?;
