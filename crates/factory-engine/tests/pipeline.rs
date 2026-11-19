@@ -38,6 +38,19 @@ struct Shop {
     worker: std::sync::Mutex<Child>,
 }
 
+/// A shop dropped without `close`, as when its test fails part way, still
+/// ends its worker, which would otherwise go on dialling its server's port.
+impl Drop for Shop {
+    fn drop(&mut self) {
+        let mut worker = self
+            .worker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = worker.kill();
+        let _ = worker.wait();
+    }
+}
+
 impl Shop {
     async fn open(name: &str, test_command: &str, scenario: &str) -> Option<Shop> {
         Shop::open_after(name, test_command, scenario, |_| {}).await
@@ -979,6 +992,215 @@ async fn a_goal_runs_from_its_opening_to_its_end_with_its_tiers_on_the_engine() 
         std::thread::sleep(Duration::from_millis(200));
     };
     assert!(left.success(), "the worker left as {left}");
+    shop.close().await;
+}
+
+/// The watcher says a pipeline never started once the server has not
+/// known it for a while, and the project hears that only when its turn
+/// comes. The turn before may be the one that started it: one turn that
+/// runs agents can take far longer than the watcher waits. A report that
+/// a pipeline never started, of one the server knows by the time the
+/// turn is taken, leaves the goal as it is; of one the server still does
+/// not know, it is handed to the goal as before.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_goal_is_not_told_that_a_pipeline_the_server_knows_never_started() {
+    use factory_driver::goal::Event;
+    use factory_engine::steps::NEVER_STARTED;
+    use factory_engine::tiers::{Project, Reach, project_id, tell};
+    use factory_slack::socket::Incoming;
+
+    let prepare = |world: &World| {
+        world.with_github("green");
+        std::fs::create_dir_all(world.path("config/goals/toy")).unwrap();
+        std::fs::write(
+            world.path("config/goals/toy/main.toml"),
+            "id = \"main\"\nflow = \"zig-sdk-bead\"\nship_flow = \"zig-sdk-ship\"\n[director]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\n",
+        )
+        .unwrap();
+        let decide = |fields: &str| {
+            let mut result = serde_json::json!({
+                "summary": "Decided.", "start": [], "file": [], "edit": [], "dropped_findings": [],
+                "open_subgoal": {"id": "", "title": "", "objective": "", "beads": []}, "ship": false,
+                "ask_owner": "", "complete": false, "evidence": "", "journal_entry": "", "project_memory": ""
+            });
+            let extra: serde_json::Value = serde_json::from_str(fields).unwrap();
+            for (key, value) in extra.as_object().unwrap() {
+                result[key] = value.clone();
+            }
+            result.to_string()
+        };
+        let say = |role: &str, n: u32, json: String| {
+            std::fs::create_dir_all(world.path("bin/state")).unwrap();
+            std::fs::write(world.path(&format!("bin/state/{role}-{n}.json")), json).unwrap();
+        };
+        say("intake", 1, r#"{"reply":"Here is the charter.","ready":true,"objective":"Ship the feature.","stop_when":"The bead has landed.","plan":"One sub-goal: toy-1.","edits":[]}"#.to_string());
+        say(
+            "director",
+            1,
+            decide(
+                r#"{"open_subgoal":{"id":"feature","title":"The feature","objective":"It works.","beads":["toy-1"]},"start":[{"bead":"toy-1","reason":"first"}]}"#,
+            ),
+        );
+        // What the director says if it is woken again.
+        say("director", 2, decide("{}"));
+    };
+    // The builder holds the bead's pipeline running until it is let go.
+    let Some(shop) = Shop::open_with(
+        "engine-late",
+        "true",
+        "hold-builder",
+        prepare,
+        "tiers = true\n",
+    )
+    .await
+    else {
+        return;
+    };
+    let world = &shop.world;
+    let client = shop.client();
+    let reach = Reach {
+        task_queue: "factory-engine-late".to_string(),
+        beat_secs: 1,
+        accounts: ACCOUNTS_ID.to_string(),
+    };
+    let wait = |what: &str, done: &dyn Fn() -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while !done() {
+            assert!(
+                Instant::now() < deadline,
+                "{what}: {:?}",
+                goal_records(world)
+                    .iter()
+                    .map(|goal| (goal.phase.clone(), goal.units.clone()))
+                    .collect::<Vec<_>>()
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    };
+    let called = |role: &str| world.calls().iter().filter(|call| call[0] == role).count();
+    let toy = || {
+        goal_records(world)[0]
+            .units
+            .iter()
+            .find(|unit| unit.bead == "toy-1")
+            .cloned()
+            .unwrap()
+    };
+    // What the goal's record says of its pipelines, and what its
+    // director and foremen have still to hear.
+    let told = || {
+        let goal = serde_json::to_value(goal_records(world).remove(0)).unwrap();
+        serde_json::json!({
+            "phase": goal["phase"],
+            "units": goal["units"],
+            "subgoals": goal["subgoals"],
+            "inbox": goal["inbox"],
+            "failures": goal["failures"],
+        })
+    };
+    // The turns that dealt with a report that a pipeline failed, once
+    // each is over.
+    let failed_turns = || async {
+        let standing = client
+            .get_workflow_handle::<Project>(project_id("toy"))
+            .query(Project::standing, (), WorkflowQueryOptions::default())
+            .await
+            .unwrap();
+        let turns = standing
+            .lately
+            .iter()
+            .filter(|line| line.contains("the pipeline for `toy-1`") && line.contains("it failed"))
+            .count();
+        (turns, standing)
+    };
+    let turned = |count: usize| async move {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let (turns, standing) = failed_turns().await;
+            if turns >= count {
+                return standing;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the report was never dealt with: {standing:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    };
+
+    // The goal is opened and started; its director starts the bead, and
+    // the bead's pipeline runs on the server.
+    let open = Event::Open {
+        project: "toy".to_string(),
+        text: "Ship the feature".to_string(),
+    };
+    tell(&client, &reach, "toy", open).await.unwrap();
+    wait("the goal was never opened", &|| {
+        !goal_records(world).is_empty()
+    });
+    let id = goal_records(world)[0].id.clone();
+    let press = Event::Slack(Incoming::Action {
+        channel: String::new(),
+        user: "OWNER".to_string(),
+        action_id: "goal_start".to_string(),
+        value: id.clone(),
+        message_ts: String::new(),
+    });
+    tell(&client, &reach, "toy", press).await.unwrap();
+    wait("the bead's pipeline never ran its builder", &|| {
+        called("builder") > 0
+    });
+    // The watcher has told the goal the pipeline's unit, so nothing else
+    // is on its way to the record.
+    wait("the goal never heard the pipeline's unit", &|| {
+        toy().unit.is_some()
+    });
+    let name = format!("pipeline-{id}-toy-1-1-0");
+    client
+        .get_workflow_handle::<Pipeline>(name.clone())
+        .describe(temporalio_client::WorkflowDescribeOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(toy().state, "running");
+    let before = told();
+
+    // What the watcher says of a pipeline the server does not know.
+    let never_started = |name: String| Event::Ended {
+        goal: id.clone(),
+        bead: "toy-1".to_string(),
+        ship: false,
+        unit: None,
+        word: "failed".to_string(),
+        rest: NEVER_STARTED.to_string(),
+        name,
+    };
+
+    // Said of the pipeline that runs, as the watcher said it during the
+    // turn that started it: the turn only looks at the records.
+    tell(&client, &reach, "toy", never_started(name.clone()))
+        .await
+        .unwrap();
+    let standing = turned(1).await;
+    assert_eq!(standing.trouble, None, "{standing:?}");
+    assert_eq!(told(), before, "the goal was told");
+    assert_eq!(called("director"), 1, "the director was woken");
+
+    // Said of a pipeline the server has never known, the goal is told.
+    tell(
+        &client,
+        &reach,
+        "toy",
+        never_started(format!("pipeline-{id}-toy-1-9-9")),
+    )
+    .await
+    .unwrap();
+    let standing = turned(2).await;
+    assert_eq!(standing.trouble, None, "{standing:?}");
+    let unit = toy();
+    assert_eq!(unit.state, "failed", "{unit:?}");
+    assert_eq!(unit.detail, NEVER_STARTED);
+
+    std::fs::write(world.path("bin/state/go-on"), "").unwrap();
     shop.close().await;
 }
 

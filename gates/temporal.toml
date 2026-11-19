@@ -92,9 +92,17 @@ timeout_secs = 900
 id = "never-started-is-checked"
 tier = "hermetic"
 bead = "sf-9a0.19"
-claim = "Only the watcher's own report that a pipeline never started names a pipeline for the turn to ask the server about before the goal is told; a pipeline that failed for a reason of its own, ended or was refused is handed on without asking. The asking itself, and the turn looking only at the records when the server knows the pipeline, is in Steps::turn and has no test on a server yet."
+claim = "Only the watcher's own report that a pipeline never started names a pipeline for the turn to ask the server about before the goal is told; a pipeline that failed for a reason of its own, ended or was refused is handed on without asking. The asking itself is proved on a server by `never-started-asks-the-server`."
 command = ["cargo", "test", "--locked", "--offline", "--package", "factory-engine", "--lib", "--", "only_the_watchers_own_report_is_checked_against_the_server"]
 timeout_secs = 600
+
+[[check]]
+id = "never-started-asks-the-server"
+tier = "host"
+bead = "sf-9a0.19"
+claim = "With the tiers on the engine and a goal's bead pipeline running on a Temporal server started on this machine, the watcher's report that the pipeline never started, handed to the project's workflow, leaves the goal's record as it was: the unit still running, nothing in the goal's inbox, no failure counted, and the director not woken. The same report of a pipeline the server does not know is handed to the goal as before, and its unit is recorded as failed with the watcher's words."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-engine", "--test", "pipeline", "--", "--test-threads=1", "a_goal_is_not_told_that_a_pipeline_the_server_knows_never_started"]
+timeout_secs = 900
 
 [[check]]
 id = "issue-schedule"

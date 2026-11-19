@@ -31,6 +31,8 @@
 #                                    its fix itself, under such a trailer
 #                    Either way, a builder told that the check on what is published
 #                    refuses the branch gives every such trailer a reason.
+#                      hold-builder  the builder waits until state/go-on is there, or two
+#                                    minutes have gone by, before it does anything
 #                      limit-default-once
 #                                    the first run without an account token is refused
 #                                    at the five-hour limit
@@ -115,6 +117,13 @@ esac
 common='"question":"","reply_to_owner":""'
 case "$role" in
   builder)
+    case "$scenario" in
+      *hold-builder*)
+        waited=0
+        while [ ! -f "$state/go-on" ] && [ "$waited" -lt 1200 ]; do
+          sleep 0.1; waited=$((waited + 1))
+        done ;;
+    esac
     nothing=0
     case "$scenario" in
       *fix-nothing*) case "$brief" in *"The command \`test\`"*) nothing=1 ;; esac ;;
