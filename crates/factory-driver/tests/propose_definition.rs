@@ -756,3 +756,197 @@ fn a_reject_that_meets_a_limit_wakes_the_executive_when_handed_in_again() {
     assert_eq!(thread.sessions().len(), calls);
     assert!(!thread.wide_anywhere());
 }
+
+const UPKEEP: &str = "id = \"upkeep\"\n[director]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\n[schedule]\nhour_utc = 4\nevery_days = 7\nmax_beads = 2\ncharter = \"Turn what keeps breaking into checks.\"\n";
+
+/// The owner asks for work that runs once a week. The executive proposes
+/// a definition with a `[schedule]`: it is checked as any proposal is, and
+/// one with a problem goes back to the executive. Approve on the valid one
+/// stores it, files its catch-up bead and puts the schedule in force, and
+/// opens no goal: the thread is told when it runs, and the owner's next
+/// reply there goes to the executive.
+#[test]
+fn a_scheduled_definition_is_proposed_and_approve_puts_it_in_force_without_opening_a_goal() {
+    let thread = Thread::new("propose-scheduled");
+    let world = &thread.world;
+    // The toy project is the factory's own here, so the catch-up bead is
+    // filed in its tracker.
+    let project = world.path("config/projects/toy.toml");
+    let text = std::fs::read_to_string(&project).unwrap()
+        + "\n[commands.release]\nargv = [\"true\"]\ntimeout_secs = 30\n\n[github]\nrepo = \"me/toy\"\nwrite = [\"me/toy\"]\n\n[self_deploy]\nbuild = \"release\"\n";
+    std::fs::write(&project, text).unwrap();
+    let filed = || -> Vec<String> {
+        std::fs::read_dir(world.path("beads"))
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("filed-"))
+            .collect()
+    };
+    let mut sup = thread.supervisor();
+
+    // One whose schedule builds under a definition the project lacks, and
+    // that opens a goal besides: both go back to the executive. The valid
+    // one, with no handoff, is posted.
+    thread.say(
+        1,
+        front(
+            "A weekly run, below.",
+            "main",
+            &UPKEEP.replace("max_beads = 2\n", "max_beads = 2\nbuild_under = \"nope\"\n"),
+            "Nothing runs by the clock.",
+            "",
+        ),
+    );
+    thread.say(
+        2,
+        front(
+            "A weekly upkeep run, below: Mondays at 04:00 UTC it files beads for what keeps breaking.",
+            "",
+            UPKEEP,
+            "No definition runs by the clock; this one files at most two beads a week.",
+            "",
+        ),
+    );
+    thread.owner_says(
+        &mut sup,
+        "Look for what keeps breaking once a week.",
+        "500.0",
+        None,
+    );
+    let second = thread.brief(2);
+    for expected in [
+        "propose_definition: goal definition `upkeep` of `toy`: its schedule builds under `nope`, which is not a goal definition of the project",
+        "open_goal and propose_definition: do one or the other",
+    ] {
+        assert!(
+            second.contains(expected),
+            "missing {expected:?} in:\n{second}"
+        );
+    }
+    assert_eq!(thread.sessions().len(), 2);
+    let posted = thread
+        .fake
+        .requests_to("chat.postMessage")
+        .into_iter()
+        .find(|request| request.contains("definition_approve"))
+        .expect("the proposal was posted with its buttons");
+    for expected in [
+        "*Proposed goal definition* `upkeep` for `toy`: a new definition",
+        "It has a schedule: approve puts the schedule in force, and the factory runs it every 7 day(s) at 04:00 UTC. No goal is opened under it.",
+        "Approve: put its schedule in force",
+        r#""action_id":"definition_reject""#,
+        r#""value":"500.0/1""#,
+    ] {
+        assert!(
+            posted.contains(expected),
+            "missing {expected:?} in {posted}"
+        );
+    }
+    assert!(!posted.contains("nope"), "{posted}");
+    let waiting = thread.proposals(&sup)[0].clone();
+    assert_eq!(
+        (
+            waiting.state.as_str(),
+            waiting.schedule.as_str(),
+            waiting.handoff.as_str()
+        ),
+        ("waiting", "every 7 day(s) at 04:00 UTC", "")
+    );
+
+    // The owner approves: it is stored under its hash, approval is logged,
+    // the catch-up bead is filed, and no goal opens. The thread is told it
+    // is in force and when it runs.
+    let before = thread.posted().len();
+    thread.press(&mut sup, "OWNER", "definition_approve", "500.0/1");
+    let stored = world.path(&format!("state/goals/toy/upkeep/{}.toml", waiting.hash));
+    assert_eq!(std::fs::read_to_string(&stored).unwrap(), UPKEEP);
+    assert!(
+        world
+            .config()
+            .goal_definitions("toy")
+            .unwrap()
+            .iter()
+            .any(|definition| definition.id == "upkeep" && definition.schedule.is_some())
+    );
+    let beads = filed();
+    assert_eq!(beads.len(), 1, "{beads:?}");
+    let bead = std::fs::read_to_string(world.path("beads").join(&beads[0])).unwrap();
+    assert!(bead.contains("config/goals/toy/upkeep.toml"), "{bead}");
+    assert_eq!(sup.goals().count(), 0);
+    let record = sup.executives().next().unwrap().threads["500.0"].clone();
+    assert_eq!(record.goal, None);
+    let approved = record.proposals[0].clone();
+    assert_eq!(
+        (approved.state.as_str(), approved.by.as_str()),
+        ("approved", "OWNER")
+    );
+    assert!(
+        approved.made.contains("no goal is opened under it")
+            && approved.made.contains("commits it to the release"),
+        "{}",
+        approved.made
+    );
+    let log =
+        std::fs::read_to_string(world.path("state/projects/toy/executive/events.jsonl")).unwrap();
+    let logged: Value = log
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|event| event["kind"] == "definition.approved")
+        .expect("definition.approved is logged");
+    assert_eq!(logged["data"]["definition"], "upkeep");
+    assert_eq!(logged["data"]["hash"], waiting.hash);
+    assert_eq!(logged["data"]["schedule"], "every 7 day(s) at 04:00 UTC");
+    // With no engine the worker has nothing to be told, and says so.
+    assert!(
+        logged["data"]["engine"]["said"][0]
+            .as_str()
+            .unwrap()
+            .contains("the factory has no engine"),
+        "{logged}"
+    );
+    let said = thread.posted_since(before);
+    assert!(
+        said.contains(
+            "`upkeep` is in force for `toy`: the factory runs it every 7 day(s) at 04:00 UTC, next at "
+        ) && said.contains("No goal is opened under it."),
+        "{said}"
+    );
+    let updated = thread.fake.requests_to("chat.update").join("\n");
+    assert!(
+        updated.contains("Approved by <@OWNER>: `upkeep` is in force"),
+        "{updated}"
+    );
+    assert_eq!(thread.sessions().len(), 2, "no executive turn on Approve");
+    assert!(
+        world.calls().iter().all(|call| call[0] != "intake"),
+        "{:?}",
+        world.calls()
+    );
+
+    // A second press does nothing but say so.
+    let before = thread.posted().len();
+    thread.press(&mut sup, "OWNER", "definition_approve", "500.0/1");
+    assert!(
+        thread
+            .posted_since(before)
+            .contains("The proposed definition `upkeep` was already approved by <@OWNER>")
+    );
+    assert_eq!(filed().len(), 1);
+
+    // The thread is still the executive's: the owner's reply reaches it in
+    // the thread's session, told that the schedule is in force.
+    thread.say(3, front("It runs on Mondays.", "", "", "", ""));
+    thread.owner_says(&mut sup, "When does it run?", "520.0", Some("500.0"));
+    let sessions = thread.sessions();
+    assert_eq!(sessions.len(), 3);
+    assert_eq!(sessions[0], sessions[2], "the thread's session is resumed");
+    let third = thread.brief(3);
+    assert!(
+        third.contains(
+            "The owner approved your proposed goal definition `upkeep` (proposal 1), which runs every 7 day(s) at 04:00 UTC: it is in force, and no goal was opened under it. This thread is still yours."
+        ),
+        "{third}"
+    );
+    assert_eq!(sup.goals().count(), 0);
+}

@@ -7,6 +7,7 @@ use factory_beads::readiness;
 use factory_config::ConfigDir;
 use factory_driver::goal::{
     Supervisor, check_definitions, enable_definition, file_catch_up_bead, release_definition_path,
+    tell_engine,
 };
 use factory_driver::{
     AccountPick, Driver, ISSUE_SWEEP_MIN_AGE_SECS, Options, Status, bead_source, load_flow,
@@ -297,41 +298,6 @@ fn goal_enable(config: &ConfigDir, project: &str, file: &str) -> Result<u8, Stri
         Err(format!(
             "`{id}` is in force for `{project}`, but {}",
             failed.join("; and ")
-        ))
-    }
-}
-
-/// Have the running worker take up a goal definition put in force: the
-/// engine's `enabled` command, run as the service runs the engine. Returns
-/// what it said. Without an engine the service reads the definitions in
-/// force whenever it opens a goal, and nothing needs telling.
-fn tell_engine(config: &ConfigDir, project: &str, id: &str) -> Result<String, String> {
-    let factory = config.factory().map_err(|err| err.to_string())?;
-    let Some(temporal) = factory.temporal.as_ref() else {
-        return Ok(
-            "the factory has no engine ([temporal] is not set): the service reads the definitions in force each time it opens a goal\n"
-                .to_string(),
-        );
-    };
-    let engine = temporal
-        .engine_bin
-        .clone()
-        .unwrap_or_else(|| factory.state_dir.join("bin/factory-engine"));
-    let said = std::process::Command::new(&engine)
-        .args(["enabled", project, id, "--config"])
-        .arg(&config.0)
-        .output()
-        .map_err(|err| format!("{} could not be run: {err}", engine.display()))?;
-    if said.status.success() {
-        Ok(String::from_utf8_lossy(&said.stdout).into_owned())
-    } else {
-        let stderr = String::from_utf8_lossy(&said.stderr);
-        let stdout = String::from_utf8_lossy(&said.stdout);
-        Err(format!(
-            "`{} enabled {project} {id}` {}: {}",
-            engine.display(),
-            said.status,
-            format!("{stdout}{stderr}").trim()
         ))
     }
 }

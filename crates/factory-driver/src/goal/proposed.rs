@@ -5,14 +5,18 @@
 //! thread's record and posted there with two buttons. Only the owner's
 //! press acts: Approve puts the definition in force, files the bead that
 //! commits it to the release, and opens the goal under it in the same
-//! thread, with no executive turn. Reject stores nothing and wakes the
-//! executive in the thread's session to hear of it; the owner's next reply
-//! there is taken as why. While a proposal waits, the owner's replies reach
+//! thread, with no executive turn. A definition with a `[schedule]` runs
+//! by the clock and no goal is opened under it: Approve has the running
+//! worker take it up as `factory goal enable` does, says in the thread
+//! when it next runs, and leaves the thread the executive's. Reject
+//! stores nothing and wakes the executive in the thread's session to hear
+//! of it; the owner's next reply there is taken as why. While a proposal waits, the owner's replies reach
 //! the executive with it named, and a new proposal supersedes it.
 
 use super::*;
 
-/// The button that puts a proposed definition in force and opens the goal.
+/// The button that puts a proposed definition in force and, for one with
+/// no schedule, opens the goal.
 pub const APPROVE: &str = "definition_approve";
 /// The button that rejects one.
 pub const REJECT: &str = "definition_reject";
@@ -37,6 +41,10 @@ pub struct DefinitionProposal {
     pub handoff: String,
     /// Whether a definition with that ID was in force when it was proposed.
     pub change: bool,
+    /// When the definition runs by itself, in words, if it has a
+    /// `[schedule]`: Approve puts it in force and opens no goal. Empty for
+    /// one without.
+    pub schedule: String,
     /// `waiting`, `approved`, `rejected` or `superseded`. Only one that
     /// waits can be approved, so a rejected or superseded one is never
     /// stored.
@@ -54,6 +62,15 @@ pub struct DefinitionProposal {
     pub why: String,
     /// The proposal (from 1) that superseded it, or 0.
     pub superseded_by: usize,
+}
+
+/// When a schedule runs, in words.
+fn schedule_words(schedule: &Schedule) -> String {
+    format!(
+        "every {} day(s) at {:02}:00 UTC",
+        schedule.every_days.max(1),
+        schedule.hour_utc
+    )
 }
 
 /// What a thread's record says the owner did on rejecting the `n`th
@@ -103,6 +120,34 @@ fn waiting_note(front: &Front) -> String {
     )
 }
 
+/// The scheduled definitions the executive proposed in a thread that the
+/// owner approved, named for the executive, or nothing when there are
+/// none: they are in force, no goal was opened under them, and the thread
+/// is still the executive's.
+fn in_force_note(front: &Front) -> String {
+    let approved: Vec<String> = front
+        .proposals
+        .iter()
+        .enumerate()
+        .filter(|(_, proposal)| proposal.state == "approved" && !proposal.schedule.is_empty())
+        .map(|(at, proposal)| {
+            format!(
+                "`{}` (proposal {}), which runs {}",
+                proposal.id,
+                at + 1,
+                proposal.schedule
+            )
+        })
+        .collect();
+    if approved.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\nThe owner approved your proposed goal definition {}: it is in force, and no goal was opened under it. This thread is still yours.\n",
+        approved.join(", ")
+    )
+}
+
 /// What the executive is told in a thread whose session it resumes: the
 /// owner's reply, or that the owner rejected the proposal at `rejected`,
 /// and which of its proposals still wait.
@@ -131,6 +176,7 @@ pub fn resumed_prompt(front: &Front, text: &str, rejected: Option<usize>) -> Str
             said
         }
     };
+    prompt.push_str(&in_force_note(front));
     prompt.push_str(&waiting_note(front));
     prompt
 }
@@ -152,7 +198,7 @@ pub fn proposal_schema() -> Value {
     object_schema(json!({
         "toml": text_schema("When no goal definition of the project suits the work: the whole TOML of the one you propose, a new ID or a change to one in force. Code checks it against the project as `factory goal enable` would, and sends any problem back to you. Empty when proposing none."),
         "reason": text_schema("For the owner: why none of the definitions in force suits the work, and which of your choices you are least sure of. Empty when proposing none."),
-        "handoff": text_schema("What the director of the goal opened under it should know that the owner's words do not say, as for `open_goal`. Empty when proposing none."),
+        "handoff": text_schema("What the director of the goal opened under it should know that the owner's words do not say, as for `open_goal`. Empty for a definition with a `[schedule]`, which runs by the clock and has no goal opened under it, or when proposing none."),
     }))
 }
 
@@ -199,15 +245,6 @@ pub fn proposal_problems(config: &ConfigDir, project: &str, result: &Value) -> V
         return problems;
     };
     let id = candidate.stored.id;
-    if candidate
-        .definitions
-        .iter()
-        .any(|definition| definition.id == id && definition.schedule.is_some())
-    {
-        problems.push(format!(
-            "propose_definition: `{id}` has a [schedule]: the factory runs such a definition at its times, and no goal is opened under it"
-        ));
-    }
     if in_force_text(config, project, &id).as_deref() == Some(text) {
         problems.push(format!(
             "propose_definition: that is the text of `{id}` in force already: open the goal under it with `open_goal`"
@@ -242,8 +279,16 @@ pub fn proposal_message(project: &str, proposal: &DefinitionProposal, old: Optio
         ),
         None => proposal.text.clone(),
     };
+    let approve = if proposal.schedule.is_empty() {
+        "Approve puts it in force and opens the goal under it in this thread.".to_string()
+    } else {
+        format!(
+            "It has a schedule: approve puts the schedule in force, and the factory runs it {}. No goal is opened under it.",
+            proposal.schedule
+        )
+    };
     format!(
-        ":scroll: *Proposed goal definition* `{id}` for `{project}`: {what}\n{reason}\n```\n{shown}{newline}```\nApprove puts it in force and opens the goal under it in this thread. It is checked again first.",
+        ":scroll: *Proposed goal definition* `{id}` for `{project}`: {what}\n{reason}\n```\n{shown}{newline}```\n{approve} It is checked again first.",
         id = proposal.id,
         reason = quote(proposal.reason.trim()),
         shown = escape(&shown),
@@ -440,8 +485,18 @@ impl Supervisor {
             return;
         };
         let given = &result["propose_definition"];
-        let id = match self.config.goal_definitions_with(project, text) {
-            Ok(candidate) => candidate.stored.id,
+        let (id, schedule) = match self.config.goal_definitions_with(project, text) {
+            Ok(candidate) => {
+                let id = candidate.stored.id;
+                let schedule = candidate
+                    .definitions
+                    .iter()
+                    .find(|definition| definition.id == id)
+                    .and_then(|definition| definition.schedule.as_ref())
+                    .map(schedule_words)
+                    .unwrap_or_default();
+                (id, schedule)
+            }
             Err(_) => return,
         };
         let old = in_force_text(&self.config, project, &id);
@@ -452,6 +507,7 @@ impl Supervisor {
             reason: strings(given, "reason").trim().to_string(),
             handoff: strings(given, "handoff").trim().to_string(),
             change: old.is_some(),
+            schedule,
             state: "waiting".to_string(),
             ..DefinitionProposal::default()
         };
@@ -468,10 +524,15 @@ impl Supervisor {
                     "hash": proposal.hash, "change": proposal.change, "text": message }),
         );
         if let Some(slack) = &self.slack {
+            let approve = if proposal.schedule.is_empty() {
+                "Approve: put it in force and open the goal"
+            } else {
+                "Approve: put its schedule in force"
+            };
             let buttons = [
                 Button {
                     action_id: APPROVE,
-                    label: "Approve: put it in force and open the goal",
+                    label: approve,
                     value: &value,
                     style: Some("primary"),
                 },
@@ -606,6 +667,29 @@ impl Supervisor {
                 "no bead was filed to commit it to the release: {err}"
             )),
         }
+        let schedule = self
+            .config
+            .goal_definitions(&project)
+            .ok()
+            .and_then(|definitions| {
+                definitions
+                    .into_iter()
+                    .find(|definition| definition.id == stored.id)
+            })
+            .and_then(|definition| definition.schedule);
+        if let Some(schedule) = schedule {
+            return self.schedule_approved(ScheduleApproved {
+                value,
+                user,
+                project: &project,
+                root,
+                at,
+                proposal,
+                stored: &stored,
+                schedule: &schedule,
+                made,
+            });
+        }
         self.log_at(
             &seat,
             "definition.approved",
@@ -646,6 +730,116 @@ impl Supervisor {
         let (goal, asked) = opened?;
         self.intake_turn(&goal, &asked)
     }
+
+    /// The owner approved a proposed definition with a `[schedule]`, and
+    /// it is in force: the running worker is told as `factory goal enable`
+    /// tells it, so the project looks at its schedule now, and the thread
+    /// is told when it next runs. No goal is opened under it, and the
+    /// thread stays the executive's.
+    fn schedule_approved(&mut self, approved: ScheduleApproved<'_>) -> Result<(), DriverError> {
+        let ScheduleApproved {
+            value,
+            user,
+            project,
+            root,
+            at,
+            mut proposal,
+            stored,
+            schedule,
+            mut made,
+        } = approved;
+        let seat = self.executive_seat(project);
+        let engine = match tell_engine(&self.config, project, &stored.id) {
+            Ok(said) => {
+                let said: Vec<&str> = said.lines().filter(|line| !line.is_empty()).collect();
+                made.push(said.join("; "));
+                json!({ "said": said })
+            }
+            Err(err) => {
+                made.push(format!("the running worker was not told: {err}"));
+                json!({ "error": err.to_string() })
+            }
+        };
+        let since = self
+            .config
+            .project(project)
+            .ok()
+            .and_then(|record| self.schedule_record(&record, &stored.id));
+        let next = match since {
+            Some(record) => record
+                .retry_at
+                .unwrap_or_else(|| schedule_due(schedule, record.since)),
+            None => schedule_due(schedule, now_unix()),
+        };
+        let words = schedule_words(schedule);
+        let when = if next <= now_unix() {
+            "and is due now".to_string()
+        } else {
+            format!("next at {}", date_utc(next))
+        };
+        made.push(format!(
+            "it runs {words}, {when}; no goal is opened under it"
+        ));
+        self.log_at(
+            &seat,
+            "definition.approved",
+            json!({ "proposal": value, "by": user, "definition": stored.id,
+                    "hash": stored.hash, "made": made, "schedule": words,
+                    "next_at": next, "engine": engine }),
+        );
+        proposal.made = made.join("; ");
+        let channel = match self.executives.get(project).cloned() {
+            Some(mut record) => {
+                let channel = record
+                    .threads
+                    .get(root)
+                    .map(|front| front.channel.clone())
+                    .unwrap_or_default();
+                if let Some(front) = record.threads.get_mut(root) {
+                    front.proposals[at] = proposal.clone();
+                    self.save_executive(record)?;
+                }
+                channel
+            }
+            None => String::new(),
+        };
+        if let (Some(slack), false) = (&self.slack, proposal.ts.is_empty()) {
+            // The message without its buttons, and how it was answered.
+            let _ = slack.update(
+                &channel,
+                &proposal.ts,
+                &format!(
+                    "{}\n_Approved by <@{user}>: {}_",
+                    proposal.message,
+                    escape(&proposal.made)
+                ),
+            );
+        }
+        self.post(
+            &channel,
+            root,
+            &format!(
+                ":calendar: `{id}` is in force for `{project}`: the factory runs it {words}, {when}. No goal is opened under it. Reply here to go on with the executive.",
+                id = stored.id,
+            ),
+        );
+        Ok(())
+    }
+}
+
+/// What [`Supervisor::schedule_approved`] is given: the press, and what
+/// approving the proposal has done so far.
+struct ScheduleApproved<'a> {
+    value: &'a str,
+    user: &'a str,
+    project: &'a str,
+    root: &'a str,
+    /// The proposal's place in its thread, from 0.
+    at: usize,
+    proposal: DefinitionProposal,
+    stored: &'a factory_config::StoredGoalDefinition,
+    schedule: &'a Schedule,
+    made: Vec<String>,
 }
 
 #[cfg(test)]

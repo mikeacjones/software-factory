@@ -4376,6 +4376,46 @@ pub fn enable_definition(
     Ok(config.store_goal_definition(project, text)?)
 }
 
+/// Have the running worker take up a goal definition put in force: the
+/// engine's `enabled` command, run as the service runs the engine, which
+/// starts the project's workflow if it is not there and, for a definition
+/// with a schedule, tells the project to look now. Returns what it said.
+/// Without an engine the service reads the definitions in force whenever
+/// it opens a goal, and nothing needs telling. `factory goal enable` and
+/// the owner's Approve of a scheduled definition proposal both use it.
+pub fn tell_engine(config: &ConfigDir, project: &str, id: &str) -> Result<String, DriverError> {
+    let factory = config.factory()?;
+    let Some(temporal) = factory.temporal.as_ref() else {
+        return Ok(
+            "the factory has no engine ([temporal] is not set): the service reads the definitions in force each time it opens a goal\n"
+                .to_string(),
+        );
+    };
+    let engine = temporal
+        .engine_bin
+        .clone()
+        .unwrap_or_else(|| factory.state_dir.join("bin/factory-engine"));
+    let said = std::process::Command::new(&engine)
+        .args(["enabled", project, id, "--config"])
+        .arg(&config.0)
+        .output()
+        .map_err(|err| {
+            DriverError::Engine(format!("{} could not be run: {err}", engine.display()))
+        })?;
+    if said.status.success() {
+        Ok(String::from_utf8_lossy(&said.stdout).into_owned())
+    } else {
+        let stderr = String::from_utf8_lossy(&said.stderr);
+        let stdout = String::from_utf8_lossy(&said.stdout);
+        Err(DriverError::Engine(format!(
+            "`{} enabled {project} {id}` {}: {}",
+            engine.display(),
+            said.status,
+            format!("{stdout}{stderr}").trim()
+        )))
+    }
+}
+
 /// Where the factory's own repository keeps a project's goal definition
 /// `id`: the release's file for it, as the owner commits it.
 pub fn release_definition_path(project: &str, id: &str) -> String {
