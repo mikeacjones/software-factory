@@ -64,6 +64,14 @@ One Claude Code conversation, named by its session ID. An agent step starts a fr
 
 An objective the owner wants reached on a project, with the condition that ends it. It starts as a conversation in Slack, runs on events, and ends when the owner accepts that the condition is met. It runs under the goal definition it opened with, pinned by content hash.
 
+## stored definition
+
+A copy of a project's goal definition kept in the factory's state directory, not in a release: `goals/<project>/<id>/<hash>.toml`, named by the SHA-256 of its text and refused when it no longer has that hash. A `current` file beside the copies names the one in force for that ID, which takes the place of the release's definition with the same ID until a release carries the same text. Owner-approved *definition proposals* and `factory goal enable` add a copy. When a goal opens, the text in force for its definition is also kept as a copy, and the goal reads that copy for as long as it runs, whatever is in force later.
+
+## catch-up bead
+
+The bead the factory files when a goal definition is put in force without a release, in the factory's own project whatever project the definition is for: commit this text, with this hash, as `config/goals/<project>/<id>.toml`. Once a release carries that text the *stored definition* is no longer needed and the release's file is in force again. Where the factory's own project forbids its steps that path, the bead is the owner's and is filed deferred. None is filed when the release's file already has the text.
+
 ## sub-goal
 
 A part of a goal that lands as one pull request, such as one feature. It has a branch of its own that its beads are absorbed into, one commit each, and it is shipped once: verified as a whole, opened as a pull request, and squashed onto the default branch, which closes its beads.
@@ -161,6 +169,10 @@ A *schedule* whose runs look at the factory as a whole and not at one project's 
 ## proposal
 
 A goal a *review* puts to the owner: a project, an objective, a stop condition and the figures that call for it, posted with an approve and a decline button. Approving opens the goal in its project as the owner's own message there would, or files it as a bead where the project has no goal definition the owner can open. Declining records it, with the reason the owner gives under the message. Later runs are shown what became of each.
+
+## definition proposal
+
+A goal definition the *executive* puts to the owner when no definition in force suits the work: its whole TOML, a new ID or a change to one in force, with a reason for the owner and a handoff for the director. Code checks it as `factory goal enable` would and sends every problem back to the executive; one that passes is posted in the thread, with a diff for a change, and an Approve and a Reject button. Approve stores it as a *stored definition*, files its *catch-up bead* and opens the goal in the thread under it. Reject stores nothing and tells the executive. A newer proposal in the thread supersedes one still waiting. Not a *proposal*, which a *review* makes.
 
 ## maintenance goal
 
