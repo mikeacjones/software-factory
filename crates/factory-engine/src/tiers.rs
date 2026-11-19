@@ -19,6 +19,7 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
+use factory_config::GoalDefinition;
 use factory_driver::Within;
 use factory_driver::goal::{Event, Turned};
 use futures::FutureExt;
@@ -146,6 +147,28 @@ pub async fn tell(
         }
     }
     Err(last)
+}
+
+/// Have the running tiers take up a goal definition of a project that was
+/// put in force while they run, so that no worker has to be restarted for
+/// it. A worker starts the workflow only of a project that has
+/// definitions, so it is started here if it is not there; one that is
+/// running is left as it is, and reads the definitions in force at its
+/// next turn. A definition with a schedule has the project look now: its
+/// workflow learns when it is next due only from a turn, and no turn has
+/// seen this schedule yet. Returns whether the project was told to look.
+pub async fn take_up(
+    client: &Client,
+    reach: &Reach,
+    project: &str,
+    definition: &GoalDefinition,
+) -> Result<bool, String> {
+    ensure_project(client, reach, project).await?;
+    let scheduled = definition.schedule.is_some();
+    if scheduled {
+        tell(client, reach, project, Event::Tick).await?;
+    }
+    Ok(scheduled)
 }
 
 /// What a project's workflow is started with, and what it hands to its

@@ -8,6 +8,9 @@
 //!   factory-engine go-on <pipeline> <step> <note>
 //!                                             continue a parked pipeline from a step
 //!   factory-engine give-up <pipeline>         end a parked pipeline
+//!   factory-engine enabled <project> <definition>
+//!                                             a goal definition was put in force: the
+//!                                             project's tiers take it up without a restart
 //!   factory-engine project <project>          where a project's tiers stand: what they
 //!                                             are doing, and what waits its turn
 //!   factory-engine open <project> <text>      open a goal as the owner's message in the
@@ -37,7 +40,7 @@ use factory_engine::accounts::{ACCOUNTS_ID, Accounts};
 use factory_engine::engine::{Adopt, GoOn, Pipeline, PipelineInput};
 use factory_engine::factory::FactoryRunner;
 use factory_engine::issues::{self, ensure_schedule};
-use factory_engine::tiers::{Project, Reach, project_id, tell};
+use factory_engine::tiers::{Project, Reach, project_id, take_up, tell};
 use factory_engine::worker::{
     WorkerSettings, connect, ensure_accounts, ensure_tiers, pipeline_options, run,
 };
@@ -280,6 +283,32 @@ async fn command(args: &[String]) -> Result<(), String> {
             });
             run(settings, runner).await?;
             eprintln!("factory-engine: stopped at a safe point, as asked");
+            Ok(())
+        }
+        ["enabled", project, id] => {
+            // A goal definition was put in force while the worker runs:
+            // its project's tiers take it up now, not at the next start.
+            let definitions = config
+                .goal_definitions(project)
+                .map_err(|err| err.to_string())?;
+            let definition = definitions
+                .iter()
+                .find(|definition| definition.id == *id)
+                .ok_or_else(|| {
+                    format!("project `{project}` has no goal definition `{id}` in force")
+                })?;
+            if !temporal.tiers {
+                println!(
+                    "the tiers are not on the engine (`tiers` is off in [temporal]): the service takes `{id}` up when it next starts"
+                );
+                return Ok(());
+            }
+            let client = connect(&temporal.address, &temporal.namespace).await?;
+            let ticked = take_up(&client, &reach(&temporal), project, definition).await?;
+            println!("the tiers of project `{project}` are running, under `{id}` among the rest");
+            if ticked {
+                println!("told project `{project}` to look now: `{id}` has a schedule");
+            }
             Ok(())
         }
         ["project", project] => {
