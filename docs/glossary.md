@@ -62,7 +62,7 @@ One Claude Code conversation, named by its session ID. An agent step starts a fr
 
 ## goal
 
-An objective the owner wants reached on a project, with the condition that ends it. It starts as a conversation in Slack, runs on events, and ends when the owner accepts that the condition is met.
+An objective the owner wants reached on a project, with the condition that ends it. It starts as a conversation in Slack, runs on events, and ends when the owner accepts that the condition is met. It runs under the goal definition it opened with, pinned by content hash.
 
 ## sub-goal
 

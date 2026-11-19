@@ -3085,6 +3085,135 @@ fn a_stored_definition_in_force_over_a_different_release_is_reported_by_the_chec
 }
 
 #[test]
+fn a_goal_keeps_the_definition_it_opened_under_across_a_change_and_a_deploy() {
+    use factory_config::{ConfigDir, goal_definition_hash};
+    use factory_driver::goal::{Supervisor, enable_definition};
+    use factory_slack::socket::Incoming;
+
+    let world = World::new("goal-pinned", "true");
+    std::fs::create_dir_all(world.path("config/goals/toy")).unwrap();
+    let definition = |pipelines: u32| {
+        format!(
+            "id = \"main\"\nmax_pipelines = {pipelines}\n[director]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\n"
+        )
+    };
+    std::fs::write(world.path("config/goals/toy/main.toml"), definition(1)).unwrap();
+    let say = |role: &str, n: u32, json: &str| {
+        std::fs::create_dir_all(world.path("bin/state")).unwrap();
+        std::fs::write(world.path(&format!("bin/state/{role}-{n}.json")), json).unwrap();
+    };
+    let charter = r#"{"reply":"Here is the charter.","ready":true,"objective":"Ship the feature.","stop_when":"toy-1 has landed.","plan":"toy-1.","edits":[]}"#;
+    say("intake", 1, charter);
+    say("intake", 2, charter);
+    let asks = r#"{"summary":"Asked.","start":[],"file":[],"edit":[],"dropped_findings":[],"ask_owner":"Which first?","complete":false,"evidence":"","journal_entry":"","project_memory":""}"#;
+    for n in 1..=3 {
+        say("director", n, asks);
+    }
+    let last_brief = || {
+        let calls = world.calls();
+        let brief =
+            std::fs::read_to_string(world.path(&format!("bin/state/brief-{}.md", calls.len())))
+                .unwrap();
+        (calls.last().unwrap()[0].clone(), brief)
+    };
+    let supervisor = |config: ConfigDir| {
+        Supervisor::new(config, None, vec!["OWNER".to_string()], false).unwrap()
+    };
+    let owner_says = |goal: &factory_driver::goal::Goal, text: &str| Incoming::Message {
+        channel: goal.channel.clone(),
+        user: "OWNER".to_string(),
+        text: text.to_string(),
+        ts: format!("{}.5", goal.thread_ts),
+        thread_ts: Some(goal.thread_ts.clone()),
+    };
+
+    // The goal opens under the release's definition, and is pinned to it.
+    let mut sup = supervisor(world.config());
+    let id = sup.open_directly("toy", "Ship the feature").unwrap();
+    let goal = sup.goals().find(|goal| goal.id == id).unwrap().clone();
+    let pinned = goal_definition_hash(&definition(1));
+    assert_eq!(goal.definition_hash.as_deref(), Some(pinned.as_str()));
+    let (role, brief) = last_brief();
+    assert_eq!(role, "intake");
+    assert!(brief.contains("up to 1 at a time"), "{brief}");
+    drop(sup);
+
+    // A deploy: the worker restarts on a new release, whose file for the
+    // definition says otherwise, and the old release is gone.
+    let release = world.path("release-2");
+    let copied = std::process::Command::new("cp")
+        .args(["-R"])
+        .arg(world.path("config"))
+        .arg(&release)
+        .status()
+        .unwrap();
+    assert!(copied.success());
+    std::fs::write(release.join("goals/toy/main.toml"), definition(3)).unwrap();
+    std::fs::remove_dir_all(world.path("config")).unwrap();
+    let deployed = ConfigDir(release.clone());
+    assert_eq!(
+        deployed.goal_definitions("toy").unwrap()[0].max_pipelines,
+        3
+    );
+    let mut sup = supervisor(deployed.clone());
+    sup.incoming(Incoming::Action {
+        channel: String::new(),
+        user: "OWNER".to_string(),
+        action_id: "goal_start".to_string(),
+        value: id.clone(),
+        message_ts: goal.thread_ts.clone(),
+    })
+    .unwrap();
+    let (role, brief) = last_brief();
+    assert_eq!(role, "director");
+    assert!(brief.contains("up to 1 at a time"), "{brief}");
+
+    // A definition put in force while the goal runs does not reach it.
+    enable_definition(&deployed, "toy", &definition(2)).unwrap();
+    assert_eq!(
+        deployed.goal_definitions("toy").unwrap()[0].max_pipelines,
+        2
+    );
+    sup.incoming(owner_says(&goal, "toy-1, then.")).unwrap();
+    let (role, brief) = last_brief();
+    assert_eq!(role, "director");
+    assert!(brief.contains("> toy-1, then."), "{brief}");
+    assert!(brief.contains("up to 1 at a time"), "{brief}");
+
+    // A goal opened now is pinned to what is in force now.
+    let newer = sup.open_directly("toy", "Something else").unwrap();
+    let newer = sup.goals().find(|goal| goal.id == newer).unwrap();
+    assert_eq!(
+        newer.definition_hash.as_deref(),
+        Some(goal_definition_hash(&definition(2)).as_str())
+    );
+    let (role, brief) = last_brief();
+    assert_eq!(role, "intake");
+    assert!(brief.contains("up to 2 at a time"), "{brief}");
+    drop(sup);
+
+    // A record written before goals were pinned has no hash: it loads, and
+    // its wakes read the definition in force.
+    let record = world.path(&format!("state/goals/{id}/goal.json"));
+    let mut old: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&record).unwrap()).unwrap();
+    old.as_object_mut()
+        .unwrap()
+        .remove("definition_hash")
+        .unwrap();
+    std::fs::write(&record, old.to_string()).unwrap();
+    let mut sup = supervisor(deployed);
+    let loaded = sup.goals().find(|goal| goal.id == id).unwrap().clone();
+    assert_eq!(loaded.definition_hash, None);
+    sup.incoming(owner_says(&loaded, "and after that?"))
+        .unwrap();
+    let (role, brief) = last_brief();
+    assert_eq!(role, "director");
+    assert!(brief.contains("> and after that?"), "{brief}");
+    assert!(brief.contains("up to 2 at a time"), "{brief}");
+}
+
+#[test]
 fn a_candidate_definition_with_problems_is_not_stored_and_its_problems_are_returned() {
     use factory_driver::goal::{check_candidate, check_definitions, enable_definition};
     let world = World::new("goal-defs-candidate", "true");
@@ -5203,6 +5332,20 @@ fn a_parked_pipeline_is_continued_by_a_foreman_that_takes_over_the_sub_goal() {
     );
     say("director", 3, direct(json!({"ask_owner": "Ship it now?"})));
     drop(sup);
+    // A goal is pinned to the definition it opened under, so a definition
+    // that changes reaches only a goal whose record holds no pin: one
+    // written before goals were pinned.
+    let goal_record = world.path(&format!("state/goals/{id}/goal.json"));
+    let mut unpinned: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&goal_record).unwrap()).unwrap();
+    assert!(
+        unpinned
+            .as_object_mut()
+            .unwrap()
+            .remove("definition_hash")
+            .is_some_and(|hash| hash.is_string())
+    );
+    std::fs::write(&goal_record, unpinned.to_string()).unwrap();
     let mut sup = supervisor();
     sup.resume().unwrap();
     let adopted = sup.goals().next().unwrap().clone();

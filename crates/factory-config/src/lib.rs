@@ -1214,6 +1214,60 @@ impl ConfigDir {
         &self,
         project: &str,
     ) -> Result<GoalDefinitions, ConfigError> {
+        Ok(self.in_force_with_texts(project)?.0)
+    }
+
+    /// Keep a copy of the text of a project's goal definition `id` as it
+    /// is in force now, the release's or a stored copy, in the store under
+    /// its hash, and return the hash: what a goal is pinned to when it
+    /// opens, read back with [`ConfigDir::stored_goal_definition`]. A
+    /// release definition is copied too, so that a goal pinned to it can
+    /// still read it after a release whose file differs. Which copy is in
+    /// force does not change. Without a `factory.toml` there is no store,
+    /// and this returns `None`.
+    pub fn pin_goal_definition(
+        &self,
+        project: &str,
+        id: &str,
+    ) -> Result<Option<String>, ConfigError> {
+        let Some(store) = self.goal_store()? else {
+            return Ok(None);
+        };
+        let (_, texts) = self.in_force_with_texts(project)?;
+        let dir = store.join(project).join(id);
+        let Some(text) = texts.get(id) else {
+            return Err(ConfigError::Invalid {
+                path: self.0.join("goals").join(project),
+                reason: format!("project `{project}` has no goal definition `{id}`"),
+            });
+        };
+        if !plain_name(project) || !plain_name(id) {
+            return Err(ConfigError::Invalid {
+                path: dir,
+                reason: format!(
+                    "project `{project}` and goal definition `{id}` are each named with letters, digits, `-` and `_`"
+                ),
+            });
+        }
+        let hash = goal_definition_hash(text);
+        let path = dir.join(format!("{hash}.toml"));
+        if std::fs::read_to_string(&path).ok().as_deref() != Some(text.as_str()) {
+            let io = |path: &Path| {
+                let path = path.to_path_buf();
+                move |source| ConfigError::Io { path, source }
+            };
+            std::fs::create_dir_all(&dir).map_err(io(&dir))?;
+            write_whole(&path, text).map_err(io(&path))?;
+        }
+        Ok(Some(hash))
+    }
+
+    /// [`ConfigDir::goal_definitions_and_warnings`], and the text of each
+    /// definition in force by its ID.
+    fn in_force_with_texts(
+        &self,
+        project: &str,
+    ) -> Result<(GoalDefinitions, BTreeMap<String, String>), ConfigError> {
         let decides = self.decides(project);
         let dir = self.0.join("goals").join(project);
         let mut release: BTreeMap<String, (PathBuf, String, GoalDefinition)> = BTreeMap::new();
@@ -1257,15 +1311,22 @@ impl ConfigDir {
                     }),
                     None => {}
                 }
-                stored.insert(id, definition);
+                stored.insert(id, (text, definition));
             }
         }
-        let mut by_id: BTreeMap<String, GoalDefinition> = release
+        let mut by_id: BTreeMap<String, (String, GoalDefinition)> = release
             .into_iter()
-            .map(|(id, (_, _, definition))| (id, definition))
+            .map(|(id, (_, text, definition))| (id, (text, definition)))
             .collect();
         by_id.extend(stored);
-        let definitions: Vec<GoalDefinition> = by_id.into_values().collect();
+        let mut texts = BTreeMap::new();
+        let definitions: Vec<GoalDefinition> = by_id
+            .into_iter()
+            .map(|(id, (text, definition))| {
+                texts.insert(id, text);
+                definition
+            })
+            .collect();
         if !one_default(&definitions) {
             return Err(ConfigError::Invalid {
                 path: dir,
@@ -1273,10 +1334,13 @@ impl ConfigDir {
                     .to_string(),
             });
         }
-        Ok(GoalDefinitions {
-            definitions,
-            warnings,
-        })
+        Ok((
+            GoalDefinitions {
+                definitions,
+                warnings,
+            },
+            texts,
+        ))
     }
 
     /// Put a goal definition in force for a project, over the release's
@@ -2412,6 +2476,71 @@ timeout_secs = 60
             err.contains("its text has changed since it was stored"),
             "{err}"
         );
+        std::fs::remove_dir_all(&dir.0).unwrap();
+    }
+
+    #[test]
+    fn a_definition_in_force_is_pinned_by_its_hash_without_changing_what_is_in_force() {
+        let (dir, store) = dir_with_store(PROJECT);
+        let first = goal("main", "default = true\nmax_pipelines = 1");
+        release(&dir, "main", &first);
+
+        // A release definition is copied into the store under its hash,
+        // and nothing is put in force by it.
+        let pinned = dir.pin_goal_definition("toy", "main").unwrap().unwrap();
+        assert_eq!(pinned, goal_definition_hash(&first));
+        assert_eq!(
+            std::fs::read_to_string(store.join(format!("main/{pinned}.toml"))).unwrap(),
+            first
+        );
+        assert!(!store.join("main/current").exists());
+        assert!(
+            dir.goal_definitions_and_warnings("toy")
+                .unwrap()
+                .warnings
+                .is_empty()
+        );
+        // Pinning again finds the copy there and writes nothing new.
+        assert_eq!(
+            dir.pin_goal_definition("toy", "main").unwrap().as_deref(),
+            Some(pinned.as_str())
+        );
+
+        // A release whose file differs, and then a stored copy put in
+        // force: the pinned copy still reads as it was.
+        release(
+            &dir,
+            "main",
+            &goal("main", "default = true\nmax_pipelines = 3"),
+        );
+        assert_eq!(dir.goal_definitions("toy").unwrap()[0].max_pipelines, 3);
+        let stored = dir
+            .store_goal_definition("toy", &goal("main", "default = true\nmax_pipelines = 5"))
+            .unwrap();
+        assert_eq!(dir.goal_definitions("toy").unwrap()[0].max_pipelines, 5);
+        let read = dir.stored_goal_definition("toy", "main", &pinned).unwrap();
+        assert_eq!(read.max_pipelines, 1);
+
+        // The copy in force is what is pinned now.
+        assert_eq!(
+            dir.pin_goal_definition("toy", "main").unwrap(),
+            Some(stored.hash)
+        );
+
+        // An ID the project lacks is refused.
+        let err = dir
+            .pin_goal_definition("toy", "nothing")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("has no goal definition `nothing`"), "{err}");
+        std::fs::remove_dir_all(&dir.0).unwrap();
+    }
+
+    #[test]
+    fn without_a_store_nothing_is_pinned() {
+        let dir = dir_with(PROJECT);
+        release(&dir, "main", &goal("main", "default = true"));
+        assert_eq!(dir.pin_goal_definition("toy", "main").unwrap(), None);
         std::fs::remove_dir_all(&dir.0).unwrap();
     }
 
