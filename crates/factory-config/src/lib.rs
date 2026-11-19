@@ -1192,162 +1192,192 @@ impl ConfigDir {
         Ok(ids)
     }
 
-    /// Every goal definition of a project. A project with none has no goals.
+    /// Every goal definition of a project in force. A project with none has
+    /// no goals. See [`ConfigDir::goal_definitions_and_warnings`]; this
+    /// leaves out what that reports.
     pub fn goal_definitions(&self, project: &str) -> Result<Vec<GoalDefinition>, ConfigError> {
+        Ok(self.goal_definitions_and_warnings(project)?.definitions)
+    }
+
+    /// Every goal definition of a project in force, and the stored copies
+    /// in force over a release file that says otherwise.
+    ///
+    /// The release's definitions are `goals/<project>/<id>.toml` in this
+    /// directory. A definition the owner has put in force since is stored
+    /// under the state directory (see [`ConfigDir::store_goal_definition`])
+    /// and takes the place of the release's with the same ID. A stored copy
+    /// whose text is the release's is dropped as it is read: the release has
+    /// caught up, and a later change to the release's file is in force
+    /// again. Without a `factory.toml` there is no state directory and so
+    /// no store.
+    pub fn goal_definitions_and_warnings(
+        &self,
+        project: &str,
+    ) -> Result<GoalDefinitions, ConfigError> {
+        let decides = self.decides(project);
         let dir = self.0.join("goals").join(project);
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            return Ok(Vec::new());
-        };
-        // A definition that does not say whether its director decides alone
-        // takes the project's setting. A project that cannot be read here
-        // fails wherever it is read next; until then its goals ask.
-        let decides = self
-            .project(project)
-            .map(|project| project.director_decides)
-            .unwrap_or(false);
-        let mut definitions = Vec::new();
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let Some(id) = name.strip_suffix(".toml") else {
-                continue;
-            };
-            let (path, text) = self.read(&format!("goals/{project}/{name}"))?;
-            let mut definition: GoalDefinition = parse(&path, &text)?;
-            definition.director_decides.get_or_insert(decides);
-            let invalid = |reason: String| ConfigError::Invalid {
-                path: path.clone(),
-                reason,
-            };
-            if definition.id != id {
-                return Err(invalid(format!(
-                    "id is `{}` but the file is named `{name}`",
-                    definition.id
-                )));
+        let mut release: BTreeMap<String, (PathBuf, String, GoalDefinition)> = BTreeMap::new();
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let Some(id) = name.strip_suffix(".toml") else {
+                    continue;
+                };
+                let (path, text) = self.read(&format!("goals/{project}/{name}"))?;
+                let named = format!("the file is named `{name}`");
+                let definition = check_goal_definition(&path, id, &named, &text, decides)?;
+                release.insert(id.to_string(), (path, text, definition));
             }
-            // A design binds every builder of its sub-goal: it waits for
-            // its own model rather than being written by another.
-            if definition
-                .designer
-                .as_ref()
-                .is_some_and(|designer| designer.fallback_model.is_some())
-            {
-                return Err(invalid(
-                    "the designer cannot have a fallback_model: a design binds every builder of its sub-goal, so it waits for its own model"
-                        .to_string(),
-                ));
-            }
-            if definition.max_pipelines == 0 {
-                return Err(invalid("max_pipelines must be at least 1".to_string()));
-            }
-            if definition.permissions.file_beads == Permission::Own {
-                return Err(invalid(
-                    "permissions.file_beads is `allow` or `ask`: `own` is for edit_beads, since a bead being filed is nobody's yet"
-                        .to_string(),
-                ));
-            }
-            for path in &definition.shared_paths {
-                let plain = !path.is_empty()
-                    && path != "."
-                    && !path.starts_with('/')
-                    && !path.split('/').any(|part| part == ".." || part.is_empty())
-                    && !path.contains(['*', '?', '[', '\\']);
-                if !plain {
-                    return Err(invalid(format!(
-                        "shared_paths: `{path}` is not a plain path inside the repository: name files and directories, with no patterns"
-                    )));
-                }
-            }
-            // Work that runs side by side has to be folded back together:
-            // a sub-goal's beads by its foreman's pipelines, and sub-goals
-            // by shipping one at a time.
-            if definition.director.slots == 0 {
-                return Err(invalid("director.slots must be at least 1".to_string()));
-            }
-            if definition.director.slots > 1 && definition.foreman.is_none() {
-                return Err(invalid(
-                    "director.slots above 1 needs a foreman: sub-goals worked on side by side are each run by one"
-                        .to_string(),
-                ));
-            }
-            if let Some(foreman) = &definition.foreman {
-                if foreman.slots == 0 {
-                    return Err(invalid("foreman.slots must be at least 1".to_string()));
-                }
-                if foreman.slots > definition.max_pipelines {
-                    return Err(invalid(format!(
-                        "foreman.slots is {} but max_pipelines, the limit for the whole goal, is {}",
-                        foreman.slots, definition.max_pipelines
-                    )));
-                }
-            }
-            if definition.foreman.is_some() && definition.ship_flow.is_none() {
-                return Err(invalid(
-                    "a foreman runs a sub-goal, so the definition needs a ship_flow".to_string(),
-                ));
-            }
-            if let Some(schedule) = &definition.schedule {
-                if definition.default {
-                    return Err(invalid(
-                        "a definition with a schedule is run by the factory, so it cannot be the default for goals the owner opens".to_string(),
-                    ));
-                }
-                if schedule.hour_utc > 23 || schedule.every_days == 0 {
-                    return Err(invalid(
-                        "schedule: hour_utc is 0 to 23 and every_days is at least 1".to_string(),
-                    ));
-                }
-                if schedule.charter.trim().is_empty() || !(1..=10).contains(&schedule.max_beads) {
-                    return Err(invalid(
-                        "schedule: it needs a charter, and max_beads from 1 to 10".to_string(),
-                    ));
-                }
-                if schedule.when_class_breaks == Some(0) {
-                    return Err(invalid(
-                        "schedule: when_class_breaks is at least 1".to_string(),
-                    ));
-                }
-                if schedule.direct
-                    && (schedule.build_under.is_none()
-                        || schedule.proposes.is_some()
-                        || schedule.when_class_breaks.is_some()
-                        || !schedule.reports.is_empty())
-                {
-                    return Err(invalid(
-                        "schedule: a direct run is one pipeline under build_under with no agent before it, so it needs build_under and cannot have proposes, reports or when_class_breaks".to_string(),
-                    ));
-                }
-                if let Some(most) = schedule.proposes {
-                    if !(1..=5).contains(&most) {
-                        return Err(invalid("schedule: proposes is from 1 to 5".to_string()));
-                    }
-                    if schedule.build_under.is_some()
-                        || schedule.when_class_breaks.is_some()
-                        || !schedule.reports.is_empty()
-                    {
-                        return Err(invalid(
-                            "schedule: a run that proposes goals files and builds nothing, so it cannot have build_under, reports or when_class_breaks".to_string(),
-                        ));
-                    }
-                }
-            }
-            if definition.designer.is_some() && definition.ship_flow.is_none() {
-                return Err(invalid(
-                    "a designer designs a sub-goal, so the definition needs a ship_flow"
-                        .to_string(),
-                ));
-            }
-            definitions.push(definition);
         }
-        definitions.sort_by(|a, b| a.id.cmp(&b.id));
-        let defaults = definitions.iter().filter(|d| d.default).count();
-        if defaults > 1 || (defaults == 0 && definitions.len() > 1) {
+        let mut warnings = Vec::new();
+        let mut stored = BTreeMap::new();
+        if let Some(store) = self.goal_store()? {
+            let store = store.join(project);
+            for (id, path, text, definition) in in_force(&store, decides)? {
+                match release.get(&id) {
+                    Some((_, released, _)) if *released == text => {
+                        // Another reader may have dropped it first.
+                        let current = store.join(&id).join(CURRENT);
+                        match std::fs::remove_file(&current) {
+                            Err(source) if source.kind() != std::io::ErrorKind::NotFound => {
+                                return Err(ConfigError::Io {
+                                    path: current,
+                                    source,
+                                });
+                            }
+                            _ => continue,
+                        }
+                    }
+                    Some((release, _, _)) => warnings.push(StoredOverride {
+                        project: project.to_string(),
+                        id: id.clone(),
+                        hash: goal_definition_hash(&text),
+                        stored: path,
+                        release: release.clone(),
+                    }),
+                    None => {}
+                }
+                stored.insert(id, definition);
+            }
+        }
+        let mut by_id: BTreeMap<String, GoalDefinition> = release
+            .into_iter()
+            .map(|(id, (_, _, definition))| (id, definition))
+            .collect();
+        by_id.extend(stored);
+        let definitions: Vec<GoalDefinition> = by_id.into_values().collect();
+        if !one_default(&definitions) {
             return Err(ConfigError::Invalid {
                 path: dir,
                 reason: "exactly one goal definition of a project must be marked `default = true`"
                     .to_string(),
             });
         }
-        Ok(definitions)
+        Ok(GoalDefinitions {
+            definitions,
+            warnings,
+        })
+    }
+
+    /// Put a goal definition in force for a project, over the release's
+    /// with the same ID: its text is written to
+    /// `<state_dir>/goals/<project>/<id>/<hash>.toml`, and that ID's
+    /// `current` file is made to name the hash. The definition is checked
+    /// as a release file is, and so is the project's set of definitions
+    /// with it in force, before anything is written. Earlier copies stay
+    /// where they are, so a goal that names one by its hash can still read
+    /// it.
+    pub fn store_goal_definition(
+        &self,
+        project: &str,
+        text: &str,
+    ) -> Result<StoredGoalDefinition, ConfigError> {
+        let store = self.goal_store()?.ok_or_else(|| ConfigError::Io {
+            path: self.0.join("factory.toml"),
+            source: std::io::Error::from(std::io::ErrorKind::NotFound),
+        })?;
+        let hash = goal_definition_hash(text);
+        let refuse = |reason: String| ConfigError::Invalid {
+            path: store.join(project).join(format!("{hash}.toml")),
+            reason,
+        };
+        let id = parse::<GoalDefinition>(&store.join(project), text)?.id;
+        if !plain_name(project) || !plain_name(&id) {
+            return Err(refuse(format!(
+                "project `{project}` and goal definition `{id}` are each named with letters, digits, `-` and `_`"
+            )));
+        }
+        let dir = store.join(project).join(&id);
+        let path = dir.join(format!("{hash}.toml"));
+        let named = format!("it is stored under `{id}`");
+        let definition = check_goal_definition(&path, &id, &named, text, self.decides(project))?;
+        let mut set = self.goal_definitions(project)?;
+        set.retain(|other| other.id != id);
+        set.push(definition);
+        if !one_default(&set) {
+            return Err(refuse(
+                "with it in force, exactly one goal definition of the project must still be marked `default = true`"
+                    .to_string(),
+            ));
+        }
+        let io = |path: &Path| {
+            let path = path.to_path_buf();
+            move |source| ConfigError::Io { path, source }
+        };
+        std::fs::create_dir_all(&dir).map_err(io(&dir))?;
+        write_whole(&path, text).map_err(io(&path))?;
+        let current = dir.join(CURRENT);
+        write_whole(&current, &format!("{hash}\n")).map_err(io(&current))?;
+        Ok(StoredGoalDefinition { id, hash, path })
+    }
+
+    /// The stored copy of a project's goal definition `id` whose text has
+    /// the hash `hash`, whether or not it is the one in force, checked as
+    /// a release file is. A copy whose text no longer has its hash is
+    /// refused.
+    pub fn stored_goal_definition(
+        &self,
+        project: &str,
+        id: &str,
+        hash: &str,
+    ) -> Result<GoalDefinition, ConfigError> {
+        let store = self.goal_store()?.ok_or_else(|| ConfigError::Io {
+            path: self.0.join("factory.toml"),
+            source: std::io::Error::from(std::io::ErrorKind::NotFound),
+        })?;
+        let dir = store.join(project).join(id);
+        if !plain_name(project) || !plain_name(id) || !is_hash(hash) {
+            return Err(ConfigError::Invalid {
+                path: dir,
+                reason: format!("`{hash}` of `{id}` in `{project}` does not name a stored copy"),
+            });
+        }
+        let (path, text) = read_stored(&dir, hash)?;
+        let named = format!("it is stored under `{id}`");
+        check_goal_definition(&path, id, &named, &text, self.decides(project))
+    }
+
+    /// `<state_dir>/goals`, where stored goal definitions are kept under
+    /// their project, or none without a `factory.toml`.
+    fn goal_store(&self) -> Result<Option<PathBuf>, ConfigError> {
+        match self.factory() {
+            Ok(factory) => Ok(Some(factory.state_dir.join("goals"))),
+            Err(ConfigError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                Ok(None)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// A definition that does not say whether its director decides alone
+    /// takes the project's setting. A project that cannot be read here
+    /// fails wherever it is read next; until then its goals ask.
+    fn decides(&self, project: &str) -> bool {
+        self.project(project)
+            .map(|project| project.director_decides)
+            .unwrap_or(false)
     }
 
     /// The text of a flow file.
@@ -1359,6 +1389,299 @@ impl ConfigDir {
     pub fn role_prompt(&self, role: &str) -> Result<String, ConfigError> {
         Ok(self.read(&format!("roles/{role}.md"))?.1)
     }
+}
+
+/// The file in a stored goal definition's directory that names, by its
+/// hash, the copy in force. Without it no stored copy of that ID is.
+const CURRENT: &str = "current";
+
+/// A project's goal definitions in force, with what the owner should be
+/// told about them.
+#[derive(Clone, Debug, Default)]
+pub struct GoalDefinitions {
+    pub definitions: Vec<GoalDefinition>,
+    /// Each stored copy in force over a release file whose text differs.
+    pub warnings: Vec<StoredOverride>,
+}
+
+/// A stored copy of a goal definition that is in force although the
+/// release's file for the same ID says something else. The stored copy
+/// wins until the owner puts the release's text in force; this says so,
+/// so that a release that changed the definition is not taken to have.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredOverride {
+    pub project: String,
+    pub id: String,
+    /// The hash of the stored copy's text.
+    pub hash: String,
+    pub stored: PathBuf,
+    pub release: PathBuf,
+}
+
+impl std::fmt::Display for StoredOverride {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "goal definition `{}` of `{}`: the stored copy {} is in force, and the release's {} differs from it",
+            self.id,
+            self.project,
+            self.stored.display(),
+            self.release.display()
+        )
+    }
+}
+
+/// A goal definition written to the store.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredGoalDefinition {
+    pub id: String,
+    /// The hash of its text, by which it can be read back.
+    pub hash: String,
+    pub path: PathBuf,
+}
+
+/// The content hash a stored goal definition is kept and read back by:
+/// the SHA-256 of its text, in lowercase hex.
+pub fn goal_definition_hash(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(text.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Whether a project's definitions have one default, as they must when
+/// there is more than one.
+fn one_default(definitions: &[GoalDefinition]) -> bool {
+    match definitions.iter().filter(|d| d.default).count() {
+        0 => definitions.len() <= 1,
+        defaults => defaults == 1,
+    }
+}
+
+fn is_hash(hash: &str) -> bool {
+    hash.len() == 64
+        && hash
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+}
+
+/// A project or definition ID that can be a directory name and nothing
+/// more.
+fn plain_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// The stored copies in force in one project's store, each as its ID, its
+/// path, its text and the definition, checked as a release file is.
+fn in_force(
+    store: &Path,
+    decides: bool,
+) -> Result<Vec<(String, PathBuf, String, GoalDefinition)>, ConfigError> {
+    let mut found = Vec::new();
+    let Ok(entries) = std::fs::read_dir(store) else {
+        return Ok(found);
+    };
+    for entry in entries.flatten() {
+        let id = entry.file_name().to_string_lossy().into_owned();
+        let dir = entry.path();
+        if !plain_name(&id) || !dir.is_dir() {
+            continue;
+        }
+        let current = dir.join(CURRENT);
+        let hash = match std::fs::read_to_string(&current) {
+            Ok(hash) => hash.trim().to_string(),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(source) => {
+                return Err(ConfigError::Io {
+                    path: current,
+                    source,
+                });
+            }
+        };
+        if !is_hash(&hash) {
+            return Err(ConfigError::Invalid {
+                path: current,
+                reason: format!("`{hash}` is not the hash of a stored copy"),
+            });
+        }
+        let (path, text) = read_stored(&dir, &hash)?;
+        let named = format!("it is stored under `{id}`");
+        let definition = check_goal_definition(&path, &id, &named, &text, decides)?;
+        found.push((id, path, text, definition));
+    }
+    Ok(found)
+}
+
+/// The text of `<dir>/<hash>.toml`, refused if it no longer has that hash:
+/// a stored copy is changed only by storing another.
+fn read_stored(dir: &Path, hash: &str) -> Result<(PathBuf, String), ConfigError> {
+    let path = dir.join(format!("{hash}.toml"));
+    let text = std::fs::read_to_string(&path).map_err(|source| ConfigError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    let actual = goal_definition_hash(&text);
+    if actual != hash {
+        return Err(ConfigError::Invalid {
+            path,
+            reason: format!("its text has changed since it was stored: its hash is now {actual}"),
+        });
+    }
+    Ok((path, text))
+}
+
+/// Write a file so that a reader sees the old text or the new, never part
+/// of either: the text goes to a file beside it, which is then renamed.
+fn write_whole(path: &Path, text: &str) -> std::io::Result<()> {
+    static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let temporary = path.with_file_name(format!(".{name}.{}.{n}.tmp", std::process::id()));
+    std::fs::write(&temporary, text)?;
+    std::fs::rename(&temporary, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&temporary);
+    })
+}
+
+/// Parse one goal definition and make the checks that need no other:
+/// `id` is the ID its place names, which `named` says for the error. A
+/// definition that does not say whether its director decides alone takes
+/// `decides`, the project's setting.
+fn check_goal_definition(
+    path: &Path,
+    id: &str,
+    named: &str,
+    text: &str,
+    decides: bool,
+) -> Result<GoalDefinition, ConfigError> {
+    let mut definition: GoalDefinition = parse(path, text)?;
+    definition.director_decides.get_or_insert(decides);
+    let invalid = |reason: String| ConfigError::Invalid {
+        path: path.to_path_buf(),
+        reason,
+    };
+    if definition.id != id {
+        return Err(invalid(format!("id is `{}` but {named}", definition.id)));
+    }
+    // A design binds every builder of its sub-goal: it waits for
+    // its own model rather than being written by another.
+    if definition
+        .designer
+        .as_ref()
+        .is_some_and(|designer| designer.fallback_model.is_some())
+    {
+        return Err(invalid(
+            "the designer cannot have a fallback_model: a design binds every builder of its sub-goal, so it waits for its own model"
+                .to_string(),
+        ));
+    }
+    if definition.max_pipelines == 0 {
+        return Err(invalid("max_pipelines must be at least 1".to_string()));
+    }
+    if definition.permissions.file_beads == Permission::Own {
+        return Err(invalid(
+            "permissions.file_beads is `allow` or `ask`: `own` is for edit_beads, since a bead being filed is nobody's yet"
+                .to_string(),
+        ));
+    }
+    for path in &definition.shared_paths {
+        let plain = !path.is_empty()
+            && path != "."
+            && !path.starts_with('/')
+            && !path.split('/').any(|part| part == ".." || part.is_empty())
+            && !path.contains(['*', '?', '[', '\\']);
+        if !plain {
+            return Err(invalid(format!(
+                "shared_paths: `{path}` is not a plain path inside the repository: name files and directories, with no patterns"
+            )));
+        }
+    }
+    // Work that runs side by side has to be folded back together:
+    // a sub-goal's beads by its foreman's pipelines, and sub-goals
+    // by shipping one at a time.
+    if definition.director.slots == 0 {
+        return Err(invalid("director.slots must be at least 1".to_string()));
+    }
+    if definition.director.slots > 1 && definition.foreman.is_none() {
+        return Err(invalid(
+            "director.slots above 1 needs a foreman: sub-goals worked on side by side are each run by one"
+                .to_string(),
+        ));
+    }
+    if let Some(foreman) = &definition.foreman {
+        if foreman.slots == 0 {
+            return Err(invalid("foreman.slots must be at least 1".to_string()));
+        }
+        if foreman.slots > definition.max_pipelines {
+            return Err(invalid(format!(
+                "foreman.slots is {} but max_pipelines, the limit for the whole goal, is {}",
+                foreman.slots, definition.max_pipelines
+            )));
+        }
+    }
+    if definition.foreman.is_some() && definition.ship_flow.is_none() {
+        return Err(invalid(
+            "a foreman runs a sub-goal, so the definition needs a ship_flow".to_string(),
+        ));
+    }
+    if let Some(schedule) = &definition.schedule {
+        if definition.default {
+            return Err(invalid(
+                "a definition with a schedule is run by the factory, so it cannot be the default for goals the owner opens".to_string(),
+            ));
+        }
+        if schedule.hour_utc > 23 || schedule.every_days == 0 {
+            return Err(invalid(
+                "schedule: hour_utc is 0 to 23 and every_days is at least 1".to_string(),
+            ));
+        }
+        if schedule.charter.trim().is_empty() || !(1..=10).contains(&schedule.max_beads) {
+            return Err(invalid(
+                "schedule: it needs a charter, and max_beads from 1 to 10".to_string(),
+            ));
+        }
+        if schedule.when_class_breaks == Some(0) {
+            return Err(invalid(
+                "schedule: when_class_breaks is at least 1".to_string(),
+            ));
+        }
+        if schedule.direct
+            && (schedule.build_under.is_none()
+                || schedule.proposes.is_some()
+                || schedule.when_class_breaks.is_some()
+                || !schedule.reports.is_empty())
+        {
+            return Err(invalid(
+                "schedule: a direct run is one pipeline under build_under with no agent before it, so it needs build_under and cannot have proposes, reports or when_class_breaks".to_string(),
+            ));
+        }
+        if let Some(most) = schedule.proposes {
+            if !(1..=5).contains(&most) {
+                return Err(invalid("schedule: proposes is from 1 to 5".to_string()));
+            }
+            if schedule.build_under.is_some()
+                || schedule.when_class_breaks.is_some()
+                || !schedule.reports.is_empty()
+            {
+                return Err(invalid(
+                    "schedule: a run that proposes goals files and builds nothing, so it cannot have build_under, reports or when_class_breaks".to_string(),
+                ));
+            }
+        }
+    }
+    if definition.designer.is_some() && definition.ship_flow.is_none() {
+        return Err(invalid(
+            "a designer designs a sub-goal, so the definition needs a ship_flow".to_string(),
+        ));
+    }
+    Ok(definition)
 }
 
 fn parse<T: serde::de::DeserializeOwned>(path: &Path, text: &str) -> Result<T, ConfigError> {
@@ -1875,5 +2198,258 @@ timeout_secs = 60
         assert_eq!(values["A"], "1");
         assert_eq!(values["B"], "two");
         assert_eq!(values["C"], "three");
+    }
+
+    /// A config directory whose state directory is inside it, so that it
+    /// has a store of goal definitions, with `main` the release's default.
+    fn dir_with_store(project: &str) -> (ConfigDir, PathBuf) {
+        let dir = dir_with(project);
+        let state = dir.0.join("state");
+        std::fs::write(
+            dir.0.join("factory.toml"),
+            format!(
+                "state_dir = \"{}\"\nallowed_models = [\"m\"]\n",
+                state.display()
+            ),
+        )
+        .unwrap();
+        (dir, state.join("goals/toy"))
+    }
+
+    fn goal(id: &str, extra: &str) -> String {
+        format!("id = \"{id}\"\n{extra}\n[director]\nmodel = \"m\"\neffort = \"high\"\n")
+    }
+
+    fn release(dir: &ConfigDir, id: &str, text: &str) -> PathBuf {
+        let goals = dir.0.join("goals/toy");
+        std::fs::create_dir_all(&goals).unwrap();
+        let path = goals.join(format!("{id}.toml"));
+        std::fs::write(&path, text).unwrap();
+        path
+    }
+
+    fn pipelines(loaded: &GoalDefinitions) -> Vec<(&str, u32)> {
+        loaded
+            .definitions
+            .iter()
+            .map(|d| (d.id.as_str(), d.max_pipelines))
+            .collect()
+    }
+
+    #[test]
+    fn a_stored_definition_overrides_the_releases_and_a_difference_is_reported() {
+        let (dir, store) = dir_with_store(PROJECT);
+        release(&dir, "main", &goal("main", "default = true"));
+        let bugs = release(&dir, "bugs", &goal("bugs", "max_pipelines = 1"));
+
+        let text = goal("bugs", "max_pipelines = 3");
+        let stored = dir.store_goal_definition("toy", &text).unwrap();
+        assert_eq!(stored.id, "bugs");
+        assert_eq!(stored.hash, goal_definition_hash(&text));
+        assert_eq!(
+            stored.path,
+            store.join(format!("bugs/{}.toml", stored.hash))
+        );
+        assert_eq!(std::fs::read_to_string(&stored.path).unwrap(), text);
+        assert_eq!(
+            std::fs::read_to_string(store.join("bugs/current")).unwrap(),
+            format!("{}\n", stored.hash)
+        );
+
+        // The stored copy wins, and the release's that it differs from is
+        // named, as `factory goal check` prints it.
+        let loaded = dir.goal_definitions_and_warnings("toy").unwrap();
+        assert_eq!(pipelines(&loaded), [("bugs", 3), ("main", 1)]);
+        assert_eq!(
+            loaded.warnings,
+            [StoredOverride {
+                project: "toy".to_string(),
+                id: "bugs".to_string(),
+                hash: stored.hash.clone(),
+                stored: stored.path.clone(),
+                release: bugs.clone(),
+            }]
+        );
+        assert!(
+            loaded.warnings[0]
+                .to_string()
+                .contains("goal definition `bugs` of `toy`: the stored copy"),
+            "{}",
+            loaded.warnings[0]
+        );
+        assert_eq!(dir.goal_definitions("toy").unwrap()[0].max_pipelines, 3);
+
+        // A release that changes the definition again does not displace
+        // the stored copy: it is still in force, and still reported.
+        release(&dir, "bugs", &goal("bugs", "max_pipelines = 2"));
+        let loaded = dir.goal_definitions_and_warnings("toy").unwrap();
+        assert_eq!(pipelines(&loaded), [("bugs", 3), ("main", 1)]);
+        assert_eq!(loaded.warnings.len(), 1);
+        std::fs::remove_dir_all(&dir.0).unwrap();
+    }
+
+    #[test]
+    fn a_stored_copy_the_release_has_caught_up_with_is_dropped_on_load() {
+        let (dir, store) = dir_with_store(PROJECT);
+        release(&dir, "main", &goal("main", "default = true"));
+        release(&dir, "bugs", &goal("bugs", "max_pipelines = 1"));
+        let text = goal("bugs", "max_pipelines = 3");
+        let stored = dir.store_goal_definition("toy", &text).unwrap();
+
+        // The release now says what the stored copy says.
+        release(&dir, "bugs", &text);
+        let loaded = dir.goal_definitions_and_warnings("toy").unwrap();
+        assert_eq!(pipelines(&loaded), [("bugs", 3), ("main", 1)]);
+        assert!(loaded.warnings.is_empty());
+        assert!(!store.join("bugs/current").exists());
+
+        // So the release's next change is the one in force.
+        release(&dir, "bugs", &goal("bugs", "max_pipelines = 2"));
+        let loaded = dir.goal_definitions_and_warnings("toy").unwrap();
+        assert_eq!(pipelines(&loaded), [("bugs", 2), ("main", 1)]);
+        assert!(loaded.warnings.is_empty());
+
+        // The dropped copy is kept, for a goal that names it.
+        let read = dir
+            .stored_goal_definition("toy", "bugs", &stored.hash)
+            .unwrap();
+        assert_eq!(read.max_pipelines, 3);
+        std::fs::remove_dir_all(&dir.0).unwrap();
+    }
+
+    #[test]
+    fn a_stored_copy_is_read_back_by_its_hash() {
+        let (dir, store) = dir_with_store(
+            &PROJECT.replace("id = \"toy\"", "id = \"toy\"\ndirector_decides = true"),
+        );
+        let first = dir
+            .store_goal_definition("toy", &goal("main", "default = true\nmax_pipelines = 2"))
+            .unwrap();
+        let second = dir
+            .store_goal_definition("toy", &goal("main", "default = true\nmax_pipelines = 4"))
+            .unwrap();
+        assert_ne!(first.hash, second.hash);
+        assert_eq!(dir.goal_definitions("toy").unwrap()[0].max_pipelines, 4);
+
+        // Either copy can be read by its hash, and takes the project's
+        // director_decides as a release file does.
+        let read = dir
+            .stored_goal_definition("toy", "main", &first.hash)
+            .unwrap();
+        assert_eq!((read.max_pipelines, read.director_decides()), (2, true));
+        let read = dir
+            .stored_goal_definition("toy", "main", &second.hash)
+            .unwrap();
+        assert_eq!(read.max_pipelines, 4);
+
+        // A hash with no copy, a name that is not a hash, and a copy whose
+        // text has changed since it was stored are each refused.
+        let none = goal_definition_hash("nothing");
+        assert!(matches!(
+            dir.stored_goal_definition("toy", "main", &none),
+            Err(ConfigError::Io { .. })
+        ));
+        let err = dir
+            .stored_goal_definition("toy", "main", "../../factory")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not name a stored copy"), "{err}");
+        std::fs::write(
+            &first.path,
+            goal("main", "default = true\nmax_pipelines = 9"),
+        )
+        .unwrap();
+        let err = dir
+            .stored_goal_definition("toy", "main", &first.hash)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("its text has changed since it was stored"),
+            "{err}"
+        );
+        // The same holds for the copy in force.
+        std::fs::write(store.join("main/current"), format!("{}\n", first.hash)).unwrap();
+        let err = dir.goal_definitions("toy").unwrap_err().to_string();
+        assert!(
+            err.contains("its text has changed since it was stored"),
+            "{err}"
+        );
+        std::fs::remove_dir_all(&dir.0).unwrap();
+    }
+
+    #[test]
+    fn a_project_with_only_stored_definitions_has_them() {
+        let (dir, _) = dir_with_store(PROJECT);
+        assert!(dir.goal_definitions("toy").unwrap().is_empty());
+        dir.store_goal_definition("toy", &goal("main", "max_pipelines = 2"))
+            .unwrap();
+        let loaded = dir.goal_definitions_and_warnings("toy").unwrap();
+        assert_eq!(pipelines(&loaded), [("main", 2)]);
+        assert!(loaded.warnings.is_empty());
+        // The project has no release definitions; another project has none.
+        assert!(!dir.0.join("goals/toy").exists());
+        assert!(dir.goal_definitions("other").unwrap().is_empty());
+        std::fs::remove_dir_all(&dir.0).unwrap();
+    }
+
+    #[test]
+    fn a_stored_copy_is_checked_as_a_release_file_is() {
+        let (dir, store) = dir_with_store(PROJECT);
+        release(&dir, "main", &goal("main", "default = true"));
+
+        // Refused before it is written: a rule of one file, and a second
+        // default for the project.
+        let err = dir
+            .store_goal_definition("toy", &goal("bugs", "max_pipelines = 0"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("max_pipelines must be at least 1"), "{err}");
+        let err = dir
+            .store_goal_definition(
+                "toy",
+                &format!(
+                    "{}[designer]\nmodel = \"m\"\neffort = \"high\"\nfallback_model = \"n\"\n",
+                    goal("bugs", "ship_flow = \"ship\"")
+                ),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("the designer cannot have a fallback_model"),
+            "{err}"
+        );
+        let err = dir
+            .store_goal_definition("toy", &goal("bugs", "default = true"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("exactly one goal definition"), "{err}");
+        let err = dir
+            .store_goal_definition("toy", &goal("../bugs", ""))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("letters, digits"), "{err}");
+        assert!(!store.exists());
+
+        // A copy put in the store by other means is checked as it is read:
+        // its ID is the directory it is under.
+        let text = goal("bugs", "");
+        let hash = goal_definition_hash(&text);
+        std::fs::create_dir_all(store.join("other")).unwrap();
+        std::fs::write(store.join(format!("other/{hash}.toml")), &text).unwrap();
+        std::fs::write(store.join("other/current"), &hash).unwrap();
+        let err = dir.goal_definitions("toy").unwrap_err().to_string();
+        assert!(
+            err.contains("id is `bugs` but it is stored under `other`"),
+            "{err}"
+        );
+        std::fs::remove_dir_all(store.join("other")).unwrap();
+
+        // A stored copy that does not say takes the project's
+        // director_decides, as a release file does.
+        dir.store_goal_definition("toy", &goal("bugs", "")).unwrap();
+        let loaded = dir.goal_definitions("toy").unwrap();
+        assert!(!loaded[0].director_decides());
+        assert_eq!(loaded[0].director_decides, Some(false));
+        std::fs::remove_dir_all(&dir.0).unwrap();
     }
 }
