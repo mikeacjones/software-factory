@@ -47,6 +47,7 @@ use serde_json::{Value, json};
 
 use crate::{Driver, DriverError, Options, Ship, Status, Within, bead_source, under};
 
+pub mod proposed;
 pub mod review;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -851,6 +852,10 @@ pub struct Front {
     /// account was at a limit, and is handed in again when one is back.
     #[serde(default)]
     pub waiting: bool,
+    /// The goal definitions the executive proposed in it, in order, and
+    /// what the owner made of each.
+    #[serde(default)]
+    pub proposals: Vec<proposed::DefinitionProposal>,
 }
 
 /// Where an agent of the supervisor sits: the directory its runs, its
@@ -3050,6 +3055,7 @@ pub fn front_schema() -> Value {
             "definition": text_schema("To open a goal: the ID of the goal definition it should run under. Empty while there is no goal to open: you are still finding out what the owner wants, or they asked something you can answer yourself."),
             "handoff": text_schema("What the goal's director should know that the owner's own words do not say: what you found out, what else is running on the project and how this goal relates to it. Empty when opening none."),
         })),
+        "propose_definition": proposed::proposal_schema(),
     }))
 }
 
@@ -4439,7 +4445,7 @@ pub fn file_catch_up_bead(
         issue_type: "task".to_string(),
         priority: 2,
         description: format!(
-            "The owner put goal definition `{id}` of project `{project}` in force with `factory goal enable`. Its text is stored at {stored_at} under its SHA-256, {hash}. {release}\n\nCommit the text below, exactly, as `{path}`, or copy the stored file: the file must have that SHA-256. Once a release carries it, the stored copy matches the release's file and is dropped as the definitions are read, and the release's file is in force again.{who}\n\n```toml\n{text}{newline}```",
+            "The owner put goal definition `{id}` of project `{project}` in force at runtime, with `factory goal enable` or by approving a definition the executive proposed. Its text is stored at {stored_at} under its SHA-256, {hash}. {release}\n\nCommit the text below, exactly, as `{path}`, or copy the stored file: the file must have that SHA-256. Once a release carries it, the stored copy matches the release's file and is dropped as the definitions are read, and the release's file is in force again.{who}\n\n```toml\n{text}{newline}```",
             id = stored.id,
             stored_at = stored.path.display(),
             hash = stored.hash,
@@ -5305,6 +5311,9 @@ impl Supervisor {
                 if let Some(approved) = review::pressed(&action_id) {
                     return self.proposal_answered(&value, approved, &user);
                 }
+                if action_id == proposed::APPROVE {
+                    return self.definition_approved(&value, &user);
+                }
                 if !self.goals.contains_key(&value) {
                     return Ok(());
                 }
@@ -5554,6 +5563,7 @@ impl Supervisor {
         let known: Vec<String> = definitions.iter().map(|d| d.id.clone()).collect();
         let source = bead_source(&project);
         let held = self.held_beads(project_id);
+        let config = self.config.clone();
         let check = |result: &Value| {
             let mut problems = Vec::new();
             if strings(result, "reply").trim().is_empty() {
@@ -5582,6 +5592,7 @@ impl Supervisor {
                     }
                 }
             }
+            problems.extend(proposed::proposal_problems(&config, project_id, result));
             problems
         };
         let turn = Turn {
@@ -5655,6 +5666,9 @@ impl Supervisor {
             );
         }
         self.post(channel, root, &said);
+        // A proposed definition waits for the owner: the goal opens under
+        // it when they approve it, and nothing opens now.
+        self.post_proposal(project_id, &mut front, root, &result);
         let open = result.get("open_goal").cloned().unwrap_or_default();
         let definition = strings(&open, "definition").trim().to_string();
         if definition.is_empty() {
@@ -5662,8 +5676,32 @@ impl Supervisor {
             self.save_executive(executive)?;
             return Ok(None);
         }
-        // The goal takes over the thread. Its director is told what was
-        // said here, since it shares no session with the executive.
+        let (goal, asked) = self.open_from_front(
+            project_id,
+            &mut executive,
+            root,
+            front,
+            &definition,
+            strings(&open, "handoff"),
+        )?;
+        self.intake_turn(&goal, &asked)?;
+        Ok(Some(goal))
+    }
+
+    /// Open a goal under `definition` in an executive's conversation with
+    /// the owner, and hand it the thread. Its director is told what was
+    /// said there, since it shares no session with the executive, after
+    /// the executive's `handoff`. Returns the goal and what the owner
+    /// asked, for the director's first turn.
+    fn open_from_front(
+        &mut self,
+        project_id: &str,
+        executive: &mut Executive,
+        root: &str,
+        mut front: Front,
+        definition: &str,
+        handoff: &str,
+    ) -> Result<(String, String), DriverError> {
         let conversation = front
             .said
             .iter()
@@ -5672,7 +5710,7 @@ impl Supervisor {
             .join("\n\n");
         let handoff = format!(
             "{}\n\nWhat was said before the goal was opened:\n\n{conversation}",
-            strings(&open, "handoff").trim()
+            handoff.trim()
         );
         let asked = front
             .said
@@ -5682,25 +5720,26 @@ impl Supervisor {
             .collect::<Vec<_>>()
             .join("\n\n");
         let opened_by = front.opened_by.clone();
+        let channel = front.channel.clone();
         let goal = self.create_goal(
             project_id,
-            channel,
+            &channel,
             root,
             &opened_by,
-            &definition,
+            definition,
             &asked,
             Some(handoff.trim().to_string()),
         )?;
         front.goal = Some(goal.clone());
         executive.threads.insert(root.to_string(), front);
-        self.save_executive(executive)?;
+        self.save_executive(executive.clone())?;
+        let seat = self.executive_seat(project_id);
         self.log_at(
             &seat,
             "goal.opened",
             json!({ "thread": root, "goal": goal, "definition": definition }),
         );
-        self.intake_turn(&goal, &asked)?;
-        Ok(Some(goal))
+        Ok((goal, asked))
     }
 
     /// The beads of a project that some goal is working on, and where.
