@@ -1783,3 +1783,215 @@ async fn a_definition_put_in_force_is_taken_up_by_the_running_worker() {
     );
     shop.close().await;
 }
+
+/// The executive proposes a definition with a schedule and the owner
+/// approves it, both as signals to the project's workflow on the running
+/// worker. Approve puts it in force and has that worker take it up by the
+/// engine's `enabled` command, as `factory goal enable` does: the project
+/// is told to look now, and the schedule, already overdue on its record,
+/// is run. No goal is opened, and the worker is the same one throughout.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_scheduled_definition_the_owner_approves_is_run_by_the_running_worker() {
+    use factory_driver::goal::Event;
+    use factory_engine::tiers::{Project, Reach, project_id, tell};
+    use factory_slack::socket::Incoming;
+
+    const UPKEEP: &str = "id = \"upkeep\"\n[director]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\n[schedule]\nhour_utc = 4\nevery_days = 7\nmax_beads = 2\ncharter = \"Turn what keeps breaking into checks.\"\n";
+    let now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    };
+    let prepare = |world: &World| {
+        world.with_github("green");
+        let project = world.path("config/projects/toy.toml");
+        let text = std::fs::read_to_string(&project).unwrap()
+            + "\n[executive]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\nslots = 2\n";
+        std::fs::write(&project, text).unwrap();
+        std::fs::create_dir_all(world.path("config/goals/toy")).unwrap();
+        std::fs::write(
+            world.path("config/goals/toy/main.toml"),
+            "id = \"main\"\ndefault = true\n[director]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(world.path("bin/state")).unwrap();
+        std::fs::write(
+            world.path("bin/state/executive-1.json"),
+            serde_json::json!({
+                "reply": "A weekly upkeep run, below.",
+                "close": [],
+                "open_goal": {"definition": "", "handoff": ""},
+                "propose_definition": {"toml": UPKEEP, "reason": "Nothing runs by the clock.", "handoff": ""},
+            })
+            .to_string(),
+        )
+        .unwrap();
+    };
+    // The engine's own command is how the worker is told.
+    let temporal = format!(
+        "tiers = true\nengine_bin = \"{}\"\n",
+        env!("CARGO_BIN_EXE_factory-engine")
+    );
+    let Some(shop) =
+        Shop::open_with("engine-approve-schedule", "true", "", prepare, &temporal).await
+    else {
+        return;
+    };
+    let world = &shop.world;
+    let client = shop.client();
+    let reach = Reach {
+        task_queue: "factory-engine-approve-schedule".to_string(),
+        beat_secs: 1,
+        accounts: ACCOUNTS_ID.to_string(),
+    };
+    let worker_pid = shop.worker.lock().unwrap().id();
+    let standing = || async {
+        client
+            .get_workflow_handle::<Project>(project_id("toy"))
+            .query(Project::standing, (), WorkflowQueryOptions::default())
+            .await
+            .ok()
+    };
+    let proposal = || -> serde_json::Value {
+        std::fs::read_to_string(world.path("state/projects/toy/executive.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .map(|executive| executive["threads"]["7.7"]["proposals"][0].clone())
+            .unwrap_or_default()
+    };
+
+    // The owner asks; the executive proposes the scheduled definition.
+    let ask = Event::Tell {
+        project: "toy".to_string(),
+        thread: "7.7".to_string(),
+        text: "Look for what keeps breaking once a week.".to_string(),
+    };
+    tell(&client, &reach, "toy", ask).await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while proposal()["state"] != "waiting" {
+        assert!(
+            Instant::now() < deadline,
+            "nothing was proposed: {:?}",
+            standing().await
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(proposal()["schedule"], "every 7 day(s) at 04:00 UTC");
+    assert!(
+        !world
+            .config()
+            .goal_definitions("toy")
+            .unwrap()
+            .iter()
+            .any(|definition| definition.id == "upkeep")
+    );
+
+    // Its record says a run is overdue, and the maintainer has its answer
+    // ready. The owner approves.
+    let record = world.path("state/projects/toy/schedules/upkeep/scheduled.json");
+    std::fs::create_dir_all(record.parent().unwrap()).unwrap();
+    std::fs::write(
+        &record,
+        serde_json::json!({ "since": now() - 8 * 86_400 }).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        world.path("bin/state/maintainer-1.json"),
+        serde_json::json!({
+            "summary": "Cleanup on error paths keeps breaking.",
+            "digest": "One bead: a check that injects allocation failure.",
+            "journal": "Nothing else was worth a bead.",
+            "file": [{"title": "Check every error path for leaks", "type": "task", "priority": 3,
+                "description": "Error paths have leaked.", "acceptance_criteria": "A check fails when one leaks.",
+                "parent": "", "discovered_from": "", "deferred": true}]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let approve = Event::Slack(Incoming::Action {
+        channel: String::new(),
+        user: "OWNER".to_string(),
+        action_id: "definition_approve".to_string(),
+        value: "7.7/1".to_string(),
+        message_ts: String::new(),
+    });
+    tell(&client, &reach, "toy", approve).await.unwrap();
+    let ran = || -> u64 {
+        std::fs::read_to_string(&record)
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .and_then(|record| record["runs"].as_u64())
+            .unwrap_or(0)
+    };
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while ran() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the schedule was never run: {:?}, {:?}, {}",
+            world.calls(),
+            standing().await,
+            proposal()
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // It is stored and in force, and the worker was told by the engine's
+    // `enabled` command, which had the project look now.
+    let approved = proposal();
+    assert_eq!(approved["state"], "approved", "{approved}");
+    let hash = approved["hash"].as_str().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(world.path(&format!("state/goals/toy/upkeep/{hash}.toml")))
+            .unwrap(),
+        UPKEEP
+    );
+    let log =
+        std::fs::read_to_string(world.path("state/projects/toy/executive/events.jsonl")).unwrap();
+    let logged: serde_json::Value = log
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|event| event["kind"] == "definition.approved")
+        .expect("definition.approved is logged");
+    let said = logged["data"]["engine"]["said"].to_string();
+    for expected in [
+        "the tiers of project `toy` are running, under `upkeep` among the rest",
+        "told project `toy` to look now: `upkeep` has a schedule",
+    ] {
+        assert!(said.contains(expected), "missing {expected:?} in {logged}");
+    }
+    assert_eq!(logged["data"]["schedule"], "every 7 day(s) at 04:00 UTC");
+    let made = approved["made"].as_str().unwrap();
+    assert!(
+        made.contains(
+            "it runs every 7 day(s) at 04:00 UTC, and is due now; no goal is opened under it"
+        ),
+        "{made}"
+    );
+    // The maintainer ran once, and no goal was opened by the approval.
+    let maintainers = world
+        .calls()
+        .iter()
+        .filter(|call| call[0] == "maintainer")
+        .count();
+    assert_eq!(maintainers, 1, "{:?}", world.calls());
+    assert!(goal_records(world).is_empty());
+    assert!(
+        world.calls().iter().all(|call| call[0] != "intake"),
+        "{:?}",
+        world.calls()
+    );
+    let executive: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(world.path("state/projects/toy/executive.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(executive["threads"]["7.7"]["goal"].is_null());
+    {
+        let mut worker = shop.worker.lock().unwrap();
+        assert_eq!(worker.id(), worker_pid);
+        assert!(worker.try_wait().unwrap().is_none(), "the worker ended");
+    }
+    let stands = standing().await.unwrap();
+    assert_eq!(stands.trouble, None, "{stands:?}");
+    shop.close().await;
+}

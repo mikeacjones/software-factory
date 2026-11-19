@@ -172,7 +172,7 @@ A goal a *review* puts to the owner: a project, an objective, a stop condition a
 
 ## definition proposal
 
-A goal definition the *executive* puts to the owner when no definition in force suits the work: its whole TOML, a new ID or a change to one in force, with a reason for the owner and a handoff for the director. Code checks it as `factory goal enable` would and sends every problem back to the executive; one that passes is posted in the thread, with a diff for a change, and an Approve and a Reject button. Approve stores it as a *stored definition*, files its *catch-up bead* and opens the goal in the thread under it. Reject stores nothing and tells the executive. A newer proposal in the thread supersedes one still waiting. Not a *proposal*, which a *review* makes.
+A goal definition the *executive* puts to the owner when no definition in force suits the work: its whole TOML, a new ID or a change to one in force, with a reason for the owner and a handoff for the director. Code checks it as `factory goal enable` would and sends every problem back to the executive; one that passes is posted in the thread, with a diff for a change, and an Approve and a Reject button. Approve stores it as a *stored definition*, files its *catch-up bead* and opens the goal in the thread under it. A definition with a *schedule* may be proposed too: Approve stores it and files the bead the same way, has the running worker take it up as `factory goal enable` does, and opens no goal; the thread is told when it next runs and stays the executive's. Reject stores nothing and tells the executive. A newer proposal in the thread supersedes one still waiting. Not a *proposal*, which a *review* makes.
 
 ## maintenance goal
 

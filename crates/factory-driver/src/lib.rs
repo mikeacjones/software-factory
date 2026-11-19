@@ -92,6 +92,9 @@ pub enum DriverError {
     Account(#[from] factory_claude::accounts::AccountError),
     #[error("{0}")]
     Preflight(String),
+    /// The engine's command could not be run, or said no.
+    #[error("{0}")]
+    Engine(String),
     #[error("unit `{0}` has already ended")]
     AlreadyEnded(String),
 }

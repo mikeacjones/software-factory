@@ -79,6 +79,22 @@ fn of_executive(project: &str, executive: &Value) -> Vec<Value> {
             let value = format!("{root}/{}", at + 1);
             let definition = text(&proposal["id"]);
             let change = proposal["change"] == true;
+            // A definition with a schedule runs by the clock: Approve puts
+            // the schedule in force and opens no goal.
+            let schedule = text(&proposal["schedule"]);
+            let (summary, approve) = if schedule.is_empty() {
+                (
+                    "The executive proposes a goal definition, as none in force suits the work. Approve puts it in force and opens the goal under it in this thread; it is checked again first. Reject stores nothing, and the executive is told.".to_string(),
+                    "Approve: put it in force and open the goal",
+                )
+            } else {
+                (
+                    format!(
+                        "The executive proposes a goal definition with a schedule. Approve puts the schedule in force, and the factory runs it {schedule}; no goal is opened under it. It is checked again first. Reject stores nothing, and the executive is told."
+                    ),
+                    "Approve: put its schedule in force",
+                )
+            };
             let body = shown(text(&proposal["message"]))
                 .unwrap_or_else(|| text(&proposal["text"]).to_string());
             let fence = if body.ends_with('\n') { "" } else { "\n" };
@@ -93,7 +109,7 @@ fn of_executive(project: &str, executive: &Value) -> Vec<Value> {
                 } else {
                     format!("New goal definition `{definition}`")
                 },
-                "summary": "The executive proposes a goal definition, as none in force suits the work. Approve puts it in force and opens the goal under it in this thread; it is checked again first. Reject stores nothing, and the executive is told.",
+                "summary": summary,
                 "at": secs_of(&proposal["ts"]).or_else(|| secs_of(&thread_at)),
                 "sections": [
                     {"label": "Why", "text": proposal["reason"]},
@@ -103,7 +119,7 @@ fn of_executive(project: &str, executive: &Value) -> Vec<Value> {
                     },
                 ],
                 "actions": [
-                    press("Approve: put it in force and open the goal", "primary", "definition_approve", &value),
+                    press(approve, "primary", "definition_approve", &value),
                     press("Reject", "plain", "definition_reject", &value),
                 ],
                 // A reply goes to the executive, and after a Reject it is
@@ -428,6 +444,53 @@ mod tests {
             executive["threads"]["600.0"]["proposals"][0]["state"] = json!(settled);
             assert!(of_project(&project, &[], &executive).is_empty());
         }
+    }
+
+    #[test]
+    fn a_proposed_definition_with_a_schedule_says_approve_puts_it_in_force_and_opens_no_goal() {
+        let project = json!({"id": "toy", "goals": [], "loose": []});
+        let executive = json!({
+            "project": "toy",
+            "threads": {
+                "500.0": {"channel": "C1", "goal": null, "said": [], "proposals": [
+                    {"id": "upkeep", "text": "id = \"upkeep\"\n", "reason": "Weekly upkeep.",
+                     "schedule": "every 7 day(s) at 04:00 UTC", "state": "waiting", "ts": "501.0"},
+                    {"id": "wide", "text": "id = \"wide\"\n", "reason": "Wide.", "state": "waiting", "ts": "502.0"},
+                ]},
+            },
+        });
+        let items = of_project(&project, &[], &executive);
+        assert_eq!(items.len(), 2, "{items:?}");
+        let of = |key: &str| {
+            items
+                .iter()
+                .find(|item| item["key"] == key)
+                .unwrap()
+                .clone()
+        };
+        let scheduled = of("definition:500.0/1");
+        let summary = scheduled["summary"].as_str().unwrap();
+        assert!(
+            summary.contains("Approve puts the schedule in force, and the factory runs it every 7 day(s) at 04:00 UTC; no goal is opened under it."),
+            "{summary}"
+        );
+        assert_eq!(
+            scheduled["actions"][0]["label"],
+            "Approve: put its schedule in force"
+        );
+        // One without a schedule is offered as before.
+        let wide = of("definition:500.0/2");
+        assert!(
+            wide["summary"]
+                .as_str()
+                .unwrap()
+                .contains("Approve puts it in force and opens the goal under it in this thread"),
+            "{wide}"
+        );
+        assert_eq!(
+            wide["actions"][0]["label"],
+            "Approve: put it in force and open the goal"
+        );
     }
 
     #[test]
