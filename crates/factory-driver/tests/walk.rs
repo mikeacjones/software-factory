@@ -12,7 +12,7 @@ use std::process::Command;
 
 use common::world::{World, repo_config, run};
 
-use factory_driver::{Driver, DriverError, Options, Status};
+use factory_driver::{Driver, DriverError, Options, Status, Stepped};
 
 const OPTIONS: Options = Options {
     slack: false,
@@ -326,6 +326,79 @@ fn a_run_cut_off_by_the_death_of_the_factory_resumes_its_session() {
     let brief =
         std::fs::read_to_string(world.path(&format!("bin/state/brief-{}.md", tester + 1))).unwrap();
     assert!(!brief.starts_with("You were interrupted"), "{brief}");
+}
+
+/// The engine's server gives a step out again when its result never
+/// reached it: the worker was stopped, or its heartbeat ran out, after the
+/// step had ended. The step's end is in the unit's log, and the attempt
+/// that comes after hands back that outcome instead of running it twice.
+#[test]
+fn a_step_asked_for_again_after_it_ended_hands_back_its_outcome_without_running() {
+    let world = World::new("recalled", "true");
+    let engine = Options {
+        engine: true,
+        ..OPTIONS
+    };
+    let mut driver = Driver::start(world.config(), "toy", "toy-1", &engine).unwrap();
+    let unit = driver.unit().id.to_string();
+    let first = driver.run_step_at("build", 1, None).unwrap();
+    assert!(matches!(&first, Stepped::Outcome(outcome) if outcome == "done"));
+    let builds = |world: &World| {
+        world
+            .calls()
+            .iter()
+            .filter(|call| call[0] == "builder")
+            .count()
+    };
+    assert_eq!(builds(&world), 1);
+    // The worker that ran it is gone before the server heard how it ended.
+    drop(driver);
+
+    // A second attempt, and a third, on a worker that has just started.
+    for _ in 0..2 {
+        let mut driver = Driver::resume(world.config(), &unit, &engine, None).unwrap();
+        let again = driver.run_step_at("build", 1, None).unwrap();
+        assert!(
+            matches!(&again, Stepped::Outcome(outcome) if outcome == "done"),
+            "{again:?}"
+        );
+        assert_eq!(builds(&world), 1, "the build was not run again");
+        assert_eq!(driver.unit().position.step, "build");
+        assert!(matches!(driver.unit().status, Status::Running));
+    }
+    let events = events_of(&world, &unit);
+    let started = |step: &str| {
+        events
+            .iter()
+            .filter(|(kind, at, _)| kind == "step.started" && at == step)
+            .count()
+    };
+    assert_eq!(started("build"), 1);
+    let recalled: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|(kind, at, _)| kind == "step.recalled" && at == "build")
+        .map(|(_, _, data)| data)
+        .collect();
+    assert_eq!(recalled.len(), 2);
+    assert_eq!(recalled[0]["outcome"], "done");
+    assert_eq!(recalled[0]["round"], 1);
+
+    // Another round of the step is new work, and runs.
+    let mut driver = Driver::resume(world.config(), &unit, &engine, None).unwrap();
+    driver.run_step_at("build", 2, None).unwrap();
+    assert_eq!(builds(&world), 2);
+    drop(driver);
+
+    // So is the same round once anything else has happened to the unit:
+    // here it is taken up by hand, as the engine's `adopt` does.
+    let mut driver = Driver::resume(world.config(), &unit, &OPTIONS, None).unwrap();
+    driver.run_step_at("build", 2, None).unwrap();
+    assert_eq!(builds(&world), 3);
+    let starts = events_of(&world, &unit)
+        .iter()
+        .filter(|(kind, at, _)| kind == "step.started" && at == "build")
+        .count();
+    assert_eq!(starts, 3);
 }
 
 /// Turn on keeping branches on the remote for the test project.

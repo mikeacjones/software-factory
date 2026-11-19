@@ -34,7 +34,7 @@ use factory_claude::accounts::{
 };
 use factory_claude::{Outcome, RunSpec, Session, Usage};
 use factory_config::{BeadSource, ConfigDir, Factory, Project, read_env_file};
-use factory_core::{EventLog, ProjectId, StepId, UnitId, now_unix};
+use factory_core::{EventLog, LogError, ProjectId, StepId, UnitId, now_unix};
 use factory_flow::{
     ExitPolicy, Flow, Next, Position, Registry, SessionRule, Step, StepKind, Target, Workspace,
 };
@@ -48,6 +48,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use thread::{Thread, ThreadState, is_stop};
+
+/// Where a step's end that the engine routes says it goes next.
+const ENGINE_DECIDES: &str = "the engine decides";
+/// The event of a step asked for again after it had ended, whose outcome
+/// was handed back instead of running it twice.
+const STEP_RECALLED: &str = "step.recalled";
 
 #[derive(Debug, thiserror::Error)]
 pub enum DriverError {
@@ -2034,6 +2040,21 @@ impl Driver {
             .rounds
             .insert(step_id.to_string(), round.max(1));
         self.unit.status = Status::Running;
+        // The same step and round asked for again, when the unit's log
+        // ends with that step's end, is the server giving out once more an
+        // attempt whose result it never took: the worker stopped, or its
+        // heartbeat ran out, after the step had ended. The step is not run
+        // twice: the outcome it ended with is handed back.
+        let round = self.unit.position.round();
+        if let Some(outcome) = self.ended_already(step_id, round)? {
+            self.event(
+                STEP_RECALLED,
+                Some(step_id),
+                json!({ "round": round, "outcome": outcome }),
+            )?;
+            self.save()?;
+            return Ok(Stepped::Outcome(outcome));
+        }
         let (step, round, started, end) = self.perform(step_id)?;
         let stepped = match end {
             StepEnd::Park(reason) => {
@@ -2046,19 +2067,52 @@ impl Driver {
             },
             StepEnd::Outcome(outcome) => {
                 self.remember(&step, round, &outcome);
+                // The record first: a step whose end is in the log is not
+                // run again, so the record must already hold all it did.
+                self.save()?;
                 self.event(
                     "step.ended",
                     Some(step_id),
                     json!({
-                        "round": round, "outcome": outcome, "next": "the engine decides",
+                        "round": round, "outcome": outcome, "next": ENGINE_DECIDES,
                         "secs": started.elapsed().as_secs(),
                     }),
                 )?;
-                Stepped::Outcome(outcome)
+                return Ok(Stepped::Outcome(outcome));
             }
         };
         self.save()?;
         Ok(stepped)
+    }
+
+    /// The outcome `step_id` ended with in `round`, if the unit's log ends
+    /// with that: the step's end as `run_step_at` writes it, and after it
+    /// nothing but a handing back of that same end. Anything else after
+    /// it (a park, a resume, another step) means the step is to run.
+    fn ended_already(&self, step_id: &str, round: u32) -> Result<Option<String>, DriverError> {
+        let events = match self.log.read() {
+            Ok(events) => events,
+            // A unit that has no log yet has not ended anything.
+            Err(LogError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(err) => return Err(err.into()),
+        };
+        let Some(last) = events
+            .iter()
+            .rev()
+            .find(|event| event.kind != STEP_RECALLED)
+        else {
+            return Ok(None);
+        };
+        let ended = last.kind == "step.ended"
+            && last.step.as_ref().map(StepId::as_str) == Some(step_id)
+            && last.data.get("round").and_then(Value::as_u64) == Some(u64::from(round))
+            && last.data.get("next").and_then(Value::as_str) == Some(ENGINE_DECIDES);
+        Ok(ended
+            .then(|| last.data.get("outcome").and_then(Value::as_str))
+            .flatten()
+            .map(str::to_string))
     }
 
     /// Record that whoever walks the flow has parked the unit, with the
