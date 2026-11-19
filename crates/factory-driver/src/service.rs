@@ -124,11 +124,7 @@ pub fn install_release(
             )));
         }
     }
-    let link = current(state_dir);
-    let staged = state_dir.join(format!("current.{}", std::process::id()));
-    let _ = std::fs::remove_file(&staged);
-    std::os::unix::fs::symlink(&dir, &staged).map_err(io(&staged))?;
-    std::fs::rename(&staged, &link).map_err(io(&link))?;
+    make_current(state_dir, &dir)?;
 
     let mut all: Vec<PathBuf> = std::fs::read_dir(releases(state_dir))
         .map_err(io(&dir))?
@@ -145,6 +141,149 @@ pub fn install_release(
         }
     }
     Ok(dir)
+}
+
+/// Point the link at a release, in one step: there is never a moment with
+/// no current release.
+fn make_current(state_dir: &Path, dir: &Path) -> Result<(), DriverError> {
+    let link = current(state_dir);
+    let staged = state_dir.join(format!("current.{}", std::process::id()));
+    let _ = std::fs::remove_file(&staged);
+    std::os::unix::fs::symlink(dir, &staged).map_err(io(&staged))?;
+    std::fs::rename(&staged, &link).map_err(io(&link))
+}
+
+/// Make the release before the current one current again, and return it.
+/// The release that was current stays on disk, so the rollback can itself
+/// be undone by hand. A service that is running goes on with what it
+/// started from until it is restarted.
+pub fn rollback_release(state_dir: &Path) -> Result<PathBuf, DriverError> {
+    let now = std::fs::canonicalize(current(state_dir)).map_err(|err| {
+        DriverError::Preflight(format!(
+            "there is no current release to roll back from ({}: {err})",
+            current(state_dir).display()
+        ))
+    })?;
+    let mut all: Vec<PathBuf> = std::fs::read_dir(releases(state_dir))
+        .map_err(io(&releases(state_dir)))?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .filter_map(|path| std::fs::canonicalize(path).ok())
+        .collect();
+    all.sort();
+    let Some(at) = all.iter().position(|release| release == &now) else {
+        return Err(DriverError::Preflight(format!(
+            "the current release {} is not among the releases kept",
+            now.display()
+        )));
+    };
+    let Some(before) = at.checked_sub(1).map(|index| all[index].clone()) else {
+        return Err(DriverError::Preflight(format!(
+            "{} is the oldest release kept, so there is nothing to roll back to",
+            now.display()
+        )));
+    };
+    make_current(state_dir, &before)?;
+    Ok(before)
+}
+
+/// Where the factory builds releases of its own landed commits: a worktree
+/// of its repository kept from one deploy to the next, so that the build
+/// starts from what the last one left.
+pub fn deploy_checkout(state_dir: &Path, project: &str) -> PathBuf {
+    state_dir.join("self-deploy").join(project)
+}
+
+/// A release the factory made of itself.
+#[derive(Debug)]
+pub struct Deployed {
+    pub release: PathBuf,
+    /// What the build printed.
+    pub output: String,
+    pub build_secs: u64,
+}
+
+/// Why the factory could not make a release of a commit that landed.
+#[derive(Debug, thiserror::Error)]
+pub enum DeployError {
+    #[error("the deploy checkout at {dir} could not be put at {commit}: {reason}")]
+    Checkout {
+        dir: PathBuf,
+        commit: String,
+        reason: String,
+    },
+    #[error("the build did not pass ({verdict})")]
+    Build { verdict: String, output: String },
+    #[error("the build passed but left no program at {0}")]
+    NoBinary(PathBuf),
+    #[error("{0}")]
+    Release(String),
+}
+
+/// Build `commit` of the factory's repository in its deploy checkout with
+/// the project's build command, and install what it built, with the
+/// config at that commit, as the current release. Nothing is restarted:
+/// the caller asks the service to stop at a safe point.
+pub fn build_and_release(
+    state_dir: &Path,
+    repo: &Path,
+    project: &str,
+    commit: &str,
+    build: &factory_config::CommandSpec,
+    binary: &Path,
+    keep: usize,
+) -> Result<Deployed, DeployError> {
+    let dir = deploy_checkout(state_dir, project);
+    let checkout_failed = |reason: String| DeployError::Checkout {
+        dir: dir.clone(),
+        commit: commit.to_string(),
+        reason,
+    };
+    if dir.join(".git").exists() {
+        factory_git::checkout_detached(&dir, commit)
+            .map_err(|err| checkout_failed(err.to_string()))?;
+    } else {
+        if let Some(parent) = dir.parent() {
+            std::fs::create_dir_all(parent).map_err(|err| checkout_failed(err.to_string()))?;
+        }
+        // A worktree whose directory was removed is still known to git
+        // until it is removed from git's list too.
+        if factory_git::worktree_add_detached(repo, &dir, commit).is_err() {
+            let _ = factory_git::worktree_remove(repo, &dir);
+            let _ = std::fs::remove_dir_all(&dir);
+            factory_git::worktree_add_detached(repo, &dir, commit)
+                .map_err(|err| checkout_failed(err.to_string()))?;
+        }
+    }
+    let result = factory_checks::run_command(
+        &build.argv,
+        &dir,
+        std::time::Duration::from_secs(build.timeout_secs),
+    );
+    if result.verdict != factory_checks::Verdict::Passed {
+        return Err(DeployError::Build {
+            verdict: format!("{:?}", result.verdict),
+            output: result.output,
+        });
+    }
+    let program = dir.join(binary);
+    if !program.is_file() {
+        return Err(DeployError::NoBinary(program));
+    }
+    let release = install_release(
+        state_dir,
+        &program,
+        &dir.join("config"),
+        &release_name(factory_core::now_unix(), Some(commit)),
+        keep,
+    )
+    .map_err(|err| DeployError::Release(err.to_string()))?;
+    Ok(Deployed {
+        release,
+        output: result.output,
+        build_secs: result.duration.as_secs(),
+    })
 }
 
 /// Copy a program to where it is run from, whole or not at all: it is
@@ -530,6 +669,95 @@ mod tests {
                 .join(format!("current.{}", std::process::id()))
                 .exists()
         );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn the_factory_releases_what_landed_and_a_rollback_makes_the_one_before_current() {
+        let root = std::env::temp_dir().join(format!("factory-self-deploy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (state, repo) = (root.join("state"), root.join("repo"));
+        std::fs::create_dir_all(repo.join("config")).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{args:?}: {out:?}");
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        // The "build" copies what the commit holds to where the release's
+        // program is looked for.
+        let commit = |text: &str| {
+            std::fs::write(repo.join("program.txt"), text).unwrap();
+            std::fs::write(repo.join("config/factory.toml"), text).unwrap();
+            git(&["add", "-A"]);
+            git(&["commit", "-q", "-m", text]);
+            git(&["rev-parse", "HEAD"])
+        };
+        git(&["init", "-q", "-b", "main"]);
+        // What the build leaves is ignored, as a cargo target directory is,
+        // so it is kept from one deploy to the next.
+        std::fs::write(repo.join(".gitignore"), "out/\n").unwrap();
+        let one = commit("one");
+        let build: factory_config::CommandSpec = toml::from_str(
+            "argv = [\"sh\", \"-c\", \"mkdir -p out && cp program.txt out/factory && echo built\"]\ntimeout_secs = 60",
+        )
+        .unwrap();
+        let binary = Path::new("out/factory");
+        let deploy = |commit: &str, build: &factory_config::CommandSpec| {
+            build_and_release(&state, &repo, "factory", commit, build, binary, 3)
+        };
+        let read = |path: PathBuf| std::fs::read_to_string(path).unwrap();
+
+        let first = deploy(&one, &build).unwrap();
+        assert!(first.output.contains("built"));
+        assert_eq!(read(current(&state).join("factory")), "one");
+        assert_eq!(read(current(&state).join("config/factory.toml")), "one");
+        // Release names are to the second and sort by age.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let two = commit("two");
+        let second = deploy(&two, &build).unwrap();
+        assert_eq!(read(current(&state).join("factory")), "two");
+        assert!(
+            second.release.to_string_lossy().contains(&two[..12]),
+            "a release is named for its commit"
+        );
+
+        // A build that fails, or leaves no program, changes nothing.
+        let broken: factory_config::CommandSpec =
+            toml::from_str("argv = [\"sh\", \"-c\", \"echo no; exit 3\"]\ntimeout_secs = 60")
+                .unwrap();
+        match deploy(&one, &broken) {
+            Err(DeployError::Build { output, .. }) => assert!(output.contains("no")),
+            other => panic!("{other:?}"),
+        }
+        let empty: factory_config::CommandSpec =
+            toml::from_str("argv = [\"true\"]\ntimeout_secs = 60").unwrap();
+        std::fs::remove_dir_all(deploy_checkout(&state, "factory").join("out")).unwrap();
+        assert!(matches!(
+            deploy(&one, &empty),
+            Err(DeployError::NoBinary(_))
+        ));
+        assert_eq!(read(current(&state).join("factory")), "two");
+
+        // The release before goes back in place, and the bad one is kept.
+        let back = rollback_release(&state).unwrap();
+        assert_eq!(back, std::fs::canonicalize(&first.release).unwrap());
+        assert_eq!(read(current(&state).join("factory")), "one");
+        assert!(second.release.exists());
+        let err = rollback_release(&state).unwrap_err().to_string();
+        assert!(err.contains("oldest release kept"), "{err}");
         std::fs::remove_dir_all(&root).unwrap();
     }
 

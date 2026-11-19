@@ -316,6 +316,32 @@ sequenceDiagram
 
 Jobs that pass when run again were a flake. No builder is sent, the pull request lands, and the flake goes to the director or foreman as a finding when the pipeline ends, to be filed as a bug or added to the bead that covers it. A fix that comes back `already_done` reaches `ci` again with the commit unchanged, and the failed jobs are run once more. Nobody is asked to run CI again. Before a fix is accepted on this branch, code runs the project's publish checks on it, so a commit the builder made with a message they refuse is reworded by that builder, in the same session.
 
+## 8. The factory works on itself every night and ships what it lands
+
+Owner's decision, 2026-11-18. `nightly` is the factory's own scheduled definition, a *direct* one: no agent decides what to build or starts it. Boxes marked *code* involve no model.
+
+```mermaid
+flowchart TD
+    clock["Code: 08:00 UTC, and no earlier run's goal open,<br/>and the project has a place for a goal"] --> file["Code: file one bead<br/>its description is the schedule's charter"]
+    file --> open["Code: open a goal under build_under,<br/>start the bead's pipeline. No director."]
+    open --> work["work · agent: builder, Opus, one session<br/>decides what most needs doing and does it"]
+    work -->|"already_done"| nothing(["Code: the bead is closed,<br/>the goal is complete"])
+    work -->|"done"| check["check · cargo xtask check, no model"]
+    check -->|"fail"| fix["fix · the same session"]
+    fix --> check
+    check -->|"pass"| describe["describe · publisher, the same session"]
+    describe --> publish["publish · action: squash, push, pull request"]
+    publish --> ci["ci · action: GitHub's check job, no model"]
+    ci -->|"red"| fix
+    ci -->|"green"| land["land · action: squash-merge, close the bead"]
+    land --> deploy["deploy · action: build the merged commit in its own checkout,<br/>make it the current release, set the drain flag"]
+    deploy -->|"done"| restart(["The service finishes the steps in flight<br/>and launchd starts it on the new release.<br/>Code completes the goal."])
+    deploy -->|"failed"| park
+    land -->|"failed"| park(["Park: code stops the goal and tells the owner.<br/>The next run comes at its time."])
+```
+
+The run may not change `.github`, the project's record, its flow or its goal definitions: those are forbidden paths, so a change to them parks the unit. `factory service rollback` makes the release before current again.
+
 ## Where each diagram comes from
 
 | Diagram | Code and config |
@@ -325,5 +351,6 @@ Jobs that pass when run again were a flake. No builder is sent, the pull request
 | 3, 4 | `config/flows/zig-sdk-bead.toml`, `config/flows/zig-sdk-ship.toml`, `config/projects/temporal-sdk-zig.toml` |
 | 5 | `crates/factory-driver/src/lib.rs` (`agent_step`, `verify_reproductions`, `adopt_regressions`, `check_regressions`), `crates/factory-brief/src/lib.rs` (`result_problems`) |
 | 6, 7 | `crates/factory-driver/src/goal.rs` (`run_schedule`, `classes_calling`, `maintenance_problems`, `open_maintenance`, `settle_maintenance`), `crates/factory-driver/src/lib.rs` (`finding_classes`, `answer_class`, `check_landed`, `classes_unchecked`), `config/goals/temporal-sdk-zig/upkeep.toml` |
+| 8 | `crates/factory-driver/src/goal.rs` (`run_direct`, `open_direct`, `settle_direct`), `crates/factory-driver/src/lib.rs` (`deploy_step`), `crates/factory-driver/src/service.rs` (`build_and_release`, `rollback_release`), `config/flows/factory-self.toml`, `config/goals/software-factory/nightly.toml` |
 
 A diagram that no longer matches these is wrong: change it with the code.

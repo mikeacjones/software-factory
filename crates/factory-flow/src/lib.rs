@@ -260,7 +260,7 @@ pub struct ActionSpec {
     pub required: &'static [&'static str],
 }
 
-pub const ACTIONS: [ActionSpec; 5] = [
+pub const ACTIONS: [ActionSpec; 6] = [
     // One final commit, a push, and the pull request. `conflict` when a
     // merge into the branch left conflicts that are still unresolved.
     ActionSpec {
@@ -300,6 +300,14 @@ pub const ACTIONS: [ActionSpec; 5] = [
         outcomes: &["done", "failed"],
         required: &["done"],
     },
+    // For the factory's own project only: build what landed, make it the
+    // factory's current release, and ask the running worker to stop at a
+    // safe point so that the new release takes over.
+    ActionSpec {
+        name: "deploy",
+        outcomes: &["done", "failed"],
+        required: &["done", "failed"],
+    },
 ];
 
 /// What a flow is checked against: the things it may name.
@@ -313,6 +321,9 @@ pub struct Registry {
     pub agents: BTreeMap<String, BTreeSet<String>>,
     pub commands: BTreeSet<String>,
     pub scopes: BTreeSet<String>,
+    /// The project deploys the factory itself, so a step may be the
+    /// `deploy` action.
+    pub deploys: bool,
 }
 
 impl Flow {
@@ -505,6 +516,11 @@ impl Flow {
                 StepKind::Action { action } => {
                     match ACTIONS.iter().find(|spec| spec.name == action) {
                         None => problems.push(format!("step `{id}`: unknown action `{action}`")),
+                        Some(spec) if spec.name == "deploy" && !registry.deploys => {
+                            problems.push(format!(
+                                "step `{id}`: the action `deploy` deploys the factory itself, and this project has no [self_deploy] table"
+                            ));
+                        }
                         Some(spec) => {
                             for outcome in step.on.keys() {
                                 if !spec.outcomes.contains(&outcome.as_str()) {
@@ -1128,6 +1144,7 @@ on.failed = "park"
             agents: BTreeMap::from([("other".to_string(), set(&["o"]))]),
             commands: set(&["test", "fmt", "vet"]),
             scopes: set(&["code"]),
+            deploys: false,
         }
     }
 
@@ -1318,6 +1335,48 @@ on.merged = "end"
             )
             .replace("on.merged = \"end\"\n", "");
         Flow::parse(&good).unwrap().check(&registry()).unwrap();
+    }
+
+    #[test]
+    fn only_the_factorys_own_project_may_deploy_and_a_failed_deploy_is_routed() {
+        let tail = r#"
+[[step]]
+id = "land"
+kind = "action"
+action = "land"
+on.done = "deploy"
+
+[[step]]
+id = "deploy"
+kind = "action"
+action = "deploy"
+on.done = "end"
+"#;
+        let text = format!(
+            "{}{tail}",
+            FLOW.replace("on.done = \"end\"", "on.done = \"land\"")
+        );
+        let found = problems(&text);
+        assert!(found.contains(
+            &"step `deploy`: the action `deploy` deploys the factory itself, and this project has no [self_deploy] table"
+                .to_string()
+        ));
+
+        let factory = Registry {
+            deploys: true,
+            ..registry()
+        };
+        let err = Flow::parse(&text).unwrap().check(&factory).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("the action `deploy` must route `failed`"),
+            "{err}"
+        );
+        let good = text.replace(
+            "action = \"deploy\"\non.done = \"end\"\n",
+            "action = \"deploy\"\non.done = \"end\"\non.failed = \"park\"\n",
+        );
+        Flow::parse(&good).unwrap().check(&factory).unwrap();
     }
 
     /// The reference flow with a reports step between the test and the tester.

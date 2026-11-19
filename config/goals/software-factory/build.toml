@@ -1,0 +1,15 @@
+# The goal definition the factory's own work runs under: the nightly direct
+# run (nightly.toml) opens its goals here, and so does a proposal of the
+# nightly review that the owner approves. A direct run's goal never wakes
+# this director; one opened from a proposal does.
+id = "build"
+default = true
+flow = "factory-self"
+max_pipelines = 1
+objective = "Improve the software factory's own code and ship it."
+stop_when = "The change the goal was opened for has landed on main and is the factory's current release."
+
+[director]
+model = "claude-opus-5-5"
+effort = "medium"
+timeout_secs = 1800

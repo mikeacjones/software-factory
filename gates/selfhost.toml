@@ -24,6 +24,38 @@ timeout_secs = 900
 id = "review-is-configured"
 tier = "hermetic"
 bead = "sf-yd3.2"
-claim = "The factory's own review is configured: the software-factory project posts in the software-factory channel and has no pipeline that builds, and its review definition runs every day at 09:00 UTC (04:00 Eastern Standard Time), proposes at most three goals a run, and has an inspector's role text."
-command = ["sh", "-c", "grep -q '^slack_channel = \"software-factory\"' config/projects/software-factory.toml && grep -q '^flow = \"no-pipeline\"' config/projects/software-factory.toml && grep -q '^hour_utc = 9' config/goals/software-factory/review.toml && grep -q '^every_days = 1' config/goals/software-factory/review.toml && grep -q '^proposes = 3' config/goals/software-factory/review.toml && grep -q '^You are the inspector' config/roles/inspector.md"]
+claim = "The factory's own review is configured: the software-factory project posts in the software-factory channel, and its review definition runs every day at 09:00 UTC (04:00 Eastern Standard Time), proposes at most three goals a run, and has an inspector's role text."
+command = ["sh", "-c", "grep -q '^slack_channel = \"software-factory\"' config/projects/software-factory.toml && grep -q '^hour_utc = 9' config/goals/software-factory/review.toml && grep -q '^every_days = 1' config/goals/software-factory/review.toml && grep -q '^proposes = 3' config/goals/software-factory/review.toml && grep -q '^You are the inspector' config/roles/inspector.md"]
+timeout_secs = 60
+
+[[check]]
+id = "direct-schedule"
+tier = "hermetic"
+bead = "sf-yd3.9"
+claim = "A direct schedule needs build_under and has no proposes, reports or when_class_breaks. At its time code files one bead from its charter, opens a goal under build_under and starts the bead's pipeline, with no maintainer and no director; a run that comes due while that goal is open waits. The goal completes by code when the bead lands, and a pipeline that parks stops the goal and is put to the owner, still with no director woken."
+command = ["sh", "-c", "cargo test --locked --offline --package factory-config --lib a_direct_schedule && cargo test --locked --offline --package factory-driver --test walk -- a_direct_run"]
+timeout_secs = 900
+
+[[check]]
+id = "deploy-action"
+tier = "hermetic"
+bead = "sf-yd3.9"
+claim = "Only a project with a [self_deploy] table, whose build command is defined and which lands through GitHub, may name the deploy action, and a flow must route its failure. It builds the landed commit in a checkout of its own, kept between deploys, installs the build with the config at that commit as the current release, and changes nothing when the build fails or leaves no program. factory service rollback makes the release before the current one current again and keeps the one it replaced."
+command = ["sh", "-c", "cargo test --locked --offline --package factory-config --lib a_project_that_deploys && cargo test --locked --offline --package factory-flow --lib only_the_factorys_own_project_may_deploy && cargo test --locked --offline --package factory-driver --lib the_factory_releases_what_landed"]
+timeout_secs = 900
+
+[[check]]
+id = "self-configured"
+tier = "hermetic"
+bead = "sf-yd3.9"
+claim = "The factory's own project is configured to ship itself: its flow factory-self is sound against the project record (one Opus builder session, cargo xtask check, publish, CI, land, deploy), its goal definitions load with the nightly direct run under build, its record forbids changes to .github, to itself, to its flow and to its goal definitions, and CI runs cargo xtask check as the required check on every pull request."
+command = ["sh", "-c", "cargo run --quiet --locked --offline --package factory-cli -- flow check software-factory --config config && cargo run --quiet --locked --offline --package factory-cli -- goal check --config config | grep -q 'software-factory/nightly: scheduled, direct' && grep -q '\"config/projects/software-factory.toml\"' config/projects/software-factory.toml && grep -q '\"config/goals/software-factory/\\*\\*\"' config/projects/software-factory.toml && grep -q '^  check:' .github/workflows/ci.yml && grep -q 'cargo xtask check' .github/workflows/ci.yml"]
+timeout_secs = 900
+
+[[check]]
+id = "first-self-ship"
+tier = "owner"
+bead = "sf-yd3.9"
+claim = "A nightly run on the live factory has landed a change to the factory and deployed it: the release it made is current, the service restarted onto it, and the run's goal completed by code."
+command = ["sh", "-c", "echo 'the owner confirms a nightly run landed and deployed a change'; exit 1"]
 timeout_secs = 60
