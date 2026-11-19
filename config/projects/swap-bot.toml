@@ -15,9 +15,13 @@ director_decides = true
 # CI's `npm ci` does.
 setup = ["install"]
 
-# CI and the publish workflow are the owner's; the beads tracker is not in
-# this repository; CI commits the coverage badge on main itself.
-forbidden_paths = [".github/**", ".beads/**", ".claude/**", "worktrees/**"]
+# The publish workflow holds the Devvit token and publishes the bot to Reddit
+# on every push to main, so it stays the owner's. The rest of .github, CI's
+# test job included, is the agents' to change: a broken test job only fails
+# the required `test` check, and nothing merges (owner's decision,
+# 2026-11-18). The beads tracker is not in this repository; CI commits the
+# coverage badge on main itself.
+forbidden_paths = [".github/workflows/devvit-publish.yml", ".beads/**", ".claude/**", "worktrees/**"]
 standards = ["README.md"]
 test_patterns = ['\b(it|test|describe)(\.each)?\(', '\bexpect\(']
 
