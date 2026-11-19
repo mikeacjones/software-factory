@@ -4283,7 +4283,8 @@ struct Turn {
 
 /// Check every project's goal definitions against what they name: the
 /// pipeline, the director's model and its prompts. Returns one line per
-/// definition, or the first problem.
+/// definition, after a `warning:` line for each stored copy in force over
+/// a release file that says otherwise, or the first problem.
 pub fn check_definitions(config: &ConfigDir) -> Result<Vec<String>, DriverError> {
     let factory = config.factory()?;
     let mut lines = Vec::new();
@@ -4302,7 +4303,11 @@ pub fn check_definitions(config: &ConfigDir) -> Result<Vec<String>, DriverError>
                 tier.model, tier.effort, tier.slots
             ));
         }
-        for definition in config.goal_definitions(&id)? {
+        let loaded = config.goal_definitions_and_warnings(&id)?;
+        for warning in &loaded.warnings {
+            lines.push(format!("warning: {warning}"));
+        }
+        for definition in loaded.definitions {
             let refuse = |reason: String| {
                 DriverError::Preflight(format!(
                     "goal definition `{}` of `{id}`: {reason}",

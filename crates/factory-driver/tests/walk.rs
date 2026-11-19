@@ -3048,6 +3048,43 @@ fn a_goal_definition_that_cannot_run_is_refused() {
 }
 
 #[test]
+fn a_stored_definition_in_force_over_a_different_release_is_reported_by_the_check() {
+    use factory_driver::goal::check_definitions;
+    let world = World::new("goal-defs-stored", "true");
+    std::fs::create_dir_all(world.path("config/goals/toy")).unwrap();
+    let definition = |pipelines: u32| {
+        format!(
+            "id = \"main\"\nmax_pipelines = {pipelines}\n[director]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\n"
+        )
+    };
+    std::fs::write(world.path("config/goals/toy/main.toml"), definition(1)).unwrap();
+    let stored = world
+        .config()
+        .store_goal_definition("toy", &definition(2))
+        .unwrap();
+    let lines = check_definitions(&world.config()).unwrap();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(
+        lines[0].starts_with("warning: goal definition `main` of `toy`: the stored copy")
+            && lines[0].contains(&stored.hash),
+        "{lines:?}"
+    );
+    assert_eq!(
+        lines[1],
+        "toy/main: director claude-opus-5-5 (high), pipeline `build-break-review`, 2 at a time"
+    );
+
+    // Once the release says the same, the stored copy is dropped and there
+    // is nothing to report.
+    std::fs::write(world.path("config/goals/toy/main.toml"), definition(2)).unwrap();
+    let lines = check_definitions(&world.config()).unwrap();
+    assert_eq!(
+        lines,
+        ["toy/main: director claude-opus-5-5 (high), pipeline `build-break-review`, 2 at a time"]
+    );
+}
+
+#[test]
 fn a_run_refused_at_a_limit_continues_its_session_under_another_account() {
     let world = World::new("accounts", "true");
     world.scenario("limit-default-once");

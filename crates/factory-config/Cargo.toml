@@ -13,3 +13,4 @@ factory-core.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 toml.workspace = true
+sha2.workspace = true
