@@ -352,15 +352,9 @@ async fn command(args: &[String]) -> Result<(), String> {
             // A button the owner pressed somewhere other than Slack, handed
             // to the project's tiers as the press in Slack would be.
             config.project(project).map_err(|err| err.to_string())?;
-            let user = factory_driver::goal::owner_id(&config).map_err(|err| err.to_string())?;
+            let event = factory_driver::goal::owner_press(&config, action_id, value)
+                .map_err(|err| err.to_string())?;
             let client = connect(&temporal.address, &temporal.namespace).await?;
-            let event = factory_driver::goal::Event::Slack(factory_slack::socket::Incoming::Action {
-                channel: String::new(),
-                user,
-                action_id: action_id.to_string(),
-                value: value.to_string(),
-                message_ts: String::new(),
-            });
             tell(&client, &reach(&temporal), project, event).await?;
             println!("handed to project `{project}`: {action_id} on {value}");
             Ok(())

@@ -393,6 +393,65 @@ async fn the_owner_acts_from_the_page_through_the_engine_and_nobody_else_does() 
     std::fs::remove_dir_all(&state).unwrap();
 }
 
+/// A definition the executive proposed is in the inbox from the
+/// executive's record, and its buttons are handed to the engine as the
+/// press in Slack is: the action and the value the Slack button carries.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_proposed_definition_is_read_from_the_executive_and_its_buttons_reach_the_engine() {
+    use std::os::unix::fs::PermissionsExt;
+    let state = state("definition");
+    std::fs::write(
+        state.join("projects/toy/executive.json"),
+        r#"{"project":"toy","threads":{"500.0":{"channel":"C1","goal":null,"said":[],"proposals":[
+            {"id":"wide","text":"id = \"wide\"\n","reason":"Nothing runs wide.","change":false,"state":"waiting",
+             "message":"x\n```\nid = \"wide\"\n```\nApprove","ts":"501.0"}]}},
+            "wakes":1,"usage":{"cost_usd":0.5},"memos":[],"pending":[]}"#,
+    )
+    .unwrap();
+    let heard = state.join("heard");
+    let engine = state.join("factory-engine");
+    std::fs::write(
+        &engine,
+        format!(
+            "#!/bin/sh\nprintf '%s|' \"$@\" > {}\necho handed\n",
+            heard.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&engine, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let with = Engine {
+        command: engine,
+        config: state.join("config"),
+    };
+    let address = open_acting(&state, &["127.0.0.0/8"], Some(with), &["127.0.0.0/8"]).await;
+    let picture = body(&ask(address, "GET", "/api/snapshot", &address.to_string()).await);
+    let item = picture["inbox"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["kind"] == "definition")
+        .unwrap_or_else(|| panic!("{}", picture["inbox"]));
+    assert_eq!(item["title"], "New goal definition `wide`");
+    assert_eq!(item["sections"][1]["text"], "```\nid = \"wide\"\n```");
+    let page = "X-Factory-Owner: 1\r\nContent-Type: application/json\r\n";
+    for action in item["actions"].as_array().unwrap() {
+        let press = serde_json::json!({"project": "toy", "act": "press",
+            "action_id": action["action_id"], "value": action["value"]});
+        let answer = post(address, page, &press.to_string()).await;
+        assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+        assert_eq!(
+            std::fs::read_to_string(&heard).unwrap(),
+            format!(
+                "--config|{}|owner|toy|press|{}|500.0/1|",
+                state.join("config").display(),
+                action["action_id"].as_str().unwrap()
+            )
+        );
+    }
+    std::fs::remove_dir_all(&state).unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn what_waits_on_the_owner_and_the_conversation_are_read_from_the_records() {
     let state = state("inbox");

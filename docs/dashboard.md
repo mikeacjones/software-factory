@@ -6,7 +6,7 @@ What the dashboard is for, how it is laid out and why, and what is left before t
 
 The factory runs without anyone watching, so the owner looks in for three reasons, in this order of urgency:
 
-1. **Something is waiting on me.** A charter to start, a completion to accept, bead changes only the owner may approve, a director's question, a review's proposal. Until 2026-11-18 these lived only in Slack threads, scattered across one channel per project, and the period report showed waits of eight hours and more on a question nobody had seen.
+1. **Something is waiting on me.** A charter to start, a completion to accept, bead changes only the owner may approve, a director's question, a review's proposal, a goal definition the executive proposed. Until 2026-11-18 these lived only in Slack threads, scattered across one channel per project, and the period report showed waits of eight hours and more on a question nobody had seen.
 2. **Is anything wrong?** A pipeline parked, an account at its limit, a goal that has stopped moving.
 3. **What is it doing?** Which agents run where, how far each goal has come, what a bead's pipeline has been through.
 
