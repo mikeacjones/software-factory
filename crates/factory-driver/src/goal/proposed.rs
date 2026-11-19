@@ -5,7 +5,10 @@
 //! thread's record and posted there with two buttons. Only the owner's
 //! press acts: Approve puts the definition in force, files the bead that
 //! commits it to the release, and opens the goal under it in the same
-//! thread, with no executive turn.
+//! thread, with no executive turn. Reject stores nothing and wakes the
+//! executive in the thread's session to hear of it; the owner's next reply
+//! there is taken as why. While a proposal waits, the owner's replies reach
+//! the executive with it named, and a new proposal supersedes it.
 
 use super::*;
 
@@ -34,7 +37,9 @@ pub struct DefinitionProposal {
     pub handoff: String,
     /// Whether a definition with that ID was in force when it was proposed.
     pub change: bool,
-    /// `waiting`, `approved` or `rejected`.
+    /// `waiting`, `approved`, `rejected` or `superseded`. Only one that
+    /// waits can be approved, so a rejected or superseded one is never
+    /// stored.
     pub state: String,
     /// Who pressed the button that settled it.
     pub by: String,
@@ -45,6 +50,89 @@ pub struct DefinitionProposal {
     pub message: String,
     /// The message the buttons are on.
     pub ts: String,
+    /// The owner's first reply in the thread after rejecting it: why.
+    pub why: String,
+    /// The proposal (from 1) that superseded it, or 0.
+    pub superseded_by: usize,
+}
+
+/// What a thread's record says the owner did on rejecting the `n`th
+/// proposal (from 1).
+fn rejection_said(proposal: &DefinitionProposal, n: usize) -> String {
+    format!(
+        "Rejected the proposed goal definition `{}` (proposal {n} in this thread).",
+        proposal.id
+    )
+}
+
+/// What a press on a proposal that no longer waits says.
+fn settled_note(proposal: &DefinitionProposal) -> String {
+    if proposal.state == "superseded" {
+        return format!(
+            "The proposed definition `{}` was superseded by proposal {} in this thread, so that press did nothing: it was not stored.",
+            proposal.id, proposal.superseded_by
+        );
+    }
+    let by = if proposal.by.is_empty() {
+        String::new()
+    } else {
+        format!(" by <@{}>", proposal.by)
+    };
+    format!(
+        "The proposed definition `{}` was already {}{by}, so that press did nothing.",
+        proposal.id, proposal.state
+    )
+}
+
+/// The proposals of a thread still waiting for the owner, named for the
+/// executive, or nothing when none waits.
+fn waiting_note(front: &Front) -> String {
+    let waiting: Vec<String> = front
+        .proposals
+        .iter()
+        .enumerate()
+        .filter(|(_, proposal)| proposal.state == "waiting")
+        .map(|(at, proposal)| format!("`{}` (proposal {})", proposal.id, at + 1))
+        .collect();
+    if waiting.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\nYour proposed goal definition {} still waits for the owner's Approve or Reject. If what they say changes it, return the whole new TOML in `propose_definition`: it supersedes the one waiting, whose buttons then do nothing.\n",
+        waiting.join(", ")
+    )
+}
+
+/// What the executive is told in a thread whose session it resumes: the
+/// owner's reply, or that the owner rejected the proposal at `rejected`,
+/// and which of its proposals still wait.
+pub fn resumed_prompt(front: &Front, text: &str, rejected: Option<usize>) -> String {
+    let mut prompt = match rejected.and_then(|at| front.proposals.get(at).map(|p| (at, p))) {
+        Some((at, proposal)) => format!(
+            "The owner rejected your proposed goal definition `{}` (proposal {} in this thread). It is not stored or put in force, and no goal opens under it. If they say why, it comes as their next reply in this thread. Say in `reply` what you will do instead: propose another definition, open the goal under one in force, or ask the owner what they want.\n",
+            proposal.id,
+            at + 1
+        ),
+        None => {
+            let mut said = format!(
+                "The owner replied in the thread:\n\n{}\n",
+                quote_plain(text)
+            );
+            if let Some(last) = front.proposals.last()
+                && last.state == "rejected"
+                && last.why == text
+            {
+                said.push_str(&format!(
+                    "\nIt is their first word since they rejected your proposed goal definition `{}` (proposal {}): read it as why.\n",
+                    last.id,
+                    front.proposals.len()
+                ));
+            }
+            said
+        }
+    };
+    prompt.push_str(&waiting_note(front));
+    prompt
 }
 
 /// What the buttons of the `n`th proposal (from 1) of a thread carry.
@@ -234,6 +322,111 @@ pub fn unified_diff(old: &str, new: &str, from: &str, to: &str) -> String {
 }
 
 impl Supervisor {
+    /// The executive proposed the `n`th definition (from 1) of a thread:
+    /// every one still waiting there is superseded by it, and its message
+    /// says so in place of its buttons.
+    fn supersede(&mut self, seat: &Seat, front: &mut Front, root: &str, n: usize) {
+        for (at, proposal) in front.proposals.iter_mut().enumerate() {
+            if proposal.state != "waiting" {
+                continue;
+            }
+            proposal.state = "superseded".to_string();
+            proposal.superseded_by = n;
+            proposal.settled_at = Some(now_unix());
+            self.log_at(
+                seat,
+                "definition.superseded",
+                json!({ "proposal": button_value(root, at + 1),
+                        "by": button_value(root, n), "definition": proposal.id }),
+            );
+            if let (Some(slack), false) = (&self.slack, proposal.ts.is_empty()) {
+                let _ = slack.update(
+                    &front.channel,
+                    &proposal.ts,
+                    &format!(
+                        "{}\n_Superseded by proposal {n} below: its buttons do nothing._",
+                        proposal.message
+                    ),
+                );
+            }
+        }
+    }
+
+    /// The owner pressed Reject on a proposed definition: it is marked
+    /// rejected, which nothing stores or puts in force, and the executive
+    /// is woken once in the thread's session to hear of it. A press on one
+    /// that no longer waits does nothing but say so.
+    pub(super) fn definition_rejected(
+        &mut self,
+        value: &str,
+        user: &str,
+    ) -> Result<(), DriverError> {
+        let Some((root, at)) = named(value) else {
+            return Ok(());
+        };
+        let Some(mut executive) = self
+            .executives
+            .values()
+            .find(|executive| {
+                executive
+                    .threads
+                    .get(root)
+                    .is_some_and(|front| at < front.proposals.len())
+            })
+            .cloned()
+        else {
+            return Ok(());
+        };
+        let project = executive.project.clone();
+        let mut front = executive.threads[root].clone();
+        let channel = front.channel.clone();
+        let mut proposal = front.proposals[at].clone();
+        let said = rejection_said(&proposal, at + 1);
+        // The press handed in again because every account was at a limit
+        // when it came: the rejection is on record, and the executive has
+        // still to hear of it.
+        let unheard = front.waiting
+            && front
+                .said
+                .last()
+                .is_some_and(|(who, what)| who == "owner" && *what == said);
+        if proposal.state == "rejected" && front.goal.is_none() && unheard {
+            return self
+                .front_turn(&project, &channel, root, user, &said, Some(at))
+                .map(|_| ());
+        }
+        if proposal.state != "waiting" {
+            self.post(&channel, root, &settled_note(&proposal));
+            return Ok(());
+        }
+        proposal.state = "rejected".to_string();
+        proposal.by = user.to_string();
+        proposal.settled_at = Some(now_unix());
+        front.proposals[at] = proposal.clone();
+        executive.threads.insert(root.to_string(), front.clone());
+        self.save_executive(executive)?;
+        let seat = self.executive_seat(&project);
+        self.log_at(
+            &seat,
+            "definition.rejected",
+            json!({ "proposal": value, "by": user, "definition": proposal.id }),
+        );
+        if let (Some(slack), false) = (&self.slack, proposal.ts.is_empty()) {
+            let _ = slack.update(
+                &channel,
+                &proposal.ts,
+                &format!("{}\n_Rejected by <@{user}>._", proposal.message),
+            );
+        }
+        // A thread that became a goal is its director's: the executive has
+        // no turn there.
+        if front.goal.is_some() {
+            return Ok(());
+        }
+        self.front_turn(&project, &channel, root, user, &said, Some(at))
+            .map(|_| ())
+    }
+
     /// Keep the definition an executive's checked result proposes on its
     /// thread's record, and post it there with its buttons.
     pub(super) fn post_proposal(
@@ -264,8 +457,10 @@ impl Supervisor {
         };
         let message = proposal_message(project, &proposal, old.as_deref());
         proposal.message = message.clone();
-        let value = button_value(root, front.proposals.len() + 1);
+        let n = front.proposals.len() + 1;
+        let value = button_value(root, n);
         let seat = self.executive_seat(project);
+        self.supersede(&seat, front, root, n);
         self.log_at(
             &seat,
             "definition.proposed",
@@ -326,19 +521,7 @@ impl Supervisor {
         let channel = front.channel.clone();
         let mut proposal = front.proposals[at].clone();
         if proposal.state != "waiting" {
-            let by = if proposal.by.is_empty() {
-                String::new()
-            } else {
-                format!(" by <@{}>", proposal.by)
-            };
-            self.post(
-                &channel,
-                root,
-                &format!(
-                    "The proposed definition `{}` was already {}{by}, so that press did nothing.",
-                    proposal.id, proposal.state
-                ),
-            );
+            self.post(&channel, root, &settled_note(&proposal));
             return Ok(());
         }
         if let Some(goal) = &front.goal {
