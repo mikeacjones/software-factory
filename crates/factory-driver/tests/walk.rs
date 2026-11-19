@@ -797,6 +797,89 @@ fn a_forbidden_file_put_back_is_not_stopped_and_a_ruling_reaches_every_later_ste
     }
 }
 
+/// Park a unit whose builder changed `.github/ci.yml`, which the project
+/// forbids, and return the unit's id.
+fn park_for_a_trespass(world: &World) -> String {
+    world.scenario("trespass");
+    let mut driver = Driver::start(world.config(), "toy", "toy-1", &OPTIONS).unwrap();
+    let Status::Parked(reason) = driver.run().unwrap() else {
+        panic!("expected the unit to park");
+    };
+    assert!(
+        reason.contains(".github/ci.yml (no step may change this path)"),
+        "{reason}"
+    );
+    assert!(driver.unit().trespassed.contains_key(".github/ci.yml"));
+    driver.unit().id.to_string()
+}
+
+#[test]
+fn a_trespass_on_a_path_the_config_no_longer_forbids_is_dropped() {
+    let world = World::new("trespass-allowed", "test -f feature.txt");
+    let unit_id = park_for_a_trespass(&world);
+
+    // The owner decides `.github` may be changed after all. The unit is
+    // continued, and the builder leaves the file as it is.
+    let project = world.path("config/projects/toy.toml");
+    let text = std::fs::read_to_string(&project).unwrap();
+    assert!(text.contains("forbidden_paths = [\".github/**\"]"));
+    std::fs::write(
+        &project,
+        text.replace("forbidden_paths = [\".github/**\"]", "forbidden_paths = []"),
+    )
+    .unwrap();
+    let carry_on = Options {
+        continued: Some("Carry on.".to_string()),
+        ..OPTIONS
+    };
+    let mut driver = Driver::resume(world.config(), &unit_id, &carry_on, None).unwrap();
+    assert_eq!(driver.run().unwrap(), Status::Ended);
+    assert!(driver.unit().trespassed.is_empty());
+    assert!(driver.unit().worktree.join(".github/ci.yml").exists());
+
+    let events = events_of(&world, &unit_id);
+    let dropped: Vec<_> = events
+        .iter()
+        .filter(|(kind, _, _)| kind == "trespass.dropped")
+        .collect();
+    assert_eq!(dropped.len(), 1, "{dropped:?}");
+    let (_, step, data) = dropped[0];
+    assert_eq!(step, "build");
+    assert_eq!(data["path"], ".github/ci.yml");
+    assert_eq!(data["step"], "build");
+    // Nothing parked the unit after the trespass was dropped.
+    let parks = events
+        .iter()
+        .filter(|(kind, _, _)| kind == "unit.parked")
+        .count();
+    assert_eq!(parks, 1, "only the first park, before the owner's decision");
+}
+
+#[test]
+fn a_trespass_on_a_path_still_forbidden_parks_the_continued_unit_again() {
+    let world = World::new("trespass-kept", "test -f feature.txt");
+    let unit_id = park_for_a_trespass(&world);
+
+    let carry_on = Options {
+        continued: Some("Carry on.".to_string()),
+        ..OPTIONS
+    };
+    let mut driver = Driver::resume(world.config(), &unit_id, &carry_on, None).unwrap();
+    let Status::Parked(reason) = driver.run().unwrap() else {
+        panic!("expected the unit to park again");
+    };
+    assert!(
+        reason.contains(".github/ci.yml (no step may change this path, and an earlier step's change to it is still there)"),
+        "{reason}"
+    );
+    assert!(driver.unit().trespassed.contains_key(".github/ci.yml"));
+    assert!(
+        !events_of(&world, &unit_id)
+            .iter()
+            .any(|(kind, _, _)| kind == "trespass.dropped")
+    );
+}
+
 #[test]
 fn a_bead_someone_else_holds_is_refused_before_anything_is_created() {
     let world = World::new("refused", "true");

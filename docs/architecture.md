@@ -22,7 +22,7 @@ A project's *flow* decides which *steps* run, in what order and on which model. 
 
 Owner's decision, 2026-11-14. Every agent runs in bypass mode as the owner's account on this Mac. There are no separate macOS accounts, no deny rules and no per-agent restrictions: the machine is the sandbox. Three things follow.
 
-1. **Output is checked after the run**, since nothing restricts an agent while it runs. Each step's changes are compared with the path scopes its flow allows, and its typed result is validated against the diff and the bead. A path no step may change, once changed, parks the unit after every step until it is as it was before; the step that puts it back is not stopped for changing it.
+1. **Output is checked after the run**, since nothing restricts an agent while it runs. Each step's changes are compared with the path scopes its flow allows, and its typed result is validated against the diff and the bead. A path no step may change, once changed, parks the unit after every step until it is as it was before; the step that puts it back is not stopped for changing it. Whether a path is forbidden is asked of the config read when the unit runs, at every step: a trespass on a path the owner has since stopped forbidding is dropped, with a `trespass.dropped` event, and parks nothing.
 2. **Files the factory depends on are checked by content hash.** Config, flows and *artifacts* can all be edited by an agent, so a change is detected, never trusted. A unit runs on a pinned copy of its flow.
 3. **What the machine can reach is set by the credentials stored on it**, so those are kept narrow. The GitHub credential is a fine-grained token limited to the repositories the factory works on.
 

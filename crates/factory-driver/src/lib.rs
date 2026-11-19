@@ -3024,6 +3024,26 @@ impl Driver {
                         .entry(trespass.path)
                         .or_insert_with(|| before.clone());
                 }
+                // A path the config read now no longer forbids is no
+                // trespass: the owner has since let it be changed. It is
+                // matched as above, so the two cannot disagree.
+                let recorded: Vec<String> = self.unit.trespassed.keys().cloned().collect();
+                let still: Vec<String> = scope_violations(
+                    &recorded,
+                    &["**".to_string()],
+                    &self.project.forbidden_paths,
+                )?
+                .into_iter()
+                .map(|violation| violation.path)
+                .collect();
+                for path in recorded.iter().filter(|path| !still.contains(path)) {
+                    self.unit.trespassed.remove(path);
+                    self.event(
+                        "trespass.dropped",
+                        Some(&step.id),
+                        json!({ "path": path, "step": step.id }),
+                    )?;
+                }
                 let mut since: BTreeMap<String, Vec<String>> = BTreeMap::new();
                 let mut restored: Vec<String> = Vec::new();
                 for (path, clean) in &self.unit.trespassed {
