@@ -1,0 +1,86 @@
+# The factory working on its own code: one session, then code.
+#
+# Owner's decision, 2026-11-18: a single Opus builder session decides what
+# most needs doing in the factory and does it. There is no adversarial
+# tester and no reviewer. What stands between its change and the running
+# factory is code: the project's full check, the same check in CI, the
+# landing rules, and a deploy that keeps the release before it for
+# `factory service rollback`.
+#
+# A project using this flow defines the command check, the path scope code
+# and a [self_deploy] table.
+id = "factory-self"
+start = "work"
+
+[[step]]
+id = "work"
+kind = "agent"
+role = "builder"
+model = "claude-opus-5-5"
+effort = "high"
+session = "fresh"
+writes = ["code"]
+on.done = "check"
+# Nothing worth changing now: the run ends and its bead is closed.
+on.already_done = "end"
+on.needs_owner = { to = "ask", max = 2 }
+
+[[step]]
+id = "check"
+kind = "command"
+command = "check"
+on.pass = "describe"
+on.fail = { to = "fix", max = 3 }
+
+# Every way back leads here, and from here through the check again.
+[[step]]
+id = "fix"
+kind = "agent"
+role = "builder"
+model = "claude-opus-5-5"
+effort = "high"
+session = "continue:work"
+writes = ["code"]
+on.done = { to = "check", max = 5 }
+on.already_done = { to = "check", max = 2 }
+on.needs_owner = { to = "ask", max = 2 }
+
+[[step]]
+id = "describe"
+kind = "agent"
+role = "publisher"
+model = "claude-opus-5-5"
+effort = "medium"
+session = "continue:work"
+on.ready = "publish"
+
+[[step]]
+id = "publish"
+kind = "action"
+action = "publish"
+on.done = "ci"
+on.failed = { to = "describe", max = 2 }
+
+[[step]]
+id = "ci"
+kind = "action"
+action = "await-ci"
+on.green = "land"
+on.red = { to = "fix", max = 2 }
+
+[[step]]
+id = "land"
+kind = "action"
+action = "land"
+on.done = "deploy"
+on.failed = "park"
+
+# Build what landed, make it the current release, and have the service
+# restart onto it at a safe point. A build that fails leaves the running
+# release as it is.
+[[step]]
+id = "deploy"
+kind = "action"
+action = "deploy"
+on.done = "end"
+on.failed = "park"

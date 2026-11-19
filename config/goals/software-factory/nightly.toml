@@ -1,0 +1,49 @@
+# The factory working on itself every night (owner's decision, 2026-11-18).
+#
+# A direct run: no maintainer decides what to build and no director starts
+# or watches it. At its time code files one bead whose description is the
+# charter below, opens a goal for it under `build` and starts its pipeline
+# (flows/factory-self.toml). That pipeline's one builder session reads the
+# charter and decides for itself what to do. What it lands is deployed. A
+# run that parks stops its goal and is put to the owner; the next run comes
+# at its time.
+id = "nightly"
+
+# A direct run has no agent of its own; the table is required of every
+# definition, and nothing reads it.
+[director]
+model = "claude-opus-5-5"
+effort = "high"
+
+[schedule]
+# 08:00 UTC, an hour before the nightly review, so the review reads it.
+hour_utc = 8
+every_days = 1
+build_under = "build"
+direct = true
+charter = """
+You are working on the software factory's own code: this repository, the \
+program that is running you. Decide what one change would most improve the \
+factory now, and make it, in this session.
+
+Where to look: `bd ready` and `bd list --status open` in this repository \
+for the backlog (prefer the highest-priority ready bead you can finish in \
+one pull request); docs/architecture.md for what the factory is meant to \
+do; and anything you find broken or missing as you read the code. A defect \
+in what is already there comes before something new.
+
+Keep it to one coherent change that fits one pull request. Follow AGENTS.md: \
+errors are typed enums, no panics outside tests, and docs/architecture.md, \
+docs/glossary.md and docs/how-it-works.md change with the code they \
+describe. `cargo xtask check --offline` must pass. If you take a bead from \
+the backlog, claim it with `bd update <id> --claim` and name it in your \
+summary and in a `Refs:` trailer.
+
+Your change is squash-merged and deployed to the running factory with no \
+person reading it first, so: do not weaken, skip or remove a check, test, \
+gate, or the code that limits what agents may do (forbidden paths, scope \
+checks, landing rules, the deploy); do not change .github, this \
+project's record, its flows or its goal definitions, which are refused; and \
+prefer a smaller safe change to a larger risky one. If nothing is worth \
+changing now, change nothing and return already_done.
+"""

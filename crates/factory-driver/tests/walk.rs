@@ -5873,6 +5873,256 @@ fn a_maintenance_run_builds_what_it_marks_in_a_goal_the_factory_opens_and_ends()
     );
 }
 
+/// A direct schedule runs one pipeline and nothing else: code files a bead
+/// from the charter and starts it, no maintainer or director is ever run,
+/// and code ends the goal when the bead lands.
+#[test]
+fn a_direct_run_is_one_pipeline_that_code_files_starts_and_ends() {
+    use factory_driver::goal::{Phase, Scheduled, Supervisor, check_definitions};
+    use std::time::{Duration, Instant};
+
+    let world = World::new("direct", "true");
+    world.with_github("green");
+    std::fs::create_dir_all(world.path("config/goals/toy")).unwrap();
+    let tier = "[director]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\n";
+    std::fs::write(
+        world.path("config/goals/toy/main.toml"),
+        format!("id = \"main\"\ndefault = true\n{tier}"),
+    )
+    .unwrap();
+    std::fs::write(
+        world.path("config/goals/toy/nightly.toml"),
+        format!("id = \"nightly\"\n{tier}[schedule]\nhour_utc = 4\ncharter = \"Find what most needs doing and do it.\"\nbuild_under = \"main\"\ndirect = true\n"),
+    )
+    .unwrap();
+    check_definitions(&world.config()).unwrap();
+
+    let mut sup = Supervisor::new(world.config(), None, vec!["OWNER".to_string()], false).unwrap();
+    let record_path = world.path("state/projects/toy/schedules/nightly/scheduled.json");
+    let record = || -> Scheduled {
+        serde_json::from_str(&std::fs::read_to_string(&record_path).unwrap()).unwrap()
+    };
+    let now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    };
+    let overdue = |record: Scheduled| {
+        let back = Scheduled {
+            since: now() - 2 * 86_400,
+            ..record
+        };
+        std::fs::write(&record_path, serde_json::to_string(&back).unwrap()).unwrap();
+    };
+    let count = |role: &str| world.calls().iter().filter(|call| call[0] == role).count();
+
+    // Seen for the first time it counts from now: nothing runs.
+    assert!(!sup.pump(Duration::ZERO).unwrap());
+    assert_eq!(sup.goals().count(), 0);
+
+    // At its time code files the bead and starts its pipeline at once.
+    overdue(record());
+    assert!(sup.pump(Duration::ZERO).unwrap());
+    assert_eq!(sup.goals().count(), 1);
+    let goal = sup.goals().next().unwrap().clone();
+    let built = goal.maintenance.clone().unwrap();
+    assert!(built.direct);
+    assert_eq!(goal.definition, "main");
+    assert_eq!(goal.phase, Phase::Running);
+    let bead = built.beads[0].clone();
+    let filed = std::fs::read_to_string(world.path(&format!("beads/{bead}.json"))).unwrap();
+    assert!(
+        filed.contains("Find what most needs doing and do it.") && filed.contains("nightly: run 1"),
+        "the bead carries the charter: {filed}"
+    );
+    assert_eq!(goal.units.len(), 1, "its pipeline was started by code");
+    assert_eq!(record().goal.as_deref(), Some(goal.id.as_str()));
+
+    // While it runs, a run that comes due waits: one at a time.
+    overdue(record());
+    sup.pump(Duration::ZERO).unwrap();
+    assert_eq!(sup.goals().count(), 1);
+    assert_eq!(record().runs, 1);
+
+    // The bead lands, and code ends the goal. No agent but the pipeline's
+    // own ever ran.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while sup.goals().next().unwrap().phase != Phase::Complete {
+        assert!(Instant::now() < deadline, "the goal never completed");
+        sup.pump(Duration::from_millis(200)).unwrap();
+    }
+    let text = std::fs::read_to_string(world.path(&format!("beads/{bead}.json"))).unwrap();
+    assert!(text.contains("\"closed\""), "{text}");
+    assert_eq!(count("director"), 0, "no director was woken");
+    assert_eq!(count("maintainer"), 0, "no maintainer was run");
+    assert!(count("builder") >= 1);
+    let log = std::fs::read_to_string(world.path(&format!("state/goals/{}/events.jsonl", goal.id)))
+        .unwrap();
+    assert!(
+        log.contains("\"goal.complete\"") && log.contains("\"by\":\"code\""),
+        "{log}"
+    );
+}
+
+/// A direct run that lands but whose deploy fails has closed its bead, and
+/// is still not complete: the running release is left as it was, and the
+/// owner is told.
+#[test]
+fn a_direct_run_that_lands_and_fails_to_deploy_is_put_to_the_owner() {
+    use factory_driver::goal::{Phase, Scheduled, Supervisor};
+    use std::time::{Duration, Instant};
+
+    let world = World::new("directdeploy", "true");
+    world.with_github("green");
+    // The toy project deploys itself, with a build that fails.
+    let project = world.path("config/projects/toy.toml");
+    let text = std::fs::read_to_string(&project).unwrap();
+    std::fs::write(
+        &project,
+        format!("{text}\n[self_deploy]\nbuild = \"release\"\n\n[commands.release]\nargv = [\"sh\", \"-c\", \"echo cannot build; exit 1\"]\ntimeout_secs = 30\n"),
+    )
+    .unwrap();
+    let flow = std::fs::read_to_string(world.path("config/flows/zig-sdk.toml"))
+        .unwrap()
+        .replace("id = \"zig-sdk\"", "id = \"toy-self\"")
+        .replace(
+            "action = \"land\"\non.done = \"end\"\n",
+            "action = \"land\"\non.done = \"deploy\"\n",
+        );
+    std::fs::write(
+        world.path("config/flows/toy-self.toml"),
+        format!("{flow}\n[[step]]\nid = \"deploy\"\nkind = \"action\"\naction = \"deploy\"\non.done = \"end\"\non.failed = \"park\"\n"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(world.path("config/goals/toy")).unwrap();
+    let tier = "[director]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\n";
+    std::fs::write(
+        world.path("config/goals/toy/main.toml"),
+        format!("id = \"main\"\ndefault = true\nflow = \"toy-self\"\n{tier}"),
+    )
+    .unwrap();
+    std::fs::write(
+        world.path("config/goals/toy/nightly.toml"),
+        format!("id = \"nightly\"\n{tier}[schedule]\nhour_utc = 4\ncharter = \"Do what needs doing.\"\nbuild_under = \"main\"\ndirect = true\n"),
+    )
+    .unwrap();
+    let mut sup = Supervisor::new(world.config(), None, vec!["OWNER".to_string()], false).unwrap();
+    let record_path = world.path("state/projects/toy/schedules/nightly/scheduled.json");
+    assert!(!sup.pump(Duration::ZERO).unwrap());
+    let record: Scheduled =
+        serde_json::from_str(&std::fs::read_to_string(&record_path).unwrap()).unwrap();
+    let since = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        - 2 * 86_400;
+    std::fs::write(
+        &record_path,
+        serde_json::to_string(&Scheduled { since, ..record }).unwrap(),
+    )
+    .unwrap();
+    assert!(sup.pump(Duration::ZERO).unwrap());
+
+    let deadline = Instant::now() + Duration::from_secs(180);
+    while !sup.goals().next().unwrap().ended() {
+        assert!(Instant::now() < deadline, "the goal never ended");
+        sup.pump(Duration::from_millis(200)).unwrap();
+    }
+    let goal = sup.goals().next().unwrap().clone();
+    assert_eq!(goal.phase, Phase::Stopped, "{:?}", goal.units);
+    let bead = &goal.maintenance.as_ref().unwrap().beads[0];
+    let text = std::fs::read_to_string(world.path(&format!("beads/{bead}.json"))).unwrap();
+    assert!(text.contains("\"closed\""), "it landed: {text}");
+    assert!(
+        !world.path("state/current").exists(),
+        "no release was made current"
+    );
+    let unit = goal.units[0].unit.clone().unwrap();
+    let events =
+        std::fs::read_to_string(world.path(&format!("state/units/{unit}/events.jsonl"))).unwrap();
+    assert!(
+        events.contains("\"landed\"")
+            && events.contains("cannot build")
+            && !events.contains("\"deployed\""),
+        "{events}"
+    );
+    assert!(
+        !world.path("state/drain").exists(),
+        "the service was not asked to stop"
+    );
+    let log = std::fs::read_to_string(world.path(&format!("state/goals/{}/events.jsonl", goal.id)))
+        .unwrap();
+    assert!(
+        log.contains("\"goal.stopped\"") && log.contains("The factory's own run stopped"),
+        "{log}"
+    );
+}
+
+/// A direct run whose pipeline parks is stopped by code and put to the
+/// owner; no director is woken to decide what to do about it.
+#[test]
+fn a_direct_run_that_parks_stops_its_goal_and_is_put_to_the_owner() {
+    use factory_driver::goal::{Phase, Scheduled, Supervisor};
+    use std::time::{Duration, Instant};
+
+    let world = World::new("directpark", "false");
+    world.with_github("green");
+    std::fs::create_dir_all(world.path("config/goals/toy")).unwrap();
+    let tier = "[director]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\n";
+    std::fs::write(
+        world.path("config/goals/toy/main.toml"),
+        format!("id = \"main\"\ndefault = true\n{tier}"),
+    )
+    .unwrap();
+    std::fs::write(
+        world.path("config/goals/toy/nightly.toml"),
+        format!("id = \"nightly\"\n{tier}[schedule]\nhour_utc = 4\ncharter = \"Do what needs doing.\"\nbuild_under = \"main\"\ndirect = true\n"),
+    )
+    .unwrap();
+    let mut sup = Supervisor::new(world.config(), None, vec!["OWNER".to_string()], false).unwrap();
+    let record_path = world.path("state/projects/toy/schedules/nightly/scheduled.json");
+    assert!(!sup.pump(Duration::ZERO).unwrap());
+    let record: Scheduled =
+        serde_json::from_str(&std::fs::read_to_string(&record_path).unwrap()).unwrap();
+    let since = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        - 2 * 86_400;
+    std::fs::write(
+        &record_path,
+        serde_json::to_string(&Scheduled { since, ..record }).unwrap(),
+    )
+    .unwrap();
+    assert!(sup.pump(Duration::ZERO).unwrap());
+
+    let deadline = Instant::now() + Duration::from_secs(180);
+    while sup.goals().next().unwrap().phase != Phase::Stopped {
+        assert!(Instant::now() < deadline, "the goal never stopped");
+        sup.pump(Duration::from_millis(200)).unwrap();
+    }
+    let goal = sup.goals().next().unwrap().clone();
+    assert_eq!(goal.units[0].state, "parked", "{:?}", goal.units);
+    assert_eq!(
+        world
+            .calls()
+            .iter()
+            .filter(|call| call[0] == "director")
+            .count(),
+        0,
+        "no director was woken"
+    );
+    let log = std::fs::read_to_string(world.path(&format!("state/goals/{}/events.jsonl", goal.id)))
+        .unwrap();
+    assert!(
+        log.contains("\"goal.stopped\"")
+            && log.contains("\"slack.need\"")
+            && log.contains("The factory's own run stopped"),
+        "{log}"
+    );
+}
+
 /// A definition with a schedule is run by the factory at its times: one
 /// agent, shown what the records say, which files beads and starts nothing.
 #[test]

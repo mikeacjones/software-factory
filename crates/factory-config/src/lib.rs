@@ -405,6 +405,29 @@ pub struct Project {
     pub publish_checks: Vec<String>,
     #[serde(default)]
     pub limits: Limits,
+    /// The project is the factory itself, and a flow of it may end in the
+    /// `deploy` action: the landed commit is built in a checkout of its
+    /// own, made the factory's current release, and the running worker is
+    /// asked to stop at a safe point so that launchd starts the new one.
+    /// No other project may name `deploy`.
+    pub self_deploy: Option<SelfDeploy>,
+}
+
+/// How the factory builds a release of itself from a commit that landed.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SelfDeploy {
+    /// The project's command that builds every program of the workspace
+    /// for a release, run in the deploy checkout at the landed commit.
+    pub build: String,
+    /// Where the build leaves the factory's binary, relative to the
+    /// checkout. The engine's binary is looked for beside it.
+    #[serde(default = "default_release_binary")]
+    pub binary: PathBuf,
+}
+
+fn default_release_binary() -> PathBuf {
+    PathBuf::from("target/release/factory")
 }
 
 fn default_goals() -> u32 {
@@ -879,6 +902,16 @@ pub struct Schedule {
     /// goals for any project. It files nothing, and nothing it proposes is
     /// opened without the owner's button.
     pub proposes: Option<u32>,
+    /// Each run is one pipeline and nothing else: no maintainer decides
+    /// what to file and no director starts or watches it. Code files one
+    /// bead whose description is the charter, opens a goal for it under
+    /// `build_under` and starts the bead's pipeline itself. The pipeline's
+    /// own agent decides what the charter asks for and does it. The goal
+    /// is complete when the bead is closed; a pipeline that parks or fails
+    /// ends the goal and is put to the owner, and the next run comes at
+    /// its time.
+    #[serde(default)]
+    pub direct: bool,
 }
 
 fn default_every_days() -> u32 {
@@ -1062,6 +1095,29 @@ impl ConfigDir {
         project.repo = expand_home(&project.repo);
         if let BeadSource::Files { dir } = &mut project.beads {
             *dir = expand_home(dir);
+        }
+        if let Some(deploy) = &project.self_deploy {
+            if !project.commands.contains_key(&deploy.build) {
+                return Err(ConfigError::Invalid {
+                    path,
+                    reason: format!(
+                        "self_deploy.build names the command `{}`, which is not defined",
+                        deploy.build
+                    ),
+                });
+            }
+            if project.github.is_none() {
+                return Err(ConfigError::Invalid {
+                    path,
+                    reason: "self_deploy deploys what landed, so the project needs a [github] table to land through".to_string(),
+                });
+            }
+            if deploy.binary.is_absolute() || deploy.binary.as_os_str().is_empty() {
+                return Err(ConfigError::Invalid {
+                    path,
+                    reason: "self_deploy.binary is a path inside the checkout, such as target/release/factory".to_string(),
+                });
+            }
         }
         for (list, names) in [
             ("setup", &project.setup),
@@ -1248,6 +1304,16 @@ impl ConfigDir {
                 if schedule.when_class_breaks == Some(0) {
                     return Err(invalid(
                         "schedule: when_class_breaks is at least 1".to_string(),
+                    ));
+                }
+                if schedule.direct
+                    && (schedule.build_under.is_none()
+                        || schedule.proposes.is_some()
+                        || schedule.when_class_breaks.is_some()
+                        || !schedule.reports.is_empty())
+                {
+                    return Err(invalid(
+                        "schedule: a direct run is one pipeline under build_under with no agent before it, so it needs build_under and cannot have proposes, reports or when_class_breaks".to_string(),
                     ));
                 }
                 if let Some(most) = schedule.proposes {
@@ -1442,6 +1508,85 @@ timeout_secs = 60
         let err = dir.project("toy").unwrap_err().to_string();
         std::fs::remove_dir_all(&dir.0).unwrap();
         assert!(err.contains("`nope`"), "{err}");
+    }
+
+    #[test]
+    fn a_project_that_deploys_the_factory_names_its_build_command_and_lands_on_github() {
+        let with = |table: &str| {
+            PROJECT.replace(
+                "[commands.deps]",
+                &format!("{table}\n\n[commands.release]\nargv = [\"true\"]\ntimeout_secs = 60\n\n[commands.deps]"),
+            )
+        };
+        let dir = dir_with(&with("[self_deploy]\nbuild = \"release\""));
+        let project = dir.project("toy").unwrap();
+        std::fs::remove_dir_all(&dir.0).unwrap();
+        let deploy = project.self_deploy.unwrap();
+        assert_eq!(deploy.build, "release");
+        assert_eq!(deploy.binary, Path::new("target/release/factory"));
+        // A project without the table deploys nothing.
+        let dir = dir_with(PROJECT);
+        assert!(dir.project("toy").unwrap().self_deploy.is_none());
+        std::fs::remove_dir_all(&dir.0).unwrap();
+
+        let refused = |text: &str| {
+            let dir = dir_with(text);
+            let err = dir.project("toy").unwrap_err().to_string();
+            std::fs::remove_dir_all(&dir.0).unwrap();
+            err
+        };
+        let err = refused(&with("[self_deploy]\nbuild = \"nope\""));
+        assert!(err.contains("`nope`, which is not defined"), "{err}");
+        let err = refused(&with(
+            "[self_deploy]\nbuild = \"release\"\nbinary = \"/usr/bin/factory\"",
+        ));
+        assert!(err.contains("a path inside the checkout"), "{err}");
+        let no_github = with("[self_deploy]\nbuild = \"release\"")
+            .replace("[github]\nrepo = \"me/toy\"\nwrite = [\"me/toy\"]\n", "");
+        let err = refused(&no_github);
+        assert!(err.contains("needs a [github] table"), "{err}");
+    }
+
+    #[test]
+    fn a_direct_schedule_builds_under_a_definition_and_runs_no_agent_before_its_pipeline() {
+        let dir = dir_with(PROJECT);
+        let goals = dir.0.join("goals/toy");
+        std::fs::create_dir_all(&goals).unwrap();
+        std::fs::write(
+            goals.join("build.toml"),
+            "id = \"build\"\ndefault = true\n[director]\nmodel = \"m\"\neffort = \"high\"\n",
+        )
+        .unwrap();
+        let nightly = |extra: &str| {
+            format!(
+                "id = \"nightly\"\n[director]\nmodel = \"m\"\neffort = \"high\"\n[schedule]\nhour_utc = 3\ncharter = \"Make it better.\"\ndirect = true\n{extra}"
+            )
+        };
+        std::fs::write(
+            goals.join("nightly.toml"),
+            nightly("build_under = \"build\""),
+        )
+        .unwrap();
+        let loaded = dir.goal_definitions("toy").unwrap();
+        let schedule = loaded[1].schedule.clone().unwrap();
+        assert!(schedule.direct);
+        assert_eq!(schedule.build_under.as_deref(), Some("build"));
+        // Without build_under there is nothing to open its goal under, and
+        // a direct run has no agent to read reports or to propose goals.
+        for (extra, why) in [
+            ("", "no build_under"),
+            ("build_under = \"build\"\nproposes = 1", "proposes"),
+            ("build_under = \"build\"\nreports = [\"deps\"]", "reports"),
+            (
+                "build_under = \"build\"\nwhen_class_breaks = 2",
+                "when_class_breaks",
+            ),
+        ] {
+            std::fs::write(goals.join("nightly.toml"), nightly(extra)).unwrap();
+            let err = dir.goal_definitions("toy").unwrap_err().to_string();
+            assert!(err.contains("a direct run is one pipeline"), "{why}: {err}");
+        }
+        std::fs::remove_dir_all(&dir.0).unwrap();
     }
 
     #[test]

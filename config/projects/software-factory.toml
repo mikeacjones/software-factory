@@ -1,25 +1,47 @@
 # The factory itself, as a project of the factory.
 #
-# Owner's rule, 2026-11-16: the factory does not ship itself. For now this
-# record is here for one thing: the nightly review in
-# goals/software-factory/review.toml, which reads how the factory ran and
-# proposes goals to the owner in #software-factory. It has no pipeline, no
-# executive and no goal definition the owner can open a goal under, so a
-# proposal for this project that the owner approves is filed as a bead in the
-# tracker below, and the owner decides who builds it. The Rust flows, and the
-# rule that the factory never merges or deploys a change to itself, come with
-# beads sf-yd3.4 and sf-yd3.5.
+# Owner's decision, 2026-11-18, replacing the rule of 2026-11-16 that the
+# factory does not ship itself: every night one pipeline works on the
+# factory's own code and ships what it lands (goals/software-factory/
+# nightly.toml). One Opus session decides what most needs doing and does
+# it; code runs `cargo xtask check`, opens the pull request, waits for CI,
+# squash-merges, builds a release of the merged commit, makes it current
+# and has the running service restart onto it at a safe point.
+# `factory service rollback` puts the release before back.
+#
+# The nightly review (goals/software-factory/review.toml) still reads how
+# the factory ran and proposes goals; an approved one for this project now
+# opens a goal under `build`.
 id = "software-factory"
 repo = "~/Source/software-factory"
 remote = "origin"
-# Work on the factory lands on this branch, not on main. The review reads it
-# as the remote has it.
-default_branch = "walking-skeleton"
+default_branch = "main"
 bead_actor = "factory"
 slack_channel = "software-factory"
-flow = "no-pipeline"
-forbidden_paths = [".github/**", ".beads/**", ".claude/**"]
-standards = ["AGENTS.md"]
+flow = "factory-self"
+# Nobody is asked: a director a goal here runs under goes with its own
+# recommendations.
+director_decides = true
+
+# What keeps the factory's own work in bounds is not the factory's to
+# change: its CI and release workflows (CI is the required check that every
+# change to itself must pass before it merges and deploys), this record,
+# its flow and its goal definitions. A change to any of them is refused,
+# so an agent cannot loosen the limits it runs under; the owner changes
+# them by hand.
+forbidden_paths = [
+  ".github/**",
+  ".beads/**",
+  ".claude/**",
+  "config/projects/software-factory.toml",
+  "config/flows/factory-self.toml",
+  "config/goals/software-factory/**",
+]
+standards = ["AGENTS.md", "docs/architecture.md", "docs/glossary.md"]
+test_patterns = ['#\[test\]', '\bassert(_eq|_ne)?!\(']
+
+publication_note = """
+Write the commit and the pull request in the owner's style. The subject is one imperative sentence naming the behaviour that changed, capitalized, no trailing period, at most about 72 characters. The body is plain prose wrapped at 72 columns: first what was wrong or missing, then what the code does now and why this way, then anything a reader must know (what deliberately stays the same, compatibility, limits), naming the real types, functions, options and files. Put bead IDs in a `Refs: <id>` trailer at the end of the body, never in the subject, and add no attribution of any kind. The pull request body has the sections `## What was changed` (one bullet per change), `## Why?` (a short paragraph) and `## Checklist` (1. Closes, 2. How was this tested: the exact commands run and their results, and plainly what was not run, 3. Any docs updates needed). The pull request is squashed when it lands and deployed to the running factory at once, so the message is what the default branch keeps."""
 
 [beads]
 kind = "dolt"
@@ -28,7 +50,37 @@ port = 3306
 user = "root"
 database = "software-factory"
 
-[commands.hold]
-argv = ["sh", "-c", "echo 'software-factory has no pipeline yet: the factory does not build itself until sf-yd3.4 and sf-yd3.5 are done'; exit 1"]
-timeout_secs = 30
-shown = "say that this project has no pipeline yet"
+[github]
+repo = "mikeacjones/software-factory"
+write = ["mikeacjones/software-factory"]
+# .github/workflows/ci.yml: `cargo xtask check` on every pull request.
+required_checks = ["check"]
+ci_poll_secs = 30
+ci_timeout_secs = 3600
+ci_settle_secs = 30
+ci_reruns = 1
+merge_method = "squash"
+merge_subject = "{title} (#{number})"
+merge_body = "{commit_body}\n\n{testing}\n\n{commit_trailers}"
+delete_branch_after_merge = true
+
+[scopes]
+code = ["**"]
+
+# What every change to the factory must pass before it is published: the
+# format check, clippy with warnings denied, and every test.
+[commands.check]
+argv = ["cargo", "xtask", "check", "--offline"]
+timeout_secs = 3600
+failure_lines = ['^error', 'panicked at', '^test .* FAILED', '^---- ']
+triage = { rerun = true }
+
+# Builds every program of the workspace for a release, in the deploy
+# checkout at the commit that landed (see [self_deploy]).
+[commands.release]
+argv = ["cargo", "build", "--release", "--locked", "--offline", "--workspace", "--bins"]
+timeout_secs = 3600
+
+[self_deploy]
+build = "release"
+binary = "target/release/factory"

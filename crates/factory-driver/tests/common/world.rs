@@ -76,7 +76,7 @@ impl World {
         run(
             &world.root,
             "git",
-            &["init", "--quiet", "--bare", "remote.git"],
+            &["init", "--quiet", "--bare", "-b", "main", "remote.git"],
         );
         let remote = path("remote.git");
         run(

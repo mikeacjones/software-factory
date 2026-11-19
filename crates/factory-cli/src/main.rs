@@ -27,6 +27,8 @@ usage:
                                               at login and whenever it exits
   factory service deploy [--now]              make a release of this build and this config
                                               current, and restart the service onto it
+  factory service rollback [--now]            make the release before the current one current
+                                              again, and restart the service onto it
   factory service restart [--now]             restart the service at a safe point: running
                                               steps finish and no other starts. `--now` stops
                                               it where it stands, and the steps run again
@@ -405,6 +407,14 @@ fn run(args: &[String]) -> Result<u8, String> {
             check_definitions(&args.config).map_err(|err| fail(&err))?;
             let job = Job::of(&factory).map_err(|err| fail(&err))?;
             let release = release_this_build(&factory, &args.config.0).map_err(|err| fail(&err))?;
+            println!("release: {}", release.display());
+            service_restart(&factory, &job, args.now)
+        }
+        ["service", "rollback"] => {
+            let factory = args.config.factory().map_err(|err| fail(&err))?;
+            let job = factory_driver::service::Job::of(&factory).map_err(|err| fail(&err))?;
+            let release = factory_driver::service::rollback_release(&factory.state_dir)
+                .map_err(|err| fail(&err))?;
             println!("release: {}", release.display());
             service_restart(&factory, &job, args.now)
         }

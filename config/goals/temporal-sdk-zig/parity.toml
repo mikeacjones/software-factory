@@ -38,14 +38,12 @@ stop_when = "All GA features and capabilities match."
 # what landed before it and only then being verified: a conflict there, in
 # code or in a shared file, goes to the builder on the sub-goal's branch, and
 # the whole verification runs on the result before the pull request opens.
+# Owner's choice, 2026-11-18: Opus 5.5 at medium effort, moved off Fable.
 [director]
-model = "claude-fable-5-2"
-effort = "high"
+model = "claude-opus-5-5"
+effort = "medium"
 timeout_secs = 2400
 slots = 2
-# When every account is at its Fable limit the director goes on with Opus
-# rather than leave its goal waiting for the window to reopen.
-fallback_model = "claude-opus-5-5"
 
 # Code routes each director wake from the goal's record, with no model
 # asked. The owner, a new goal, a landed sub-goal and a design to rule on
@@ -77,13 +75,14 @@ slots = 2
 # It runs as a turn of the project's tiers, like the foreman, so while it
 # reads no other tier of the project is woken. Pipelines carry on.
 #
-# It always runs on Fable and has no fallback: the slices it designs are
-# what every builder of the sub-goal is held to, so a design waits for
-# Fable rather than being written by another model. Config refuses a
-# designer with a fallback_model.
+# It has no fallback: the slices it designs are what every builder of the
+# sub-goal is held to, so a design waits for its own model rather than
+# being written by another. Config refuses a designer with a
+# fallback_model. Owner's choice, 2026-11-18: Opus 5.5 at medium effort,
+# moved off Fable.
 [designer]
-model = "claude-fable-5-2"
-effort = "high"
+model = "claude-opus-5-5"
+effort = "medium"
 timeout_secs = 2700
 
 [permissions]

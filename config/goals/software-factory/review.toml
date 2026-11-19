@@ -7,10 +7,11 @@
 #
 # Nothing is opened, started or filed without the owner's button. Approving
 # a proposal for a project that has goal definitions opens the goal there,
-# as the owner's own message in that project's channel would. Approving one
-# for a project that has none, as the factory itself has none yet, files it
-# as a bead in that project's tracker. Declining records it, with the reason
-# if the owner replies under the message, and later runs are shown it.
+# as the owner's own message in that project's channel would: for the
+# factory itself, a goal under `build`. Approving one for a project that has
+# none files it as a bead in that project's tracker. Declining records it,
+# with the reason if the owner replies under the message, and later runs
+# are shown it.
 id = "review"
 
 # The agent of each run. A scheduled definition has no director; this table
@@ -49,6 +50,7 @@ say so in the digest and watch it. Prefer a change to the factory that \
 stops a kind of waste to a change in one project that mends one case. A \
 goal for a project's own code belongs to that project's upkeep unless the \
 figures show the factory at fault. Not yours: what the open goals already \
-cover, and anything that would have the factory merge or deploy a change \
-to itself, which stays with the owner.
+cover. The factory works on its own code every night (`nightly`), and what \
+it lands is deployed: say in the digest what that run changed and whether \
+the figures since bear it out.
 """

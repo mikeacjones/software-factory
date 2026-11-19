@@ -1,0 +1,37 @@
+# The check every change to the factory must pass before it merges: the
+# format check, clippy with warnings denied, and every test, as
+# `cargo xtask check` runs them by hand. The factory waits for this job
+# (`check`, the project's required check) before it squash-merges a change
+# to itself and deploys it, so it runs where the factory does: on macOS.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: check-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: check-${{ runner.os }}-
+      - run: cargo xtask check

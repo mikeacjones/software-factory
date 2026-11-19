@@ -776,6 +776,10 @@ pub struct Maintained {
     pub schedule: String,
     /// The beads it lands. When none of them is open any more, it is done.
     pub beads: Vec<String>,
+    /// Opened by a direct run: code started its one pipeline, and code
+    /// settles it when that ends. No director is ever woken for it.
+    #[serde(default)]
+    pub direct: bool,
 }
 
 /// The factory's record of a project's executive: the agent the owner
@@ -4464,6 +4468,16 @@ pub fn check_definitions(config: &ConfigDir) -> Result<Vec<String>, DriverError>
                         ", called at once when a class of defect breaks {step} more bead(s)"
                     ));
                 }
+                if schedule.direct {
+                    lines.push(format!(
+                        "{id}/{}: scheduled, direct: every {} day(s) at {:02}:00 UTC, one pipeline under `{}` on a bead filed from the charter, with no agent before it",
+                        definition.id,
+                        schedule.every_days,
+                        schedule.hour_utc,
+                        schedule.build_under.as_deref().unwrap_or("")
+                    ));
+                    continue;
+                }
                 lines.push(format!(
                     "{id}/{}: scheduled, maintainer {} ({}), every {} day(s) at {:02}:00 UTC, at most {} bead(s) a run{builds}",
                     definition.id,
@@ -6847,6 +6861,12 @@ impl Supervisor {
         if self.draining || goal.phase != Phase::Running || goal.inbox.is_empty() {
             return Ok(());
         }
+        // A direct run's goal has no director at all. It is settled before
+        // the bead is looked at: a run that landed and then failed to
+        // deploy has closed its bead, and is not complete.
+        if goal.maintenance.as_ref().is_some_and(|built| built.direct) {
+            return self.settle_direct(id);
+        }
         // A goal the factory opened for a maintenance run ends by itself
         // when its beads are closed: no director is woken to say so.
         if goal.maintenance.is_some() && self.settle_maintenance(id)? {
@@ -7574,6 +7594,16 @@ impl Supervisor {
         if let Some(most) = schedule.proposes {
             return self.run_review(project, definition, schedule, &seat, record, most);
         }
+        if schedule.direct {
+            return self.run_direct(
+                project,
+                definition,
+                schedule,
+                &seat,
+                record,
+                building.is_some(),
+            );
+        }
         let may_build = match (&schedule.build_under, &building) {
             (None, _) => MayBuild::FilesOnly,
             (Some(_), Some(goal)) => MayBuild::Building(goal.clone()),
@@ -7815,6 +7845,198 @@ impl Supervisor {
         Ok(true)
     }
 
+    /// A direct scheduled run: no agent decides what to build or starts it.
+    /// Code files one bead whose description is the schedule's charter,
+    /// opens a goal for it under `build_under` and starts the bead's
+    /// pipeline; the pipeline's own agent decides what the charter calls
+    /// for. A run waits while the last one's goal is open or the project
+    /// has no place for a goal. Returns whether anything was done.
+    fn run_direct(
+        &mut self,
+        project: &Project,
+        definition: &GoalDefinition,
+        schedule: &Schedule,
+        seat: &Seat,
+        mut record: Scheduled,
+        building: bool,
+    ) -> Result<bool, DriverError> {
+        let Some(under) = schedule.build_under.clone() else {
+            return Ok(false);
+        };
+        if building || self.active(project.id.as_str()).len() >= goal_limit(project) {
+            return Ok(false);
+        }
+        let run = record.runs + 1;
+        let day = factory_core::clock(now_unix());
+        let request = json!({
+            "title": format!("{}: run {run} ({})", definition.id, &day[..day.len().min(10)]),
+            "type": "task",
+            "priority": 2,
+            "description": schedule.charter.trim(),
+            "acceptance_criteria": "One change the description calls for lands with every check passing, or the builder returns already_done because nothing is worth changing now.",
+        });
+        let source = bead_source(project);
+        let (bead, line) = self.file_bead_at(seat, &source, project, &request);
+        let Some(bead) = bead else {
+            self.schedule_failed(project, definition, seat, &mut record, &line)?;
+            return Ok(true);
+        };
+        record.runs = run;
+        record.failures = 0;
+        record.retry_at = None;
+        record.since = now_unix();
+        self.log_at(
+            seat,
+            "schedule.ran",
+            json!({ "definition": definition.id, "run": run, "filed": [line],
+                    "build": [bead], "direct": true }),
+        );
+        let posted = self.tell_channel(
+            project,
+            seat,
+            &format!(
+                ":robot_face: *{}* · run {run} of `{}`\nOne pipeline is working on `{bead}` in this thread, deciding for itself what the schedule's charter calls for. `stop` here ends it.",
+                escape(&definition.id),
+                project.id
+            ),
+        );
+        // Saved before the goal is opened: a run that has filed must not
+        // run again because what came after it failed.
+        self.save_schedule(seat, &record)?;
+        let goal = self.open_direct(project, &definition.id, &under, run, &bead, posted)?;
+        self.log_at(
+            seat,
+            "schedule.building",
+            json!({ "goal": goal, "beads": [bead], "direct": true }),
+        );
+        record.goal = Some(goal);
+        self.save_schedule(seat, &record)?;
+        Ok(true)
+    }
+
+    /// Open a direct run's goal and start its one pipeline, with no
+    /// director. Its stop condition is the bead being closed.
+    fn open_direct(
+        &mut self,
+        project: &Project,
+        schedule: &str,
+        under: &str,
+        run: u32,
+        bead: &str,
+        posted: Option<(String, String)>,
+    ) -> Result<String, DriverError> {
+        let (channel, ts) = posted.unwrap_or_else(|| (String::new(), now_unix().to_string()));
+        let id = self.create_goal(
+            project.id.as_str(),
+            &channel,
+            &ts,
+            "",
+            under,
+            &format!("direct: run {run} of {schedule}"),
+            None,
+        )?;
+        let mut goal = self.goals[&id].clone();
+        goal.charter = Some(Charter {
+            objective: format!(
+                "Run {run} of `{schedule}`: one pipeline on `{bead}`, whose builder decides what the schedule's charter calls for and does it."
+            ),
+            stop_when: format!("`{bead}` is closed. The factory checks this itself."),
+            plan: String::new(),
+            paths: Vec::new(),
+        });
+        goal.maintenance = Some(Maintained {
+            schedule: schedule.to_string(),
+            beads: vec![bead.to_string()],
+            direct: true,
+        });
+        goal.phase = Phase::Running;
+        let definition = self.definition(&goal)?;
+        self.start_bead(
+            &mut goal,
+            &definition,
+            None,
+            bead,
+            "a direct scheduled run",
+            Vec::new(),
+        )?;
+        self.save(goal)?;
+        Ok(id)
+    }
+
+    /// Settle a direct run's goal once its pipeline has ended. One that
+    /// landed, and so deployed, completes as a maintenance goal does. One
+    /// that ended without a change (its builder found nothing worth doing)
+    /// closes its bead and completes. One that parked or failed, including
+    /// after landing when its deploy failed, stops the goal and is put to
+    /// the owner; its unit is kept as it is. While the pipeline runs there
+    /// is nobody to read what is written in the thread.
+    fn settle_direct(&mut self, id: &str) -> Result<(), DriverError> {
+        let mut goal = self.goals[id].clone();
+        goal.inbox.clear();
+        let last = goal.units.last().cloned();
+        let Some(last) = last.filter(|unit| unit.state != "running") else {
+            return self.save(goal);
+        };
+        if last.state == "landed" {
+            self.save(goal)?;
+            self.settle_maintenance(id)?;
+            return Ok(());
+        }
+        let project = self.config.project(&goal.project)?;
+        if last.state == "published" && last.unit.is_some() {
+            // The flow reached its end without landing: the builder said
+            // there was nothing to do.
+            let source = bead_source(&project);
+            if let Err(err) = source.close(
+                &last.bead,
+                "The run's builder found nothing worth changing now.",
+                &project.bead_actor,
+            ) {
+                self.log(
+                    &goal,
+                    "bead.close_failed",
+                    json!({ "bead": last.bead, "error": err.to_string() }),
+                );
+            }
+            goal.phase = Phase::Complete;
+            goal.evidence = Some(format!("`{}` ended with nothing to change.", last.bead));
+            self.log(
+                &goal,
+                "goal.complete",
+                json!({ "by": "code", "evidence": goal.evidence }),
+            );
+            self.say(
+                &goal,
+                &format!(
+                    ":white_check_mark: *Nothing to do.* `{}` found nothing worth changing now.",
+                    last.bead
+                ),
+            );
+        } else {
+            goal.phase = Phase::Stopped;
+            self.log(
+                &goal,
+                "goal.stopped",
+                json!({ "by": "code", "bead": last.bead, "unit": last.unit,
+                        "state": last.state, "detail": last.detail }),
+            );
+            self.need(
+                &mut goal,
+                &format!(
+                    ":warning: *The factory's own run stopped.* `{}` {}: {}\nIts unit `{}` is kept as it is: `factory run --unit {}` continues it, and the next scheduled run comes at its time.",
+                    last.bead,
+                    last.state,
+                    escape(&truncate(&last.detail, 1500)),
+                    last.unit.clone().unwrap_or_default(),
+                    last.unit.clone().unwrap_or_default()
+                ),
+            );
+        }
+        let project = goal.project.clone();
+        self.save(goal)?;
+        self.start_queued(&project)
+    }
+
     /// Open the goal that builds what a maintenance run marked, and start
     /// it as the owner's Start would: at once if the project has a place
     /// free, else in line. Its charter is written here, from the run's
@@ -7867,6 +8089,7 @@ impl Supervisor {
         goal.maintenance = Some(Maintained {
             schedule: schedule.to_string(),
             beads,
+            direct: false,
         });
         self.save(goal.clone())?;
         self.enter(
@@ -12059,6 +12282,7 @@ mod tests {
             build_under: None,
             when_class_breaks: None,
             proposes: None,
+            direct: false,
         }
     }
 

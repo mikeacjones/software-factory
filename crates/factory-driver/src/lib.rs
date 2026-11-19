@@ -870,6 +870,7 @@ pub fn load_flow(
         models,
         commands: project.commands.keys().cloned().collect(),
         scopes: project.scopes.keys().cloned().collect(),
+        deploys: project.self_deploy.is_some(),
     })?;
     // A role the flow names must have a prompt before anything starts, and a
     // command must write an artifact exactly when its step says it produces one.
@@ -1856,6 +1857,7 @@ impl Driver {
             StepKind::Action { action } => match action.as_str() {
                 "await-ci" => self.await_ci_step(&step)?,
                 "land" => self.land_step(&step)?,
+                "deploy" => self.deploy_step(&step)?,
                 "sync" => self.sync_step(&step)?,
                 _ => self.publish_step(&step)?,
             },
@@ -4438,6 +4440,82 @@ impl Driver {
             }
             std::thread::sleep(poll);
         }
+    }
+
+    /// The `deploy` action, for the factory's own project: build the commit
+    /// the unit landed, make it the factory's current release, and ask the
+    /// running service to stop at a safe point. launchd then starts the new
+    /// release, which goes on with everything in flight. It never waits for
+    /// the restart: the service it would wait on is the one running it.
+    fn deploy_step(&mut self, step: &Step) -> Result<StepEnd, DriverError> {
+        let Some(deploy) = self.project.self_deploy.clone() else {
+            return Ok(StepEnd::Park(format!(
+                "step `{}` deploys the factory, but project `{}` has no [self_deploy] table",
+                step.id, self.project.id
+            )));
+        };
+        let Some(merged) = self.unit.merged.clone() else {
+            return Ok(StepEnd::Park(format!(
+                "step `{}` deploys what the unit landed, but it has landed nothing",
+                step.id
+            )));
+        };
+        let Some(build) = self.project.commands.get(&deploy.build).cloned() else {
+            return Ok(StepEnd::Park(format!(
+                "the build command `{}` is not in the project's record",
+                deploy.build
+            )));
+        };
+        self.thread.status(&format!(
+            ":building_construction: *{}* · building `{}`",
+            step.id,
+            &merged[..merged.len().min(10)]
+        ));
+        let built = service::build_and_release(
+            &self.factory.state_dir,
+            &self.project.repo,
+            self.project.id.as_str(),
+            &merged,
+            &build,
+            &deploy.binary,
+            self.factory.service.releases_kept,
+        );
+        let deployed = match built {
+            Ok(deployed) => deployed,
+            Err(err) => {
+                let mut reason = format!("the landed commit `{merged}` was not deployed: {err}");
+                if let service::DeployError::Build { output, .. } = &err {
+                    let log = self.artifact(&format!("{}-build.log", step.id), output)?;
+                    reason.push_str(&format!(
+                        ". The running release is unchanged. Its output is in {}:\n{}",
+                        log.display(),
+                        tail(output, 30)
+                    ));
+                }
+                return self.action_failed(step, reason);
+            }
+        };
+        let flag = drain_flag(&self.factory.state_dir);
+        std::fs::write(&flag, "").map_err(io(&flag))?;
+        self.event(
+            "deployed",
+            Some(&step.id),
+            json!({
+                "commit": merged, "release": deployed.release,
+                "build_secs": deployed.build_secs, "drain": flag,
+            }),
+        )?;
+        self.thread.say(&format!(
+            ":rocket: *{}* · `{}` is the factory's current release. The service stops at a safe point and starts again on it. `factory service rollback` puts the one before back.",
+            step.id,
+            deployed
+                .release
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        ));
+        self.save()?;
+        Ok(StepEnd::Outcome("done".to_string()))
     }
 
     /// The `land` action: merge the pull request, confirm the merge commit is
