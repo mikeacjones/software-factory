@@ -1,0 +1,62 @@
+# Fix the bugs in the tracker at their root cause (owner's request,
+# 2026-11-19, as the project's executive proposed it).
+#
+# A goal of this kind works through the project's open bug beads until none
+# is left. Its director groups them into sub-goals by area (workflow
+# futures, the time-skipping environment, ProtoJSON and timestamps, the
+# client, samples); each sub-goal has a foreman and lands as one pull
+# request. Which bugs count (deferred ones, say) is agreed in the
+# charter, not here.
+#
+# Owner's decision, 2026-11-19: for the bugs already in the tracker,
+# writing their acceptance criteria and their design is part of the
+# goal's first loop, not something put to the owner. A sub-goal's beads
+# get acceptance criteria from the director (or its foreman) where they
+# have none, and its designer designs the fix, before any bead of it is
+# built.
+#
+# A bug is fixed only at its cause and with no regression: the bead flows'
+# tester, reviewer and regression tests hold every fix to that, and the
+# roles already refuse a retry, a longer time limit or a loosened test as a
+# fix.
+id = "bugfix"
+flow = "zig-sdk-bead"
+ship_flow = "zig-sdk-ship"
+max_pipelines = 2
+# As parity's: files that pieces of work running side by side both touch.
+shared_paths = ["README.md", "PARITY.md", "CHANGELOG.md", "changelog", "samples/README.md", "samples/dispatch.zig"]
+objective = "Fix every open bug in the tracker at its root cause, with no regressions. For each sub-goal, first give every bug in it that lacks them acceptance criteria that state the root cause to remove and the regression test that proves it gone, writing them into the bead yourself; then have the sub-goal designed; only then start its beads."
+stop_when = "No open bug bead remains in the project's tracker, other than any the charter leaves out."
+
+[director]
+model = "claude-opus-5-5"
+effort = "medium"
+timeout_secs = 2400
+slots = 2
+
+# As parity's: a light model for the wakes code can tell need less.
+[routes]
+ship = "claude-sonnet-5-5"
+settle = "claude-opus-5-5"
+
+[foreman]
+model = "claude-opus-5-5"
+effort = "high"
+timeout_secs = 1800
+slots = 2
+
+# Kept, though the executive was least sure of it: many of these bugs come
+# in clusters with one cause (timestamp panics, workflow futures), and the
+# designer is what finds that cause before each builder patches its own
+# symptom. A sub-goal of small unrelated fixes costs one design read.
+[designer]
+model = "claude-opus-5-5"
+effort = "medium"
+timeout_secs = 2700
+
+[permissions]
+# Bugs it finds along the way are filed as it goes.
+file_beads = "allow"
+# It changes any bead itself, so that writing the acceptance criteria of
+# the bugs already in the tracker is part of its loop and waits for nobody.
+edit_beads = "allow"
