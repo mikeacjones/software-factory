@@ -1363,3 +1363,201 @@ async fn a_schedule_new_to_a_project_is_run_when_a_worker_starts_with_it_overdue
     assert_eq!((later.turns, maintainers()), (turns, 1), "{later:?}");
     shop.close().await;
 }
+
+/// A goal definition put in force while the worker runs is taken up by
+/// that worker, as `factory goal enable` has it taken up: the engine's
+/// `enabled` command. A project that had no definitions had no workflow,
+/// and has one; a definition with a schedule has its project look at once,
+/// so that a schedule already overdue is run then and not at the next
+/// start. The worker is the same one throughout.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_definition_put_in_force_is_taken_up_by_the_running_worker() {
+    use factory_engine::tiers::{INTAKE_ID, Project, project_id};
+    use temporalio_client::errors::WorkflowInteractionError;
+    use temporalio_client::{UntypedWorkflow, WorkflowDescribeOptions};
+
+    let Some(shop) = Shop::open_with(
+        "engine-enable",
+        "true",
+        "",
+        |world| world.with_github("green"),
+        "tiers = true\n",
+    )
+    .await
+    else {
+        return;
+    };
+    let world = &shop.world;
+    let client = shop.client();
+    assert!(world.config().goal_definitions("toy").unwrap().is_empty());
+    let worker_pid = shop.worker.lock().unwrap().id();
+    let still_running = || {
+        let mut worker = shop.worker.lock().unwrap();
+        assert_eq!(worker.id(), worker_pid);
+        assert!(worker.try_wait().unwrap().is_none(), "the worker ended");
+    };
+    let standing = || async {
+        client
+            .get_workflow_handle::<Project>(project_id("toy"))
+            .query(Project::standing, (), WorkflowQueryOptions::default())
+            .await
+            .ok()
+    };
+    let now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    };
+    let enabled = |id: &str| {
+        let said = Command::new(env!("CARGO_BIN_EXE_factory-engine"))
+            .args(["enabled", "toy", id, "--config"])
+            .arg(world.path("config"))
+            .output()
+            .unwrap();
+        assert!(said.status.success(), "{said:?}");
+        String::from_utf8_lossy(&said.stdout).into_owned()
+    };
+
+    // The worker starts the intake last: once it is there, the worker has
+    // started every project's workflow it is going to, and toy, with no
+    // definition, has none.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while client
+        .get_workflow_handle::<UntypedWorkflow>(INTAKE_ID.to_string())
+        .describe(WorkflowDescribeOptions::default())
+        .await
+        .is_err()
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the worker never started the intake"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let none = client
+        .get_workflow_handle::<UntypedWorkflow>(project_id("toy"))
+        .describe(WorkflowDescribeOptions::default())
+        .await;
+    assert!(
+        matches!(none, Err(WorkflowInteractionError::NotFound(_))),
+        "{none:?}"
+    );
+
+    // The owner puts a first definition in force: the project's workflow
+    // is started by the running worker, and takes its first turn.
+    factory_driver::goal::enable_definition(
+        &world.config(),
+        "toy",
+        "id = \"main\"\ndefault = true\n[director]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\n",
+    )
+    .unwrap();
+    let said = enabled("main");
+    assert!(!said.contains("to look now"), "{said}");
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let first = loop {
+        let stands = standing().await;
+        if let Some(stands) = stands
+            .as_ref()
+            .filter(|stands| stands.turns >= 1 && stands.waiting == 0)
+        {
+            break stands.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the project never took a turn: {stands:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert_eq!(
+        (first.due_at, first.trouble.clone()),
+        (None, None),
+        "{first:?}"
+    );
+    // Nothing comes due by itself: the workflow waits.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(standing().await.unwrap().turns, first.turns);
+    still_running();
+
+    // Then one with a schedule whose time has passed. Nothing else would
+    // wake the waiting workflow: the call has the project look now.
+    let record = world.path("state/projects/toy/schedules/upkeep/scheduled.json");
+    std::fs::create_dir_all(record.parent().unwrap()).unwrap();
+    std::fs::write(
+        &record,
+        serde_json::json!({ "since": now() - 8 * 86_400 }).to_string(),
+    )
+    .unwrap();
+    std::fs::create_dir_all(world.path("bin/state")).unwrap();
+    std::fs::write(
+        world.path("bin/state/maintainer-1.json"),
+        serde_json::json!({
+            "summary": "Cleanup on error paths keeps breaking.",
+            "digest": "One bead: a check that injects allocation failure.",
+            "journal": "Nothing else was worth a bead.",
+            "file": [{"title": "Check every error path for leaks", "type": "task", "priority": 3,
+                "description": "Error paths have leaked.", "acceptance_criteria": "A check fails when one leaks.",
+                "parent": "", "discovered_from": "", "deferred": true}]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    factory_driver::goal::enable_definition(
+        &world.config(),
+        "toy",
+        "id = \"upkeep\"\n[director]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\n[schedule]\nhour_utc = 4\nevery_days = 7\nmax_beads = 2\ncharter = \"Turn what keeps breaking into checks.\"\n",
+    )
+    .unwrap();
+    let said = enabled("upkeep");
+    assert!(said.contains("told project `toy` to look now"), "{said}");
+    let ran = || -> u64 {
+        std::fs::read_to_string(&record)
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .and_then(|record| record["runs"].as_u64())
+            .unwrap_or(0)
+    };
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while ran() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the schedule was never run: {:?}, {:?}",
+            world.calls(),
+            standing().await,
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let maintainers = world
+        .calls()
+        .iter()
+        .filter(|call| call[0] == "maintainer")
+        .count();
+    assert_eq!(maintainers, 1, "{:?}", world.calls());
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let stands = loop {
+        let stands = standing().await;
+        if let Some(stands) = stands.as_ref().filter(|stands| stands.due_at.is_some()) {
+            break stands.clone();
+        }
+        assert!(Instant::now() < deadline, "no next time: {stands:?}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert_eq!(stands.trouble, None, "{stands:?}");
+    let lately = stands.lately.join("\n");
+    assert!(lately.contains("see to what has come due"), "{lately}");
+    still_running();
+
+    // A definition that is not in force is refused, and nothing is told.
+    let refused = Command::new(env!("CARGO_BIN_EXE_factory-engine"))
+        .args(["enabled", "toy", "nowhere", "--config"])
+        .arg(world.path("config"))
+        .output()
+        .unwrap();
+    assert!(!refused.status.success(), "{refused:?}");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr)
+            .contains("project `toy` has no goal definition `nowhere` in force"),
+        "{refused:?}"
+    );
+    shop.close().await;
+}
