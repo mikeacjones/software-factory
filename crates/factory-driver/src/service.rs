@@ -949,10 +949,19 @@ grep -q fine \"$3/factory.toml\" || { echo \"unknown field fallback_model\"; exi
         let (state, source) = (root.join("state"), root.join("source"));
         std::fs::create_dir_all(source.join("config")).unwrap();
         std::fs::create_dir_all(&state).unwrap();
-        // Real programs, so that codesign has something to sign: the engine
-        // answers `check` with success, as `true` does.
-        std::fs::copy("/usr/bin/true", source.join("factory")).unwrap();
-        std::fs::copy("/usr/bin/true", source.join("factory-engine")).unwrap();
+        // Programs codesign can sign, of our own: the engine answers `check`
+        // with success. Not a copy of /usr/bin/true: that is Apple's arm64e
+        // build, which macOS 15 refuses to run once it is signed as anyone
+        // else's, so the engine's check failed there.
+        for program in ["factory", "factory-engine"] {
+            let path = source.join(program);
+            std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(
+                &path,
+                std::os::unix::fs::PermissionsExt::from_mode(0o755),
+            )
+            .unwrap();
+        }
         std::fs::write(source.join("config/factory.toml"), "fine").unwrap();
         let install = |name: &str, signing: Option<&str>| {
             install_release(
