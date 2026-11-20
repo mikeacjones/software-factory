@@ -249,6 +249,10 @@ pub struct Design {
     pub note: String,
     /// How many times the designer has returned for it.
     pub rounds: u32,
+    /// The round it was at when the owner last wrote in the goal's thread:
+    /// the director may send it back `MAX_DESIGN_ROUNDS` times from there.
+    #[serde(default)]
+    pub owner_round: u32,
     pub failures: u32,
     pub retry_at: Option<u64>,
 }
@@ -646,7 +650,8 @@ pub fn recent_journal(journal: &str, keep: usize, path: &Path) -> String {
 }
 
 /// How many times a director may send one design back before it must
-/// accept it or take it to the owner.
+/// accept it or take it to the owner. The owner's reply in the goal's
+/// thread allows as many again.
 const MAX_DESIGN_ROUNDS: u32 = 3;
 
 /// The factory's record of the agent that runs one sub-goal.
@@ -682,7 +687,25 @@ const MAX_CONTINUES: u32 = 3;
 
 /// How many messages a director and a foreman may pass each other without
 /// a pipeline starting, before the director must ship or ask the owner.
+/// The count starts again when a pipeline of the sub-goal starts or is
+/// continued, and when the owner writes in the goal's thread.
 const MAX_EXCHANGES: u32 = 6;
+
+/// The owner has written in the goal's thread. Where code cut the director
+/// off, it told it to ask the owner, and the owner cannot reach a foreman or
+/// a designer any other way: so the owner's word lifts both caps on every
+/// open sub-goal. The director may write to its foreman again, and send its
+/// design back `MAX_DESIGN_ROUNDS` more times (its rounds keep their numbers).
+fn owner_weighed_in(goal: &mut Goal) {
+    for sub in goal.subgoals.iter_mut().filter(|sub| sub.state == "open") {
+        if let Some(foreman) = sub.foreman.as_mut() {
+            foreman.exchanges = 0;
+        }
+        if let Some(design) = sub.design.as_mut() {
+            design.owner_round = design.rounds;
+        }
+    }
+}
 
 /// One pipeline the goal started.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2766,10 +2789,14 @@ pub fn decision_problems(
             Some(_) if !accept && strings(ruling, "note").trim().is_empty() => problems.push(format!(
                 "design: `{target}` is sent back without a `note`: say what must change"
             )),
-            Some(design) if !accept && design.rounds >= MAX_DESIGN_ROUNDS => problems.push(format!(
-                "design: `{target}` has been designed {} times. Accept it, or ask the owner",
-                design.rounds
-            )),
+            Some(design)
+                if !accept && design.rounds.saturating_sub(design.owner_round) >= MAX_DESIGN_ROUNDS =>
+            {
+                problems.push(format!(
+                    "design: `{target}` has been designed {} times. Accept it, or ask the owner (once the owner replies in the goal's thread you may send it back again)",
+                    design.rounds
+                ))
+            }
             Some(_) => {}
         }
     }
@@ -2796,7 +2823,7 @@ pub fn decision_problems(
                     open.id
                 )),
                 Some(foreman) if foreman.exchanges >= MAX_EXCHANGES => problems.push(format!(
-                    "tell_foreman: you and the foreman of `{}` have passed {} messages without a pipeline starting: ship what is absorbed, or ask the owner",
+                    "tell_foreman: you and the foreman of `{}` have passed {} messages without a pipeline starting: ship what is absorbed, or ask the owner (once the owner replies in the goal's thread you may write to the foreman again)",
                     open.id, foreman.exchanges
                 )),
                 Some(_) => {}
@@ -6626,6 +6653,7 @@ impl Supervisor {
                     goal.phase = Phase::Running;
                     goal.evidence = None;
                 }
+                owner_weighed_in(&mut goal);
                 goal.inbox.push(Happening::OwnerSaid {
                     text: text.to_string(),
                 });
@@ -11106,7 +11134,21 @@ mod tests {
         assert_eq!(
             problems(&d, &with("proposed", 3), rule(false, "Again.")),
             [format!(
-                "design: `{id}` has been designed 3 times. Accept it, or ask the owner"
+                "design: `{id}` has been designed 3 times. Accept it, or ask the owner (once the owner replies in the goal's thread you may send it back again)"
+            )]
+        );
+        // The owner's reply, which the director was told to get, allows as
+        // many rounds again; the rounds keep their numbers.
+        let mut answered = with("proposed", 3);
+        owner_weighed_in(&mut answered);
+        let design = answered.subgoals[0].design.as_ref().unwrap();
+        assert_eq!((design.rounds, design.owner_round), (3, 3));
+        assert!(problems(&d, &answered, rule(false, "Again.")).is_empty());
+        answered.subgoals[0].design.as_mut().unwrap().rounds = 6;
+        assert_eq!(
+            problems(&d, &answered, rule(false, "Again.")),
+            [format!(
+                "design: `{id}` has been designed 6 times. Accept it, or ask the owner (once the owner replies in the goal's thread you may send it back again)"
             )]
         );
         for state in ["pending", "accepted"] {
@@ -11725,8 +11767,23 @@ mod tests {
         circling.subgoals[0].foreman.as_mut().unwrap().exchanges = MAX_EXCHANGES;
         let cut = problems(&d, &circling, json!({"tell_foreman": "Try again."}));
         assert!(
-            cut[0].contains("have passed 6 messages without a pipeline starting"),
+            cut[0].contains("have passed 6 messages without a pipeline starting")
+                && cut[0].contains("once the owner replies"),
             "{cut:?}"
+        );
+        // The owner's reply, which the director was told to get, lets it
+        // write to the foreman again.
+        owner_weighed_in(&mut circling);
+        assert_eq!(circling.subgoals[0].foreman.as_ref().unwrap().exchanges, 0);
+        assert!(problems(&d, &circling, json!({"tell_foreman": "Try again."})).is_empty());
+        // A sub-goal that is no longer open keeps its count.
+        let mut shipping = with_foreman(&["toy-1"], Some("ready"));
+        shipping.subgoals[0].state = "shipping".into();
+        shipping.subgoals[0].foreman.as_mut().unwrap().exchanges = MAX_EXCHANGES;
+        owner_weighed_in(&mut shipping);
+        assert_eq!(
+            shipping.subgoals[0].foreman.as_ref().unwrap().exchanges,
+            MAX_EXCHANGES
         );
 
         // There has to be a foreman to tell.

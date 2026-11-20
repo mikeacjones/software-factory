@@ -89,7 +89,7 @@ sequenceDiagram
     Owner->>Tiers: Start
     Note over Tiers: Code writes the agreed bead edits.<br/>The goal runs, or queues behind the project's running goals.
     Note over Tiers: Director agent, fresh session at every wake.<br/>It opens a sub-goal with its beads and paths.
-    Note over Tiers: Designer agent designs the sub-goal.<br/>The director accepts it or sends it back, up to three times.
+    Note over Tiers: Designer agent designs the sub-goal.<br/>The director accepts it or sends it back, up to three times<br/>(three more after the owner replies).
     Note over Tiers: Foreman agent, fresh session at every wake.<br/>It starts beads, side by side unless the design says one comes after another.
     Tiers-->>Project: pipelines to start, and the next time something is due
 
