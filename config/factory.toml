@@ -64,8 +64,10 @@ pipelines = true
 id = "claude"
 token_env_file = "~/Source/machine-config/.env"
 token_env = "CLAUDE_OAUTH_TOKEN"
-# No usage login: the only full login of this account was the CLI's own,
-# which is whichever account the owner last logged in as.
+# A login of this account's own for reading usage (CLAUDE_CONFIG_DIR
+# ~/.claude-usage-claude), kept fresh by the factory as claude2's is.
+usage_keychain = "Claude Code-credentials-c3500784"
+usage_refresh = true
 
 [[account]]
 id = "claude2"
