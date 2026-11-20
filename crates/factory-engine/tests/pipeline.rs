@@ -5,6 +5,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+mod common;
 #[path = "../../factory-driver/tests/common/world.rs"]
 mod world;
 
@@ -84,11 +85,7 @@ impl Shop {
         if !scenario.is_empty() {
             world.scenario(scenario);
         }
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
+        let port = common::reserved_port();
         let options = LocalWorkflowEnvironmentOptions::builder()
             .server_executable(EphemeralExe::ExistingPath(cli))
             .port(port)
