@@ -3,6 +3,7 @@
 
 #![allow(dead_code, clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -23,6 +24,37 @@ pub fn temporal_cli() -> Option<String> {
         let path = Path::new(dir).join("temporal");
         path.is_file().then(|| path.to_string_lossy().into_owned())
     })
+}
+
+/// A port for a test's server to listen on, which no other socket is
+/// given before the server takes it.
+///
+/// Binding port 0 and dropping the listener frees the port at once, and the
+/// kernel hands it to the next socket that asks for any port once its
+/// cursor comes round to it. On macOS that cursor is one for every process
+/// and goes up by one port at a time, but it also jumps: between two runs
+/// on the agents' Mac it went from 58929 to 50097. When it lands just
+/// behind a port picked a moment ago, another socket is given that port,
+/// the server fails with `bind: address already in use`, and its test waits
+/// out the start-up timeout on a port nothing listens on. So the port is
+/// connected to and closed from the listening side first, as the SDK's own
+/// choice of port does: that leaves it in TIME_WAIT, where the kernel does
+/// not hand it out for a while, yet the server, which binds it by number
+/// with SO_REUSEADDR, can still take it. The SDK's choice is not used
+/// itself because `WorkflowEnvironment` does not say which port it chose,
+/// and the test must tell its workers.
+pub fn reserved_port() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let mut client = TcpStream::connect(address).unwrap();
+    let (mut server, _) = listener.accept().unwrap();
+    // The listening side closes first, so its end is the one left in
+    // TIME_WAIT; both wait for the other's close before they are dropped.
+    server.shutdown(Shutdown::Write).unwrap();
+    std::io::copy(&mut client, &mut std::io::sink()).unwrap();
+    client.shutdown(Shutdown::Write).unwrap();
+    std::io::copy(&mut server, &mut std::io::sink()).unwrap();
+    address.port()
 }
 
 /// A local server, a directory with the scripted step, and the workers
@@ -53,28 +85,13 @@ impl Rig {
             eprintln!("no `temporal` CLI on the PATH: skipped");
             return None;
         };
-        // Something else on the machine may be starting and stopping
-        // servers of its own, and one of ours can then fail to come up.
-        // That says nothing about the engine: it is started again.
-        let mut tries = 0;
-        let (env, port) = loop {
-            let port = std::net::TcpListener::bind("127.0.0.1:0")
-                .unwrap()
-                .local_addr()
-                .unwrap()
-                .port();
-            let options = LocalWorkflowEnvironmentOptions::builder()
-                .server_executable(EphemeralExe::ExistingPath(cli.clone()))
-                .port(port)
-                .startup_timeout(Duration::from_secs(30))
-                .build();
-            tries += 1;
-            match WorkflowEnvironment::start_local(options).await {
-                Ok(env) => break (env, port),
-                Err(err) if tries < 3 => eprintln!("the test server did not start: {err}"),
-                Err(err) => panic!("the test server did not start, three times: {err}"),
-            }
-        };
+        let port = reserved_port();
+        let options = LocalWorkflowEnvironmentOptions::builder()
+            .server_executable(EphemeralExe::ExistingPath(cli))
+            .port(port)
+            .startup_timeout(Duration::from_secs(30))
+            .build();
+        let env = WorkflowEnvironment::start_local(options).await.unwrap();
         let dir =
             std::env::temp_dir().join(format!("factory-engine-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
