@@ -4131,6 +4131,193 @@ fn a_foreman_runs_a_sub_goals_beads_and_the_director_only_plans_and_ships() {
     assert_eq!(sup.goals().next().unwrap().phase, Phase::Complete);
 }
 
+/// An existing open bead the director did not plan for a sub-goal is put
+/// into it by the director, not filed again as a copy: its foreman, woken
+/// with it, starts it ahead of the rest, and the sub-goal's ship closes it.
+#[test]
+fn a_bead_the_director_adds_to_an_open_sub_goal_is_started_by_its_foreman_and_closed_when_it_lands()
+{
+    use factory_driver::goal::{Addition, Phase, Supervisor};
+    use factory_slack::socket::Incoming;
+    use std::time::{Duration, Instant};
+
+    let world = World::new("added", "true");
+    world.with_github("green");
+    // toy-3 builds on toy-1: it is launchable in the sub-goal once toy-1
+    // is absorbed there.
+    std::fs::write(
+        world.path("beads/toy-3.json"),
+        r#"{"id":"toy-3","title":"The follow-up","description":"Later.","acceptance_criteria":"- it follows","status":"open","open_blockers":["toy-1"]}"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(world.path("config/goals/toy")).unwrap();
+    std::fs::write(
+        world.path("config/goals/toy/main.toml"),
+        "id = \"main\"\nflow = \"zig-sdk-bead\"\nship_flow = \"zig-sdk-ship\"\n[director]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\n[foreman]\nmodel = \"claude-opus-5-5\"\neffort = \"medium\"\n",
+    )
+    .unwrap();
+    let say = |role: &str, n: u32, json: String| {
+        std::fs::create_dir_all(world.path("bin/state")).unwrap();
+        std::fs::write(world.path(&format!("bin/state/{role}-{n}.json")), json).unwrap();
+    };
+    let with = |mut result: serde_json::Value, fields: &str| {
+        let extra: serde_json::Value = serde_json::from_str(fields).unwrap();
+        for (key, value) in extra.as_object().unwrap() {
+            result[key] = value.clone();
+        }
+        result.to_string()
+    };
+    let direct = |fields: &str| {
+        with(
+            serde_json::json!({
+                "summary": "Decided.", "start": [], "file": [], "edit": [], "dropped_findings": [],
+                "ship": false, "tell_foreman": "", "ask_owner": "", "complete": false,
+                "evidence": "", "journal_entry": "", "project_memory": ""
+            }),
+            fields,
+        )
+    };
+    let foreman = |fields: &str| {
+        with(
+            serde_json::json!({
+                "summary": "Decided.", "start": [], "file": [], "dropped_findings": [],
+                "report": "working", "message": "", "journal_entry": ""
+            }),
+            fields,
+        )
+    };
+    say("intake", 1, r#"{"reply":"Here is the charter.","ready":true,"objective":"Ship the feature.","stop_when":"Both beads have landed.","plan":"One sub-goal: toy-1.","edits":[]}"#.to_string());
+    // The director plans the sub-goal without toy-3.
+    say(
+        "director",
+        1,
+        direct(
+            r#"{"open_subgoals":[{"id":"feature","title":"The feature","objective":"It works.","beads":["toy-1"]}]}"#,
+        ),
+    );
+    say(
+        "foreman",
+        1,
+        foreman(r#"{"start":[{"bead":"toy-1","reason":"the plan"}]}"#),
+    );
+    // toy-1 is absorbed. The foreman finds that toy-3 belongs here, and
+    // asks the director rather than filing a copy.
+    say(
+        "foreman",
+        2,
+        foreman(
+            r#"{"report":"escalate","message":"toy-3 belongs in this sub-goal: please add it, first."}"#,
+        ),
+    );
+    say(
+        "director",
+        2,
+        direct(
+            r#"{"add_to_subgoal":[{"subgoal":"feature","bead":"toy-3","paths":[],"first":true}]}"#,
+        ),
+    );
+    say(
+        "foreman",
+        3,
+        foreman(r#"{"start":[{"bead":"toy-3","reason":"the director added it, first"}]}"#),
+    );
+    say(
+        "foreman",
+        4,
+        foreman(r#"{"report":"ready","message":"toy-1 and toy-3 are absorbed."}"#),
+    );
+    say("director", 3, direct(r#"{"ship":["feature"]}"#));
+    say(
+        "director",
+        4,
+        direct(r#"{"complete":true,"evidence":"The sub-goal landed as one pull request."}"#),
+    );
+
+    let mut sup = Supervisor::new(world.config(), None, vec!["OWNER".to_string()], false).unwrap();
+    let id = sup.open_directly("toy", "Ship the feature").unwrap();
+    sup.incoming(Incoming::Action {
+        channel: String::new(),
+        user: "OWNER".to_string(),
+        action_id: "goal_start".to_string(),
+        value: id.clone(),
+        message_ts: String::new(),
+    })
+    .unwrap();
+    let goal = |sup: &Supervisor| sup.goals().next().unwrap().clone();
+    let brief = |world: &World, role: &str, n: usize| {
+        let calls = world.calls();
+        let index = (0..calls.len())
+            .filter(|&i| calls[i][0] == role)
+            .nth(n - 1)
+            .unwrap();
+        std::fs::read_to_string(world.path(&format!("bin/state/brief-{}.md", index + 1))).unwrap()
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(240);
+    while goal(&sup).wakes < 4 {
+        assert!(Instant::now() < deadline, "the sub-goal never landed");
+        sup.pump(Duration::from_millis(200)).unwrap();
+    }
+    let landed = goal(&sup);
+    assert_eq!(landed.phase, Phase::ProposedComplete);
+    let sub = &landed.subgoals[0];
+    assert_eq!(sub.state, "landed");
+    assert_eq!(sub.planned, ["toy-1"]);
+    assert_eq!(sub.added, ["toy-3"]);
+    assert_eq!(
+        sub.additions,
+        [Addition {
+            bead: "toy-3".into(),
+            first: true
+        }]
+    );
+    assert_eq!(
+        sub.absorbed
+            .iter()
+            .map(|(bead, _)| bead.as_str())
+            .collect::<Vec<_>>(),
+        ["toy-1", "toy-3"]
+    );
+    // Each bead ran once, and nothing was filed: no copy of toy-3.
+    assert_eq!(
+        landed
+            .units
+            .iter()
+            .filter(|unit| !unit.ship)
+            .map(|unit| unit.bead.as_str())
+            .collect::<Vec<_>>(),
+        ["toy-1", "toy-3"]
+    );
+    assert!(!world.path("beads/filed-4.json").exists());
+    // The foreman was woken with the bead, and told to start it first.
+    let woken = brief(&world, "foreman", 3);
+    for expected in [
+        "- The director added `toy-3`, an existing bead, to this sub-goal: it is one of its beads now, and yours to start. Start it first, ahead of the beads still waiting to start.",
+        "- Added by the director since it opened: toy-3 (to start first).",
+        "- Not yet absorbed: toy-3.",
+    ] {
+        assert!(
+            woken.contains(expected),
+            "missing {expected:?} in:\n{woken}"
+        );
+    }
+    // The sub-goal's ship closed the bead the director added with the one
+    // it planned.
+    for bead in ["toy-1", "toy-3"] {
+        let text = std::fs::read_to_string(world.path(&format!("beads/{bead}.json"))).unwrap();
+        assert!(
+            text.contains("\"closed\""),
+            "{bead} is closed when the sub-goal lands: {text}"
+        );
+    }
+    let log =
+        std::fs::read_to_string(world.path(&format!("state/goals/{id}/events.jsonl"))).unwrap();
+    assert!(
+        log.contains(r#""kind":"subgoal.added""#),
+        "no subgoal.added in the goal's log"
+    );
+}
+
 #[test]
 fn a_foreman_that_cannot_run_is_retried_and_then_handed_to_the_director() {
     use factory_driver::goal::Supervisor;

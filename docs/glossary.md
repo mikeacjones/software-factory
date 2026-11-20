@@ -76,6 +76,8 @@ The bead the factory files when a goal definition is put in force without a rele
 
 A part of a goal that lands as one pull request, such as one feature. It has a branch of its own that its beads are absorbed into, one commit each, and it is shipped once: verified as a whole, opened as a pull request, and squashed onto the default branch, which closes its beads.
 
+Its beads are those the director planned for it as it opened, those its foreman filed to run in it, and existing open beads the director added to it since, each to start first or after the beads waiting. A bead belongs to one sub-goal at a time: an existing bead is added, never filed again as a copy, and code refuses to add one that is running, absorbed or another sub-goal's.
+
 ## pipeline
 
 What one bead goes through from being started to being landed: a unit walking its flow. A goal runs pipelines, up to its cap at a time.
@@ -92,7 +94,7 @@ It is also where tracker work that is no goal's goes. A director that finds an o
 
 ## foreman
 
-The agent that runs one sub-goal under the director: it starts the sub-goal's beads, rules on their findings, and reports to the director when the sub-goal is ready to ship or when it needs an answer. Like the director it starts fresh at every event and its decisions are checked by code.
+The agent that runs one sub-goal under the director: it starts the sub-goal's beads, rules on their findings, and reports to the director when the sub-goal is ready to ship or when it needs an answer. It starts only the sub-goal's own beads; for an existing bead that belongs there it escalates, and the director adds it. Like the director it starts fresh at every event and its decisions are checked by code.
 
 ## designer
 
