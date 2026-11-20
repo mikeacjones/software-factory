@@ -72,12 +72,18 @@ fn copy_tree(from: &Path, to: &Path) -> Result<(), DriverError> {
 ///
 /// A service that is running goes on with the release it started from: it
 /// resolved the link when it started.
+///
+/// With a `signing` identity, each program of the release is signed with
+/// it (`sign_program`), and a release whose programs could not be signed
+/// is removed and never made current: it would run, but macOS would no
+/// longer allow it what it allowed the release before.
 pub fn install_release(
     state_dir: &Path,
     factory: &Path,
     config: &Path,
     name: &str,
     keep: usize,
+    signing: Option<&str>,
 ) -> Result<PathBuf, DriverError> {
     let dir = releases(state_dir).join(name);
     if dir.exists() {
@@ -95,12 +101,22 @@ pub fn install_release(
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
             .map_err(io(&binary))?;
     }
+    let signed = |program: &Path| -> Result<(), DriverError> {
+        let Some(identity) = signing else {
+            return Ok(());
+        };
+        sign_program(program, identity).inspect_err(|_| {
+            let _ = std::fs::remove_dir_all(&dir);
+        })
+    };
+    signed(&binary)?;
     // The engine's command built beside the factory's goes with it, so
     // that a release is one build of both.
     let engine = factory.with_file_name("factory-engine");
     if engine.is_file() {
         let built = dir.join("factory-engine");
         put_program(&engine, &built)?;
+        signed(&built)?;
         // A release whose engine cannot read its config would leave the
         // service starting and dying until someone looks: the engine of a
         // build older than the config, say, because only the factory's own
@@ -232,7 +248,7 @@ pub fn build_and_release(
     commit: &str,
     build: &factory_config::CommandSpec,
     binary: &Path,
-    keep: usize,
+    service: &factory_config::ServiceSettings,
 ) -> Result<Deployed, DeployError> {
     let dir = deploy_checkout(state_dir, project);
     let checkout_failed = |reason: String| DeployError::Checkout {
@@ -276,7 +292,8 @@ pub fn build_and_release(
         &program,
         &dir.join("config"),
         &release_name(factory_core::now_unix(), Some(commit)),
-        keep,
+        service.releases_kept,
+        service.signing_identity.as_deref(),
     )
     .map_err(|err| DeployError::Release(err.to_string()))?;
     Ok(Deployed {
@@ -284,6 +301,56 @@ pub fn build_and_release(
         output: result.output,
         build_secs: result.duration.as_secs(),
     })
+}
+
+/// What a release's program is called to macOS, whatever its build: the
+/// prefix and the program's file name, such as
+/// `software-factory.factory-engine`.
+const SIGNING_PREFIX: &str = "software-factory";
+
+/// Sign a program of a release with `identity`, under a name that stays
+/// the same from one build to the next, and check the signature. macOS
+/// then knows each build as the same program (its designated requirement
+/// is the name and the identity's certificate, not the build's hash), so
+/// what it has allowed the program goes on applying after a deploy. The
+/// identity's private key must let `codesign` use it without asking: a
+/// deploy of the factory's own landed commit runs with nobody at the
+/// screen, and a prompt would only time out.
+fn sign_program(program: &Path, identity: &str) -> Result<(), DriverError> {
+    let name = program
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let identifier = format!("{SIGNING_PREFIX}.{name}");
+    let path = program.to_string_lossy();
+    let steps: [&[&str]; 2] = [
+        &[
+            "codesign",
+            "--force",
+            "--sign",
+            identity,
+            "--identifier",
+            &identifier,
+            &path,
+        ],
+        &["codesign", "--verify", "--strict", &path],
+    ];
+    for argv in steps {
+        let done = run(argv)?;
+        if !done.success() {
+            let why = if done.timed_out {
+                "it timed out, which is what a Keychain prompt nobody answers looks like: let codesign use the identity's key without asking".to_string()
+            } else {
+                format!("{}{}", done.stdout, done.stderr).trim().to_string()
+            };
+            return Err(DriverError::Preflight(format!(
+                "`{}` on {} failed, so the release was not made current: {why}",
+                argv[..2].join(" "),
+                program.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Copy a program to where it is run from, whole or not at all: it is
@@ -432,6 +499,7 @@ pub fn release_this_build(
         config,
         &release_name(factory_core::now_unix(), commit.as_deref()),
         factory.service.releases_kept,
+        factory.service.signing_identity.as_deref(),
     )
 }
 
@@ -611,6 +679,7 @@ mod tests {
                 &source.join("config"),
                 name,
                 2,
+                None,
             )
             .unwrap()
         };
@@ -654,7 +723,8 @@ mod tests {
                 &source.join("factory"),
                 &source.join("config"),
                 "2026-11-15T140000Z-bbb",
-                2
+                2,
+                None
             )
             .is_err()
         );
@@ -716,7 +786,18 @@ mod tests {
         .unwrap();
         let binary = Path::new("out/factory");
         let deploy = |commit: &str, build: &factory_config::CommandSpec| {
-            build_and_release(&state, &repo, "factory", commit, build, binary, 3)
+            build_and_release(
+                &state,
+                &repo,
+                "factory",
+                commit,
+                build,
+                binary,
+                &factory_config::ServiceSettings {
+                    releases_kept: 3,
+                    ..Default::default()
+                },
+            )
         };
         let read = |path: PathBuf| std::fs::read_to_string(path).unwrap();
 
@@ -790,6 +871,7 @@ grep -q fine \"$3/factory.toml\" || { echo \"unknown field fallback_model\"; exi
                 &source.join("config"),
                 name,
                 3,
+                None,
             )
         };
 
@@ -858,5 +940,77 @@ grep -q fine \"$3/factory.toml\" || { echo \"unknown field fallback_model\"; exi
             }
         );
         assert_eq!(job_state("Could not find service"), JobState::default());
+    }
+
+    #[test]
+    fn a_signed_release_names_each_program_the_same_from_build_to_build() {
+        let root = std::env::temp_dir().join(format!("factory-signed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (state, source) = (root.join("state"), root.join("source"));
+        std::fs::create_dir_all(source.join("config")).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        // Programs codesign can sign, of our own: the engine answers `check`
+        // with success. Not a copy of /usr/bin/true: that is Apple's arm64e
+        // build, which macOS 15 refuses to run once it is signed as anyone
+        // else's, so the engine's check failed there.
+        for program in ["factory", "factory-engine"] {
+            let path = source.join(program);
+            std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+                .unwrap();
+        }
+        std::fs::write(source.join("config/factory.toml"), "fine").unwrap();
+        let install = |name: &str, signing: Option<&str>| {
+            install_release(
+                &state,
+                &source.join("factory"),
+                &source.join("config"),
+                name,
+                3,
+                signing,
+            )
+        };
+        let identifier = |program: PathBuf| {
+            let out = std::process::Command::new("codesign")
+                .args(["--display", "--verbose=1"])
+                .arg(&program)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stderr)
+                .lines()
+                .find_map(|line| line.strip_prefix("Identifier=").map(str::to_string))
+                .unwrap_or_default()
+        };
+
+        // `-` is the ad-hoc identity: it needs no certificate, and is enough
+        // to show the name each program is given.
+        let signed = install("2026-11-20T150000Z-aaa", Some("-")).unwrap();
+        assert_eq!(
+            identifier(signed.join("factory")),
+            "software-factory.factory"
+        );
+        assert_eq!(
+            identifier(signed.join("factory-engine")),
+            "software-factory.factory-engine"
+        );
+
+        // An identity the Keychain does not hold: the release is removed and
+        // the one before stays current.
+        let err = install(
+            "2026-11-20T160000Z-bbb",
+            Some("No Such Identity For The Factory Test"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("codesign --force") && err.contains("not made current"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::canonicalize(current(&state)).unwrap(),
+            std::fs::canonicalize(&signed).unwrap()
+        );
+        assert!(!releases(&state).join("2026-11-20T160000Z-bbb").exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

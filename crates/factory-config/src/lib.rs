@@ -184,6 +184,17 @@ pub struct ServiceSettings {
     /// sets. Without it they have only `path`.
     #[serde(default = "default_login_shell")]
     pub login_shell: bool,
+    /// The code-signing identity in the owner's login Keychain that each
+    /// release's programs are signed with, by its name as `security
+    /// find-identity -p codesigning` lists it. macOS keeps what it has
+    /// allowed a program, such as Full Disk Access or reaching the local
+    /// network, for the program's signature: a program with only the
+    /// linker's ad-hoc signature is a new program to it at every build, and
+    /// loses what it was allowed at every deploy. Signed with one identity
+    /// under a name that does not change, every build is the same program.
+    /// Without it the programs keep the linker's signature.
+    #[serde(default)]
+    pub signing_identity: Option<String>,
 }
 
 fn default_service_label() -> String {
@@ -221,6 +232,7 @@ impl Default for ServiceSettings {
             path: default_service_path(),
             releases_kept: default_releases_kept(),
             login_shell: default_login_shell(),
+            signing_identity: None,
         }
     }
 }
