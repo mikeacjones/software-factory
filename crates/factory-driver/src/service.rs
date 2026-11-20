@@ -956,11 +956,8 @@ grep -q fine \"$3/factory.toml\" || { echo \"unknown field fallback_model\"; exi
         for program in ["factory", "factory-engine"] {
             let path = source.join(program);
             std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
-            std::fs::set_permissions(
-                &path,
-                std::os::unix::fs::PermissionsExt::from_mode(0o755),
-            )
-            .unwrap();
+            std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+                .unwrap();
         }
         std::fs::write(source.join("config/factory.toml"), "fine").unwrap();
         let install = |name: &str, signing: Option<&str>| {
