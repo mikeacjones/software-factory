@@ -99,6 +99,7 @@ sequenceDiagram
         Intake->>Project: signal that the pipeline finished, seen by watch
         Project->>Tiers: activity turn
         Note over Tiers: Foreman rules on each unfixed finding: file a bead or drop it.<br/>It continues a parked pipeline, starts the next bead,<br/>or reports ready or escalate to the director.
+        Note over Tiers: An existing bead that belongs in the sub-goal: the foreman escalates,<br/>and the director adds it with add_to_subgoal, first if it says so.<br/>Code checks it is open, launchable and no other sub-goal's, then wakes the foreman to start it.
     end
 
     Note over Tiers: Director ships the sub-goal.<br/>Code refuses while the default branch's CI is red,<br/>and lets one sub-goal of a project ship at a time.
