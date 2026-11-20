@@ -4560,7 +4560,7 @@ impl Driver {
             &merged,
             &build,
             &deploy.binary,
-            self.factory.service.releases_kept,
+            &self.factory.service,
         );
         let deployed = match built {
             Ok(deployed) => deployed,

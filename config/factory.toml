@@ -13,6 +13,14 @@ allowed_models = ["claude-fable-5-2", "claude-opus-5-5", "claude-sonnet-5-5", "c
 label = "software-factory"
 login_shell = true
 path = ["~/.local/bin", "/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+# Sign each release's programs with this code-signing identity from the
+# login Keychain, so that what macOS allows them (Full Disk Access, the
+# local network) survives a deploy: an ad-hoc signed build is a new program
+# to macOS every time. Its key must let /usr/bin/codesign use it without
+# asking. A release that cannot be signed is refused. A self-signed
+# certificate in the owner's login Keychain (SHA-1 B547555E..., to 2036),
+# imported with codesign allowed to use its key.
+signing_identity = "Software Factory"
 
 # The Temporal server the flow engine runs on (`factory-engine worker`): the
 # owner's cluster, in a namespace of the factory's own. Nothing uses it yet
