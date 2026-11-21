@@ -5,8 +5,9 @@
 //! another agent with `bd create`, would otherwise have none until some
 //! goal took it up. A Temporal Schedule per project starts [`IssueSync`]
 //! every so often, and its one activity sweeps the project's open beads:
-//! a bead with no issue gets one, and each issue's type and priority
-//! follow its bead's.
+//! a bead with no issue gets one, each issue's type and priority follow
+//! its bead's, and an issue still open whose bead is closed is closed,
+//! which is how one whose close failed with its bead comes into step.
 //!
 //! The schedule is the worker's to keep. Each time a worker starts it sees
 //! that every project that keeps issues has one, as it was meant to be: one
@@ -71,7 +72,7 @@ impl IssueSync {
     ) -> WorkflowResult<IssueSweep> {
         let beat = input.beat_secs.max(1);
         ctx.set_current_details(format!(
-            "Sweeping the open beads of `{}` against their GitHub issues.",
+            "Sweeping the beads of `{}` against their GitHub issues.",
             input.project
         ));
         // A worker that dies in the middle hands the sweep to another. Each
@@ -86,7 +87,7 @@ impl IssueSync {
                     .build(),
             )
             .summary(describe::line(&format!(
-                "Project `{}`: give each open bead without a GitHub issue one, and bring every issue's type and priority into step",
+                "Project `{}`: give each open bead without a GitHub issue one, bring every issue's type and priority into step, and close the issue of each closed bead",
                 input.project
             )))
             .build();
@@ -99,7 +100,7 @@ impl IssueSync {
         if !sweep.failed.is_empty() {
             return Err(
                 ApplicationFailure::non_retryable(std::io::Error::other(format!(
-                    "{} of the open beads of `{}` could not be brought into step: {}",
+                    "{} beads of `{}` could not be brought into step: {}",
                     sweep.failed.len(),
                     input.project,
                     sweep.failed.join("; ")
@@ -134,7 +135,7 @@ async fn wanted(
         .to_payload(
             &context,
             &describe::line(&format!(
-                "Project `{project}`: give each open bead without a GitHub issue one, and bring every issue's type and priority into step"
+                "Project `{project}`: give each open bead without a GitHub issue one, bring every issue's type and priority into step, and close the issue of each closed bead"
             )),
         )
         .await

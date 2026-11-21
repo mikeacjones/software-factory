@@ -27,7 +27,7 @@ flowchart TB
         watch["Activity watch<br/>reads the goals' records and asks the server about each pipeline"]
         turn["Activity turn<br/>a supervisor made for one event:<br/>executive, directors, designers, foremen, maintainer"]
         steps["Activities prepare, agent, plain, finish, park<br/>the driver does one step of one unit"]
-        issues["Activity issues<br/>gives open beads without one a GitHub issue, and sets type and priority"]
+        issues["Activity issues<br/>gives open beads without one a GitHub issue, sets type and priority, and closes the issues of closed beads"]
         claude["claude -p<br/>headless, bypass mode, one account's token"]
         records[("State directory<br/>goals, units, schedules, class checks, accounts")]
     end
