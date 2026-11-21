@@ -8618,6 +8618,66 @@ fn a_check_that_fails_on_the_base_too_parks_without_a_fix_round() {
     assert!(driver.unit().worktree.join("feature.txt").exists());
 }
 
+/// A unit that parks because a check fails on the base too keeps on its
+/// record the base, the branch head and the command. Read back as a restart
+/// reads it, continued on the same commits it keeps them; continued once the
+/// branch has moved on, it no longer does.
+#[test]
+fn a_park_on_a_failure_at_the_base_is_recorded_until_the_branch_moves_on() {
+    let world = triage_world(
+        "triage-base-recorded",
+        "echo 'error: the server never answers'; exit 1",
+        "triage = { base = true }\n",
+    );
+    let mut driver = Driver::start(world.config(), "toy", "toy-1", &OPTIONS).unwrap();
+    assert!(matches!(driver.run().unwrap(), Status::Parked(_)));
+    let unit_id = driver.unit().id.to_string();
+    let worktree = driver.unit().worktree.clone();
+    let base = driver.unit().base.clone();
+    let head = factory_git::rev_parse(&worktree, "HEAD").unwrap();
+    assert_ne!(base, head, "the branch has the change on it");
+    drop(driver);
+
+    // On disk, as a driver started after a restart reads it.
+    let recorded = Driver::read_unit(&world.config(), &unit_id)
+        .unwrap()
+        .fails_at_base
+        .expect("the park is recorded");
+    assert_eq!(recorded.base, base);
+    assert_eq!(recorded.head, head);
+    assert_eq!(recorded.commands, ["test"]);
+
+    // Continued with nothing changed, the record stands.
+    let carry_on = Options {
+        continued: Some("Carry on.".to_string()),
+        ..OPTIONS
+    };
+    let driver = Driver::resume(world.config(), &unit_id, &carry_on, None).unwrap();
+    assert_eq!(driver.unit().fails_at_base.as_ref(), Some(&recorded));
+    drop(driver);
+    assert_eq!(
+        Driver::read_unit(&world.config(), &unit_id)
+            .unwrap()
+            .fails_at_base
+            .as_ref(),
+        Some(&recorded)
+    );
+
+    // Continued once the branch has another head, it is gone.
+    std::fs::write(worktree.join("other.txt"), "moved on\n").unwrap();
+    run(&worktree, "git", &["add", "--all"]);
+    run(&worktree, "git", &["commit", "--quiet", "-m", "moved on"]);
+    let driver = Driver::resume(world.config(), &unit_id, &carry_on, None).unwrap();
+    assert_eq!(driver.unit().fails_at_base, None);
+    drop(driver);
+    assert_eq!(
+        Driver::read_unit(&world.config(), &unit_id)
+            .unwrap()
+            .fails_at_base,
+        None
+    );
+}
+
 /// A check that passes on the base fails because of the change: the builder
 /// is sent, and told that the base passed.
 #[test]

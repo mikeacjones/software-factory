@@ -246,8 +246,77 @@ pub struct Unit {
     /// the failure was handed on.
     #[serde(default)]
     pub ci: Option<CiWatch>,
+    /// What the unit last parked on because a check failed on its base
+    /// too. Kept while the base and the branch head are what they were,
+    /// and forgotten when the unit is picked up on another of either.
+    #[serde(default)]
+    pub fails_at_base: Option<FailsAtBase>,
     pub runs: u32,
     pub started_at: u64,
+}
+
+impl Unit {
+    /// Record that `command` failed on the branch at `head` and on `base`
+    /// as well, so the unit parks on it. Commands that do so on the same
+    /// base and head are kept together, as a step that runs several at
+    /// once parks on all of them.
+    pub fn record_fails_at_base(&mut self, base: &str, head: &str, command: &str) {
+        match &mut self.fails_at_base {
+            Some(known) if known.base == base && known.head == head => {
+                if !known.commands.iter().any(|known| known == command) {
+                    known.commands.push(command.to_string());
+                }
+            }
+            _ => {
+                self.fails_at_base = Some(FailsAtBase {
+                    base: base.to_string(),
+                    head: head.to_string(),
+                    commands: vec![command.to_string()],
+                });
+            }
+        }
+    }
+
+    /// Forget what the unit parked on at its base if `base` or `head` is
+    /// not what it was then: the failure was seen on other code. Returns
+    /// whether it was forgotten.
+    pub fn forget_fails_at_base_unless(&mut self, base: &str, head: &str) -> bool {
+        let changed = self
+            .fails_at_base
+            .as_ref()
+            .is_some_and(|known| known.base != base || known.head != head);
+        if changed {
+            self.fails_at_base = None;
+        }
+        changed
+    }
+}
+
+/// Forget what `unit` parked on at its base if its base or its branch head
+/// is no longer the one the failure was seen on: picked up on other code,
+/// the unit runs something that park says nothing of. A worktree whose head
+/// cannot be read leaves the record as it is.
+fn forget_stale_fails_at_base(unit: &mut Unit) {
+    if unit.fails_at_base.is_none() {
+        return;
+    }
+    if let Ok(head) = factory_git::rev_parse(&unit.worktree, "HEAD") {
+        let base = unit.base.clone();
+        unit.forget_fails_at_base_unless(&base, &head);
+    }
+}
+
+/// A park because a check failed on the unit's base as well as on its
+/// branch: the failure is not the change's, and running the same commands
+/// on the same two commits again would only show it again.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FailsAtBase {
+    /// The commit the check was run on with the change put back.
+    pub base: String,
+    /// The branch's head commit, on which the check failed.
+    pub head: String,
+    /// The names of the commands that failed on both.
+    pub commands: Vec<String>,
 }
 
 /// A check that failed and then passed on the same commit.
@@ -1289,6 +1358,7 @@ impl Driver {
                 failures: BTreeMap::new(),
                 flakes: Vec::new(),
                 ci: None,
+                fails_at_base: None,
                 conflicts: Vec::new(),
                 runs: 0,
                 started_at,
@@ -1463,6 +1533,7 @@ impl Driver {
                 "{before}This pipeline stopped and has been continued by the agent that runs its sub-goal. {stopped}What it says to you:\n\n{note}"
             ));
         }
+        forget_stale_fails_at_base(&mut unit);
         unit.status = Status::Running;
         let saved_thread = unit.thread.clone();
         let mut driver = Driver {
@@ -1804,6 +1875,9 @@ impl Driver {
     }
 
     fn park(&mut self, reason: &str) -> Result<Status, DriverError> {
+        // A park for another reason after the branch moved on leaves no
+        // record of a failure at the base that is no longer this code's.
+        forget_stale_fails_at_base(&mut self.unit);
         self.unit.status = Status::Parked(reason.to_string());
         self.event(
             "unit.parked",
@@ -3916,7 +3990,14 @@ impl Driver {
         };
         if command.triage.base {
             match self.run_at_base(step, failed)? {
-                AtBase::FailsToo(reason) => return Ok(Triaged::End(StepEnd::Park(reason))),
+                AtBase::FailsToo(reason) => {
+                    // What it parked on, so that going on with it while
+                    // neither commit has changed can be told apart.
+                    let head = factory_git::rev_parse(&self.unit.worktree, "HEAD")?;
+                    let base = self.unit.base.clone();
+                    self.unit.record_fails_at_base(&base, &head, failed.name);
+                    return Ok(Triaged::End(StepEnd::Park(reason)));
+                }
                 AtBase::Found(line) => found.push(line),
             }
         }
@@ -6428,6 +6509,67 @@ mod tests {
             wrap(&"word ".repeat(40), 72)
                 .lines()
                 .all(|line| line.len() <= 72)
+        );
+    }
+
+    /// A unit's record as one written before it knew of failures at the
+    /// base would be.
+    fn old_unit_record() -> Unit {
+        serde_json::from_value(json!({
+            "id": "toy-1-1", "project": "toy", "bead": "toy-1", "title": "t",
+            "flow": "f", "branch": "b", "base": "base1", "checkpoint": "head1",
+            "worktree": "/nowhere", "position": {"step": "test"},
+            "status": "running", "sessions": {}, "in_step": null,
+            "feedback": null, "notes": {}, "results": {}, "usage": {},
+            "thread": null, "owner_messages": [], "answer": null,
+            "pull_request": null, "runs": 0, "started_at": 0,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_failure_at_the_base_is_recorded_kept_on_the_same_commits_and_forgotten_on_others() {
+        let mut unit = old_unit_record();
+        assert_eq!(unit.fails_at_base, None, "an old record has none");
+
+        unit.record_fails_at_base("base1", "head1", "test");
+        // A step running several checks at once parks on each of them.
+        unit.record_fails_at_base("base1", "head1", "lint");
+        unit.record_fails_at_base("base1", "head1", "test");
+        let recorded = FailsAtBase {
+            base: "base1".to_string(),
+            head: "head1".to_string(),
+            commands: vec!["test".to_string(), "lint".to_string()],
+        };
+        assert_eq!(unit.fails_at_base.as_ref(), Some(&recorded));
+
+        // It is on the record as written to disk, and read back whole.
+        let text = serde_json::to_string(&unit).unwrap();
+        let read: Unit = serde_json::from_str(&text).unwrap();
+        assert_eq!(read.fails_at_base.as_ref(), Some(&recorded));
+
+        // Picked up on the same two commits, nothing has changed.
+        assert!(!unit.forget_fails_at_base_unless("base1", "head1"));
+        assert_eq!(unit.fails_at_base.as_ref(), Some(&recorded));
+
+        // On another branch head, or another base, it is forgotten.
+        assert!(unit.forget_fails_at_base_unless("base1", "head2"));
+        assert_eq!(unit.fails_at_base, None);
+        unit.record_fails_at_base("base1", "head1", "test");
+        assert!(unit.forget_fails_at_base_unless("base2", "head1"));
+        assert_eq!(unit.fails_at_base, None);
+        assert!(!unit.forget_fails_at_base_unless("base2", "head1"));
+
+        // A failure on other commits replaces the one before it.
+        unit.record_fails_at_base("base1", "head1", "test");
+        unit.record_fails_at_base("base1", "head2", "lint");
+        assert_eq!(
+            unit.fails_at_base,
+            Some(FailsAtBase {
+                base: "base1".to_string(),
+                head: "head2".to_string(),
+                commands: vec!["lint".to_string()],
+            })
         );
     }
 
