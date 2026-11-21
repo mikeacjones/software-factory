@@ -185,7 +185,8 @@ timeout_secs = 3600
 shown = "zig build test on Linux arm64, glibc and musl, Debug and ReleaseSafe (in containers)"
 # Long enough for the script to stop four containers and print their logs.
 stop_grace_secs = 60
-# The script exits 2 when a container was killed or did not start.
+# The script exits 2 only when every configuration that did not pass was
+# killed or did not start; 1 when any really failed.
 could_not_run_exit = [2]
 could_not_run_when = ["invalid ephemeral server download", "failed to download ephemeral server executable", "Docker is not running"]
 failure_lines = ['^error: .* (failed|timed out)', ': error: ', '^panic: ']
