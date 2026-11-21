@@ -984,7 +984,21 @@ enum Triaged {
     /// The step ends here, not at a builder: passed as a flake, or parked.
     End(StepEnd),
     /// The failure goes to the builder, with what was found on the way.
-    Found(Vec<String>),
+    Found {
+        lines: Vec<String>,
+        /// The run the change is judged on in place of the first, when the
+        /// first was the host's fault and was run once more.
+        rerun: Option<Rerun>,
+    },
+}
+
+/// A run once more of a failed command, kept to judge the change on.
+struct Rerun {
+    result: CommandResult,
+    /// How it failed, as the thread says it.
+    how: String,
+    /// Where its output was kept.
+    output: PathBuf,
 }
 
 /// What a run on the base said.
@@ -1005,6 +1019,36 @@ fn verdict_text(verdict: &Verdict) -> String {
         Verdict::TimedOut => "timed out".to_string(),
         Verdict::CouldNotRun(why) => format!("could not run ({why})"),
     }
+}
+
+/// How a run of a command that had to pass failed, as the thread says it.
+fn failure_how(verdict: &Verdict, timeout_secs: u64) -> String {
+    match verdict {
+        Verdict::TimedOut => format!(
+            "was still running after {} and was killed",
+            duration_text(timeout_secs)
+        ),
+        other => verdict_text(other),
+    }
+}
+
+/// Why a run once more of a command was the host's fault too, if it was:
+/// it could not start, or the project's word says so.
+fn rerun_host_fault(
+    again: &CommandResult,
+    command: &factory_config::CommandSpec,
+) -> Result<Option<String>, DriverError> {
+    let code = match &again.verdict {
+        Verdict::CouldNotRun(why) => return Ok(Some(why.clone())),
+        Verdict::Failed { code } => *code,
+        _ => None,
+    };
+    Ok(host_fault(
+        &again.output,
+        code,
+        &command.could_not_run_when,
+        &command.could_not_run_exit,
+    )?)
 }
 
 fn short_commit(commit: &str) -> &str {
@@ -3701,6 +3745,7 @@ impl Driver {
             return Ok(StepEnd::Outcome("pass".to_string()));
         }
         let mut found = Vec::new();
+        let mut rerun = None;
         if matches!(check.policy, ExitPolicy::MustPass)
             && matches!(result.verdict, Verdict::Failed { .. } | Verdict::TimedOut)
         {
@@ -3715,9 +3760,35 @@ impl Driver {
             };
             match self.triage(check.step, &failed)? {
                 Triaged::End(end) => return Ok(end),
-                Triaged::Found(lines) => found = lines,
+                Triaged::Found {
+                    lines,
+                    rerun: again,
+                } => {
+                    found = lines;
+                    rerun = again;
+                }
             }
         }
+        // A first run that was the host's fault is not what the builder is
+        // sent: the run once more after it is.
+        let (result, output_path, how, secs) = match &rerun {
+            Some(again) => {
+                let secs = again.result.duration.as_secs();
+                self.unit.notes.insert(
+                    check.key.clone(),
+                    Note {
+                        title: format!("Check `{name}`"),
+                        body: format!(
+                            "`{shown}` {how} on commit `{short}`, the host's fault, and {} when run once more (took {}).",
+                            again.how,
+                            duration_text(secs)
+                        ),
+                    },
+                );
+                (&again.result, &again.output, &again.how, secs)
+            }
+            None => (result, &output_path, &how, secs),
+        };
         let found = if found.is_empty() {
             String::new()
         } else {
@@ -3749,7 +3820,9 @@ impl Driver {
     /// change's: the project's word that the host was at fault, a run once
     /// more on the change, a run on the code as it was at the base, and
     /// whether it failed the same way as the last time. Each but the first
-    /// and the last only where the project's command turns it on.
+    /// and the last only where the project's command turns it on. A first
+    /// run that was the host's fault parks the step, unless the command is
+    /// run once more: then that run is what the change is judged on.
     fn triage(&mut self, step: &Step, failed: &Failed) -> Result<Triaged, DriverError> {
         let name = failed.name;
         let command = failed.command;
@@ -3768,6 +3841,8 @@ impl Driver {
             &failed.result.output,
             &command.failure_lines,
         );
+        let mut found = Vec::new();
+        let mut rerun = None;
         if let Some(why) = host_fault(
             &failed.result.output,
             code,
@@ -3779,72 +3854,44 @@ impl Driver {
                 Some(&step.id),
                 json!({ "command": name, "why": why }),
             )?;
-            return Ok(Triaged::End(StepEnd::Park(format!(
-                "the command `{name}` {} and could not run properly: {why}. The host is at fault, not the change, so no builder was sent. Its output is in `{}`.",
-                failed.how,
-                failed.output.display()
-            ))));
-        }
-        let mut found = Vec::new();
-        if command.triage.rerun {
-            self.thread.status(&format!(
-                ":arrows_counterclockwise: *{}* · `{}` {}: running it once more",
-                failed.key,
-                escape(&command.display()),
-                failed.how
-            ));
-            let again = run_command_with_grace(
-                failed.argv,
-                &self.unit.worktree,
-                Duration::from_secs(command.timeout_secs),
-                Duration::from_secs(command.stop_grace_secs),
-            );
-            let path = self.artifact(&format!("{}-rerun-output.txt", failed.key), &again.output)?;
-            self.event(
-                "command.rerun",
-                Some(&step.id),
-                json!({
-                    "command": name, "verdict": format!("{:?}", again.verdict),
-                    "secs": again.duration.as_secs(), "output": path,
-                }),
-            )?;
+            if !command.triage.rerun {
+                return Ok(Triaged::End(StepEnd::Park(format!(
+                    "the command `{name}` {} and could not run properly: {why}. The host is at fault, not the change, so no builder was sent. Its output is in `{}`.",
+                    failed.how,
+                    failed.output.display()
+                ))));
+            }
+            // The host may have been short of something for a moment: one
+            // run more, on its own, says whether it still is.
+            let (again, path) = self.run_again(step, failed, true)?;
             if again.verdict == Verdict::Passed {
-                self.event(
-                    "command.flaky",
-                    Some(&step.id),
-                    json!({ "command": name, "first": failed.output, "rerun": path }),
-                )?;
-                // Not the change's, and still somebody's: whoever started
-                // the pipeline is handed it when the pipeline ends.
-                self.unit.flakes.push(Flake {
-                    step: step.id.clone(),
-                    check: name.to_string(),
-                    commit: self.unit.checkpoint.clone(),
-                    signature: failure_signature(&failed.result.output, &command.failure_lines)?,
-                    output: Some(failed.output.to_path_buf()),
-                });
-                self.unit.failures.remove(failed.key);
-                self.unit.notes.insert(
-                    failed.key.to_string(),
-                    Note {
-                        title: format!("Check `{name}`"),
-                        body: format!(
-                            "`{}` {} on commit `{}` and passed when run again: a flake. Both outputs are kept (`{}`, `{}`).",
-                            command.display(),
-                            failed.how,
-                            short_commit(&self.unit.checkpoint),
-                            failed.output.display(),
-                            path.display()
-                        ),
-                    },
-                );
-                self.thread.say(&format!(
-                    ":recycle: *{}* · `{}` {} and then passed when run again: a flake, not the change's, recorded and passed",
-                    failed.key,
-                    escape(&command.display()),
-                    failed.how
-                ));
-                return Ok(Triaged::End(StepEnd::Outcome("pass".to_string())));
+                return self.flake(step, failed, &path);
+            }
+            if let Some(why_again) = rerun_host_fault(&again, command)? {
+                return Ok(Triaged::End(StepEnd::Park(format!(
+                    "the command `{name}` {} and could not run properly: {why}. Run once more on its own, it {} and could not run properly again: {why_again}. The host is at fault, not the change, so no builder was sent. The first run's output is in `{}`, the second's in `{}`.",
+                    failed.how,
+                    verdict_text(&again.verdict),
+                    failed.output.display(),
+                    path.display()
+                ))));
+            }
+            found.push(format!(
+                "Its first run {} and could not run properly ({why}), so it was run once more on its own, and {}: that run is the failure here (`{}`). The first run's output is in `{}`.",
+                failed.how,
+                verdict_text(&again.verdict),
+                path.display(),
+                failed.output.display()
+            ));
+            rerun = Some(Rerun {
+                how: failure_how(&again.verdict, command.timeout_secs),
+                result: again,
+                output: path,
+            });
+        } else if command.triage.rerun {
+            let (again, path) = self.run_again(step, failed, false)?;
+            if again.verdict == Verdict::Passed {
+                return self.flake(step, failed, &path);
             }
             found.push(format!(
                 "Run once more on the change, it {} again (`{}`).",
@@ -3852,6 +3899,21 @@ impl Driver {
                 path.display()
             ));
         }
+        // From here the change is judged on the run once more, where the
+        // first was the host's.
+        let judged;
+        let failed = match &rerun {
+            Some(again) => {
+                judged = Failed {
+                    result: &again.result,
+                    how: &again.how,
+                    output: &again.output,
+                    ..*failed
+                };
+                &judged
+            }
+            None => failed,
+        };
         if command.triage.base {
             match self.run_at_base(step, failed)? {
                 AtBase::FailsToo(reason) => return Ok(Triaged::End(StepEnd::Park(reason))),
@@ -3883,7 +3945,98 @@ impl Driver {
                 commit: self.unit.checkpoint.clone(),
             },
         );
-        Ok(Triaged::Found(found))
+        Ok(Triaged::Found {
+            lines: found,
+            rerun,
+        })
+    }
+
+    /// Run a failed command once more on the change, on its own, and keep
+    /// its output. `after_host_fault` says why: the first run was the
+    /// host's, rather than the project's `triage.rerun` asking.
+    fn run_again(
+        &mut self,
+        step: &Step,
+        failed: &Failed,
+        after_host_fault: bool,
+    ) -> Result<(CommandResult, PathBuf), DriverError> {
+        let command = failed.command;
+        self.thread.status(&format!(
+            ":arrows_counterclockwise: *{}* · `{}` {}{}: running it once more",
+            failed.key,
+            escape(&command.display()),
+            failed.how,
+            if after_host_fault {
+                ", the host's fault"
+            } else {
+                ""
+            }
+        ));
+        let again = run_command_with_grace(
+            failed.argv,
+            &self.unit.worktree,
+            Duration::from_secs(command.timeout_secs),
+            Duration::from_secs(command.stop_grace_secs),
+        );
+        let path = self.artifact(&format!("{}-rerun-output.txt", failed.key), &again.output)?;
+        self.event(
+            "command.rerun",
+            Some(&step.id),
+            json!({
+                "command": failed.name, "verdict": format!("{:?}", again.verdict),
+                "secs": again.duration.as_secs(), "output": path,
+                "after_host_fault": after_host_fault,
+            }),
+        )?;
+        Ok((again, path))
+    }
+
+    /// A failed command that passed when run once more (output in `rerun`)
+    /// was a flake: recorded, and the step passes.
+    fn flake(
+        &mut self,
+        step: &Step,
+        failed: &Failed,
+        rerun: &Path,
+    ) -> Result<Triaged, DriverError> {
+        let name = failed.name;
+        let command = failed.command;
+        self.event(
+            "command.flaky",
+            Some(&step.id),
+            json!({ "command": name, "first": failed.output, "rerun": rerun }),
+        )?;
+        // Not the change's, and still somebody's: whoever started the
+        // pipeline is handed it when the pipeline ends.
+        self.unit.flakes.push(Flake {
+            step: step.id.clone(),
+            check: name.to_string(),
+            commit: self.unit.checkpoint.clone(),
+            signature: failure_signature(&failed.result.output, &command.failure_lines)?,
+            output: Some(failed.output.to_path_buf()),
+        });
+        self.unit.failures.remove(failed.key);
+        self.unit.notes.insert(
+            failed.key.to_string(),
+            Note {
+                title: format!("Check `{name}`"),
+                body: format!(
+                    "`{}` {} on commit `{}` and passed when run again: a flake. Both outputs are kept (`{}`, `{}`).",
+                    command.display(),
+                    failed.how,
+                    short_commit(&self.unit.checkpoint),
+                    failed.output.display(),
+                    rerun.display()
+                ),
+            },
+        );
+        self.thread.say(&format!(
+            ":recycle: *{}* · `{}` {} and then passed when run again: a flake, not the change's, recorded and passed",
+            failed.key,
+            escape(&command.display()),
+            failed.how
+        ));
+        Ok(Triaged::End(StepEnd::Outcome("pass".to_string())))
     }
 
     /// Run a failed command on a copy of the worktree with every file the
