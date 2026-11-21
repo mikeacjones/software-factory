@@ -669,6 +669,9 @@ pub struct Foreman {
     pub message: String,
     /// Messages between it and the director since a pipeline last started.
     pub exchanges: u32,
+    /// The wait its last `working` report carried, until it ends.
+    #[serde(default)]
+    pub wait: Option<Waiting>,
 }
 
 /// How a stopped pipeline is continued by decision.
@@ -863,6 +866,11 @@ pub struct Goal {
     /// may change its own beads, these are the ones.
     #[serde(default)]
     pub filed: Vec<String>,
+    /// The wait the director's last accepted result carried, until it
+    /// ends: code wakes the director when its condition holds or its
+    /// interval runs out.
+    #[serde(default)]
+    pub wait: Option<Waiting>,
 }
 
 /// What a goal opened for a maintenance run is there to build.
@@ -1557,7 +1565,8 @@ fn wait_schema(whose: &str) -> Value {
 }
 
 /// What a wait in a result waits for.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum WaitOn {
     /// The default branch has moved past this commit.
     MainPast(String),
@@ -1703,6 +1712,276 @@ fn waits(result: &Value, scope: &WaitScope, problems: &mut Vec<String>) -> bool 
             problems.extend(why);
             false
         }
+    }
+}
+
+/// How often, in seconds, the default branch is looked at for a wait on
+/// it: one on `main_past`, or one on a command that runs once the branch
+/// has moved.
+pub const WAIT_LOOK_SECS: u64 = 60;
+
+/// A wait a director or a foreman returned and code accepted. It is kept
+/// on the goal's record, or on its foreman's, so that it outlives the
+/// process that accepted it. Code looks at its condition and wakes the
+/// agent when the condition holds or, at the latest, when its interval
+/// runs out. The next result the agent returns replaces it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Waiting {
+    pub on: WaitOn,
+    pub interval_minutes: u64,
+    /// When it was accepted, in unix seconds.
+    pub since: u64,
+    /// When its condition was last looked at.
+    pub looked_at: u64,
+    /// For a command: the head of the default branch when the wait was
+    /// accepted, which the agent saw. The command runs only once the
+    /// branch has moved past it, or past the commit it last ran on.
+    #[serde(default)]
+    pub head: String,
+    /// For a command: its last run, under this wait or under the wait on
+    /// the same command that this one replaced.
+    #[serde(default)]
+    pub ran: Option<WaitRun>,
+}
+
+/// One run of the command a wait names, on the default branch.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WaitRun {
+    /// The commit of the default branch it ran on.
+    pub commit: String,
+    /// When it ran, in unix seconds.
+    pub at: u64,
+    pub passed: bool,
+    /// How it ended, in words: `passed`, `failed (exit code 1)`.
+    pub how: String,
+}
+
+/// What a look at a wait found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Looked {
+    /// The condition holds, and how.
+    Holds(String),
+    /// The interval ran out, and how the condition stands.
+    RanOut(String),
+    /// Neither yet.
+    Waits,
+}
+
+/// The first ten characters of a commit's SHA, as people are shown it.
+fn short(sha: &str) -> &str {
+    &sha[..sha.len().min(10)]
+}
+
+impl Waiting {
+    /// `wait`, accepted at `now` with the default branch at `head`. A
+    /// wait on the same command as the one it replaces, `before`, keeps
+    /// that one's last run: the command runs at most once an interval,
+    /// and not again on a commit it has run on.
+    pub fn new(wait: Wait, now: u64, head: String, before: Option<&Waiting>) -> Waiting {
+        let ran = before
+            .filter(|before| before.on == wait.on && matches!(wait.on, WaitOn::Command(_)))
+            .and_then(|before| before.ran.clone());
+        Waiting {
+            on: wait.on,
+            interval_minutes: wait.interval_minutes,
+            since: now,
+            looked_at: now,
+            head,
+            ran,
+        }
+    }
+
+    fn interval_secs(&self) -> u64 {
+        self.interval_minutes.max(1) * 60
+    }
+
+    /// When the interval runs out: the agent is woken then at the latest.
+    pub fn until(&self) -> u64 {
+        self.since + self.interval_secs()
+    }
+
+    /// When the command may next run: an interval after its last run.
+    fn runs_from(&self) -> u64 {
+        self.ran
+            .as_ref()
+            .map_or(0, |ran| ran.at + self.interval_secs())
+    }
+
+    /// When its condition is next looked at.
+    pub fn next_look(&self) -> u64 {
+        let until = self.until();
+        match &self.on {
+            WaitOn::At(at) => (*at).min(until),
+            WaitOn::MainPast(_) => (self.looked_at + WAIT_LOOK_SECS).min(until),
+            WaitOn::Command(_) => (self.looked_at + WAIT_LOOK_SECS)
+                .max(self.runs_from())
+                .min(until),
+        }
+    }
+
+    /// What it waits for, in words.
+    pub fn describe(&self) -> String {
+        match &self.on {
+            WaitOn::MainPast(sha) => format!("the default branch moving past `{sha}`"),
+            WaitOn::Command(name) => format!("`{name}` passing on the default branch"),
+            WaitOn::At(at) => date_utc(*at),
+        }
+    }
+
+    /// Look at its condition at `now`. `head` reads the head of the
+    /// default branch; `run` runs the named command on a commit of it.
+    /// The command is run only when the branch has moved since it last
+    /// ran (or since the wait was accepted) and not within an interval of
+    /// its last run. The condition is looked at before the interval: a
+    /// condition that holds when the interval runs out is said to hold.
+    pub fn look(
+        &mut self,
+        now: u64,
+        head: &mut dyn FnMut() -> Result<String, String>,
+        run: &mut dyn FnMut(&str, &str) -> WaitRun,
+    ) -> Looked {
+        self.looked_at = now;
+        let (holds, state) = match self.on.clone() {
+            WaitOn::At(at) => (now >= at, format!("it is {} now", date_utc(now))),
+            WaitOn::MainPast(sha) => match head() {
+                Ok(head)
+                    if !head
+                        .to_ascii_lowercase()
+                        .starts_with(&sha.to_ascii_lowercase()) =>
+                {
+                    (
+                        true,
+                        format!("the default branch is at `{}` now", short(&head)),
+                    )
+                }
+                Ok(head) => (
+                    false,
+                    format!("the default branch is still at `{}`", short(&head)),
+                ),
+                Err(why) => (
+                    false,
+                    format!("the default branch could not be read: {why}"),
+                ),
+            },
+            WaitOn::Command(name) => match head() {
+                Err(why) => (
+                    false,
+                    format!("the default branch could not be read: {why}"),
+                ),
+                Ok(head) => {
+                    let last = self
+                        .ran
+                        .as_ref()
+                        .map_or(self.head.clone(), |ran| ran.commit.clone());
+                    if head != last && now >= self.runs_from() {
+                        self.ran = Some(run(&name, &head));
+                    }
+                    match &self.ran {
+                        Some(ran) if ran.commit == head => (
+                            ran.passed,
+                            format!("`{name}` {} on `{}`", ran.how, short(&ran.commit)),
+                        ),
+                        Some(ran) => (
+                            false,
+                            format!(
+                                "`{name}` {} on `{}`, and the default branch has moved to `{}` since, less than an interval after that run",
+                                ran.how,
+                                short(&ran.commit),
+                                short(&head)
+                            ),
+                        ),
+                        None => (
+                            false,
+                            format!(
+                                "the default branch is still at `{}`, so `{name}` was not run",
+                                short(&head)
+                            ),
+                        ),
+                    }
+                }
+            },
+        };
+        if holds {
+            Looked::Holds(state)
+        } else if now >= self.until() {
+            Looked::RanOut(state)
+        } else {
+            Looked::Waits
+        }
+    }
+
+    /// What the agent is told when the wait ends: which of the two ended
+    /// it, and how the condition stands.
+    pub fn ended(&self, looked: &Looked) -> String {
+        match looked {
+            Looked::Holds(state) => format!(
+                "Your wait on {} is over: the condition holds. {}.",
+                self.describe(),
+                capital(state)
+            ),
+            _ => format!(
+                "Your wait on {} is over: its interval of {} minutes ran out, and the condition does not hold yet. {}.",
+                self.describe(),
+                self.interval_minutes,
+                capital(match looked {
+                    Looked::RanOut(state) => state,
+                    _ => "",
+                })
+            ),
+        }
+    }
+
+    /// What an agent woken while it waits is shown of the wait.
+    fn brief(&self, whose: &str) -> String {
+        format!(
+            "## What this {whose} waits on\n\nThe last result accepted here waits on {}, since {}. The factory looks at it and wakes you when it holds, or at the latest at {}, when its interval of {} minutes runs out. What you return now replaces it: give `wait` again to go on waiting.\n\n",
+            self.describe(),
+            date_utc(self.since),
+            date_utc(self.until()),
+            self.interval_minutes
+        )
+    }
+}
+
+/// Whether a command of the project run outside any pipeline passed, and
+/// how it ended in words: `passed`, `failed (exit code 1)`. A summary that
+/// shows a result its `fail_when` names fails it.
+fn judged(
+    command: &factory_config::CommandSpec,
+    result: &factory_checks::CommandResult,
+    summary: &str,
+) -> (bool, String) {
+    let blocked = first_match(summary, &command.fail_when).unwrap_or(None);
+    match (&result.verdict, blocked) {
+        (Verdict::Passed, None) => (true, "passed".to_string()),
+        (Verdict::Passed, Some(line)) => (
+            false,
+            format!("showed a result that must not pass (`{}`)", line.trim()),
+        ),
+        (Verdict::Failed { code }, _) => (
+            false,
+            format!(
+                "failed (exit code {})",
+                code.map_or("none".to_string(), |code| code.to_string())
+            ),
+        ),
+        (Verdict::TimedOut, _) => (
+            false,
+            format!(
+                "was still running after {} seconds and was killed",
+                command.timeout_secs
+            ),
+        ),
+        (Verdict::CouldNotRun(reason), _) => (false, format!("could not be run: {reason}")),
+    }
+}
+
+/// `text` with its first letter a capital.
+fn capital(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
     }
 }
 
@@ -4316,6 +4595,9 @@ pub fn wake_brief(
     if let Some(red) = &goal.default_red {
         out.push_str(&red.brief());
     }
+    if let Some(wait) = &goal.wait {
+        out.push_str(&wait.brief("goal"));
+    }
     out.push_str("## What happened since you last ran\n\n");
     out.push_str(&told(&goal.inbox));
     if definition.ship_flow.is_some() {
@@ -4506,6 +4788,9 @@ pub fn foreman_brief(
             "## The design of this sub-goal\n\nA designer wrote it before any bead was built, and the director accepted it. Every builder, tester and reviewer of the sub-goal's beads is given it. Start the beads in the order it gives unless what has happened since makes that wrong, and rule on findings by it. If a bead cannot be done within it, escalate: the design is the director's to change.\n\n{}\n\n",
             design.trim()
         ));
+    }
+    if let Some(wait) = &foreman.wait {
+        out.push_str(&wait.brief("sub-goal"));
     }
     out.push_str("## What happened since you last ran\n\n");
     out.push_str(&told(&foreman.inbox));
@@ -6054,6 +6339,7 @@ impl Supervisor {
             handoff,
             maintenance: None,
             filed: Vec::new(),
+            wait: None,
         };
         let id = goal.id.clone();
         self.save(goal.clone())?;
@@ -7145,29 +7431,7 @@ impl Supervisor {
             return;
         }
         let (result, summary) = self.run_apart(command, &cwd, &commit, &out);
-        let blocked = first_match(&summary, &command.fail_when).unwrap_or(None);
-        let (passed, how) = match (&result.verdict, blocked) {
-            (Verdict::Passed, None) => (true, "passed".to_string()),
-            (Verdict::Passed, Some(line)) => (
-                false,
-                format!("showed a result that must not pass (`{}`)", line.trim()),
-            ),
-            (Verdict::Failed { code }, _) => (
-                false,
-                format!(
-                    "failed (exit code {})",
-                    code.map_or("none".to_string(), |code| code.to_string())
-                ),
-            ),
-            (Verdict::TimedOut, _) => (
-                false,
-                format!(
-                    "was still running after {} seconds and was killed",
-                    command.timeout_secs
-                ),
-            ),
-            (Verdict::CouldNotRun(reason), _) => (false, format!("could not be run: {reason}")),
-        };
+        let (passed, how) = judged(command, &result, &summary);
         let text = if summary.trim().is_empty() {
             tail(&result.output, 60)
         } else {
@@ -7186,6 +7450,197 @@ impl Supervisor {
             how,
             text,
         });
+    }
+
+    /// The head of the default branch on the project's remote, fetched now.
+    fn main_head(&self, project: &Project) -> Result<String, String> {
+        factory_git::fetch(&project.repo, &project.remote).map_err(|err| err.to_string())?;
+        factory_git::rev_parse(
+            &project.repo,
+            &format!("{}/{}", project.remote, project.default_branch),
+        )
+        .map_err(|err| err.to_string())
+    }
+
+    /// The wait an accepted result carries, ready to keep on the record.
+    /// `before` is the wait it replaces. The result has been checked
+    /// already, so a time that has come in the meantime does not undo it.
+    fn accepted_wait(
+        &self,
+        goal: &Goal,
+        project: &Project,
+        result: &Value,
+        before: Option<&Waiting>,
+        subgoal: Option<&str>,
+    ) -> Option<Waiting> {
+        let scope = WaitScope {
+            now: 0,
+            ..WaitScope::of(project)
+        };
+        let wait = wait_of(result, &scope).ok().flatten()?;
+        // A command runs only once the branch moves past what the agent
+        // saw when it decided to wait.
+        let head = match wait.on {
+            WaitOn::Command(_) => self.main_head(project).unwrap_or_default(),
+            _ => String::new(),
+        };
+        let waiting = Waiting::new(wait, now_unix(), head, before);
+        self.log(
+            goal,
+            "wait.accepted",
+            json!({ "subgoal": subgoal, "on": waiting.on, "interval_minutes": waiting.interval_minutes,
+                    "until": waiting.until(), "head": waiting.head }),
+        );
+        Some(waiting)
+    }
+
+    /// Run the command a wait of `goal` names on `commit` of the default
+    /// branch, in a scratch checkout of the goal's own.
+    fn run_waited(&self, goal: &Goal, project: &Project, name: &str, commit: &str) -> WaitRun {
+        let could_not = |how: String| WaitRun {
+            commit: commit.to_string(),
+            at: now_unix(),
+            passed: false,
+            how,
+        };
+        let Some(command) = project.commands.get(name) else {
+            return could_not("could not be run: the project's record has no such command".into());
+        };
+        let home = self.dir(&goal.id);
+        let cwd = home.join("wait-checkout");
+        let out = home.join("wait-out");
+        let ready = if cwd.exists() {
+            factory_git::checkout_detached(&cwd, commit)
+        } else {
+            factory_git::worktree_add_detached(&project.repo, &cwd, commit)
+        };
+        if let Err(err) = ready {
+            return could_not(format!("could not be run: {err}"));
+        }
+        let _ = std::fs::remove_dir_all(&out);
+        if let Err(err) = std::fs::create_dir_all(&out) {
+            return could_not(format!("could not be run: {}: {err}", out.display()));
+        }
+        let (result, summary) = self.run_apart(command, &cwd, commit, &out);
+        let (passed, how) = judged(command, &result, &summary);
+        self.log(
+            goal,
+            "wait.ran",
+            json!({ "command": name, "commit": commit, "passed": passed, "how": how,
+                    "secs": result.duration.as_secs() }),
+        );
+        WaitRun {
+            commit: commit.to_string(),
+            at: now_unix(),
+            passed,
+            how,
+        }
+    }
+
+    /// Look at every wait whose time to be looked at has come, and wake
+    /// the director or foreman of each that has ended, with a note saying
+    /// whether its condition held or its interval ran out. Whether one
+    /// ended.
+    fn look_at_waits(&mut self) -> Result<bool, DriverError> {
+        // What a look could start, a command, waits for the next service.
+        if self.draining {
+            return Ok(false);
+        }
+        let now = now_unix();
+        let due: Vec<(String, Option<String>)> = self
+            .goals
+            .values()
+            .filter(|goal| goal.phase == Phase::Running)
+            .flat_map(|goal| {
+                let own = goal
+                    .wait
+                    .as_ref()
+                    .filter(|wait| wait.next_look() <= now)
+                    .map(|_| (goal.id.clone(), None));
+                let foremen = goal
+                    .subgoals
+                    .iter()
+                    .filter(|sub| {
+                        sub.state == "open"
+                            && sub.foreman.as_ref().is_some_and(|foreman| {
+                                foreman.waiting.is_none()
+                                    && foreman
+                                        .wait
+                                        .as_ref()
+                                        .is_some_and(|wait| wait.next_look() <= now)
+                            })
+                    })
+                    .map(|sub| (goal.id.clone(), Some(sub.id.clone())));
+                own.into_iter().chain(foremen).collect::<Vec<_>>()
+            })
+            .collect();
+        let mut ended = false;
+        for (id, subgoal) in due {
+            let Some(mut goal) = self.goals.get(&id).cloned() else {
+                continue;
+            };
+            let project = self.config.project(&goal.project)?;
+            let held = match &subgoal {
+                None => goal.wait.clone(),
+                Some(sub) => goal
+                    .subgoals
+                    .iter()
+                    .find(|open| &open.id == sub)
+                    .and_then(|open| open.foreman.as_ref())
+                    .and_then(|foreman| foreman.wait.clone()),
+            };
+            let Some(mut waiting) = held else {
+                continue;
+            };
+            let looked = {
+                let mut head = || self.main_head(&project);
+                let mut run =
+                    |name: &str, commit: &str| self.run_waited(&goal, &project, name, commit);
+                waiting.look(now_unix(), &mut head, &mut run)
+            };
+            let note = match &looked {
+                Looked::Waits => None,
+                ended => {
+                    let text = waiting.ended(ended);
+                    self.log(
+                        &goal,
+                        "wait.ended",
+                        json!({ "subgoal": subgoal, "on": waiting.on,
+                                "why": if matches!(ended, Looked::Holds(_)) { "holds" } else { "interval" },
+                                "text": text }),
+                    );
+                    Some(Happening::Note { text })
+                }
+            };
+            let kept = note.is_none().then_some(waiting);
+            let woken = note.is_some();
+            match &subgoal {
+                None => {
+                    goal.wait = kept;
+                    goal.inbox.extend(note);
+                }
+                Some(sub) => {
+                    if let Some(foreman) = goal
+                        .subgoals
+                        .iter_mut()
+                        .find(|open| &open.id == sub)
+                        .and_then(|open| open.foreman.as_mut())
+                    {
+                        foreman.wait = kept;
+                        foreman.inbox.extend(note);
+                    }
+                }
+            }
+            self.save(goal)?;
+            if woken {
+                ended = true;
+                match &subgoal {
+                    None => self.wake(&id)?,
+                    Some(sub) => self.wake_foreman(&id, sub)?,
+                }
+            }
+        }
+        Ok(ended)
     }
 
     /// A checkout for an agent to read, kept apart from the owner's own
@@ -7914,6 +8369,10 @@ impl Supervisor {
         goal.failures = 0;
         goal.wakes += 1;
         goal.inbox.clear();
+        // What it waits on now, if anything: a result replaces the wait
+        // the last one carried.
+        let before = goal.wait.take();
+        goal.wait = self.accepted_wait(&goal, &project, &result, before.as_ref(), None);
 
         // Beads first: a bead the director files may be one it starts next time.
         let mut did: Vec<String> = Vec::new();
@@ -9564,6 +10023,14 @@ impl Supervisor {
         foreman.retry_at = None;
         foreman.wakes += 1;
         foreman.inbox.clear();
+        // A foreman that keeps working may wait; one that hands the
+        // sub-goal to the director waits for the director.
+        let before = foreman.wait.take();
+        foreman.wait = if strings(&result, "report") == "working" {
+            self.accepted_wait(&goal, &project, &result, before.as_ref(), Some(sub_id))
+        } else {
+            None
+        };
 
         let mut did: Vec<String> = Vec::new();
         let mut here: Vec<String> = Vec::new();
@@ -10239,8 +10706,9 @@ impl Supervisor {
     }
 
     /// When this supervisor next has something to do by itself: an agent
-    /// to try again, a note to an executive to deal with, a bead waiting
-    /// to be closed. `None` if only an event can move it.
+    /// to try again, a wait to look at, a note to an executive to deal
+    /// with, a bead waiting to be closed. `None` if only an event can move
+    /// it.
     pub fn next_due(&self) -> Option<u64> {
         // Only what a later look would act on: a time left on the record
         // of an agent that has nothing to read, or whose goal has
@@ -10314,8 +10782,25 @@ impl Supervisor {
                         .unwrap_or_else(|| schedule_due(schedule, record.since)),
                 )
             });
+        // A wait is looked at when its condition may have changed, and at
+        // the latest when its interval runs out: as `look_at_waits` picks.
+        let waits = self
+            .goals
+            .values()
+            .filter(|goal| goal.phase == Phase::Running)
+            .flat_map(|goal| {
+                let foremen = goal
+                    .subgoals
+                    .iter()
+                    .filter(|sub| sub.state == "open")
+                    .filter_map(|sub| sub.foreman.as_ref())
+                    .filter(|foreman| foreman.waiting.is_none())
+                    .filter_map(|foreman| foreman.wait.as_ref());
+                goal.wait.iter().chain(foremen).map(Waiting::next_look)
+            });
         goals
             .chain(foremen)
+            .chain(waits)
             .chain(designers)
             .chain(desks)
             .chain(schedules)
@@ -10454,6 +10939,8 @@ impl Supervisor {
             happened = true;
             self.wake_foreman(&goal, &sub)?;
         }
+        // Waits whose condition is due to be looked at.
+        happened |= self.look_at_waits()?;
         let due: Vec<String> = self
             .goals
             .values()
@@ -11683,6 +12170,209 @@ mod tests {
         let mut fine = wait("", "check", json!(0), json!(0));
         fine["start"] = start;
         assert_eq!(problems(&d, &goal(), fine), Vec::<String>::new());
+    }
+
+    /// A wait accepted at [`NOW`] on `on`, checked within `minutes`, with
+    /// the default branch at `head` then.
+    fn waiting(on: WaitOn, minutes: u64, head: &str) -> Waiting {
+        Waiting::new(
+            Wait {
+                on,
+                interval_minutes: minutes,
+            },
+            NOW,
+            head.to_string(),
+            None,
+        )
+    }
+
+    /// Look at `wait` at `now` with the default branch at `head`, running
+    /// nothing: a command run here fails the test.
+    fn look_at(wait: &mut Waiting, now: u64, head: Result<&str, &str>) -> Looked {
+        wait.look(
+            now,
+            &mut || head.map(str::to_string).map_err(str::to_string),
+            &mut |name, commit| panic!("`{name}` ran on {commit}"),
+        )
+    }
+
+    #[test]
+    fn a_wait_on_a_time_holds_when_the_time_comes_or_ends_when_its_interval_runs_out() {
+        let mut soon = waiting(WaitOn::At(NOW + 600), 60, "");
+        assert_eq!((soon.until(), soon.next_look()), (NOW + 3600, NOW + 600));
+        assert_eq!(look_at(&mut soon, NOW + 599, Err("unread")), Looked::Waits);
+        let held = look_at(&mut soon, NOW + 600, Err("unread"));
+        assert!(matches!(held, Looked::Holds(_)), "{held:?}");
+        assert_eq!(
+            soon.ended(&held),
+            format!(
+                "Your wait on {} is over: the condition holds. It is {} now.",
+                date_utc(NOW + 600),
+                date_utc(NOW + 600)
+            )
+        );
+        // A time past the interval: the interval ends it first.
+        let mut late = waiting(WaitOn::At(NOW + 7200), 10, "");
+        assert_eq!(late.next_look(), NOW + 600);
+        let out = look_at(&mut late, NOW + 600, Err("unread"));
+        assert!(matches!(out, Looked::RanOut(_)), "{out:?}");
+        assert!(
+            late.ended(&out).starts_with(&format!(
+                "Your wait on {} is over: its interval of 10 minutes ran out, and the condition does not hold yet. It is ",
+                date_utc(NOW + 7200)
+            )),
+            "{}",
+            late.ended(&out)
+        );
+    }
+
+    #[test]
+    fn a_wait_on_the_default_branch_reads_its_head_every_minute_until_it_moves() {
+        let mut wait = waiting(WaitOn::MainPast(SHA[..7].to_string()), 5, "");
+        assert_eq!(wait.next_look(), NOW + WAIT_LOOK_SECS);
+        assert_eq!(look_at(&mut wait, NOW + 60, Ok(SHA)), Looked::Waits);
+        assert_eq!(wait.next_look(), NOW + 60 + WAIT_LOOK_SECS);
+        // A branch that cannot be read does not end the wait early.
+        assert_eq!(look_at(&mut wait, NOW + 120, Err("offline")), Looked::Waits);
+        let moved = look_at(&mut wait, NOW + 180, Ok("fedcba9876543210"));
+        assert_eq!(
+            moved,
+            Looked::Holds("the default branch is at `fedcba9876` now".to_string())
+        );
+        assert_eq!(
+            wait.ended(&moved),
+            "Your wait on the default branch moving past `0123456` is over: the condition holds. The default branch is at `fedcba9876` now."
+        );
+        // Unmoved when the interval runs out, it ends all the same, and
+        // says so.
+        let mut still = waiting(WaitOn::MainPast(SHA.to_string()), 5, "");
+        assert_eq!(look_at(&mut still, NOW + 240, Ok(SHA)), Looked::Waits);
+        assert_eq!(still.next_look(), NOW + 300, "no later than its interval");
+        let out = look_at(&mut still, NOW + 300, Ok(SHA));
+        assert_eq!(
+            still.ended(&out),
+            format!(
+                "Your wait on the default branch moving past `{SHA}` is over: its interval of 5 minutes ran out, and the condition does not hold yet. The default branch is still at `0123456789`."
+            )
+        );
+    }
+
+    #[test]
+    fn a_wait_on_a_command_runs_it_once_the_branch_moves_and_at_most_once_an_interval() {
+        let runs = std::cell::RefCell::new(Vec::<(String, String, u64)>::new());
+        let look = |wait: &mut Waiting, now: u64, head: &str, passes: bool| {
+            wait.look(now, &mut || Ok(head.to_string()), &mut |name, commit| {
+                runs.borrow_mut()
+                    .push((name.to_string(), commit.to_string(), now));
+                WaitRun {
+                    commit: commit.to_string(),
+                    at: now,
+                    passed: passes,
+                    how: if passes {
+                        "passed"
+                    } else {
+                        "failed (exit code 1)"
+                    }
+                    .to_string(),
+                }
+            })
+        };
+        let mut wait = waiting(WaitOn::Command("check".into()), 60, "aaaa");
+        // Not on the commit the director saw when it chose to wait.
+        assert_eq!(look(&mut wait, NOW + 60, "aaaa", true), Looked::Waits);
+        assert!(runs.borrow().is_empty());
+        // Once the branch moves it runs, there, and fails.
+        assert_eq!(look(&mut wait, NOW + 120, "bbbb", false), Looked::Waits);
+        assert_eq!(
+            *runs.borrow(),
+            [("check".to_string(), "bbbb".to_string(), NOW + 120)]
+        );
+        // Not again within the interval, however the branch moves: it is
+        // next looked at when the interval runs out.
+        assert_eq!(wait.next_look(), wait.until());
+        assert_eq!(look(&mut wait, NOW + 180, "cccc", true), Looked::Waits);
+        let out = look(&mut wait, NOW + 3600, "cccc", true);
+        assert_eq!(
+            out,
+            Looked::RanOut("`check` failed (exit code 1) on `bbbb`, and the default branch has moved to `cccc` since, less than an interval after that run".to_string())
+        );
+        assert_eq!(runs.borrow().len(), 1);
+        // The wait that replaces it on the same command keeps that run:
+        // the command runs an interval after it, on the commit now.
+        let mut again = Waiting::new(
+            Wait {
+                on: WaitOn::Command("check".into()),
+                interval_minutes: 60,
+            },
+            NOW + 3600,
+            "cccc".to_string(),
+            Some(&wait),
+        );
+        assert_eq!(again.ran, wait.ran);
+        assert_eq!(again.next_look(), NOW + 120 + 3600);
+        assert_eq!(look(&mut again, NOW + 3660, "cccc", true), Looked::Waits);
+        let held = look(&mut again, NOW + 3720, "cccc", true);
+        assert_eq!(held, Looked::Holds("`check` passed on `cccc`".to_string()));
+        assert_eq!(
+            again.ended(&held),
+            "Your wait on `check` passing on the default branch is over: the condition holds. `check` passed on `cccc`."
+        );
+        assert_eq!(runs.borrow().len(), 2);
+        // A wait on another command starts with no run.
+        let other = Waiting::new(
+            Wait {
+                on: WaitOn::Command("conformance".into()),
+                interval_minutes: 60,
+            },
+            NOW,
+            "cccc".to_string(),
+            Some(&again),
+        );
+        assert_eq!(other.ran, None);
+    }
+
+    #[test]
+    fn a_director_woken_while_it_waits_is_shown_the_wait_its_answer_replaces() {
+        let d = definition(1, "ask");
+        let mut goal = goal();
+        assert!(!wake_brief(&d, &goal, &[], "", "").contains("waits on"));
+        goal.wait = Some(waiting(WaitOn::MainPast(SHA[..7].into()), 15, ""));
+        let brief = wake_brief(&d, &goal, &[], "", "");
+        assert!(
+            brief.contains(&format!(
+                "## What this goal waits on\n\nThe last result accepted here waits on the default branch moving past `0123456`, since {}. The factory looks at it and wakes you when it holds, or at the latest at {}, when its interval of 15 minutes runs out. What you return now replaces it: give `wait` again to go on waiting.\n\n",
+                date_utc(NOW),
+                date_utc(NOW + 900)
+            )),
+            "{brief}"
+        );
+    }
+
+    #[test]
+    fn a_wait_is_kept_on_the_record_and_one_from_before_waits_were_kept_reads_as_none() {
+        let mut goal = goal();
+        assert_eq!(goal.wait, None);
+        goal.wait = Some(waiting(WaitOn::MainPast(SHA.into()), 15, ""));
+        let foreman = Foreman {
+            wait: Some(waiting(WaitOn::Command("check".into()), 30, SHA)),
+            ..Foreman::default()
+        };
+        let text = serde_json::to_string(&goal).unwrap();
+        assert!(
+            text.contains(&format!(r#""on":{{"main_past":"{SHA}"}}"#)),
+            "{text}"
+        );
+        let read: Goal = serde_json::from_str(&text).unwrap();
+        assert_eq!(read.wait, goal.wait);
+        let read: Foreman =
+            serde_json::from_str(&serde_json::to_string(&foreman).unwrap()).unwrap();
+        assert_eq!(read.wait, foreman.wait);
+        let old: Foreman = serde_json::from_value(json!({
+            "inbox": [], "wakes": 1, "failures": 0, "retry_at": null,
+            "waiting": null, "message": "", "exchanges": 0
+        }))
+        .unwrap();
+        assert_eq!(old.wait, None);
     }
 
     #[test]
