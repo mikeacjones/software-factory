@@ -8721,6 +8721,152 @@ fn a_failure_the_project_names_as_the_hosts_parks_without_a_fix_round() {
         "{reason}"
     );
     assert_eq!(events_named(&world, &driver, "command.host_fault").len(), 1);
+    // Without `triage.rerun` it is not run again.
+    assert!(events_named(&world, &driver, "command.rerun").is_empty());
+    assert_eq!(
+        builder_runs(&world),
+        1,
+        "only the build ran: {:?}",
+        world.calls()
+    );
+}
+
+/// A `test` command whose runs are counted in `{root}/runs`: run `n` prints
+/// and exits as the arm of `arms` for `n` says (`1) ...;;` and so on), and
+/// any other run passes. Output naming `out of memory` is the host's fault.
+fn counted_triage_world(name: &str, arms: &str, triage: &str) -> World {
+    triage_world(
+        name,
+        &format!(
+            "n=$(cat {{root}}/runs 2>/dev/null || echo 0); n=$((n+1)); echo $n > {{root}}/runs; case $n in {arms} esac; exit 0"
+        ),
+        &format!("could_not_run_when = [\"out of memory\"]\ntriage = {{ {triage} }}\n"),
+    )
+}
+
+/// How many times the counted `test` command has run.
+fn runs_of(world: &World) -> u32 {
+    std::fs::read_to_string(world.path("runs"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+/// A run killed for want of memory, as an arm of [`counted_triage_world`].
+const OOM: &str = "echo 'Killed: out of memory'; exit 137;;";
+
+/// A first run that was the host's fault, with `triage.rerun`, is run once
+/// more before anything parks: a pass there is a flake, recorded, and the
+/// step passes with no builder sent.
+#[test]
+fn a_host_fault_run_once_more_that_passes_is_a_flake_and_nothing_parks() {
+    let world = counted_triage_world("triage-host-flake", &format!("1) {OOM}"), "rerun = true");
+    let mut driver = Driver::start(world.config(), "toy", "toy-1", &OPTIONS).unwrap();
+    assert_eq!(driver.run().unwrap(), Status::Ended);
+    assert_eq!(events_named(&world, &driver, "command.host_fault").len(), 1);
+    let reruns = events_named(&world, &driver, "command.rerun");
+    assert_eq!(reruns.len(), 1, "{reruns:?}");
+    assert_eq!(reruns[0]["verdict"], "Passed");
+    assert_eq!(reruns[0]["after_host_fault"], true);
+    let flaky = events_named(&world, &driver, "command.flaky");
+    assert_eq!(flaky.len(), 1, "{flaky:?}");
+    assert_eq!(flaky[0]["rerun"], reruns[0]["output"]);
+    let kinds = world.event_kinds(&driver);
+    assert!(kinds.contains(&"test:pass".to_string()), "{kinds:?}");
+    assert!(!kinds.contains(&"test:fail".to_string()), "{kinds:?}");
+    let flakes = &driver.unit().flakes;
+    assert_eq!(flakes.len(), 1, "{flakes:?}");
+    assert_eq!(flakes[0].check, "test");
+    assert!(flakes[0].signature.contains("out of memory"), "{flakes:?}");
+    assert_eq!(
+        builder_runs(&world),
+        2,
+        "the build and the tester's scripted fix only: {:?}",
+        world.calls()
+    );
+}
+
+/// A first run that was the host's fault, run once more, that then fails
+/// for the change is triaged as that failure: run on the base, then sent to
+/// the builder with the second run's output, and not run a third time.
+#[test]
+fn a_host_fault_run_once_more_that_fails_goes_on_to_the_builder() {
+    let world = counted_triage_world(
+        "triage-host-then-fail",
+        &format!("1) {OOM} 2) echo 'error: feature broke it'; exit 1;;"),
+        "rerun = true, base = true",
+    );
+    let mut driver = Driver::start(world.config(), "toy", "toy-1", &OPTIONS).unwrap();
+    assert_eq!(driver.run().unwrap(), Status::Ended);
+    assert_eq!(events_named(&world, &driver, "command.host_fault").len(), 1);
+    // One run once more, after the host's fault; none for `triage.rerun`.
+    let reruns = events_named(&world, &driver, "command.rerun");
+    assert_eq!(reruns.len(), 1, "{reruns:?}");
+    assert_eq!(reruns[0]["verdict"], "Failed { code: Some(1) }");
+    assert!(events_named(&world, &driver, "command.flaky").is_empty());
+    // The base ran (the third run), and passed.
+    let base = events_named(&world, &driver, "command.base");
+    assert_eq!(base.len(), 1, "{base:?}");
+    assert_eq!(base[0]["verdict"], "Passed");
+    let ended: Vec<String> = world
+        .event_kinds(&driver)
+        .into_iter()
+        .filter(|k| k.contains(':'))
+        .collect();
+    let at = ended
+        .iter()
+        .position(|k| k == "test:fail")
+        .expect("test failed once");
+    assert_eq!(ended[at + 1], "fix:done", "{ended:?}");
+    // The builder is given the second run's output, and told of the first.
+    let calls = world.calls();
+    let fix = (0..calls.len())
+        .filter(|&i| calls[i][0] == "builder")
+        .nth(1)
+        .unwrap();
+    let brief =
+        std::fs::read_to_string(world.path(&format!("bin/state/brief-{}.md", fix + 1))).unwrap();
+    assert!(brief.contains("error: feature broke it"), "{brief}");
+    assert!(
+        brief.contains(reruns[0]["output"].as_str().unwrap()),
+        "{brief}"
+    );
+    assert!(brief.contains("failed (exit code 1)"), "{brief}");
+    assert!(brief.contains("could not run properly"), "{brief}");
+    assert!(
+        brief.contains("it passed: the failure comes with the change"),
+        "{brief}"
+    );
+}
+
+/// A first run that was the host's fault and a run once more that was the
+/// host's fault too park the unit, naming both outputs; no builder is sent.
+#[test]
+fn a_host_fault_twice_parks_naming_both_outputs() {
+    let world = counted_triage_world(
+        "triage-host-twice",
+        &format!("1|2) {OOM}"),
+        "rerun = true, base = true",
+    );
+    let mut driver = Driver::start(world.config(), "toy", "toy-1", &OPTIONS).unwrap();
+    let Status::Parked(reason) = driver.run().unwrap() else {
+        panic!("the unit should park");
+    };
+    let ran = events_named(&world, &driver, "command.ran");
+    let reruns = events_named(&world, &driver, "command.rerun");
+    assert_eq!(reruns.len(), 1, "{reruns:?}");
+    let first = ran.last().unwrap()["output"].as_str().unwrap().to_string();
+    let second = reruns[0]["output"].as_str().unwrap().to_string();
+    assert_ne!(first, second);
+    assert!(reason.contains(&first), "{reason}");
+    assert!(reason.contains(&second), "{reason}");
+    assert!(reason.contains("could not run properly again"), "{reason}");
+    assert!(reason.contains("out of memory"), "{reason}");
+    assert_eq!(events_named(&world, &driver, "command.host_fault").len(), 1);
+    // Neither the base nor a third run.
+    assert!(events_named(&world, &driver, "command.base").is_empty());
+    assert_eq!(runs_of(&world), 2);
     assert_eq!(
         builder_runs(&world),
         1,

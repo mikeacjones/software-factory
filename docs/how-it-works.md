@@ -159,6 +159,7 @@ Not drawn, to keep it readable:
 - A route that has been used as often as it allows parks the unit. Whoever runs the sub-goal's beads may continue a parked unit from a step it names, up to three times.
 - Any agent step may return `needs_owner`. The question goes to the run's thread and the answer comes back to that step.
 - After every step the driver pushes the unit's branch to the remote, and during a builder's run each time it commits.
+- A command that fails is looked into by code before the builder is sent (*triage*). Output the project names as the host's fault parks the step, but where the command has `triage.rerun` it is first run once more, on its own: a pass is a flake and the step passes, the host's fault again parks naming both outputs, and any other failure goes on through the base run to the builder as the failure of the change. Otherwise `triage.rerun` runs a failure once more, and a pass is a flake; `triage.base` runs it on the code as at the base, and a failure there too parks.
 
 ## 4. Shipping a sub-goal
 
@@ -349,7 +350,7 @@ The run may not change `.github`, the project's record, its flow or its goal def
 |---|---|
 | 1 | `crates/factory-engine/src/tiers.rs`, `engine.rs`, `accounts.rs`, `steps.rs`, `worker.rs` |
 | 2 | `crates/factory-driver/src/goal.rs` (`Supervisor::turn`, `wake`, `wake_foreman`, `ship`, `act`), `config/goals/temporal-sdk-zig/parity.toml`, `config/roles/` |
-| 3, 4 | `config/flows/zig-sdk-bead.toml`, `config/flows/zig-sdk-ship.toml`, `config/projects/temporal-sdk-zig.toml` |
+| 3, 4 | `config/flows/zig-sdk-bead.toml`, `config/flows/zig-sdk-ship.toml`, `config/projects/temporal-sdk-zig.toml`, `crates/factory-driver/src/lib.rs` (`triage`) |
 | 5 | `crates/factory-driver/src/lib.rs` (`agent_step`, `verify_reproductions`, `adopt_regressions`, `check_regressions`), `crates/factory-brief/src/lib.rs` (`result_problems`) |
 | 6, 7 | `crates/factory-driver/src/goal.rs` (`run_schedule`, `classes_calling`, `maintenance_problems`, `open_maintenance`, `settle_maintenance`), `crates/factory-driver/src/lib.rs` (`finding_classes`, `answer_class`, `check_landed`, `classes_unchecked`), `config/goals/temporal-sdk-zig/upkeep.toml` |
 | 8 | `crates/factory-driver/src/goal.rs` (`run_direct`, `open_direct`, `settle_direct`), `crates/factory-driver/src/lib.rs` (`deploy_step`), `crates/factory-driver/src/service.rs` (`build_and_release`, `rollback_release`), `config/flows/factory-self.toml`, `config/goals/software-factory/nightly.toml` |

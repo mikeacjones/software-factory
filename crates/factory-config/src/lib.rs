@@ -684,7 +684,8 @@ pub struct CommandSpec {
     /// a run that failed or timed out) that mean the host was at fault, not
     /// the code: a download that came back broken, a daemon that is not
     /// running. Such a run counts as one that could not run, and parks the
-    /// step: no fix round can help.
+    /// step: no fix round can help. With `triage.rerun` it is first run once
+    /// more, and parks only if that run is the host's fault too.
     #[serde(default)]
     pub could_not_run_when: Vec<String>,
     /// Exit codes that mean the same, for a tool that says so by its code.
@@ -714,7 +715,9 @@ pub struct CommandSpec {
 #[serde(deny_unknown_fields)]
 pub struct Triage {
     /// Run it once more on the change. A pass makes the failure a flake: the
-    /// step passes, and the flake is recorded.
+    /// step passes, and the flake is recorded. A first run that was the
+    /// host's fault is run once more too, instead of parking at once; if
+    /// that run fails otherwise, it is the failure the change is judged on.
     #[serde(default)]
     pub rerun: bool,
     /// Run it on the code as it was at the unit's base: a copy of the
