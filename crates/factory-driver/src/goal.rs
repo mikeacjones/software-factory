@@ -1913,14 +1913,19 @@ impl Waiting {
     /// What the agent is told when the wait ends: which of the two ended
     /// it, and how the condition stands.
     pub fn ended(&self, looked: &Looked) -> String {
+        format!("Your wait {}", self.over(looked))
+    }
+
+    /// `on <what> is over: <which of the two>. <how it stands>.`
+    fn over(&self, looked: &Looked) -> String {
         match looked {
             Looked::Holds(state) => format!(
-                "Your wait on {} is over: the condition holds. {}.",
+                "on {} is over: the condition holds. {}.",
                 self.describe(),
                 capital(state)
             ),
             _ => format!(
-                "Your wait on {} is over: its interval of {} minutes ran out, and the condition does not hold yet. {}.",
+                "on {} is over: its interval of {} minutes ran out, and the condition does not hold yet. {}.",
                 self.describe(),
                 self.interval_minutes,
                 capital(match looked {
@@ -1929,6 +1934,31 @@ impl Waiting {
                 })
             ),
         }
+    }
+
+    /// The line the goal's thread is shown when the wait is accepted:
+    /// what `who` (`the director`, `the foreman of `x``) waits for, when
+    /// the factory looks at it again, and when its interval runs out.
+    pub fn accepted_line(&self, who: &str) -> String {
+        format!(
+            ":hourglass_flowing_sand: *{} waits* on {}. The factory looks at it again at {}, and wakes it when it holds or at the latest at {}, when its interval of {} minutes runs out.",
+            capital(who),
+            self.describe(),
+            date_utc(self.next_look()),
+            date_utc(self.until()),
+            self.interval_minutes
+        )
+    }
+
+    /// The line the goal's thread is shown when the wait ends: what
+    /// ended it, the condition holding or the interval running out, and
+    /// how the condition stands.
+    pub fn ended_line(&self, who: &str, looked: &Looked) -> String {
+        format!(
+            ":alarm_clock: *{} is woken*: its wait {}",
+            capital(who),
+            self.over(looked)
+        )
     }
 
     /// What an agent woken while it waits is shown of the wait.
@@ -6028,6 +6058,24 @@ impl Supervisor {
         }
     }
 
+    /// Show the owner a wait a director or foreman holds, or what ended
+    /// one. Posted whether or not `quiet` is set, since the owner sees
+    /// every wait, but without naming them: a wait asks nothing of the
+    /// owner. A goal the factory opened by itself is given its thread
+    /// here, so the caller saves the goal.
+    fn show(&self, goal: &mut Goal, text: &str) {
+        self.log(goal, "slack.say", json!({ "text": text }));
+        self.root(goal);
+        if goal.channel.is_empty() {
+            return;
+        }
+        if let Some(slack) = &self.slack
+            && let Err(err) = slack.post(&goal.channel, Some(&goal.thread_ts), text)
+        {
+            self.log(goal, "slack.failed", json!({ "error": err.to_string() }));
+        }
+    }
+
     /// Say something the goal cannot go on without the owner for. Always
     /// posted, with the owner named. The caller saves the goal: one the
     /// factory opened by itself is given its thread here.
@@ -7609,6 +7657,12 @@ impl Supervisor {
                                 "why": if matches!(ended, Looked::Holds(_)) { "holds" } else { "interval" },
                                 "text": text }),
                     );
+                    let who = match &subgoal {
+                        None => "the director".to_string(),
+                        Some(sub) => format!("the foreman of `{sub}`"),
+                    };
+                    let line = waiting.ended_line(&who, ended);
+                    self.show(&mut goal, &line);
                     Some(Happening::Note { text })
                 }
             };
@@ -8441,6 +8495,13 @@ impl Supervisor {
             ));
         }
         self.say(&goal, &text);
+        if let Some(line) = goal
+            .wait
+            .as_ref()
+            .map(|wait| wait.accepted_line("the director"))
+        {
+            self.show(&mut goal, &line);
+        }
 
         if !request.files.is_empty() || !request.edits.is_empty() {
             let mut lines: Vec<String> = request
@@ -10107,8 +10168,15 @@ impl Supervisor {
             json!({ "subgoal": sub_id, "wake": foreman.wakes, "report": strings(&result, "report") }),
         );
         let again = !foreman.inbox.is_empty();
+        let waits = foreman
+            .wait
+            .as_ref()
+            .map(|wait| wait.accepted_line(&format!("the foreman of `{sub_id}`")));
         goal.subgoals[index].foreman = Some(foreman);
         self.say(&goal, &text);
+        if let Some(line) = waits {
+            self.show(&mut goal, &line);
+        }
         for start in items(&result, "start") {
             self.start_bead(
                 &mut goal,
