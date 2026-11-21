@@ -5493,6 +5493,7 @@ fn a_parked_pipeline_is_continued_by_a_foreman_that_takes_over_the_sub_goal() {
         &[],
         &|_| Vec::new(),
         &[],
+        &factory_driver::goal::WaitScope::default(),
         &direct(json!({"start": [{"bead": "toy-1", "reason": "again"}]})),
     );
     assert!(!refused.is_empty());
