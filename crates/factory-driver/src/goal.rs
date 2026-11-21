@@ -1534,6 +1534,178 @@ fn dropped_schema() -> Value {
     }))})
 }
 
+/// The shortest and longest interval, in minutes, at which a wait's
+/// condition is checked, and the interval when the result gives none.
+pub const WAIT_INTERVAL_MIN: u64 = 5;
+pub const WAIT_INTERVAL_MAX: u64 = 60;
+pub const WAIT_INTERVAL_DEFAULT: u64 = 60;
+
+/// A wait on a condition outside the goal, which a result may carry when
+/// nothing it starts would move the goal. `whose` is what waits: the goal
+/// or the sub-goal.
+fn wait_schema(whose: &str) -> Value {
+    let mut schema = object_schema(json!({
+        "main_past": text_schema("Empty, or the SHA of a commit (7 to 40 hex digits): wait until the default branch has moved past it."),
+        "command": text_schema("Empty, or the name of one of the project's commands, such as `check`: wait until it passes on the default branch."),
+        "at": { "type": "integer", "description": "0, or a unix time in seconds still to come: wait until then." },
+        "interval_minutes": { "type": "integer", "description": "How often the condition is checked: 5 to 60 minutes, or 0 for every 60." },
+    }));
+    schema["description"] = json!(format!(
+        "Empty in every field, unless what moves this {whose} next is outside it and code can check it: another piece of work landing, a command that has to pass, a time. Then name exactly one of `main_past`, `command` and `at`, and you are woken when it holds. A result that leaves nothing running may wait instead of asking."
+    ));
+    schema
+}
+
+/// What a wait in a result waits for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WaitOn {
+    /// The default branch has moved past this commit.
+    MainPast(String),
+    /// The project command of this name passes.
+    Command(String),
+    /// This unix time, in seconds, has come.
+    At(u64),
+}
+
+/// A well-formed wait a director's or foreman's result carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Wait {
+    pub on: WaitOn,
+    /// How often the condition is checked, in minutes.
+    pub interval_minutes: u64,
+}
+
+/// What a wait may name: the project's commands, and the time it is now
+/// in unix seconds.
+#[derive(Debug, Clone, Default)]
+pub struct WaitScope {
+    pub commands: Vec<String>,
+    pub now: u64,
+}
+
+impl WaitScope {
+    /// The commands of `project`, at the time it is now.
+    pub fn of(project: &Project) -> WaitScope {
+        WaitScope {
+            commands: project.commands.keys().cloned().collect(),
+            now: now_unix(),
+        }
+    }
+}
+
+/// The wait `result` carries: `Ok(None)` when it carries none, or why it
+/// may not wait as it says, when what it names cannot be checked.
+pub fn wait_of(result: &Value, scope: &WaitScope) -> Result<Option<Wait>, Vec<String>> {
+    let wait = match result.get("wait") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(wait) if wait.is_object() => wait,
+        Some(_) => return Err(vec!["wait: it could not be read".to_string()]),
+    };
+    let mut problems = Vec::new();
+    let main_past = strings(wait, "main_past").trim();
+    let command = strings(wait, "command").trim();
+    let at = match wait.get("at") {
+        None | Some(Value::Null) => None,
+        Some(at) => match at.as_u64() {
+            Some(0) => None,
+            Some(at) => Some(at),
+            None => {
+                problems.push(format!("wait: `at` is `{at}`, not a unix time in seconds"));
+                None
+            }
+        },
+    };
+    let interval = match wait.get("interval_minutes") {
+        None | Some(Value::Null) => None,
+        Some(given) => match given.as_u64() {
+            Some(0) => None,
+            Some(minutes) if (WAIT_INTERVAL_MIN..=WAIT_INTERVAL_MAX).contains(&minutes) => {
+                Some(minutes)
+            }
+            _ => {
+                problems.push(format!(
+                    "wait: `interval_minutes` is `{given}`: give {WAIT_INTERVAL_MIN} to {WAIT_INTERVAL_MAX} minutes, or 0 for {WAIT_INTERVAL_DEFAULT}"
+                ));
+                Some(WAIT_INTERVAL_DEFAULT)
+            }
+        },
+    };
+    let named = [!main_past.is_empty(), !command.is_empty(), at.is_some()]
+        .iter()
+        .filter(|named| **named)
+        .count();
+    if named == 0 {
+        if interval.is_some() || !problems.is_empty() {
+            problems.push(
+                "wait: it names no condition: give exactly one of `main_past`, `command` and `at`, or leave every field empty"
+                    .to_string(),
+            );
+            return Err(problems);
+        }
+        return Ok(None);
+    }
+    if named > 1 {
+        problems.push(format!(
+            "wait: it names {named} conditions: give exactly one of `main_past`, `command` and `at`"
+        ));
+    }
+    if !main_past.is_empty()
+        && !((7..=40).contains(&main_past.len())
+            && main_past.chars().all(|c| c.is_ascii_hexdigit()))
+    {
+        problems.push(format!(
+            "wait: `main_past` is `{main_past}`, not the SHA of a commit (7 to 40 hex digits)"
+        ));
+    }
+    if !command.is_empty() && !scope.commands.iter().any(|known| known == command) {
+        problems.push(format!(
+            "wait: `{command}` is not a command of this project, which has {}",
+            if scope.commands.is_empty() {
+                "none".to_string()
+            } else {
+                scope
+                    .commands
+                    .iter()
+                    .map(|known| format!("`{known}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        ));
+    }
+    if let Some(at) = at.filter(|at| *at <= scope.now) {
+        problems.push(format!(
+            "wait: `at` is {at}, which is not still to come: it is {} now",
+            scope.now
+        ));
+    }
+    if !problems.is_empty() {
+        return Err(problems);
+    }
+    let on = if !main_past.is_empty() {
+        WaitOn::MainPast(main_past.to_string())
+    } else if !command.is_empty() {
+        WaitOn::Command(command.to_string())
+    } else {
+        WaitOn::At(at.unwrap_or_default())
+    };
+    Ok(Some(Wait {
+        on,
+        interval_minutes: interval.unwrap_or(WAIT_INTERVAL_DEFAULT),
+    }))
+}
+
+/// Whether `result` carries a well-formed wait. What is wrong with one
+/// that does not goes into `problems`.
+fn waits(result: &Value, scope: &WaitScope, problems: &mut Vec<String>) -> bool {
+    match wait_of(result, scope) {
+        Ok(wait) => wait.is_some(),
+        Err(why) => {
+            problems.extend(why);
+            false
+        }
+    }
+}
+
 /// What a sub-goal's foreman returns each time an event wakes it.
 pub fn foreman_schema() -> Value {
     object_schema(json!({
@@ -1544,6 +1716,7 @@ pub fn foreman_schema() -> Value {
         "dropped_findings": dropped_schema(),
         "report": { "enum": ["working", "ready", "escalate"], "description": "`working` while a pipeline of this sub-goal is running or being started. `ready` when everything meant for it is absorbed and the director should ship it. `escalate` when you need the director: a bead that cannot run, a question, work that does not belong." },
         "message": text_schema("To the director, when `report` is `ready` or `escalate`: what the sub-goal holds and what they should know, or what you need from them. Otherwise empty."),
+        "wait": wait_schema("sub-goal"),
         "journal_entry": text_schema("What you want to remember at the next wake of this sub-goal. You start fresh each time; this is all that carries over. The brief shows only your newest entries, so carry forward here whatever still matters from the older ones."),
     }))
 }
@@ -1588,6 +1761,7 @@ pub fn wake_schema() -> Value {
         }))},
         "tell_executive": text_schema("Something for the project's executive, the level above goals, or empty. For tracker work that is not this goal's: an open bead that should be closed because what landed already delivers it or because it duplicates another, said with the bead IDs and the reason. The executive can close a bead; you cannot, and it is not a question for the owner."),
         "ask_owner": text_schema("One question only the owner can answer, or empty."),
+        "wait": wait_schema("goal"),
         "hand_up": text_schema("Empty, unless your brief gives this wake a route: then, when the wake needs a decision that route does not allow, why the director's own model has to decide instead."),
         "complete": { "type": "boolean", "description": "True when the stop condition is met. Whether that proposes the end of the goal to the owner or ends it is in your brief, under what you may decide." },
         "evidence": text_schema("When complete: how the stop condition is met, point by point, with what you checked. Otherwise empty."),
@@ -2497,13 +2671,15 @@ impl StopCheck {
 /// Why a director's decisions may not be carried out. Empty means they may.
 ///
 /// `launchable` answers, for a bead ID, why the readiness check would refuse
-/// it (empty: it would not).
+/// it (empty: it would not). `scope` is what a `wait` may name: a result
+/// that leaves nothing running may wait on a condition code can check.
 pub fn decision_problems(
     definition: &GoalDefinition,
     goal: &Goal,
     tracker: &[Summary],
     launchable: &dyn Fn(&str) -> Vec<String>,
     steps: &[String],
+    scope: &WaitScope,
     result: &Value,
 ) -> Vec<String> {
     let mut problems = Vec::new();
@@ -2514,6 +2690,10 @@ pub fn decision_problems(
     let batched = definition.ship_flow.is_some();
     if strings(result, "summary").trim().is_empty() {
         problems.push("`summary` is empty".to_string());
+    }
+    let waits_on = waits(result, scope, &mut problems);
+    if complete && waits_on {
+        problems.push("wait: a goal that is complete waits for nothing".to_string());
     }
     if complete && definition.stop_check.is_some() {
         match &goal.stop_check {
@@ -2989,7 +3169,9 @@ pub fn decision_problems(
     let needs_approval = goal.must_ask(definition.permissions.edit_beads, &edits)
         || (definition.permissions.file_beads == Permission::Ask
             && !items(result, "file").is_empty());
-    if in_flight == 0 && !asks_owner && !complete && !needs_approval {
+    // A wait on a condition code can check moves it too: it is woken
+    // when the condition holds.
+    if in_flight == 0 && !asks_owner && !complete && !needs_approval && !waits_on {
         problems.push(
             if definition.director_decides() {
                 if foreman {
@@ -3730,8 +3912,10 @@ fn flag(value: &Value, key: &str) -> bool {
 /// Why a foreman's decisions may not be carried out. Empty means they may.
 ///
 /// The rule that matters most: a sub-goal is never left with nothing that
-/// can move it. After every decision a pipeline is running in it, or the
-/// director has been told.
+/// can move it. After every decision a pipeline is running in it, the
+/// director has been told, or it waits on a condition code can check (what
+/// that may name is in `scope`).
+#[allow(clippy::too_many_arguments)]
 pub fn foreman_problems(
     definition: &GoalDefinition,
     goal: &Goal,
@@ -3739,12 +3923,14 @@ pub fn foreman_problems(
     tracker: &[Summary],
     launchable: &dyn Fn(&str) -> Vec<String>,
     steps: &[String],
+    scope: &WaitScope,
     result: &Value,
 ) -> Vec<String> {
     let mut problems = Vec::new();
     if strings(result, "summary").trim().is_empty() {
         problems.push("`summary` is empty".to_string());
     }
+    let waits_on = waits(result, scope, &mut problems);
     let report = strings(result, "report");
     let slots = definition.foreman.as_ref().map_or(1, |tier| tier.slots) as usize;
     let running = goal.running_in(&sub.id);
@@ -3860,7 +4046,7 @@ pub fn foreman_problems(
     let message = strings(result, "message").trim();
     match report {
         "ready" => {
-            if running > 0 || going > 0 || here > 0 {
+            if running > 0 || going > 0 || here > 0 || waits_on {
                 problems.push(
                     "ready: a sub-goal is ready when nothing in it is running, starting or waiting to run"
                         .to_string(),
@@ -3886,7 +4072,7 @@ pub fn foreman_problems(
             }
         }
         "working" => {
-            if running + going + here == 0 {
+            if running + going + here == 0 && !waits_on {
                 problems.push(
                     "working: nothing would be running in this sub-goal and the director would not be told: start a bead, continue one that stopped, report `ready`, or `escalate`"
                         .to_string(),
@@ -7660,9 +7846,17 @@ impl Supervisor {
                 // director may have filed beads with `bd` in this very
                 // wake, and a bead it filed is one it may start.
                 let now_open = source.list_open().ok();
+                let scope = WaitScope::of(&project);
                 let now = now_open.as_deref().unwrap_or(&tracker);
-                let mut problems =
-                    decision_problems(&definition, &snapshot, now, &launchable, &steps, result);
+                let mut problems = decision_problems(
+                    &definition,
+                    &snapshot,
+                    now,
+                    &launchable,
+                    &steps,
+                    &scope,
+                    result,
+                );
                 problems.extend(add_problems(
                     &definition,
                     &snapshot,
@@ -9343,6 +9537,7 @@ impl Supervisor {
                 &tracker,
                 &launchable,
                 &steps,
+                &WaitScope::of(&project),
                 result,
             )
         };
@@ -10992,6 +11187,7 @@ mod tests {
                 &tracker,
                 &|_| Vec::new(),
                 &steps(),
+                &scope(),
                 &result,
             )
         };
@@ -11311,6 +11507,17 @@ mod tests {
         .collect()
     }
 
+    /// The time it is in the tests that check a wait, in unix seconds.
+    const NOW: u64 = 1_800_000_000;
+
+    /// What a wait may name in the tests: two commands, at [`NOW`].
+    fn scope() -> WaitScope {
+        WaitScope {
+            commands: vec!["check".to_string(), "conformance".to_string()],
+            now: NOW,
+        }
+    }
+
     fn problems(definition: &GoalDefinition, goal: &Goal, extra: Value) -> Vec<String> {
         decision_problems(
             definition,
@@ -11318,8 +11525,207 @@ mod tests {
             &tracker(),
             &launchable,
             &steps(),
+            &scope(),
             &result(extra),
         )
+    }
+
+    /// A result's `wait`, as the schema has it.
+    fn wait(main_past: &str, command: &str, at: Value, interval: Value) -> Value {
+        json!({"wait": {"main_past": main_past, "command": command, "at": at, "interval_minutes": interval}})
+    }
+
+    const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    #[test]
+    fn a_director_that_leaves_nothing_running_may_wait_on_a_condition_code_can_check() {
+        let d = definition(1, "ask");
+        let idle = problems(&d, &goal(), json!({}));
+        assert_eq!(idle.len(), 1);
+        assert!(idle[0].starts_with("nothing would be running"), "{idle:?}");
+        let later = json!(NOW + 3600);
+        for waits in [
+            wait(SHA, "", json!(0), json!(0)),
+            wait("0123456", "", json!(0), json!(0)),
+            wait("", "check", json!(0), json!(5)),
+            wait("", "", later.clone(), json!(60)),
+        ] {
+            assert_eq!(
+                problems(&d, &goal(), waits.clone()),
+                Vec::<String>::new(),
+                "{waits}"
+            );
+        }
+        // So may one that decides alone.
+        let mut decides = definition(1, "allow");
+        decides.director_decides = Some(true);
+        assert_eq!(
+            problems(
+                &decides,
+                &goal(),
+                wait("", "conformance", json!(0), json!(0))
+            ),
+            Vec::<String>::new()
+        );
+        // What is well-formed is read as what it names, every 60 minutes
+        // unless it says otherwise.
+        let read = |waits: Value| wait_of(&result(waits), &scope());
+        assert_eq!(
+            read(wait(SHA, "", json!(0), json!(0))),
+            Ok(Some(Wait {
+                on: WaitOn::MainPast(SHA.into()),
+                interval_minutes: 60
+            }))
+        );
+        assert_eq!(
+            read(wait("", " check ", json!(0), json!(15))),
+            Ok(Some(Wait {
+                on: WaitOn::Command("check".into()),
+                interval_minutes: 15
+            }))
+        );
+        assert_eq!(
+            read(wait("", "", later, Value::Null)),
+            Ok(Some(Wait {
+                on: WaitOn::At(NOW + 3600),
+                interval_minutes: 60
+            }))
+        );
+        // A complete goal waits for nothing.
+        let mut done = wait(SHA, "", json!(0), json!(0));
+        done["complete"] = json!(true);
+        done["evidence"] = json!("All of it.");
+        assert_eq!(
+            problems(&d, &goal(), done),
+            ["wait: a goal that is complete waits for nothing"]
+        );
+    }
+
+    #[test]
+    fn a_wait_that_names_nothing_code_can_check_is_refused() {
+        let d = definition(1, "ask");
+        let idle = problems(&d, &goal(), json!({}));
+        // No wait, in either form the result may carry, is no way out.
+        assert_eq!(
+            problems(&d, &goal(), wait("", "", json!(0), json!(0))),
+            idle
+        );
+        assert_eq!(problems(&d, &goal(), json!({"wait": null})), idle);
+        let refused = |waits: Value| {
+            let mut found = problems(&d, &goal(), waits.clone());
+            // Each is refused for what is wrong with it, and as leaving
+            // nothing running.
+            assert_eq!(found.pop().as_ref(), idle.first(), "{waits}");
+            found
+        };
+        assert_eq!(
+            refused(wait("", "deploy", json!(0), json!(0))),
+            ["wait: `deploy` is not a command of this project, which has `check`, `conformance`"]
+        );
+        for sha in [
+            "main",
+            "012345",
+            "0123456789abcdef0123456789abcdef012345678",
+            "xyz1234",
+            "0123 456",
+        ] {
+            assert_eq!(
+                refused(wait(sha, "", json!(0), json!(0))),
+                [format!(
+                    "wait: `main_past` is `{sha}`, not the SHA of a commit (7 to 40 hex digits)"
+                )]
+            );
+        }
+        assert_eq!(
+            refused(wait("", "", json!(NOW), json!(0))),
+            [format!(
+                "wait: `at` is {NOW}, which is not still to come: it is {NOW} now"
+            )]
+        );
+        assert_eq!(
+            refused(wait("", "", json!(NOW - 60), json!(0))),
+            [format!(
+                "wait: `at` is {}, which is not still to come: it is {NOW} now",
+                NOW - 60
+            )]
+        );
+        assert_eq!(
+            refused(wait("", "", json!(-5), json!(0))),
+            [
+                "wait: `at` is `-5`, not a unix time in seconds",
+                "wait: it names no condition: give exactly one of `main_past`, `command` and `at`, or leave every field empty",
+            ]
+        );
+        assert_eq!(
+            refused(wait(SHA, "check", json!(0), json!(0))),
+            ["wait: it names 2 conditions: give exactly one of `main_past`, `command` and `at`"]
+        );
+        assert_eq!(
+            refused(wait(SHA, "check", json!(NOW + 60), json!(0))),
+            ["wait: it names 3 conditions: give exactly one of `main_past`, `command` and `at`"]
+        );
+        // An interval alone names nothing.
+        assert_eq!(
+            refused(wait("", "", json!(0), json!(30))),
+            [
+                "wait: it names no condition: give exactly one of `main_past`, `command` and `at`, or leave every field empty"
+            ]
+        );
+        assert_eq!(
+            refused(json!({"wait": "main"})),
+            ["wait: it could not be read"]
+        );
+        // A malformed wait is refused also beside work that is running.
+        let start = json!([{"bead": "toy-1", "reason": "first"}]);
+        let mut both = wait("", "deploy", json!(0), json!(0));
+        both["start"] = start.clone();
+        assert_eq!(problems(&d, &goal(), both).len(), 1);
+        let mut fine = wait("", "check", json!(0), json!(0));
+        fine["start"] = start;
+        assert_eq!(problems(&d, &goal(), fine), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_wait_is_checked_every_5_to_60_minutes_and_every_60_unless_it_says() {
+        let d = definition(1, "ask");
+        for minutes in [5, 6, 30, 59, 60] {
+            assert_eq!(
+                problems(&d, &goal(), wait(SHA, "", json!(0), json!(minutes))),
+                Vec::<String>::new()
+            );
+            assert_eq!(
+                wait_of(&result(wait(SHA, "", json!(0), json!(minutes))), &scope())
+                    .map(|wait| wait.map(|wait| wait.interval_minutes)),
+                Ok(Some(minutes))
+            );
+        }
+        let idle = problems(&d, &goal(), json!({}));
+        for minutes in [
+            json!(1),
+            json!(4),
+            json!(61),
+            json!(1440),
+            json!(-5),
+            json!(7.5),
+            json!("ten"),
+        ] {
+            let found = problems(&d, &goal(), wait(SHA, "", json!(0), minutes.clone()));
+            assert_eq!(
+                found,
+                [
+                    format!(
+                        "wait: `interval_minutes` is `{minutes}`: give 5 to 60 minutes, or 0 for 60"
+                    ),
+                    idle[0].clone(),
+                ]
+            );
+        }
+        // Given as 0, or not given at all, it is 60.
+        let default = |waits: Value| {
+            wait_of(&result(waits), &scope()).map(|wait| wait.map(|wait| wait.interval_minutes))
+        };
+        assert_eq!(default(wait(SHA, "", json!(0), json!(0))), Ok(Some(60)));
+        assert_eq!(default(json!({"wait": {"main_past": SHA}})), Ok(Some(60)));
     }
 
     #[test]
@@ -11694,6 +12100,7 @@ mod tests {
             &tracker(),
             &launchable,
             &steps(),
+            &scope(),
             &result,
         )
     }
@@ -11845,6 +12252,64 @@ mod tests {
             idle[0].starts_with("working: nothing would be running in this sub-goal"),
             "{idle:?}"
         );
+        // Unless it waits on a condition code can check.
+        for waits in [
+            wait(SHA, "", json!(0), json!(0)),
+            wait("", "check", json!(0), json!(10)),
+            wait("", "", json!(NOW + 60), json!(60)),
+        ] {
+            assert!(
+                foreman_says(&d, &fresh, waits.clone()).is_empty(),
+                "{waits}"
+            );
+        }
+        // A wait that names nothing checkable, or none, is no way out.
+        assert_eq!(
+            foreman_says(&d, &fresh, wait("", "", json!(0), json!(0))),
+            idle
+        );
+        for (waits, why) in [
+            (
+                wait("", "deploy", json!(0), json!(0)),
+                "wait: `deploy` is not a command of this project, which has `check`, `conformance`",
+            ),
+            (
+                wait("nope", "", json!(0), json!(0)),
+                "wait: `main_past` is `nope`, not the SHA of a commit (7 to 40 hex digits)",
+            ),
+            (
+                wait("", "", json!(NOW - 1), json!(0)),
+                &format!(
+                    "wait: `at` is {}, which is not still to come: it is {NOW} now",
+                    NOW - 1
+                ),
+            ),
+            (
+                wait(SHA, "check", json!(0), json!(0)),
+                "wait: it names 2 conditions: give exactly one of `main_past`, `command` and `at`",
+            ),
+            (
+                wait("", "", json!(0), json!(30)),
+                "wait: it names no condition: give exactly one of `main_past`, `command` and `at`, or leave every field empty",
+            ),
+            (
+                wait(SHA, "", json!(0), json!(61)),
+                "wait: `interval_minutes` is `61`: give 5 to 60 minutes, or 0 for 60",
+            ),
+        ] {
+            assert_eq!(
+                foreman_says(&d, &fresh, waits),
+                [why.to_string(), idle[0].clone()]
+            );
+        }
+        // A sub-goal that waits is not ready.
+        let mut ready = wait(SHA, "", json!(0), json!(0));
+        ready["report"] = json!("ready");
+        ready["message"] = json!("Both are in.");
+        assert!(
+            foreman_says(&d, &with_foreman(&["toy-1", "toy-2"], None), ready)
+                .contains(&"ready: a sub-goal is ready when nothing in it is running, starting or waiting to run".to_string())
+        );
         // One at a time.
         let mut busy = with_foreman(&[], None);
         busy.units.push(GoalUnit {
@@ -11985,6 +12450,7 @@ mod tests {
                 &tracker,
                 &launchable,
                 &steps(),
+                &scope(),
                 &json!({"summary": "Decided.", "start": [{"bead": bead, "reason": ""}], "report": "working"}),
             )
         };
@@ -12012,6 +12478,7 @@ mod tests {
                 &tracker,
                 &launchable,
                 &steps(),
+                &scope(),
                 &result(extra.clone())
             ),
             Vec::<String>::new()
@@ -12123,6 +12590,7 @@ mod tests {
                 &tracker,
                 &launchable,
                 &steps(),
+                &scope(),
                 &file
             ),
             Vec::<String>::new()
@@ -12162,6 +12630,7 @@ mod tests {
                 &tracker_with_toy_3(),
                 &launchable,
                 &steps(),
+                &scope(),
                 &result(both)
             ),
             Vec::<String>::new()
@@ -12439,6 +12908,7 @@ mod tests {
                 &tracker,
                 &|_| Vec::new(),
                 &steps(),
+                &scope(),
                 &result,
             )
         };
@@ -12497,6 +12967,7 @@ mod tests {
                 &tracker(),
                 &launchable,
                 &steps(),
+                &scope(),
                 &result,
             )
         };

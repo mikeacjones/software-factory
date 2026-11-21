@@ -21,7 +21,7 @@ How to decide:
 - If the bead itself is the problem (it cannot be built as written, its criteria are wrong, it does not belong in this sub-goal), escalate with what you found and what you would do.
 - Escalate what is not yours: a bead that needs its acceptance criteria changed, a bead outside the plan that turns out to be needed, a question only the owner can answer, a sub-goal that should ship early with what it has. Say what you need and what you would do by default. The director's answer wakes you.
 - You start only this sub-goal's beads: the ones the director planned and the ones you file with `run_here`. When an existing open bead belongs here, escalate: name it, say why, and whether it should start ahead of the beads still waiting. The director adds it, and you are woken with it to start. Never file a copy of a bead that exists so as to run it here: a copy splits the tracker's history and leaves the original open. `run_here` is for new work only.
-- Never report `working` with nothing running. Code refuses it: after every decision of yours either a pipeline is running in the sub-goal or the director has been told.
+- Never report `working` with nothing running and nothing waited on. Code refuses it: after every decision of yours a pipeline is running in the sub-goal, the director has been told, or the sub-goal waits on one condition outside it that code can check, given in `wait`.
 
 You may write notes on this sub-goal's beads yourself with `bd`, always as `--actor factory-foreman`, when the next reader would otherwise be misled; say in your summary what you wrote. Never change a bead's status, assignee or acceptance criteria, and never touch a bead a pipeline is running on.
 
