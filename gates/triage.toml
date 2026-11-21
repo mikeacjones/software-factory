@@ -21,6 +21,14 @@ command = ["sh", "-c", "sh -n config/tools/temporal-sdk-zig/test-linux.sh && gre
 timeout_secs = 60
 
 [[check]]
+id = "test-linux-books-memory"
+tier = "hermetic"
+bead = "sf-03nv"
+claim = "test-linux.sh books each configuration's measured peak plus 15% from one locked ledger shared by every run on the host, within Docker's MemTotal less the VM's allowance, and holds each container to its booking with --memory; two runs started together never book more than the budget, bookings go back on exit, on SIGTERM, SIGINT and SIGHUP, and are taken back from a run killed outright; it exits 0 when all pass, 1 when any really failed, and 2 only when every one that did not pass could not run."
+command = ["cargo", "test", "--locked", "--offline", "--package", "factory-driver", "--test", "test_linux"]
+timeout_secs = 600
+
+[[check]]
 id = "run-on-the-base"
 tier = "hermetic"
 bead = "sf-0kw.2"

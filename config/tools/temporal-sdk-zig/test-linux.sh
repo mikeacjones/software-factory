@@ -13,14 +13,17 @@
 #   all                             those four
 #
 # With none named it runs Debug. Several run at the same time, each in a
-# container of its own, as far as the memory Docker has allows: compiling
-# the tests takes about 3 GiB in Debug and 6 GiB in ReleaseSafe, and those
-# that do not fit together run in turn. With 18 GiB or more all four run at
-# once and cost little more time than the slowest. TEST_LINUX_JOBS, if set,
-# is the most to run at once. Each test may run for TEST_LINUX_TEST_TIMEOUT
-# (10m unless set, or a --test-timeout after `--`) before it fails as hung.
-# Asked to stop with SIGTERM, it stops its containers and prints what each
-# configuration got to, keeping the logs.
+# container of its own, as far as the memory Docker has allows: each
+# configuration books what it was measured to take at its worst, plus 15%,
+# from one ledger that every test-linux.sh on this host shares, and those
+# that do not fit run in turn, so that two runs at once (a builder's and a
+# ship's) queue rather than overcommit. Each container is held to its
+# booking with --memory. TEST_LINUX_JOBS, if set, is the most of this run's
+# to run at once; TEST_LINUX_LEDGER, if set, is the ledger's directory in
+# place of the host's (for a test of this script). Each test may run for
+# TEST_LINUX_TEST_TIMEOUT (10m unless set, or a --test-timeout after `--`)
+# before it fails as hung. Asked to stop with SIGTERM, it stops its
+# containers and prints what each configuration got to, keeping the logs.
 #
 # It needs Docker. The containers are the architecture Docker runs natively
 # (arm64 on Apple silicon; CI's x86_64 rows are not covered) and are set up
@@ -35,8 +38,9 @@
 # that failed, the errors from its log. The whole logs are kept when
 # anything fails, and it says where.
 #
-# Exit status: 0 if every configuration passed, 1 if any failed its tests,
-# 2 if any could not be run.
+# Exit status: 0 if every configuration passed; 1 if any failed its tests,
+# whatever happened to the others; 2 only if every configuration that did
+# not pass could not be run (the host's fault, not the change's).
 set -eu
 
 configs=
@@ -105,8 +109,139 @@ WORKDIR /work
 DOCKERFILE
 fi
 
+# Memory, in MiB. Each configuration's peak is the cgroup v2 memory.peak of
+# its own container, read from /sys/fs/cgroup/memory.peak inside it as
+# `zig build test` ended, run as this script runs it (same image, volumes
+# and command, no --memory) on a Mac with Docker Desktop 4.100 (16 CPUs,
+# MemTotal 31.27 GiB, kernel 7.0.14-linuxkit) against temporal-sdk-zig at
+# d8cd551, all four at once, on 2026-11-21. The caches were empty, so each
+# also compiled the Rust core, except ReleaseSafe, whose first run lost a
+# race in cargo's registry and was measured again with the core built (its
+# cargo build is Debug's, whose peak covers it). memory.peak counts the
+# page cache the build writes as well as what the processes hold, so it is
+# the larger of the two; what the processes held at most (anon, kernel and
+# shmem in memory.stat, sampled every half second or less) is beside it:
+#
+#   configuration       memory.peak     held by the processes
+#   Debug               6486 MiB        3701 MiB (anon only)
+#   ReleaseSafe         6690 MiB        6512 MiB
+#   musl-Debug          5314 MiB        3684 MiB (anon only)
+#   musl-ReleaseSafe    7097 MiB        6685 MiB (anon only)
+#
+# Docker's VM with nothing running used 676 MiB, and 287 MiB of cache, as
+# `free -b` in an ubuntu:24.04 container counts them (its /proc/meminfo is
+# the VM's). The allowance is that, rounded up, with room for Docker's own
+# daemons to grow.
+peak() {
+  case "$1" in
+    Debug) echo 6486 ;;
+    ReleaseSafe) echo 6690 ;;
+    musl-Debug) echo 5314 ;;
+    musl-ReleaseSafe) echo 7097 ;;
+  esac
+}
+vm_allowance=1536
+
+# What a configuration books, and the most its container may use: its
+# measured peak and 15% more, and never more than all there is.
+need() {
+  echo $(( ($(peak "$1") * 115 + 99) / 100 ))
+}
+budget=$(( $(docker info --format '{{.MemTotal}}') / 1048576 - vm_allowance ))
+if [ "$budget" -le 0 ]; then
+  echo "test-linux: Docker has no more memory than its VM's own allowance ($vm_allowance MiB)" >&2
+  exit 2
+fi
+booking() {
+  mib=$(need "$1")
+  [ "$mib" -le "$budget" ] || mib=$budget
+  echo "$mib"
+}
+
+# One ledger for every test-linux.sh on this host, since they share one
+# Docker: a run that assumed it had all of Docker's memory would overcommit
+# beside another, and the kernel would kill what did not fit. It is a fixed
+# path, not under TMPDIR, which differs between the factory's processes.
+# Each line is one booking: the pid of the run that made it, when that
+# process started (a pid can be reused), the container's name, and MiB. It
+# is read and written only under an flock(2) of its lock file, which the
+# kernel releases when the process holding it dies, however it dies.
+ledger=${TEST_LINUX_LEDGER:-/tmp/test-linux-ledger-$(id -u)}
+started() {
+  ps -o lstart= -p "$1" 2>/dev/null | sed 's/^ *//; s/ *$//; s/  */ /g' | tr ' ' '_'
+}
+me_started=$(started $$)
+[ -n "$me_started" ] || me_started=-
+# Runs its arguments with the ledger locked, in a subshell, so that the
+# lock goes when they end. It exits 3 if the ledger cannot be locked.
+locked() {
+  (
+    exec 9>>"$ledger/lock" || exit 3
+    if command -v flock >/dev/null 2>&1; then
+      flock 9 || exit 3
+    elif command -v lockf >/dev/null 2>&1; then
+      lockf -s 9 || exit 3
+    else
+      perl -MFcntl=:flock -e 'open(my $f, ">&=", 9) && flock($f, LOCK_EX) or exit 1' || exit 3
+    fi
+    [ -f "$ledger/bookings" ] || : >"$ledger/bookings"
+    "$@"
+  )
+}
+# Drops the bookings of runs that have ended without releasing them (killed
+# with SIGKILL, say), and stops their containers, which nobody is waiting
+# for any more.
+tidy() {
+  : >"$ledger/bookings.new"
+  checked=
+  alive=
+  while read -r pid start name mib; do
+    [ -n "$mib" ] || continue
+    if [ "$pid" != "$checked" ]; then
+      checked=$pid
+      alive=
+      if [ "$pid" = $$ ] || { kill -0 "$pid" 2>/dev/null && { [ "$start" = - ] || [ "$(started "$pid")" = "$start" ]; }; }; then
+        alive=1
+      fi
+    fi
+    if [ -n "$alive" ]; then
+      echo "$pid $start $name $mib" >>"$ledger/bookings.new"
+    else
+      echo "test-linux: $name ($mib MiB) was booked by a run that has ended (pid $pid); taking it back" >&2
+      docker kill "$name" >/dev/null 2>&1 || true
+    fi
+  done <"$ledger/bookings"
+  mv "$ledger/bookings.new" "$ledger/bookings"
+}
+# Books MiB for a container if the ledger has room for it, or returns 1.
+book() {
+  tidy
+  used=$(awk '{ used += $4 } END { print used + 0 }' "$ledger/bookings")
+  [ $((used + $2)) -le "$budget" ] || return 1
+  echo "$$ $me_started $1 $2" >>"$ledger/bookings"
+}
+# Releases this run's bookings of the containers named, or all of them.
+release() {
+  awk -v pid=$$ -v names=" $* " \
+    '!($1 == pid && (names == "  " || index(names, " " $3 " ")))' \
+    "$ledger/bookings" >"$ledger/bookings.new"
+  mv "$ledger/bookings.new" "$ledger/bookings"
+}
+if ! mkdir -p "$ledger" || ! locked true; then
+  echo "test-linux: cannot use the memory ledger in $ledger" >&2
+  exit 2
+fi
+
 work=$(mktemp -d "${TMPDIR:-/tmp}/test-linux.XXXXXX")
 run=$(basename "$work" | tr -c 'A-Za-z0-9\n' '-')
+# However it ends, what it booked goes back.
+trap 'locked release || true' EXIT
+
+# A process the kernel killed, or a container that never ran, says nothing
+# about the change under test.
+could_not_run() {
+  [ "$1" -ge 125 ] || grep -Eq 'signal KILL|Out of memory|No space left on device' "$2"
+}
 
 # Containers outlive the script that started them unless they are stopped.
 stop() {
@@ -116,16 +251,23 @@ stop() {
 }
 # Asked to stop (the factory does at a command's time limit): stop the
 # containers, then say what each configuration got to, so that whoever reads
-# the end of the output knows which test it was on. The logs are kept.
+# the end of the output knows which test it was on. The logs are kept. It
+# exits 1 if one had already failed its tests, and 2 if none had.
 stopped() {
   stop
   wait 2>/dev/null || true
   echo "===== test-linux: stopped before it ended ====="
+  failed=0
   for config in $configs; do
     [ -f "$work/$config.log" ] || continue
     if [ -f "$work/$config.status" ]; then
-      read -r status secs <"$work/$config.status" || status=?
-      echo "$config: had ended (exit $status)."
+      read -r status secs <"$work/$config.status" || status=125
+      if [ "$status" -ne 0 ] && ! could_not_run "$status" "$work/$config.log"; then
+        echo "$config: had ended, and FAILED (exit $status)."
+        failed=1
+      else
+        echo "$config: had ended (exit $status)."
+      fi
     else
       echo "$config: still running. What failed so far, then its last lines:"
       grep -E '^error: ' "$work/$config.log" | cut -c1-400 | head -n 20
@@ -134,6 +276,7 @@ stopped() {
   done
   rm -f "$work/src.tar"
   echo "The whole logs are in $work"
+  [ "$failed" -eq 0 ] || exit 1
   exit 2
 }
 trap stopped TERM
@@ -150,17 +293,19 @@ tar -cf "$work/src.tar" \
 
 # One configuration, in its own container. Zig's caches and cargo's are
 # shared by all of them and lock what they write, so the core is compiled
-# once and the others wait for it.
+# once and the others wait for it. The container may use no more memory
+# than its booking, which it gives back when it ends.
 one() {
   config=$1
-  shift
+  mib=$2
+  shift 2
   case "$config" in
     musl-*) target=$arch-linux-musl; optimize=${config#musl-} ;;
     *) target=; optimize=$config ;;
   esac
   began=$(date +%s)
   status=0
-  docker run --rm -i --init --name "$run-$config" \
+  docker run --rm -i --init --name "$run-$config" --memory "${mib}m" \
       -v zig-linux-test-local:/work/.zig-cache \
       -v zig-linux-test-global:/root/.cache/zig \
       -v zig-linux-test-cargo-registry:/opt/cargo/registry \
@@ -186,67 +331,61 @@ one() {
         echo "test-linux: $(uname -sm), zig $(zig version), $(rustc --version), -Doptimize=$OPTIMIZE ${TARGET:+-Dtarget=$TARGET}" >&2
         exec zig build test "-Doptimize=$OPTIMIZE" --summary all "$@"
       ' sh "$@" <"$work/src.tar" >"$work/$config.log" 2>&1 || status=$?
+  locked release "$run-$config" || true
   echo "$status $(( $(date +%s) - began ))" >"$work/$config.status"
 }
 
-# How much memory compiling a configuration's tests takes at its worst, in
-# GiB, rounded up from what was measured (2.8 and 5.8).
-need() {
-  case "$1" in
-    *ReleaseSafe) echo 6 ;;
-    *) echo 3 ;;
-  esac
-}
-
-# Start each configuration as soon as it fits beside those running. One
-# that is killed for want of memory looks like a failure of the change, so
-# they are not all simply started together.
-budget=$(( $(docker info --format '{{.MemTotal}}') / 1073741824 ))
+# Start each configuration as soon as the ledger has room for it beside
+# what this run and the others on the host have booked. One that is killed
+# for want of memory looks like a failure of the change, so they are not all
+# simply started together.
 jobs=${TEST_LINUX_JOBS:-0}
 wanted=0
 for config in $configs; do
-  wanted=$((wanted + $(need "$config")))
+  wanted=$((wanted + $(booking "$config")))
 done
 if [ "$wanted" -gt "$budget" ]; then
-  echo "test-linux: Docker has $budget GiB and these would take $wanted GiB at once; those that do not fit together run in turn" >&2
+  echo "test-linux: Docker has $budget MiB for tests and these would take $wanted MiB at once; those that do not fit together run in turn" >&2
 fi
 pending=$configs
 running=
+waiting=
 while [ -n "$pending$running" ]; do
   still=
-  used=0
   count=0
   for config in $running; do
     if [ ! -f "$work/$config.status" ]; then
       still="$still $config"
-      used=$((used + $(need "$config")))
       count=$((count + 1))
     fi
   done
   running=$still
   rest=
   for config in $pending; do
-    fits=$((used + $(need "$config")))
-    if [ -z "$running" ] || { [ "$fits" -le "$budget" ] && { [ "$jobs" -le 0 ] || [ "$count" -lt "$jobs" ]; }; }; then
-      one "$config" "$@" &
-      running="$running $config"
-      used=$fits
-      count=$((count + 1))
-    else
+    mib=$(booking "$config")
+    if [ "$jobs" -gt 0 ] && [ "$count" -ge "$jobs" ]; then
       rest="$rest $config"
+    elif locked book "$run-$config" "$mib"; then
+      one "$config" "$mib" "$@" &
+      running="$running $config"
+      count=$((count + 1))
+    elif [ $? -eq 1 ]; then
+      rest="$rest $config"
+    else
+      echo "test-linux: cannot lock the memory ledger in $ledger" >&2
+      stop
+      exit 2
     fi
   done
   pending=$rest
-  [ -z "$running" ] || sleep 1
+  if [ -n "$pending" ] && [ -z "$running" ] && [ -z "$waiting" ]; then
+    echo "test-linux: waiting for memory that other test-linux runs on this host have booked" >&2
+    waiting=1
+  fi
+  [ -z "$pending$running" ] || sleep 1
 done
 wait
 rm -f "$work/src.tar"
-
-# A process the kernel killed, or a container that never ran, says nothing
-# about the change under test.
-could_not_run() {
-  [ "$1" -ge 125 ] || grep -Eq 'signal KILL|Out of memory|No space left on device' "$2"
-}
 
 failed=0
 unrun=0
@@ -291,5 +430,5 @@ if [ "$bad" -eq 0 ]; then
   exit 0
 fi
 echo "The whole logs are in $work"
-[ "$unrun" -eq 0 ] || exit 2
-exit 1
+[ "$failed" -eq 0 ] || exit 1
+exit 2
