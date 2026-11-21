@@ -514,6 +514,31 @@ impl GitHub {
             })
     }
 
+    /// The numbers of a repository's open issues, up to [`OPEN_ISSUES_MAX`].
+    pub fn open_issues(&self, cwd: &Path, repo: &str) -> Result<Vec<u64>, GitHubError> {
+        let limit = OPEN_ISSUES_MAX.to_string();
+        let args = [
+            "issue", "list", "--repo", repo, "--state", "open", "--limit", &limit, "--json",
+            "number",
+        ];
+        let out = self.gh(cwd, &args, None)?;
+        let answer: Value =
+            serde_json::from_str(out.trim()).map_err(|err| GitHubError::Answer {
+                command: format!("gh {}", args.join(" ")),
+                detail: err.to_string(),
+            })?;
+        let Some(issues) = answer.as_array() else {
+            return Err(GitHubError::Answer {
+                command: format!("gh {}", args.join(" ")),
+                detail: format!("not a list: `{}`", out.trim()),
+            });
+        };
+        Ok(issues
+            .iter()
+            .filter_map(|issue| issue.get("number").and_then(Value::as_u64))
+            .collect())
+    }
+
     /// Close an issue that no pull request closes, with a comment that
     /// says why.
     pub fn close_issue(
@@ -657,6 +682,10 @@ impl GitHub {
         self.gh(cwd, &["auth", "status"], None).is_ok()
     }
 }
+
+/// How many open issues [`GitHub::open_issues`] asks for at most: more
+/// than any project of the factory has had open at once.
+pub const OPEN_ISSUES_MAX: usize = 5000;
 
 /// Why an issue is closed by the factory itself and not by a pull request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

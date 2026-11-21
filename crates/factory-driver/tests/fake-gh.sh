@@ -12,6 +12,8 @@
 #   state/reruns      how often a run's failed jobs were run again. Each
 #                     time, the jobs the checks point at are new ones.
 #   state/no-rerun    if it exists, running failed jobs again is refused
+#   state/open-issues the numbers of the repository's open issues, one per
+#                     line, less those closed since (state/issues-closed)
 #   state/calls       one line per call
 here=$(cd "$(dirname "$0")" && pwd)
 state="$here/state-gh"
@@ -46,6 +48,16 @@ case "$1 $2" in
       *)
         cat "$state/graphql" 2>/dev/null || echo '{"data":{"repository":{"issueTypes":{"nodes":[{"id":"IT_task","name":"Task","isEnabled":true},{"id":"IT_bug","name":"Bug","isEnabled":true}]},"issueFields":{"nodes":[{"id":"IFSS_priority","name":"Priority","options":[{"id":"O_critical","name":"Critical"},{"id":"O_high","name":"High"}]}]},"issue":{"id":"I_1","issueType":null,"issueFieldValues":{"nodes":[]}}}}}' ;;
     esac ;;
+  "issue list")
+    printf '['
+    sep=''
+    for n in $(cat "$state/open-issues" 2>/dev/null); do
+      if ! grep -q "^$n " "$state/issues-closed" 2>/dev/null; then
+        printf '%s{"number":%s}' "$sep" "$n"
+        sep=','
+      fi
+    done
+    echo ']' ;;
   "issue close")
     shift 2
     echo "$*" >> "$state/issues-closed" ;;

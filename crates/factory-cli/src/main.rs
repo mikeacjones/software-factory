@@ -39,7 +39,8 @@ usage:
   factory service uninstall                   stop it and take it out of launchd
   factory issues sync <project>               give every open bead that has none a GitHub
                                               issue, and set each issue's type and priority
-                                              to its bead's, where they differ: what the
+                                              to its bead's, where they differ, and close
+                                              the open issue of each closed bead: what the
                                               engine's hourly schedule does
   factory accounts                            each Claude account's usage windows, and which
                                               one a run would use now
@@ -587,14 +588,18 @@ fn run(args: &[String]) -> Result<u8, String> {
             for line in &sweep.created {
                 println!("{line}: issue created");
             }
+            for line in &sweep.closed {
+                println!("{line}: issue closed, its bead is closed");
+            }
             for line in sweep.changed.iter().chain(&sweep.failed).chain(&sweep.left) {
                 println!("{line}");
             }
             println!(
-                "{} open beads: {} given an issue, {} brought into step, {} left for later, {} failed",
+                "{} open beads: {} given an issue, {} brought into step, {} issues of closed beads closed, {} left for later, {} failed",
                 sweep.open,
                 sweep.created.len(),
                 sweep.changed.len(),
+                sweep.closed.len(),
                 sweep.left.len(),
                 sweep.failed.len()
             );

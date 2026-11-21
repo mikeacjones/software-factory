@@ -105,6 +105,19 @@ impl Summary {
     }
 }
 
+/// A closed bead that is tracked outside the tracker, as the issue sweep
+/// reads it to bring its issue into step.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClosedLinked {
+    pub id: String,
+    /// Its GitHub issue's URL.
+    pub external_ref: String,
+    /// Why it was closed, as whoever closed it said.
+    pub reason: String,
+    /// How long ago it was closed, in seconds.
+    pub closed_secs: u64,
+}
+
 /// A bead to file.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct NewBead {
@@ -356,6 +369,83 @@ impl Source {
                 })
                 .collect()),
         }
+    }
+
+    /// Every closed bead that has an issue link, by ID. In a directory of
+    /// files a bead's reason is the last `Closed:` line of its notes, as
+    /// [`Source::close`] writes it there, and it was closed when its file
+    /// was last written.
+    pub fn list_closed_linked(&self) -> Result<Vec<ClosedLinked>, BeadError> {
+        let mut beads = match self {
+            Source::Files { dir } => {
+                let entries = std::fs::read_dir(dir).map_err(|source| BeadError::Io {
+                    path: dir.clone(),
+                    source,
+                })?;
+                let mut beads = Vec::new();
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    let Some(id) = name.strip_suffix(".json") else {
+                        continue;
+                    };
+                    let bead = self.read(id)?;
+                    if bead.status != "closed" || bead.external_ref.trim().is_empty() {
+                        continue;
+                    }
+                    let closed_secs = entry
+                        .metadata()
+                        .and_then(|meta| meta.modified())
+                        .ok()
+                        .and_then(|at| at.elapsed().ok())
+                        .map_or(0, |age| age.as_secs());
+                    let reason = bead
+                        .notes
+                        .lines()
+                        .rev()
+                        .find_map(|line| line.strip_prefix("Closed: "))
+                        .unwrap_or("")
+                        .to_string();
+                    beads.push(ClosedLinked {
+                        id: bead.id,
+                        external_ref: bead.external_ref,
+                        reason,
+                        closed_secs,
+                    });
+                }
+                beads
+            }
+            // The tracker writes its times in UTC, so the server's own
+            // clock in UTC is what they are measured against.
+            Source::Dolt { .. } => self
+                .query(
+                    "select id, external_ref, coalesce(close_reason, '') as close_reason, \
+                     timestampdiff(second, coalesce(closed_at, updated_at), utc_timestamp()) as closed_secs \
+                     from issues where status = 'closed' and coalesce(external_ref, '') <> ''",
+                )?
+                .iter()
+                .filter_map(|row| {
+                    let text = |key: &str| {
+                        row.get(key)
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string()
+                    };
+                    let closed_secs = row.get("closed_secs").and_then(|value| {
+                        value
+                            .as_i64()
+                            .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+                    })?;
+                    Some(ClosedLinked {
+                        id: text("id"),
+                        external_ref: text("external_ref"),
+                        reason: text("close_reason"),
+                        closed_secs: u64::try_from(closed_secs).unwrap_or(0),
+                    })
+                })
+                .collect(),
+        };
+        beads.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(beads)
     }
 
     /// Every bead that is not closed and is a piece of work (not an epic or
@@ -825,6 +915,38 @@ mod tests {
         let closed = source.close("toy-1", "merged", "factory").unwrap();
         assert_eq!(closed.status, "closed");
         assert!(closed.notes.contains("Closed: merged"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn closed_beads_with_an_issue_are_listed_with_why_they_closed() {
+        let dir = std::env::temp_dir().join(format!("factory-beads-closed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = Source::Files { dir: dir.clone() };
+        let linked = |id: &str| Bead {
+            id: id.to_string(),
+            external_ref: format!("https://github.com/me/toy/issues/{}", &id[4..]),
+            ..ready()
+        };
+        // Open with an issue, closed without one, closed with one.
+        source.write_file(&dir, &linked("toy-1")).unwrap();
+        let mut bare = ready();
+        bare.id = "toy-2".to_string();
+        source.write_file(&dir, &bare).unwrap();
+        source.close("toy-2", "done", "factory").unwrap();
+        source.write_file(&dir, &linked("toy-3")).unwrap();
+        source.close("toy-3", "merged", "factory").unwrap();
+        source
+            .close("toy-3", "Closed as a duplicate", "factory")
+            .unwrap();
+
+        let closed = source.list_closed_linked().unwrap();
+        assert_eq!(closed.len(), 1, "{closed:?}");
+        assert_eq!(closed[0].id, "toy-3");
+        assert_eq!(closed[0].external_ref, "https://github.com/me/toy/issues/3");
+        assert_eq!(closed[0].reason, "Closed as a duplicate");
+        assert!(closed[0].closed_secs < 60, "{closed:?}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

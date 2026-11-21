@@ -8437,6 +8437,106 @@ fn the_issue_sweep_gives_each_open_bead_one_issue_and_leaves_those_being_given_o
     assert_eq!(sweep, factory_driver::IssueSweep::default());
 }
 
+#[test]
+fn the_issue_sweep_closes_the_open_issue_of_a_closed_bead() {
+    let world = World::new("sweep-closed", "true");
+    world.with_github("green");
+    let project = world.path("config/projects/toy.toml");
+    let text = std::fs::read_to_string(&project).unwrap().replace(
+        "write = [\"me/toy\"]",
+        "write = [\"me/toy\"]\nissues = true",
+    );
+    std::fs::write(&project, text).unwrap();
+    // Closed while closing its issue failed, as the executive closes one;
+    // closed on landing with its issue still open; closed with its issue
+    // closed; and closed with an issue of another repository.
+    for (id, issue, reason) in [
+        (
+            "toy-5",
+            "https://github.com/me/toy/issues/40",
+            "Closed as a duplicate, by the project's executive: toy-1 covers it",
+        ),
+        (
+            "toy-6",
+            "https://github.com/me/toy/issues/41",
+            "Merged https://github.com/me/toy/pull/7 as abc; every CI check passed",
+        ),
+        ("toy-7", "https://github.com/me/toy/issues/42", "done"),
+        ("toy-8", "https://github.com/someone/else/issues/43", "done"),
+    ] {
+        std::fs::write(
+            world.path(&format!("beads/{id}.json")),
+            serde_json::json!({"id": id, "title": "Done", "status": "closed", "notes": format!("Closed: {reason}"), "external_ref": issue}).to_string(),
+        )
+        .unwrap();
+    }
+    std::fs::write(world.path("bin/state-gh/open-issues"), "40\n41\n43\n").unwrap();
+    let config = world.config();
+    let factory = config.factory().unwrap();
+    let project = config.project("toy").unwrap();
+    let closed_issues = || {
+        std::fs::read_to_string(world.path("bin/state-gh/issues-closed"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+
+    // Closed a moment ago: whoever closed it is closing its issue.
+    let sweep = factory_driver::sweep_issues(&factory, &project, 3600).unwrap();
+    assert!(sweep.closed.is_empty(), "{sweep:?}");
+    assert!(closed_issues().is_empty());
+    for id in ["toy-5", "toy-6"] {
+        assert!(
+            sweep
+                .left
+                .iter()
+                .any(|line| line.starts_with(&format!("{id}: closed "))),
+            "{sweep:?}"
+        );
+    }
+
+    // Long enough ago: each open issue of a closed bead is closed, as the
+    // bead's reason says, and nothing else.
+    let sweep = factory_driver::sweep_issues(&factory, &project, 0).unwrap();
+    assert_eq!(sweep.closed, ["toy-5 #40", "toy-6 #41"], "{sweep:?}");
+    assert!(sweep.failed.is_empty(), "{sweep:?}");
+    let closed = closed_issues();
+    assert_eq!(closed.len(), 2, "{closed:?}");
+    assert!(
+        closed[0].starts_with("40 --repo me/toy --reason duplicate --comment Its bead `toy-5` is closed: Closed as a duplicate"),
+        "{closed:?}"
+    );
+    assert!(
+        closed[1].starts_with(
+            "41 --repo me/toy --reason completed --comment Its bead `toy-6` is closed: Merged"
+        ),
+        "{closed:?}"
+    );
+
+    // In step now: the next sweep closes nothing more.
+    let sweep = factory_driver::sweep_issues(&factory, &project, 0).unwrap();
+    assert!(sweep.closed.is_empty(), "{sweep:?}");
+    assert_eq!(closed_issues().len(), 2);
+
+    // A refusal from GitHub is named, and the issue tried again next time.
+    std::fs::write(world.path("bin/state-gh/issues-closed"), "").unwrap();
+    std::fs::write(world.path("bin/state-gh/open-issues"), "40\n").unwrap();
+    let gh = world.path("bin/gh");
+    let script = std::fs::read_to_string(&gh).unwrap().replace(
+        "  \"issue close\")\n",
+        "  \"issue close\")\n    echo 'TLS handshake timeout' >&2; exit 1\n",
+    );
+    std::fs::write(&gh, script).unwrap();
+    let sweep = factory_driver::sweep_issues(&factory, &project, 0).unwrap();
+    assert!(sweep.closed.is_empty(), "{sweep:?}");
+    assert_eq!(sweep.failed.len(), 1, "{sweep:?}");
+    assert!(
+        sweep.failed[0].starts_with("toy-5: ") && sweep.failed[0].contains("TLS handshake timeout"),
+        "{sweep:?}"
+    );
+}
+
 /// A world whose `test` command is `script`, with `extra` lines added to the
 /// command's table (the last table of the project file). `{root}` in the
 /// script is the world's own directory, outside the worktree.

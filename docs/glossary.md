@@ -154,7 +154,7 @@ When a goal definition is run by the factory itself: at an hour of the day, ever
 
 ## issue sweep
 
-One run of a project's Temporal Schedule `issues-<project>`, hourly unless the `[temporal]` table says otherwise: every open bead without a GitHub issue is given one, and every issue's type and priority follow its bead's. A bead filed in the last ten minutes, or claimed by the factory, is left for a later run. Not a *schedule*: no goal definition is run.
+One run of a project's Temporal Schedule `issues-<project>`, hourly unless the `[temporal]` table says otherwise: every open bead without a GitHub issue is given one, every issue's type and priority follow its bead's, and an issue still open whose bead is closed is closed. A bead filed or closed in the last ten minutes, or claimed by the factory, is left for a later run. Not a *schedule*: no goal definition is run.
 
 ## maintainer
 

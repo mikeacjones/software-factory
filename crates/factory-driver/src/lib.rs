@@ -5856,6 +5856,11 @@ pub struct IssueSweep {
     pub left: Vec<String>,
     /// What went wrong, each as `<bead>: <error>`.
     pub failed: Vec<String>,
+    /// Issues closed because their bead was closed, each as
+    /// `<bead> #<issue>`. Absent from the record of a sweep before there
+    /// were any.
+    #[serde(default)]
+    pub closed: Vec<String>,
 }
 
 /// Bring every open bead of a project into step with GitHub: a bead with
@@ -5863,7 +5868,11 @@ pub struct IssueSweep {
 /// type and priority follow its bead's, as [`sync_issue_fields`] sets
 /// them. A bead younger than `min_age_secs`, or one the factory has
 /// claimed, gets no issue here: whoever filed or claimed it is making
-/// one. What fails for one bead is recorded and the sweep goes on.
+/// one. An issue still open whose bead is closed is closed, with the
+/// bead's reason, unless the bead was closed less than `min_age_secs`
+/// ago: whoever closed it is closing its issue. That is how an issue whose
+/// close failed when its bead was closed comes back into step. What fails
+/// for one bead is recorded and the sweep goes on.
 pub fn sweep_issues(
     factory: &Factory,
     project: &Project,
@@ -5938,7 +5947,90 @@ pub fn sweep_issues(
             Err(err) => sweep.failed.push(format!("{id}: {err}")),
         }
     }
+    close_issues_of_closed_beads(factory, project, &source, min_age_secs, &mut sweep);
     Ok(sweep)
+}
+
+/// Close each open issue of the project's repository whose bead is
+/// closed, as [`sweep_issues`] says. The open issues are asked for once;
+/// a bead whose issue is not among them is in step already.
+fn close_issues_of_closed_beads(
+    factory: &Factory,
+    project: &Project,
+    source: &Source,
+    min_age_secs: u64,
+    sweep: &mut IssueSweep,
+) {
+    let Some(settings) = project.github.as_ref() else {
+        return;
+    };
+    let closed = match source.list_closed_linked() {
+        Ok(closed) => closed,
+        Err(err) => {
+            sweep.failed.push(format!("(closed beads): {err}"));
+            return;
+        }
+    };
+    let linked: Vec<_> = closed
+        .into_iter()
+        .filter_map(|bead| {
+            factory_github::issue_number(&bead.external_ref, &settings.repo)
+                .map(|number| (bead, number))
+        })
+        .collect();
+    if linked.is_empty() {
+        return;
+    }
+    let github = github_client(factory, settings);
+    let open = match github.open_issues(&project.repo, &settings.repo) {
+        Ok(open) => open,
+        Err(err) => {
+            sweep.failed.push(format!("(open issues): {err}"));
+            return;
+        }
+    };
+    for (bead, number) in linked {
+        if !open.contains(&number) {
+            continue;
+        }
+        let id = &bead.id;
+        if bead.closed_secs < min_age_secs {
+            sweep.left.push(format!(
+                "{id}: closed {}s ago, its issue #{number} still open",
+                bead.closed_secs
+            ));
+            continue;
+        }
+        let reason = bead.reason.trim();
+        let comment = if reason.is_empty() {
+            format!("Its bead `{id}` is closed.")
+        } else {
+            format!("Its bead `{id}` is closed: {}", truncate(reason, 2000))
+        };
+        match github.close_issue(
+            &project.repo,
+            &settings.repo,
+            number,
+            closing_for(reason),
+            &comment,
+        ) {
+            Ok(()) => sweep.closed.push(format!("{id} #{number}")),
+            Err(err) => sweep.failed.push(format!("{id}: {err}")),
+        }
+    }
+}
+
+/// How to close the issue of a bead closed for `reason`: as the executive
+/// closes a bead's issue when it closes the bead, by the words it closes
+/// the bead with, and otherwise as completed.
+fn closing_for(reason: &str) -> factory_github::Closing {
+    if reason.starts_with("Closed as a duplicate") {
+        factory_github::Closing::Duplicate
+    } else if reason.starts_with("Closed as not planned") {
+        factory_github::Closing::NotPlanned
+    } else {
+        factory_github::Closing::Completed
+    }
 }
 
 pub(crate) fn github_client(factory: &Factory, settings: &factory_config::GitHub) -> GitHub {

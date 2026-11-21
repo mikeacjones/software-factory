@@ -352,6 +352,9 @@ pub fn issue_sync_static(project: &str, every_secs: u64) -> String {
          priority are set to its bead's. A bead filed less than ten minutes ago, or one the \
          factory's pipeline has claimed, is left for a later run: whoever filed or claimed it \
          is making its issue.\n\n\
+         It also closes each open issue whose bead is closed, with the bead's reason, so that \
+         an issue whose close failed when its bead was closed comes back into step. A bead \
+         closed less than ten minutes ago is left: whoever closed it is closing its issue.\n\n\
          A run fails when some bead could not be brought into step, and names each; the next \
          run tries them again. `factory issues sync {project}` does the same sweep at once.",
         span(every_secs)
@@ -364,16 +367,18 @@ pub fn issue_sweep_details(project: &str, sweep: &factory_driver::IssueSweep) ->
         return format!("`{project}` does not keep GitHub issues in step with its beads.");
     }
     let mut text = format!(
-        "{} open beads of `{project}`: {} given an issue, {} brought into step, {} left for a later run, {} failed.",
+        "{} open beads of `{project}`: {} given an issue, {} brought into step, {} issues of closed beads closed, {} left for a later run, {} failed.",
         sweep.open,
         sweep.created.len(),
         sweep.changed.len(),
+        sweep.closed.len(),
         sweep.left.len(),
         sweep.failed.len()
     );
     for (heading, lines) in [
         ("Given an issue", &sweep.created),
         ("Brought into step", &sweep.changed),
+        ("Issue closed with its bead", &sweep.closed),
         ("Failed", &sweep.failed),
         ("Left for a later run", &sweep.left),
     ] {
