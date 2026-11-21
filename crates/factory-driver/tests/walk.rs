@@ -9337,6 +9337,15 @@ fn waiting_goal(
     world: &World,
     results: &[serde_json::Value],
 ) -> (factory_driver::goal::Supervisor, String) {
+    waiting_goal_on(world, results, None)
+}
+
+/// [`waiting_goal`], posting to `slack`.
+fn waiting_goal_on(
+    world: &World,
+    results: &[serde_json::Value],
+    slack: Option<factory_slack::Slack>,
+) -> (factory_driver::goal::Supervisor, String) {
     use factory_driver::goal::Supervisor;
     use factory_slack::socket::Incoming;
 
@@ -9380,7 +9389,7 @@ fn waiting_goal(
         }
         say("director", n + 1, &result);
     }
-    let mut sup = Supervisor::new(world.config(), None, vec!["OWNER".to_string()], false).unwrap();
+    let mut sup = Supervisor::new(world.config(), slack, vec!["OWNER".to_string()], false).unwrap();
     let id = sup.open_directly("toy", "Ship it").unwrap();
     sup.incoming(Incoming::Action {
         channel: String::new(),
@@ -9435,6 +9444,18 @@ fn restart_later_at(
     pointer: &str,
     secs: u64,
 ) -> factory_driver::goal::Supervisor {
+    restart_later_on(world, sup, id, pointer, secs, None)
+}
+
+/// [`restart_later_at`], the new supervisor posting to `slack`.
+fn restart_later_on(
+    world: &World,
+    sup: factory_driver::goal::Supervisor,
+    id: &str,
+    pointer: &str,
+    secs: u64,
+    slack: Option<factory_slack::Slack>,
+) -> factory_driver::goal::Supervisor {
     drop(sup);
     let path = world.path(&format!("state/goals/{id}/goal.json"));
     let mut record: serde_json::Value =
@@ -9445,8 +9466,57 @@ fn restart_later_at(
         wait[field] = serde_json::json!(at - secs);
     }
     std::fs::write(&path, record.to_string()).unwrap();
-    factory_driver::goal::Supervisor::new(world.config(), None, vec!["OWNER".to_string()], false)
+    factory_driver::goal::Supervisor::new(world.config(), slack, vec!["OWNER".to_string()], false)
         .unwrap()
+}
+
+/// What a goal said in its thread, in order: every line its log records
+/// as said, whether or not it was posted.
+fn goal_said(world: &World, id: &str) -> Vec<String> {
+    std::fs::read_to_string(world.path(&format!("state/goals/{id}/events.jsonl")))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|event| event["kind"] == "slack.say")
+        .map(|event| event["data"]["text"].as_str().unwrap_or("").to_string())
+        .collect()
+}
+
+/// The lines of `said` that start with `mark`.
+fn lines_with(said: &[String], mark: &str) -> Vec<String> {
+    said.iter()
+        .filter(|line| line.starts_with(mark))
+        .cloned()
+        .collect()
+}
+
+/// A unix time as the goal's thread shows it: `2026-11-21 13:05 UTC`.
+fn utc(unix: u64) -> String {
+    // Count the days forward from 1970-01-01, month by month.
+    let mut days = unix / 86_400;
+    let mut year = 1970;
+    loop {
+        let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+        let length = if leap { 366 } else { 365 };
+        if days < length {
+            let february = if leap { 29 } else { 28 };
+            let months = [31, february, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+            let mut month = 0;
+            while days >= months[month] {
+                days -= months[month];
+                month += 1;
+            }
+            return format!(
+                "{year:04}-{:02}-{:02} {:02}:{:02} UTC",
+                month + 1,
+                days + 1,
+                (unix % 86_400) / 3600,
+                (unix % 3600) / 60
+            );
+        }
+        days -= length;
+        year += 1;
+    }
 }
 
 /// A director with nothing to start waits for the default branch to move
@@ -9479,6 +9549,16 @@ fn a_director_that_waits_on_the_default_branch_is_woken_when_it_moves() {
     );
     assert_eq!(director_briefs(&world).len(), 1, "accepted at once");
     assert_eq!(sup.next_due(), Some(wait.since + WAIT_LOOK_SECS));
+    // The thread is shown the wait: what it waits for, and when it is
+    // looked at again, in UTC.
+    assert_eq!(
+        lines_with(&goal_said(&world, &id), ":hourglass_flowing_sand:"),
+        [format!(
+            ":hourglass_flowing_sand: *The director waits* on the default branch moving past `{main}`. The factory looks at it again at {}, and wakes it when it holds or at the latest at {}, when its interval of 60 minutes runs out.",
+            utc(wait.since + WAIT_LOOK_SECS),
+            utc(wait.until())
+        )]
+    );
     // Nothing is looked at before its time.
     assert!(!sup.pump(Duration::ZERO).unwrap());
 
@@ -9492,6 +9572,10 @@ fn a_director_that_waits_on_the_default_branch_is_woken_when_it_moves() {
     let looked = sup.goals().next().unwrap().wait.clone().unwrap();
     assert!(looked.looked_at > kept.looked_at);
     assert_eq!(director_briefs(&world).len(), 1);
+    assert!(
+        lines_with(&goal_said(&world, &id), ":alarm_clock:").is_empty(),
+        "a look that ends nothing shows nothing"
+    );
 
     // The other work lands. At the next look the director is woken.
     let moved = land_on_main(&world, "other.txt");
@@ -9509,6 +9593,16 @@ fn a_director_that_waits_on_the_default_branch_is_woken_when_it_moves() {
     );
     let goal = sup.goals().next().unwrap().clone();
     assert_eq!(goal.wait, None, "the wait is over");
+    // The thread is shown what ended it: the condition held.
+    let said = goal_said(&world, &id);
+    assert_eq!(
+        lines_with(&said, ":alarm_clock:"),
+        [format!(
+            ":alarm_clock: *The director is woken*: its wait on the default branch moving past `{main}` is over: the condition holds. The default branch is at `{}` now.",
+            &moved[..10]
+        )]
+    );
+    assert_eq!(lines_with(&said, ":hourglass_flowing_sand:").len(), 1);
     let events =
         std::fs::read_to_string(world.path(&format!("state/goals/{id}/events.jsonl"))).unwrap();
     assert!(events.contains(r#""kind":"wait.accepted""#), "{events}");
@@ -9544,6 +9638,14 @@ fn a_director_that_waits_on_a_command_is_woken_when_its_interval_runs_out() {
     assert_eq!(wait.interval_minutes, 5);
     let start = factory_git::rev_parse(&world.path("toy"), "HEAD").unwrap();
     assert_eq!(wait.head, start, "it knows the commit the director saw");
+    assert_eq!(
+        lines_with(&goal_said(&world, &id), ":hourglass_flowing_sand:"),
+        [format!(
+            ":hourglass_flowing_sand: *The director waits* on `conformance` passing on the default branch. The factory looks at it again at {}, and wakes it when it holds or at the latest at {}, when its interval of 5 minutes runs out.",
+            utc(wait.since + 60),
+            utc(wait.since + 300)
+        )]
+    );
     let runs = || {
         std::fs::read_to_string(world.path("conformance-runs"))
             .unwrap_or_default()
@@ -9593,6 +9695,15 @@ fn a_director_that_waits_on_a_command_is_woken_when_its_interval_runs_out() {
         briefs[1]
     );
     assert_eq!(sup.goals().next().unwrap().wait, None);
+    // The thread is shown what ended it: the interval ran out.
+    assert_eq!(
+        lines_with(&goal_said(&world, &id), ":alarm_clock:"),
+        [format!(
+            ":alarm_clock: *The director is woken*: its wait on `conformance` passing on the default branch is over: its interval of 5 minutes ran out, and the condition does not hold yet. `conformance` failed (exit code 1) on `{}`, and the default branch has moved to `{}` since, less than an interval after that run.",
+            &first[..10],
+            &second[..10]
+        )]
+    );
     let events =
         std::fs::read_to_string(world.path(&format!("state/goals/{id}/events.jsonl"))).unwrap();
     assert_eq!(
@@ -9694,6 +9805,14 @@ fn a_foreman_that_waits_on_the_default_branch_is_woken_when_it_moves() {
         .expect("the foreman keeps its wait");
     assert_eq!(wait.on, WaitOn::MainPast(main.clone()));
     assert_eq!(wait.interval_minutes, 30);
+    assert_eq!(
+        lines_with(&goal_said(&world, &id), ":hourglass_flowing_sand:"),
+        [format!(
+            ":hourglass_flowing_sand: *The foreman of `feature` waits* on the default branch moving past `{main}`. The factory looks at it again at {}, and wakes it when it holds or at the latest at {}, when its interval of 30 minutes runs out.",
+            utc(wait.since + 60),
+            utc(wait.since + 1800)
+        )]
+    );
     assert!(!sup.pump(Duration::ZERO).unwrap());
 
     let moved = land_on_main(&world, "other.txt");
@@ -9714,6 +9833,82 @@ fn a_foreman_that_waits_on_the_default_branch_is_woken_when_it_moves() {
     let goal = sup.goals().next().unwrap().clone();
     let foreman = goal.subgoals[0].foreman.clone().unwrap();
     assert_eq!(foreman.wait, None, "the wait is over");
+    assert_eq!(
+        lines_with(&goal_said(&world, &id), ":alarm_clock:"),
+        [format!(
+            ":alarm_clock: *The foreman of `feature` is woken*: its wait on the default branch moving past `{main}` is over: the condition holds. The default branch is at `{}` now.",
+            &moved[..10]
+        )]
+    );
     assert_eq!(foreman.waiting.as_deref(), Some("escalated"));
     assert_eq!(count("director"), 2, "the escalation reached the director");
+}
+
+/// With `quiet` set a goal still shows the owner each wait and what ended
+/// it, in the goal's thread, without naming them: a wait asks nothing of
+/// the owner. A goal the factory opened with no thread is given one for
+/// it. What else the goal says stays in its log.
+#[test]
+fn a_quiet_goal_posts_each_wait_and_what_ended_it() {
+    use std::time::Duration;
+
+    let world = World::new("wait-quiet", "true");
+    let fake = common::FakeSlack::start_with(true, &[("100.0", "BOT", "root")], None);
+    world.with_slack(&fake.url);
+    quiet(&world);
+    let slack = || Some(factory_slack::Slack::with_base_url("xoxb-test", &fake.url));
+    let main = factory_git::rev_parse(&world.path("toy"), "HEAD").unwrap();
+    let (sup, id) = waiting_goal_on(
+        &world,
+        &[
+            serde_json::json!({"summary": "Nothing to start until the other work lands.",
+                "wait": {"main_past": main, "command": "", "at": 0, "interval_minutes": 0}}),
+            serde_json::json!({"summary": "It landed; I go on.",
+                "wait": {"main_past": "", "command": "", "at": 4_000_000_000_u64, "interval_minutes": 0}}),
+        ],
+        slack(),
+    );
+    let posts = || fake.requests_to("chat.postMessage");
+    let waits: Vec<String> = posts()
+        .into_iter()
+        .filter(|post| post.contains(":hourglass_flowing_sand:"))
+        .collect();
+    assert_eq!(waits.len(), 1, "{:#?}", posts());
+    assert!(
+        waits[0].contains("*The director waits* on the default branch moving past")
+            && waits[0].contains(r#""thread_ts""#)
+            && !waits[0].contains("<@OWNER>"),
+        "{}",
+        waits[0]
+    );
+    let goal = sup.goals().next().unwrap().clone();
+    assert!(!goal.channel.is_empty(), "the goal was given a thread");
+    assert!(
+        !posts().join("\n").contains("*Director* · wake 1"),
+        "the director's wake stays in the log"
+    );
+
+    land_on_main(&world, "other.txt");
+    let mut sup = restart_later_on(&world, sup, &id, "/wait", 60, slack());
+    assert!(sup.pump(Duration::ZERO).unwrap());
+    let posts = posts();
+    let woken: Vec<&String> = posts
+        .iter()
+        .filter(|post| post.contains(":alarm_clock:"))
+        .collect();
+    assert_eq!(woken.len(), 1, "{posts:#?}");
+    assert!(
+        woken[0].contains("*The director is woken*: its wait on the default branch moving past")
+            && woken[0].contains("the condition holds")
+            && woken[0].contains(&format!(r#""thread_ts":"{}""#, goal.thread_ts))
+            && !woken[0].contains("<@OWNER>"),
+        "{}",
+        woken[0]
+    );
+    // The result it woke to waits again: that wait is shown too.
+    let waits = posts
+        .iter()
+        .filter(|post| post.contains(":hourglass_flowing_sand:"))
+        .count();
+    assert_eq!(waits, 2, "{posts:#?}");
 }

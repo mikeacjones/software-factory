@@ -86,8 +86,9 @@ poll_secs = 10
 answer_wait_secs = 43200
 # Post only what needs the owner, with the owner named: a question, a prompt
 # with a button, a goal that stopped by itself, a red default branch, a
-# proposal. A pipeline opens no thread unless a step asks the owner
-# something, and what a director, a foreman or a pipeline would say as it
+# proposal. A goal also posts each wait a director or foreman holds, and
+# what ended it, without naming the owner. A pipeline opens no thread
+# unless a step asks the owner something, and what a director, a foreman or a pipeline would say as it
 # goes is in its log, which the dashboard reads.
 quiet = true
 
