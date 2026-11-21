@@ -9328,3 +9328,392 @@ fn a_failed_check_is_put_to_the_classifier_and_nothing_is_routed_by_what_it_says
     assert!(events_named(&world, &driver, "failure.judged").is_empty());
     assert!(events_named(&world, &driver, "failure.judge_failed").is_empty());
 }
+
+/// A world with one goal definition, a `conformance` command that passes
+/// once the default branch has the file that says so, and a director that
+/// says, in turn, what `results` give. The goal is opened and started, so
+/// the director has decided once. Returns the supervisor and the goal.
+fn waiting_goal(
+    world: &World,
+    results: &[serde_json::Value],
+) -> (factory_driver::goal::Supervisor, String) {
+    use factory_driver::goal::Supervisor;
+    use factory_slack::socket::Incoming;
+
+    let project = world.path("config/projects/toy.toml");
+    let text = std::fs::read_to_string(&project).unwrap();
+    std::fs::write(
+        &project,
+        format!(
+            "{text}\n[commands.conformance]\nargv = [\"sh\", \"-c\", \"echo ran >> {}; test -f conformance.ok\"]\ntimeout_secs = 30\n",
+            world.path("conformance-runs").display()
+        ),
+    )
+    .unwrap();
+    std::fs::create_dir_all(world.path("config/goals/toy")).unwrap();
+    std::fs::write(
+        world.path("config/goals/toy/main.toml"),
+        "id = \"main\"\n[director]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\n",
+    )
+    .unwrap();
+    factory_driver::goal::check_definitions(&world.config()).unwrap();
+    let say = |role: &str, n: usize, json: &serde_json::Value| {
+        std::fs::create_dir_all(world.path("bin/state")).unwrap();
+        std::fs::write(
+            world.path(&format!("bin/state/{role}-{n}.json")),
+            json.to_string(),
+        )
+        .unwrap();
+    };
+    say(
+        "intake",
+        1,
+        &serde_json::json!({"reply": "Here is the charter.", "ready": true, "objective": "Ship it once the other work lands.", "stop_when": "It shipped.", "plan": "Wait for the other work.", "edits": []}),
+    );
+    for (n, fields) in results.iter().enumerate() {
+        let mut result = serde_json::json!({
+            "summary": "Decided.", "start": [], "file": [], "edit": [], "dropped_findings": [],
+            "ask_owner": "", "complete": false, "evidence": "", "journal_entry": "", "project_memory": ""
+        });
+        for (key, value) in fields.as_object().unwrap() {
+            result[key] = value.clone();
+        }
+        say("director", n + 1, &result);
+    }
+    let mut sup = Supervisor::new(world.config(), None, vec!["OWNER".to_string()], false).unwrap();
+    let id = sup.open_directly("toy", "Ship it").unwrap();
+    sup.incoming(Incoming::Action {
+        channel: String::new(),
+        user: "OWNER".to_string(),
+        action_id: "goal_start".to_string(),
+        value: id.clone(),
+        message_ts: String::new(),
+    })
+    .unwrap();
+    (sup, id)
+}
+
+/// The briefs of the director's runs so far, in order.
+fn director_briefs(world: &World) -> Vec<String> {
+    world
+        .calls()
+        .iter()
+        .enumerate()
+        .filter(|(_, call)| call[0] == "director")
+        .map(|(at, _)| {
+            std::fs::read_to_string(world.path(&format!("bin/state/brief-{}.md", at + 1))).unwrap()
+        })
+        .collect()
+}
+
+/// A commit on the default branch of the toy project's remote.
+fn land_on_main(world: &World, file: &str) -> String {
+    let toy = world.path("toy");
+    std::fs::write(toy.join(file), "landed\n").unwrap();
+    run(&toy, "git", &["add", "--all"]);
+    run(&toy, "git", &["commit", "--quiet", "-m", file]);
+    run(&toy, "git", &["push", "--quiet", "origin", "main"]);
+    factory_git::rev_parse(&toy, "HEAD").unwrap()
+}
+
+/// Stop the supervisor, move the times on a goal's wait `secs` into the
+/// past, as if that long had gone by, and start a new one from the records.
+fn restart_later(
+    world: &World,
+    sup: factory_driver::goal::Supervisor,
+    id: &str,
+    secs: u64,
+) -> factory_driver::goal::Supervisor {
+    restart_later_at(world, sup, id, "/wait", secs)
+}
+
+/// [`restart_later`] for the wait at `pointer` in the goal's record.
+fn restart_later_at(
+    world: &World,
+    sup: factory_driver::goal::Supervisor,
+    id: &str,
+    pointer: &str,
+    secs: u64,
+) -> factory_driver::goal::Supervisor {
+    drop(sup);
+    let path = world.path(&format!("state/goals/{id}/goal.json"));
+    let mut record: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let wait = record.pointer_mut(pointer).unwrap();
+    for field in ["since", "looked_at"] {
+        let at = wait[field].as_u64().unwrap();
+        wait[field] = serde_json::json!(at - secs);
+    }
+    std::fs::write(&path, record.to_string()).unwrap();
+    factory_driver::goal::Supervisor::new(world.config(), None, vec!["OWNER".to_string()], false)
+        .unwrap()
+}
+
+/// A director with nothing to start waits for the default branch to move
+/// past a commit. The wait is accepted and kept on the goal's record, which
+/// a restart reads back; next_due names its next look; and once the
+/// branch has moved the director is woken, told that the condition holds.
+#[test]
+fn a_director_that_waits_on_the_default_branch_is_woken_when_it_moves() {
+    use factory_driver::goal::{Phase, WAIT_LOOK_SECS, WaitOn};
+    use std::time::Duration;
+
+    let world = World::new("wait-moves", "true");
+    let main = factory_git::rev_parse(&world.path("toy"), "HEAD").unwrap();
+    let (mut sup, id) = waiting_goal(
+        &world,
+        &[
+            serde_json::json!({"summary": "Nothing to start until the other work lands.",
+                "wait": {"main_past": main, "command": "", "at": 0, "interval_minutes": 0}}),
+            serde_json::json!({"ask_owner": "The other work landed: shall I ship?"}),
+        ],
+    );
+    let goal = sup.goals().next().unwrap().clone();
+    assert_eq!(goal.phase, Phase::Running, "the wait was accepted");
+    assert!(goal.units.is_empty(), "nothing is running");
+    let wait = goal.wait.clone().expect("the goal keeps its wait");
+    assert_eq!(wait.on, WaitOn::MainPast(main.clone()));
+    assert_eq!(
+        (wait.interval_minutes, wait.until()),
+        (60, wait.since + 3600)
+    );
+    assert_eq!(director_briefs(&world).len(), 1, "accepted at once");
+    assert_eq!(sup.next_due(), Some(wait.since + WAIT_LOOK_SECS));
+    // Nothing is looked at before its time.
+    assert!(!sup.pump(Duration::ZERO).unwrap());
+
+    // A minute on, with the default branch unmoved, and a restart between:
+    // the wait is still there, looked at, and kept.
+    let mut sup = restart_later(&world, sup, &id, WAIT_LOOK_SECS);
+    let kept = sup.goals().next().unwrap().wait.clone().unwrap();
+    assert_eq!(kept.on, wait.on, "the restart read the wait back");
+    assert!(sup.next_due().unwrap() <= factory_core::now_unix());
+    assert!(!sup.pump(Duration::ZERO).unwrap(), "it has not moved");
+    let looked = sup.goals().next().unwrap().wait.clone().unwrap();
+    assert!(looked.looked_at > kept.looked_at);
+    assert_eq!(director_briefs(&world).len(), 1);
+
+    // The other work lands. At the next look the director is woken.
+    let moved = land_on_main(&world, "other.txt");
+    let mut sup = restart_later(&world, sup, &id, WAIT_LOOK_SECS);
+    assert!(sup.pump(Duration::ZERO).unwrap());
+    let briefs = director_briefs(&world);
+    assert_eq!(briefs.len(), 2);
+    assert!(
+        briefs[1].contains(&format!(
+            "- Your wait on the default branch moving past `{main}` is over: the condition holds. The default branch is at `{}` now.",
+            &moved[..10]
+        )),
+        "{}",
+        briefs[1]
+    );
+    let goal = sup.goals().next().unwrap().clone();
+    assert_eq!(goal.wait, None, "the wait is over");
+    let events =
+        std::fs::read_to_string(world.path(&format!("state/goals/{id}/events.jsonl"))).unwrap();
+    assert!(events.contains(r#""kind":"wait.accepted""#), "{events}");
+    assert!(
+        events.contains(r#""kind":"wait.ended""#) && events.contains(r#""why":"holds""#),
+        "{events}"
+    );
+}
+
+/// A director waits for a command to pass on the default branch, checked
+/// within five minutes. The command runs once the branch moves, and fails;
+/// it does not run again within the interval, though the branch moves
+/// again; and when the interval runs out the director is woken, told that
+/// it ran out and how the command stands.
+#[test]
+fn a_director_that_waits_on_a_command_is_woken_when_its_interval_runs_out() {
+    use factory_driver::goal::{Phase, WaitOn};
+    use std::time::Duration;
+
+    let world = World::new("wait-runs-out", "true");
+    let (sup, id) = waiting_goal(
+        &world,
+        &[
+            serde_json::json!({"summary": "Nothing to start until conformance passes.",
+                "wait": {"main_past": "", "command": "conformance", "at": 0, "interval_minutes": 5}}),
+            serde_json::json!({"ask_owner": "Conformance still fails: shall I plan the fix?"}),
+        ],
+    );
+    let goal = sup.goals().next().unwrap().clone();
+    assert_eq!(goal.phase, Phase::Running);
+    let wait = goal.wait.clone().unwrap();
+    assert_eq!(wait.on, WaitOn::Command("conformance".to_string()));
+    assert_eq!(wait.interval_minutes, 5);
+    let start = factory_git::rev_parse(&world.path("toy"), "HEAD").unwrap();
+    assert_eq!(wait.head, start, "it knows the commit the director saw");
+    let runs = || {
+        std::fs::read_to_string(world.path("conformance-runs"))
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+
+    // A minute on, on the commit the director saw, the command is not run.
+    let mut sup = restart_later(&world, sup, &id, 60);
+    assert!(!sup.pump(Duration::ZERO).unwrap());
+    assert_eq!(runs(), 0);
+
+    // The branch moves: the command runs there, and fails.
+    let first = land_on_main(&world, "half.txt");
+    let mut sup = restart_later(&world, sup, &id, 60);
+    assert!(!sup.pump(Duration::ZERO).unwrap());
+    assert_eq!(runs(), 1);
+    let ran = sup
+        .goals()
+        .next()
+        .unwrap()
+        .wait
+        .clone()
+        .unwrap()
+        .ran
+        .unwrap();
+    assert_eq!((ran.commit.as_str(), ran.passed), (first.as_str(), false));
+
+    // It moves again, to where the command would pass, but the command ran
+    // less than an interval ago: it is not run, and when the interval runs
+    // out the director is woken with how things stand.
+    let second = land_on_main(&world, "conformance.ok");
+    let mut sup = restart_later(&world, sup, &id, 60);
+    assert!(!sup.pump(Duration::ZERO).unwrap());
+    let mut sup = restart_later(&world, sup, &id, 180);
+    assert!(sup.pump(Duration::ZERO).unwrap());
+    assert_eq!(runs(), 1, "at most once an interval");
+    let briefs = director_briefs(&world);
+    assert_eq!(briefs.len(), 2);
+    assert!(
+        briefs[1].contains(&format!(
+            "- Your wait on `conformance` passing on the default branch is over: its interval of 5 minutes ran out, and the condition does not hold yet. `conformance` failed (exit code 1) on `{}`, and the default branch has moved to `{}` since, less than an interval after that run.",
+            &first[..10],
+            &second[..10]
+        )),
+        "{}",
+        briefs[1]
+    );
+    assert_eq!(sup.goals().next().unwrap().wait, None);
+    let events =
+        std::fs::read_to_string(world.path(&format!("state/goals/{id}/events.jsonl"))).unwrap();
+    assert_eq!(
+        events.matches(r#""kind":"wait.ran""#).count(),
+        1,
+        "{events}"
+    );
+    assert!(events.contains(r#""why":"interval""#), "{events}");
+}
+
+/// A sub-goal's foreman with nothing to start waits for the default branch
+/// to move. Its wait is kept on its record across a restart, and once the
+/// branch has moved the foreman, not the director, is woken and told so.
+#[test]
+fn a_foreman_that_waits_on_the_default_branch_is_woken_when_it_moves() {
+    use factory_driver::goal::{Supervisor, WaitOn};
+    use factory_slack::socket::Incoming;
+    use std::time::Duration;
+
+    let world = World::new("wait-foreman", "true");
+    world.with_github("green");
+    std::fs::create_dir_all(world.path("config/goals/toy")).unwrap();
+    std::fs::write(
+        world.path("config/goals/toy/main.toml"),
+        "id = \"main\"\nflow = \"zig-sdk-bead\"\nship_flow = \"zig-sdk-ship\"\n[director]\nmodel = \"claude-opus-5-5\"\neffort = \"high\"\n[foreman]\nmodel = \"claude-opus-5-5\"\neffort = \"medium\"\n",
+    )
+    .unwrap();
+    let main = factory_git::rev_parse(&world.path("toy"), "HEAD").unwrap();
+    let say = |role: &str, n: u32, json: serde_json::Value| {
+        std::fs::create_dir_all(world.path("bin/state")).unwrap();
+        std::fs::write(
+            world.path(&format!("bin/state/{role}-{n}.json")),
+            json.to_string(),
+        )
+        .unwrap();
+    };
+    say(
+        "intake",
+        1,
+        serde_json::json!({"reply": "Here is the charter.", "ready": true, "objective": "Ship the feature.", "stop_when": "It landed.", "plan": "One sub-goal: toy-1.", "edits": []}),
+    );
+    say(
+        "director",
+        1,
+        serde_json::json!({"summary": "Opened.", "start": [], "file": [], "edit": [], "dropped_findings": [],
+            "open_subgoal": {"id": "feature", "title": "The feature", "objective": "It works.", "beads": ["toy-1"]},
+            "ship": false, "tell_foreman": "", "ask_owner": "", "complete": false, "evidence": "",
+            "journal_entry": "", "project_memory": ""}),
+    );
+    let foreman = |fields: serde_json::Value| {
+        let mut result = serde_json::json!({"summary": "Decided.", "start": [], "file": [],
+            "dropped_findings": [], "report": "working", "message": "", "journal_entry": ""});
+        for (key, value) in fields.as_object().unwrap() {
+            result[key] = value.clone();
+        }
+        result
+    };
+    say(
+        "foreman",
+        1,
+        foreman(
+            serde_json::json!({"summary": "toy-1 needs the other work on main first.",
+            "wait": {"main_past": main, "command": "", "at": 0, "interval_minutes": 30}}),
+        ),
+    );
+    say(
+        "foreman",
+        2,
+        foreman(
+            serde_json::json!({"report": "escalate", "message": "Main moved: is toy-1 still wanted?"}),
+        ),
+    );
+    say(
+        "director",
+        2,
+        serde_json::json!({"summary": "Asked.", "start": [], "file": [], "edit": [], "dropped_findings": [],
+            "open_subgoal": {"id": "", "title": "", "objective": "", "beads": []},
+            "ship": false, "tell_foreman": "", "ask_owner": "Is toy-1 still wanted?", "complete": false,
+            "evidence": "", "journal_entry": "", "project_memory": ""}),
+    );
+    let mut sup = Supervisor::new(world.config(), None, vec!["OWNER".to_string()], false).unwrap();
+    let id = sup.open_directly("toy", "Ship the feature").unwrap();
+    sup.incoming(Incoming::Action {
+        channel: String::new(),
+        user: "OWNER".to_string(),
+        action_id: "goal_start".to_string(),
+        value: id.clone(),
+        message_ts: String::new(),
+    })
+    .unwrap();
+    let count = |role: &str| world.calls().iter().filter(|call| call[0] == role).count();
+    assert_eq!((count("director"), count("foreman")), (1, 1));
+    let goal = sup.goals().next().unwrap().clone();
+    assert_eq!(goal.wait, None, "the director waits on nothing");
+    let wait = goal.subgoals[0]
+        .foreman
+        .as_ref()
+        .and_then(|foreman| foreman.wait.clone())
+        .expect("the foreman keeps its wait");
+    assert_eq!(wait.on, WaitOn::MainPast(main.clone()));
+    assert_eq!(wait.interval_minutes, 30);
+    assert!(!sup.pump(Duration::ZERO).unwrap());
+
+    let moved = land_on_main(&world, "other.txt");
+    let mut sup = restart_later_at(&world, sup, &id, "/subgoals/0/foreman/wait", 60);
+    assert!(sup.pump(Duration::ZERO).unwrap());
+    assert_eq!(count("foreman"), 2, "the foreman was woken");
+    let calls = world.calls();
+    let at = calls.iter().rposition(|call| call[0] == "foreman").unwrap();
+    let brief =
+        std::fs::read_to_string(world.path(&format!("bin/state/brief-{}.md", at + 1))).unwrap();
+    assert!(
+        brief.contains(&format!(
+            "- Your wait on the default branch moving past `{main}` is over: the condition holds. The default branch is at `{}` now.",
+            &moved[..10]
+        )),
+        "{brief}"
+    );
+    let goal = sup.goals().next().unwrap().clone();
+    let foreman = goal.subgoals[0].foreman.clone().unwrap();
+    assert_eq!(foreman.wait, None, "the wait is over");
+    assert_eq!(foreman.waiting.as_deref(), Some("escalated"));
+    assert_eq!(count("director"), 2, "the escalation reached the director");
+}
