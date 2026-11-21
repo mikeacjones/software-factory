@@ -4423,13 +4423,36 @@ fn table(tracker: &[Summary], done: &[String]) -> String {
 }
 
 fn permission_text(definition: &GoalDefinition) -> String {
-    format!("{}\n{}", decisions_text(definition), owner_text(definition))
+    format!(
+        "{}\n{}\n{}",
+        decisions_text(definition),
+        owner_text(definition),
+        wait_text(
+            "goal",
+            if definition.director_decides() {
+                "after which nothing would be running, unless it completes the goal or carries a `wait`: a question to the owner does not count"
+            } else {
+                "after which nothing would be running and nobody would be asked, unless it completes the goal or carries a `wait`"
+            },
+            "A goal that is complete waits for nothing.",
+        )
+    )
+}
+
+/// The rule against leaving nothing running, as `refused` words it for
+/// this agent, and the `wait` a result may carry instead: its three
+/// conditions and the bounds of its interval. `whose` is what waits: the
+/// goal or the sub-goal. `also` is what else is refused with a wait.
+fn wait_text(whose: &str, refused: &str, also: &str) -> String {
+    format!(
+        "- Leaving nothing running: code refuses a result {refused}. When what moves this {whose} next is outside it and code can check it, the result may instead carry a `wait` that names exactly one condition: `main_past`, the SHA of a commit the default branch must move past; `command`, one of the project's commands, which must pass on the default branch; or `at`, a unix time still to come. Its `interval_minutes` is {WAIT_INTERVAL_MIN} to {WAIT_INTERVAL_MAX}, or 0 for {WAIT_INTERVAL_DEFAULT}: you are woken when the condition holds, or at the latest when the interval runs out, and the goal's thread shows the wait and what ended it. A result with neither something running nor a wait is still refused, and so is a wait that names no condition, more than one, or one code cannot check. {also}"
+    )
 }
 
 /// What is left to the owner: their questions, and the end of the goal.
 fn owner_text(definition: &GoalDefinition) -> String {
     if definition.director_decides() {
-        "- Questions: the owner has said you go with your own recommendations, and this stands over anything agreed earlier about bringing decisions to them first. Where you would ask them which way to go, choose the way you would recommend, carry it out in this same result, and say in `summary` what you chose and why, so they can overrule it in the thread. `ask_owner` is only for what nobody but the owner can supply, such as access or a credential, and never stands in for work: code refuses a result that asks and leaves nothing running.\n- Ending the goal: yours. When you have checked the stop condition against the repository and the tracker, point by point, `complete` closes the goal, and the owner is shown your evidence.".to_string()
+        "- Questions: the owner has said you go with your own recommendations, and this stands over anything agreed earlier about bringing decisions to them first. Where you would ask them which way to go, choose the way you would recommend, carry it out in this same result, and say in `summary` what you chose and why, so they can overrule it in the thread. `ask_owner` is only for what nobody but the owner can supply, such as access or a credential, and never stands in for work: code refuses a result that asks and leaves nothing running, unless it waits on a condition as below.\n- Ending the goal: yours. When you have checked the stop condition against the repository and the tracker, point by point, `complete` closes the goal, and the owner is shown your evidence.".to_string()
     } else {
         "- Ending the goal: you propose, the owner decides.".to_string()
     }
@@ -4919,7 +4942,7 @@ pub fn foreman_brief(
         ));
     }
     out.push_str(&format!(
-        "\n## What you may decide\n\n- Starting a pipeline: carried out at once, on a launchable bead of this sub-goal, up to {slots} at a time. A bead blocked only by beads this sub-goal has absorbed is launchable.{}\n- Continuing a pipeline that parked or failed: `continue`, from the step you name, with a note for that step. It goes on in its own worktree with everything it built, and its used-up rounds are open again. A pipeline may be continued {MAX_CONTINUES} times; after that it goes to the director.\n- Filing a new bead: {}\n- Reporting: `working` while a pipeline runs; `ready` hands the sub-goal to the director to ship; `escalate` asks the director, and you are woken with the answer.\n- An existing bead that belongs in this sub-goal and is not one of its beads: escalate, naming it and whether it should go first, and the director adds it. Never file a copy of it.\n- Not yours: shipping, changing a bead that exists, and talking to the owner. Those are the director's; escalate.\n\nReturn the structured result. Code checks every decision against the tracker before carrying it out, and sends back what it refuses.\n",
+        "\n## What you may decide\n\n- Starting a pipeline: carried out at once, on a launchable bead of this sub-goal, up to {slots} at a time. A bead blocked only by beads this sub-goal has absorbed is launchable.{}\n- Continuing a pipeline that parked or failed: `continue`, from the step you name, with a note for that step. It goes on in its own worktree with everything it built, and its used-up rounds are open again. A pipeline may be continued {MAX_CONTINUES} times; after that it goes to the director.\n- Filing a new bead: {}\n- Reporting: `working` while a pipeline runs or the sub-goal waits; `ready` hands the sub-goal to the director to ship; `escalate` asks the director, and you are woken with the answer.\n{}\n- An existing bead that belongs in this sub-goal and is not one of its beads: escalate, naming it and whether it should go first, and the director adds it. Never file a copy of it.\n- Not yours: shipping, changing a bead that exists, and talking to the owner. Those are the director's; escalate.\n\nReturn the structured result. Code checks every decision against the tracker before carrying it out, and sends back what it refuses.\n",
         if slots > 1 {
             format!(
                 "\n- Side by side: where this sub-goal has a design, its order says what each bead comes after, and code refuses to start a bead before those are absorbed. Beads with nothing between them are meant to run at the same time, also when they change the same files: start them together whenever places are free. Where there is no design, or it was written before designs said what comes after what, beads run at the same time only when each has `paths`, the files and directories it will change, and no two declarations overlap; then start beads together when you have read the code each will touch and neither needs the other's result.{} Give a bead its `paths` when you can: its builder is told them. Each bead is built from the branch as it is now; the one absorbed second has the first merged into it and its checks run again, and a conflict goes back to its builder and through the whole pipeline.",
@@ -4934,6 +4957,11 @@ pub fn foreman_brief(
             Permission::Ask =>
                 "not yours on this goal. Describe it in `message` and escalate.",
         },
+        wait_text(
+            "sub-goal",
+            "that reports `working` while nothing would be running in this sub-goal, unless it carries a `wait`",
+            "A `ready` report may not carry a wait: a sub-goal that waits is not ready.",
+        ),
     ));
     out
 }
@@ -12414,6 +12442,61 @@ mod tests {
             )),
             "{brief}"
         );
+    }
+
+    /// The director and the foreman are told, where they are told not to
+    /// leave nothing running, that a result may wait instead, on which
+    /// conditions and at what interval, and that one with neither is
+    /// still refused.
+    #[test]
+    fn the_director_and_the_foreman_are_told_they_may_wait_instead_of_leaving_nothing_running() {
+        let common = [
+            "may instead carry a `wait` that names exactly one condition: `main_past`, the SHA of a commit the default branch must move past; `command`, one of the project's commands, which must pass on the default branch; or `at`, a unix time still to come.",
+            "Its `interval_minutes` is 5 to 60, or 0 for 60: you are woken when the condition holds, or at the latest when the interval runs out",
+            "A result with neither something running nor a wait is still refused",
+        ];
+        let asks = definition(1, "ask");
+        let mut decides = definition(1, "ask");
+        decides.director_decides = Some(true);
+        for (d, refused) in [
+            (
+                &asks,
+                "- Leaving nothing running: code refuses a result after which nothing would be running and nobody would be asked, unless it completes the goal or carries a `wait`.",
+            ),
+            (
+                &decides,
+                "- Leaving nothing running: code refuses a result after which nothing would be running, unless it completes the goal or carries a `wait`: a question to the owner does not count.",
+            ),
+        ] {
+            let brief = wake_brief(d, &goal(), &[], "", "");
+            for expected in common
+                .iter()
+                .chain([&refused, &"A goal that is complete waits for nothing."])
+            {
+                assert!(brief.contains(expected), "{expected}\n{brief}");
+            }
+        }
+        let text = permission_text(&decides);
+        assert!(
+            text.contains("code refuses a result that asks and leaves nothing running, unless it waits on a condition as below."),
+            "{text}"
+        );
+
+        let d = tiered("allow");
+        let goal = with_foreman(&[], None);
+        let pipeline = steps();
+        let shop = Shop {
+            steps: &pipeline,
+            records: Path::new("/state/units"),
+        };
+        let brief = foreman_brief(&d, &goal, &goal.subgoals[0], &tracker(), &shop, "", "");
+        for expected in common.iter().chain([
+            &"- Reporting: `working` while a pipeline runs or the sub-goal waits;",
+            &"- Leaving nothing running: code refuses a result that reports `working` while nothing would be running in this sub-goal, unless it carries a `wait`. When what moves this sub-goal next is outside it",
+            &"A `ready` report may not carry a wait: a sub-goal that waits is not ready.",
+        ]) {
+            assert!(brief.contains(expected), "{expected}\n{brief}");
+        }
     }
 
     #[test]

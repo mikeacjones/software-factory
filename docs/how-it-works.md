@@ -344,6 +344,52 @@ flowchart TD
 
 The run may not change `.github`, the project's record, its flow or its goal definitions: those are forbidden paths, so a change to them parks the unit. `factory service rollback` makes the release before current again.
 
+## 9. A director or foreman waits on a condition outside the goal
+
+Code refuses a director's result that would leave nothing running, unless it asks the owner (where the owner has not left decisions to the director), puts a bead it files or changes to the owner for approval, or completes the goal. It refuses a foreman's `working` report with nothing running in the sub-goal. Sometimes what moves the goal next is outside it: another piece of work has to land, a command has to pass, a time has to come. For that the result may carry a *wait* instead. A result with neither something running nor a wait is refused as before.
+
+A wait names exactly one condition, and code checks it as it accepts the result (`wait_of` in `factory-driver/src/goal.rs`):
+
+| Field | What it names | Refused when |
+|---|---|---|
+| `main_past` | The SHA of a commit: the default branch must move past it | It is not 7 to 40 hex digits |
+| `command` | One of the project's commands: it must pass on the default branch | The project has no command of that name |
+| `at` | A unix time in seconds: it must come | It is not still to come |
+| `interval_minutes` | The latest the agent is woken after the wait is accepted | It is not 5 to 60; 0 or none means 60 |
+
+A wait that names no condition, or more than one, is refused too, also beside running work. A goal that is complete waits for nothing, and a foreman's `ready` report may not carry a wait.
+
+```mermaid
+sequenceDiagram
+    participant Agent as Director or foreman agent
+    participant Tiers as A turn of the tiers
+    participant Project as Project workflow
+    participant Main as The default branch
+    participant Slack as The goal's thread
+
+    Agent->>Tiers: a result with nothing running and a wait
+    Note over Tiers: Code checks the wait and keeps it on the goal's record,<br/>or on its foreman's while the foreman reports working.<br/>It logs wait.accepted. The agent's next result replaces it.
+    Tiers->>Slack: hourglass line: who waits, on what,<br/>when it is looked at again, when its interval runs out (UTC)
+    Tiers-->>Project: the next time something is due, the wait's next look among them
+
+    loop at each look that is due, until it holds or the interval runs out
+        Project->>Tiers: activity turn, look_at_waits
+        alt main_past
+            Tiers->>Main: read its head, at most once a minute
+        else command
+            Tiers->>Main: run the command in a scratch checkout of the default branch,<br/>only once the branch has moved past the commit the agent saw<br/>or the command last ran on, and at most once an interval
+        else at
+            Note over Tiers: compare the time with the clock
+        end
+    end
+
+    Note over Tiers: Code clears the wait and logs wait.ended.<br/>A condition that holds when the interval runs out is said to hold.
+    Tiers->>Slack: alarm clock line: who is woken, whether the condition held<br/>or the interval ran out, and how the condition stands
+    Tiers->>Agent: woken, with a note saying the same
+```
+
+Both lines are posted with `quiet` set as well, so the owner sees every wait, and neither names the owner, since a wait asks nothing of them. A goal the factory opened by itself, which has no thread yet, is given one for them. A director or foreman woken by something else while it waits is shown its wait in its brief, and gives `wait` again to go on waiting. Nothing is looked at while the service drains: a look could start a command, and that waits for the next release.
+
 ## Where each diagram comes from
 
 | Diagram | Code and config |
@@ -354,5 +400,6 @@ The run may not change `.github`, the project's record, its flow or its goal def
 | 5 | `crates/factory-driver/src/lib.rs` (`agent_step`, `verify_reproductions`, `adopt_regressions`, `check_regressions`), `crates/factory-brief/src/lib.rs` (`result_problems`) |
 | 6, 7 | `crates/factory-driver/src/goal.rs` (`run_schedule`, `classes_calling`, `maintenance_problems`, `open_maintenance`, `settle_maintenance`), `crates/factory-driver/src/lib.rs` (`finding_classes`, `answer_class`, `check_landed`, `classes_unchecked`), `config/goals/temporal-sdk-zig/upkeep.toml` |
 | 8 | `crates/factory-driver/src/goal.rs` (`run_direct`, `open_direct`, `settle_direct`), `crates/factory-driver/src/lib.rs` (`deploy_step`), `crates/factory-driver/src/service.rs` (`build_and_release`, `rollback_release`), `config/flows/factory-self.toml`, `config/goals/software-factory/nightly.toml` |
+| 9 | `crates/factory-driver/src/goal.rs` (`wait_schema`, `wait_of`, `decision_problems`, `foreman_problems`, `Waiting`, `look_at_waits`, `Supervisor::show`), `config/roles/foreman.md` |
 
 A diagram that no longer matches these is wrong: change it with the code.

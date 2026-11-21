@@ -148,6 +148,12 @@ A command step that runs each test a change adds or alters on the code as it was
 
 A command of the project that a goal definition names to decide the goal's stop condition. Code runs it on the default branch, shows the director what it said, and refuses a proposal that the goal is complete while it fails.
 
+## wait
+
+What a director's result, or a foreman's `working` report, may carry instead of leaving something running, when what moves the goal or sub-goal next is outside it and code can check it. It names exactly one condition: `main_past`, a commit the default branch must move past; `command`, one of the project's commands, which must pass on the default branch; or `at`, a unix time still to come. Its `interval_minutes`, 5 to 60 and 60 by default, is the latest the agent is woken. Code refuses a wait that names no condition, more than one, or one it cannot check, and still refuses a result that leaves nothing running and carries no wait.
+
+Code keeps an accepted wait on the goal's record, or the foreman's, until the agent's next result replaces it. It reads the default branch once a minute, runs the command on it once the branch has moved and at most once an interval, and compares a time with the clock. When the condition holds or the interval runs out it clears the wait and wakes the agent with how the condition stands. The goal's thread shows a line when a wait is accepted and one when it ends, also with `quiet` set. Not the accounts workflow's waiting for an *account*, which is no agent's decision.
+
 ## schedule
 
 When a goal definition is run by the factory itself: at an hour of the day, every so many days, and, if it says so, as soon as a *finding class* has broken so many beads more. A definition with one is not a goal the owner opens. Each run is one agent, which files beads; a schedule that names a definition to build under lets a run mark beads the factory then builds.
